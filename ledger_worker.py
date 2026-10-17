@@ -100,7 +100,7 @@ def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None,
     observer = NativeReceiver(store)
     service = remote or RemoteLedger(store, environment)
     totals = {"sent": 0, "failed": 0, "deferred": 0}
-    last_retention = 0.0
+    last_retention: float | None = None
     while True:
         with worker_lock(store) as acquired:
             if not acquired:
@@ -111,7 +111,7 @@ def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None,
                 stream.write(str(os.getpid()))
             try:
                 while True:
-                    if time.monotonic() - last_retention > 3600:
+                    if last_retention is None or time.monotonic() - last_retention > 3600:
                         store.retention()
                         last_retention = time.monotonic()
                     for key, value in service.pump().items():

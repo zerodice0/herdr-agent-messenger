@@ -80,6 +80,57 @@ class WorkerHandoffTest(unittest.TestCase):
         self.assertEqual(state,'queued')
         self.assertTrue(ledger_worker.maintenance_pending(self.store))
 
+    def test_once_retains_current_data_and_purges_expired_rows_at_zero_monotonic_epoch(self):
+        now = time.time()
+        day = 86400
+        with patch.dict(os.environ, {'HERDR_AGENT_LEDGER_AUTOSTART': '0'}):
+            expired, recent, nonfinal = (self.send() for _ in range(3))
+        self.mail.handle(self.recipient, [expired['message_id'], recent['message_id']])
+        claim = self.mail.claim(terminal_id=self.recipient['terminal_id'],
+                                agent_id=self.recipient['agent_id'],
+                                generation=self.recipient['generation'])
+        self.mail.resolve_claim(claim_id=claim['claim_id'], agent_id=claim['agent_id'],
+                                generation=claim['generation'], disposition='applied',
+                                evidence='Explicit operator-applied retention fixture, not native evidence')
+        with self.store.transaction() as connection:
+            for message, age in ((expired, 91), (recent, 89)):
+                connection.execute('UPDATE messages SET created_at=?,final_at=? WHERE message_id=?',
+                                   (now-age*day, now-age*day, message['message_id']))
+            connection.execute('UPDATE messages SET created_at=? WHERE message_id=?',
+                               (now-120*day, nonfinal['message_id']))
+            connection.execute('DELETE FROM status_log')
+            for seq, age in ((101, 31), (102, 29)):
+                connection.execute('INSERT INTO wake_log VALUES (?,?,?,?)',
+                                   (seq, self.recipient['agent_id'], now-age*day, '[]'))
+                connection.execute('INSERT INTO status_log VALUES (?,?,?,?,?)',
+                                   (seq, self.recipient['agent_id'], 'phase', 'retention fixture', now-age*day))
+            current_status = [dict(row) for row in connection.execute('SELECT * FROM agent_status ORDER BY agent_id')]
+        self.assertFalse(ledger_worker.maintenance_pending(self.store))
+        with patch.object(ledger_worker.time, 'monotonic', return_value=0.0):
+            result = ledger_worker.run_worker(self.store, self.environment, once=True)
+        with self.store.read() as connection:
+            observed = {
+                'messages': sorted(row[0] for row in connection.execute('SELECT message_id FROM messages')),
+                'wake_log': [row[0] for row in connection.execute('SELECT seq FROM wake_log ORDER BY seq')],
+                'status_log': [row[0] for row in connection.execute('SELECT seq FROM status_log ORDER BY seq')],
+            }
+            self.assertEqual(observed, {
+                'messages': sorted([recent['message_id'], nonfinal['message_id']]),
+                'wake_log': [102],
+                'status_log': [102],
+            })
+            self.assertEqual([dict(row) for row in connection.execute(
+                'SELECT * FROM agent_status ORDER BY agent_id')], current_status)
+            self.assertEqual(connection.execute('SELECT count(*) FROM dedupe_receipts').fetchone()[0], 3)
+            retained = connection.execute(
+                'SELECT m.final_at,d.state,d.confirmation_source FROM messages m '
+                'JOIN deliveries d USING(message_id) WHERE message_id=?', (nonfinal['message_id'],)).fetchone()
+            self.assertEqual(tuple(retained), (None, 'delivered', 'operator'))
+        self.assertEqual(result['reason'], 'one_pass')
+        self.assertFalse((self.store.directory/'worker.pid').exists())
+        with ledger_worker.worker_lock(self.store) as acquired:
+            self.assertTrue(acquired)
+
     def test_repeated_diagnostic_is_one_last_seen_row_and_expires_after_thirty_days(self):
         for _ in range(100):
             self.store.note_notification_failure('worker sweep: Herdr unavailable')

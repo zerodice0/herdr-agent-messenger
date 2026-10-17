@@ -416,6 +416,9 @@ Deploy in this order, separately on every participating host:
 
 Storage uses a private 0700 state directory, 0600 SQLite database and WAL.
 Final message bodies expire after 90 days; wake/status logs after 30 days.
+Each worker run performs startup cleanup immediately after taking its lock,
+regardless of the monotonic clock's epoch, including one-pass/no-work runs.
+A continuing worker repeats cleanup hourly.
 Dedupe hashes, compact receipts and withdrawal tombstones remain. The UI checks
 the local bell every second and remote live status every 30 seconds
 independently; these and worker/OMP safety checks are code-only, not model
