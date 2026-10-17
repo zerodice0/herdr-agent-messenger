@@ -39,6 +39,9 @@ command = ["python3", "agent_labels.py", "reconcile"]
 [[startup]]
 command = ["python3", "agent_delivery.py", "reconcile"]
 
+[[startup]]
+command = ["python3", "ledger_cli.py", "ledger", "reconcile"]
+
 [[events]]
 on = "pane.agent_detected"
 command = ["python3", "agent_labels.py", "event"]
@@ -46,6 +49,14 @@ command = ["python3", "agent_labels.py", "event"]
 [[events]]
 on = "pane.agent_status_changed"
 command = ["python3", "agent_labels.py", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "ledger_cli.py", "ledger", "event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "ledger_cli.py", "ledger", "event"]
 
 [[panes]]
 id = "messenger"

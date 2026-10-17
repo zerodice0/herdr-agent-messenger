@@ -16,6 +16,8 @@ from dataclasses import asdict
 from typing import Any
 
 import agent_delivery
+import ledger_cli
+from ledger_store import LedgerError
 import request_lifecycle
 from agent_batch_dispatch import (
     CANCELLED,
@@ -1336,6 +1338,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
             help="Hold focused-recipient delivery before asking for a decision in ms (default: 180000).",
         )
     add_spawn_parser(subparsers)
+    ledger_cli.add_parsers(subparsers)
     return parser.parse_args(argv)
 
 
@@ -1353,7 +1356,9 @@ def main(
             arguments.host, arguments.label = parse_agent_address(
                 arguments.address, arguments.host
             )
-        if arguments.command == "list":
+        if arguments.command in ledger_cli.COMMANDS:
+            payload = ledger_cli.dispatch(arguments, environment)
+        elif arguments.command == "list":
             payload = list_command(
                 arguments.host,
                 environment,
@@ -1455,7 +1460,7 @@ def main(
             for report in reports:
                 report()
         return exit_code
-    except (BatchDispatchError, SkillCommandError, SpawnError) as error:
+    except (BatchDispatchError, SkillCommandError, SpawnError, LedgerError) as error:
         _write_json(
             {"error": {"code": error.code, "message": error.message}},
             compact=command == "batch",

@@ -112,6 +112,56 @@ HAM `spawn --kind claude`의 준비 상태 확인을 막을 수 있습니다.
 반환되었습니다. 이 호스트·세션 조건을 스킬 누락이나 Claude 인증 전반의 실패로
 해석하지 마세요.
 
+## 로컬 메일함
+
+진행 중인 프롬프트를 방해하지 않고 메시지를 남기려면 로컬 메일함을 사용하세요.
+등록된 Herdr 에이전트 pane에서 다음 명령을 실행합니다.
+
+```bash
+HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
+python3 "$HAM_CLI" mail send --to local/blue-owl --kind action --body '경계 조건을 검토해 주세요.'
+python3 "$HAM_CLI" inbox read
+python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
+python3 "$HAM_CLI" mail show --thread THREAD_UUID
+```
+
+`mail send`는 같은 저장소의 로컬 `--to local/LABEL`과 `--body TEXT` 또는
+`--body-file PATH` 중 하나를 받습니다. 본문은 비어 있지 않은 UTF-8이며 최대
+16 KiB입니다. `--kind fyi|action`의 기본값은 `fyi`이고,
+`--subject TEXT`는 새 대화 제목을 정합니다(UTF-8 기준 최대 1024바이트).
+`--reply-to UUID`는 기존 대화와 이어지고 hop을 1 늘립니다. 답장자가 수신자인
+queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로 바뀝니다.
+종류가 action이어도 이 명령 자체는 모델을 깨우지 않습니다.
+
+`inbox read`는 `--message UUID`, `--all`, `--limit N`을 받습니다.
+기본 한도는 100개이며 1~1000개를 지정할 수 있습니다. 조회는 상태·로그·초인종을
+바꾸지 않으며, 같은 pane을 쓰는 서브에이전트도 같습니다.
+`inbox handle --message UUID`는 여러 번 지정할 수 있고 전체를 검증한 뒤
+한꺼번에 handled로 바꿉니다. queued 메시지를 처리해도 delivered 시각을 만들지
+않습니다. `mail withdraw --message UUID`는 아직 claim되지 않은 메시지를
+철회하며, 이미 claim됐거나 최종 상태이면 `withdrawn:false`를 반환합니다.
+`mail show --thread UUID`는 대화를, `repo show`는 저장소 설정을 조회합니다.
+
+CLI는 프로세스 조상과 Herdr의 공개 `pane process-info`가 반환한 shell PID를
+대조해 이동한 terminal을 찾습니다. stdin TTY나 `HERDR_TERMINAL_ID`가 없어도
+동작하며, 정체성을 확인할 수 없으면 상속된 옛 pane ID로 추측하지 않고
+거절합니다. 세션 generation은 native session 정체성에 따라 바뀌며 표시·상태
+revision만 바뀌어서는 증가하지 않습니다. 다른 저장소나 shell이 terminal을
+차지하면 queued 메시지를 보류합니다. 접수 여부를 모르는 delivering 메시지는
+세션 교체나 재시작 뒤에도 자동 재전송하지 않습니다.
+
+Git HTTPS/SSH/scp origin은 host와 경로를 기준으로 정규화합니다. origin 이름을
+바꿀 때 정체성을 유지하려면 미리
+`git config ham.repo-id 'git:host/stable/repo'`를 지정하세요.
+기본 저장 위치는 `${XDG_STATE_HOME:-~/.local/state}/herdr-agent-messenger/ledger`입니다.
+테스트에는 `HERDR_AGENT_LEDGER_DIR`를 쓰고, 새 원장의 고정 host 이름은
+`HERDR_AGENT_CANONICAL_HOST`로 지정할 수 있습니다.
+내부 서비스인 `ledger doctor`, `ledger reconcile`, `ledger event`,
+`ledger retention`, `ledger agent-session`, `ledger delivery claim|started|release`의
+JSON과 복구·증거 계약은 [참고서](../../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)에
+정리되어 있습니다. 기존 prompt 전송과 Held Messages는 그대로이며, 로컬 메일함
+명령이 runtime 확장이나 전역 규칙을 설치하지 않습니다.
+
 ## 주소 선택과 새 세션 생성
 
 항상 호스트가 포함된 정확한 Agent Labels 주소를 사용하세요. 리터럴 호스트

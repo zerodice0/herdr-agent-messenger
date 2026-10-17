@@ -4,7 +4,7 @@ Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloa
 
 ## Command and flag reference
 
-All eight commands accept `-h` / `--help` (usage, exit 0) and `--verbose` (full diagnostic JSON instead of compact output; default off). Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
+The eight prompt-routing commands below accept `-h` / `--help` (usage, exit 0) and `--verbose` (full diagnostic JSON instead of compact output; default off). The separate mailbox commands also accept help, but have no verbose flag. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
 
 ### Recipient selectors
 
@@ -20,6 +20,72 @@ All eight commands accept `-h` / `--help` (usage, exit 0) and `--verbose` (full 
 Only literal `local` means local transport. Even a hostname matching this machine means SSH. Labels can repeat across hosts and do not guarantee the same occupant after restart. Missing/ambiguous hosts or labels must be reported, not guessed. Never substitute a pane ID or create a missing agent unless asked.
 
 A verified route can refresh only when continuity checks identify one safe occupant. In verbose output, retain a new `route` when `route_refreshed: true`. Compact output intentionally omits routes; use addresses for normal agent workflows.
+
+### Local mailbox
+
+Mailbox messages are durable data, not terminal prompts. Local same-repository
+agents can exchange them without interrupting an ongoing turn:
+
+```bash
+python3 scripts/herdr_agent_messenger.py mail send \
+  --to local/blue-owl --kind action --subject 'Review' --body 'Inspect the boundary.'
+python3 scripts/herdr_agent_messenger.py inbox read
+python3 scripts/herdr_agent_messenger.py inbox handle --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py mail show --thread THREAD_UUID
+python3 scripts/herdr_agent_messenger.py mail withdraw --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py repo show
+```
+
+| Command | Flags and semantics |
+| --- | --- |
+| `mail send` | Required `--to local/LABEL` (the canonical local host also works). `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered mail also marks that parent handled atomically. |
+| `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000). Without `--all`, shows queued, uncertain delivering, and delivered mail. Reads never change delivery, logs, or bells, even from subagents. |
+| `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
+| `mail show` | Required `--thread UUID`; returns retained bodies and delivery state. |
+| `mail withdraw` | Required `--message UUID`; originating terminal only. Withdraw races atomically with queued→delivering claim. Already-claimed/delivered/handled messages are not withdrawn; inspect the returned `withdrawn` flag. |
+| `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
+
+All commands return one JSON object. Errors use the existing CLI convention
+`{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; argparse usage errors exit 2.
+The legacy request lifecycle's `error_code` field is unchanged. Useful codes:
+`sender_unresolved`, `stale_session`, `recipient_absent`, `repo_mismatch`,
+`message_conflict`, `delivery_in_progress`, `body_too_large`.
+
+Messages use the stable terminal slot, not inherited pane IDs. The CLI matches
+its process ancestors against Herdr's public `pane process-info` shell PID;
+cached old pane bindings only prioritize that lookup. Piped tool subprocesses
+work after a move without `HERDR_TERMINAL_ID` or a stdin TTY. A runtime that has
+already resolved its stable terminal can supply `HERDR_TERMINAL_ID`. If no
+identity can be proven, HAM fails closed rather than guessing from a stale pane.
+
+Git HTTPS/SSH/scp origins normalize to `git:host[:nondefault-port]/Path`, preserving
+path case. Set `git config ham.repo-id 'git:host/stable/repo'` before a configured
+origin rename to keep that explicit identity. Without an origin, identity is
+local to the canonical host and real repository root. A different-repository
+occupant holds queued mail; a same-repository new session can claim it. Missing
+agents hold queued mail; closed terminals make unclaimed mail undeliverable.
+Unknown claims are never automatically replayed across crashes/session changes.
+
+Storage is `${XDG_STATE_HOME:-~/.local/state}/herdr-agent-messenger/ledger`
+(directory 0700, database 0600, SQLite WAL). Use `HERDR_AGENT_LEDGER_DIR` for
+isolated tests; `HERDR_AGENT_CANONICAL_HOST` sets a new ledger's fixed host name,
+and reopening an existing ledger with a different name is rejected. Final
+message bodies expire after 90 days; permanent compact hashes/receipts prevent
+ID reuse even after deletion. Status/wake history expires after 30 days.
+
+Internal plugin/runtime services use the same launcher: `ledger doctor`,
+`ledger reconcile`, `ledger event`, `ledger retention`, `ledger agent-session`,
+and `ledger delivery claim|started|release`. Reconcile/events fetch a fresh
+complete snapshot under a per-ledger lock. `agent-session` takes JSON stdin with
+`terminal_id`, `session_ref`, `client`, `repo_id`, `extension_present`.
+`delivery claim` takes `terminal_id`, `agent_id`, `generation`, optional `kinds`
+(`fyi`, `action`) and `via` (`wake`, `before_agent_start`, `hook`); it returns
+`claim_id` and the claimed messages. `started` takes `claim_id`, `agent_id`,
+`generation`, `evidence` and requires actual context-application evidence, not
+hook return or terminal acceptance. `release` takes the same identity/evidence
+and `disposition` (`not_applied` to requeue, `unknown` to retain the uncertain
+claim). These APIs do not themselves prove native OMP/Claude admission; no
+automatic receiver/wake is enabled by the local mailbox commands.
 
 ### `list`
 

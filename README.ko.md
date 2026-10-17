@@ -106,6 +106,20 @@ HAM 플러그인을 활성화하지 않고 Herdr와 스킬만 사용할 수도 �
 단독 설치 방법과 제약은 [스킬 가이드](docs/ko/skill-guide.md#플러그인-없이-ham-사용)를
 참고하세요.
 
+## 로컬 메일함
+
+등록된 Herdr 에이전트 pane에서 `mail send --to local/LABEL --body TEXT`로
+진행 중인 작업을 방해하지 않고 메시지를 남길 수 있습니다. 받는 쪽은
+`inbox read`로 조회하고 `inbox handle --message UUID`로 처리를 기록합니다.
+같은 pane을 쓰는 서브에이전트가 조회해도 전달·처리 상태는 바뀌지 않습니다.
+`mail show --thread UUID`는 대화와 상태를 보여 주며,
+`mail withdraw --message UUID`는 아직 전달 claim이 없는 메시지를 철회합니다.
+
+현재 메일함 명령은 로컬의 같은 저장소 에이전트에게만 보냅니다. 터미널에
+프롬프트를 넣거나 모델을 깨우지 않습니다. 기존 `send`/`request`, Held
+Messages와 원격 전송 동작은 그대로 유지됩니다. 플래그, 저장 위치와 격리 방법,
+정체성 설정은 [스킬 가이드](docs/ko/skill-guide.md#로컬-메일함)를 참고하세요.
+
 ## 문서
 
 | 주제 | 한국어 | English |

@@ -90,6 +90,52 @@ over SSH while their macOS Keychains were unavailable to non-GUI sessions
 (`User interaction is not allowed`). That observed host/session condition is
 not evidence of a missing skill or a general Claude authentication failure.
 
+## Local mailbox
+
+Use the local mailbox when a message must remain available without submitting a
+prompt or waking the recipient. Run from a registered Herdr agent pane:
+
+```bash
+HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
+python3 "$HAM_CLI" mail send --to local/blue-owl --kind action --body 'Review the boundary.'
+python3 "$HAM_CLI" inbox read
+python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
+python3 "$HAM_CLI" mail show --thread THREAD_UUID
+```
+
+`mail send` requires `--to` and exactly one of `--body` / `--body-file` (UTF-8,
+nonblank, 16 KiB maximum). `--kind fyi|action` defaults to `fyi`; `--subject`
+sets a new thread's subject (1024 UTF-8 bytes), and `--reply-to UUID` keeps the
+thread, increments hop, and atomically handles an addressed queued/delivered
+parent. Both kinds remain queued until explicitly handled or claimed by a
+runtime receiver. The local command does not wake a model.
+
+`inbox read` accepts `--message UUID`, `--all`, and `--limit N` (default 100,
+1–1000). It never changes state/logs/bells, including when a task agent shares
+the calling pane. `inbox handle --message UUID` is repeatable and all-or-nothing;
+queued→handled does not invent a native delivered timestamp.
+`mail withdraw --message UUID` competes atomically with delivery claim and
+returns `withdrawn:false` once claimed/final. `mail show --thread UUID` reads the
+thread, and `repo show` reads this agent's repository/settings.
+
+The CLI resolves moved terminals through process ancestry and Herdr's public
+`pane process-info` shell PID, without requiring a TTY or inherited terminal
+variable. It refuses an unprovable/stale-pane identity. Native session references
+determine generations; a display/status revision does not create a new session.
+Queued mail can move to a new session in the same repository; other-repository
+or shell occupants hold it. Uncertain delivering claims are never auto-replayed.
+
+Git HTTPS/SSH/scp origins normalize to a host/path identity. Preserve a planned
+origin rename explicitly with `git config ham.repo-id 'git:host/stable/repo'`.
+Default storage is `${XDG_STATE_HOME:-~/.local/state}/herdr-agent-messenger/ledger`;
+set `HERDR_AGENT_LEDGER_DIR` for tests and `HERDR_AGENT_CANONICAL_HOST` only when
+creating a new ledger. Internal `ledger doctor`, `ledger reconcile`, `ledger
+event`, `ledger retention`, `ledger agent-session` and `ledger delivery
+claim|started|release` share the Python store. See the
+[reference](../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
+for their JSON contracts and recovery/evidence requirements. The local mailbox
+does not change legacy prompt routing, Held Messages, or install any runtime.
+
 ## CLI commands and addressing
 
 The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.

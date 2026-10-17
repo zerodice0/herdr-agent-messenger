@@ -111,6 +111,21 @@ HAM can also be used with Herdr without enabling the plugin. See the
 [skill guide](docs/skill-guide.md#use-ham-without-the-plugin) for the
 source-backed standalone setup and its limitations.
 
+## Durable local mailbox
+
+The checkout also provides a non-interrupting local mailbox. From a registered
+Herdr agent pane, use `mail send --to local/LABEL --body TEXT`, then let the
+recipient use `inbox read` and `inbox handle --message UUID`. A read never marks
+mail delivered or handled, including reads from task agents sharing the pane.
+`mail show --thread UUID` shows the thread; `mail withdraw --message UUID`
+withdraws only mail that has not already been claimed.
+
+The current mailbox commands accept local, same-repository recipients. They do
+not submit a terminal prompt or wake a model. Existing `send`/`request`, Held
+Messages, and their remote behavior are unchanged. See the
+[mailbox command reference](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
+for flags, state/recovery rules, storage isolation, and identity configuration.
+
 ## Documentation
 
 | Guide | English | 한국어 |
