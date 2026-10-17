@@ -58,6 +58,11 @@ within the same repository. The [HAM TUI](docs/ui-reference.md) provides Status,
 Threads, Compose, and Settings views. Its user composer distinguishes ordinary
 mailbox messages from direct input that may interrupt the recipient; direct
 input is not the agent-to-agent coordination path.
+Status groups agents under per-host headers showing stale/error state. Each agent
+has one clipped metadata line and up to three indented summary lines. Enter opens
+full labeled details with hanging-indent wrapping on every field and local
+date/time plus relative age; status-update and observation times remain separate.
+Hangul/Latin preserve word boundaries; Han/Kana/emoji allow display-cell breaks.
 
 The legacy **Send Prompt to Agents** popup still supports coordinator delegation
 and direct multi-recipient delivery where participation policy permits it.
@@ -162,6 +167,51 @@ delivered timestamp. Replies to mail addressed to the current recipient
 atomically handle that parent. Use `mail show --thread UUID` to inspect the
 thread and `mail withdraw --message UUID` to request withdrawal; already-claimed
 mail cannot simply be recalled.
+
+### Read repository history and the status board
+
+Use the bundled CLI prefix above with these read-only commands:
+
+```text
+mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+```
+
+History defaults to the verified caller's repository; explicit `--repo REPO_ID`
+avoids a Herdr caller-identity lookup. Both lists cover all participants' retained
+records in that repository on this ledger, including sent/received threads and
+pending remote copies, not replicated all-host history. Direct history is
+read-only user-direct submission evidence, not permission to send direct input.
+`--limit` defaults to 100 (1–1000). Results contain `repo_id`,
+`threads` or `submissions`, and `next_cursor` (`null` at the end). Pass the opaque,
+HMAC-signed cursor unchanged; it is bound to the ledger, query and repository.
+Ordering is `updated_at DESC`, UUID ascending, using keyset pagination, not OFFSET.
+Pages are live, not a frozen snapshot: updates can move records before the
+boundary; restart from the first page to see newer updates. Tampered or
+wrong-scope tokens fail with `invalid_cursor`.
+
+The board defaults to all local repositories and all registered peers. Bare
+`--repo` selects the caller's repository; `--repo ID` filters explicitly.
+`--host` selects only the local ledger or one registered canonical host/SSH alias.
+The result is `{repo_id,agents,hosts}`, with full role/turn/phase/summary/unread,
+receiver and placement fields. `status_updated_at` records the status update;
+`last_seen` records registry observation. It reads stored snapshots without
+registry refresh, status/display/claim mutation, or peer refresh (`refresh=false`).
+Peer failures stay in `hosts` as structured errors with `stale:true`, unread `?`;
+a stateless CLI does not invent missing agent rows. A TUI may retain verified
+prior rows as stale. `list` and local `status list` remain narrower reads.
+Peers must support this read API: older versions may ignore `refresh=false`
+and perform their legacy registry refresh. A partial peer failure still exits
+with code 0; inspect each host's `error`, `stale` and unread fields. An unknown or
+ambiguous `--host` returns `peer_not_configured` with exit code 1.
+
+All three commands accept `-h` / `--help`, have no `--verbose`, and return one
+JSON object. Domain errors use `{"error":{"code":"CODE","message":"TEXT"}}`
+(exit 1); usage errors exit 2. Reads never acknowledge mail or expose public
+settings, user-compose/direct-send, or operator ACK bypasses. See the
+[reference terminology](.agents/skills/herdr-agent-messenger/reference.md#mailbox-terminology)
+for inbox, Threads, transport outbox, message states and unread counts.
 
 ### Participation and roles
 

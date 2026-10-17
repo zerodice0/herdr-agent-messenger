@@ -15,24 +15,28 @@ from ledger_mail import Mailbox
 from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerStore
+from terminal_text import display_width
 from mailbox_tui import (Job, MailboxApp, OPENER_PANE, OPENER_TERMINAL, REPO_ENV, clip,
                          close_owned, describe_message, dispatch_direct, edit_buffer,
-                         execute_job, launch, local_snapshot)
+                         execute_job, launch, local_snapshot, wrap_summary)
 
 
 class Screen:
     def __init__(self, height=24, width=100):
         self.height, self.width = height, width
         self.rows = {}
+        self.attributes = {}
 
     def getmaxyx(self):
         return self.height, self.width
 
     def erase(self):
         self.rows = {}
+        self.attributes = {}
 
     def addstr(self, row, column, text, attribute=0):
         self.rows[row] = text
+        self.attributes[row] = attribute
 
     def refresh(self):
         pass
@@ -75,8 +79,9 @@ class MailboxUiTest(unittest.TestCase):
         self.environment[REPO_ENV] = self.repo_id
         self.mail = Mailbox(self.store, self.environment)
 
-    def app(self):
-        app = MailboxApp(Screen(), self.environment, job_factory=PendingJob, clock=lambda: self.now)
+    def app(self, **options):
+        app = MailboxApp(Screen(), self.environment, job_factory=PendingJob,
+                         clock=lambda: self.now, **options)
         app.local = local_snapshot(self.store, self.repo_id)
         return app
 
@@ -120,7 +125,7 @@ class MailboxUiTest(unittest.TestCase):
     def test_remote_schedule_independent_of_local_bell_and_input(self):
         self.now = 0
         app = self.app()
-        app.local['peers'] = [{'canonical_name': 'offline'}]
+        app.local['peers'] = [{'canonical_name': 'offline', 'uuid': 'offline-uuid'}]
         app.tick()
         remote = app.jobs['remote:offline']
         app.key('4')
@@ -484,6 +489,388 @@ class MailboxUiTest(unittest.TestCase):
             app.render()
         self.assertGreater(app.scroll, len(app.items()))
         self.assertTrue(any('x' in row for row in app.screen.rows.values()))
+
+    def test_status_summary_uses_indented_lines_at_narrow_and_wide_widths(self):
+        self.now = 0
+        summary = '한국어 상태 🐦 日本語の進捗 review complete'
+        for width in (40, 200):
+            with self.subTest(width=width):
+                app = self.app()
+                agent = {**app.local['agents'][0], 'summary': summary, 'user_border': True,
+                         'role': 'worker', 'turn_state': 'working', 'phase': 'review'}
+                app.local['agents'] = [agent]
+                app.screen = Screen(80, width)
+                app.render()
+                rows = [text for row, text in sorted(app.screen.rows.items())
+                        if 3 <= row < 78 and app.screen.attributes[row] == curses.A_REVERSE]
+                self.assertTrue(rows[0].startswith('› '))
+                self.assertTrue(all(line.startswith('    ') for line in rows[1:]))
+                self.assertNotIn('Summary:', ''.join(rows))
+                self.assertEqual(''.join(summary.split()), ''.join(''.join(rows[1:]).split()))
+                if width == 40:
+                    for column in ('worker', 'working/review', ' 0'):
+                        self.assertIn(column, rows[0])
+                else:
+                    for column in ('worker', 'working/review', 'unread:', 'extension absent',
+                                   'user border preserved'):
+                        self.assertIn(column, rows[0])
+                self.assertTrue(all(display_width(text) <= width - 1 for text in rows))
+
+    def test_status_wrapped_selection_and_scroll_stay_item_based(self):
+        self.now = 0
+        app = self.app()
+        first, second = app.agents()
+        app.local['agents'] = [{**first, 'summary': '긴 작업 설명입니다 ' * 20},
+                               {**second, 'summary': '次の作業を確認します 🐦'}]
+        app.screen = Screen(10, 40)
+        app.render()
+        app.key(curses.KEY_NPAGE)
+        app.render()
+        self.assertGreater(app.scroll, 0)
+        self.assertEqual(app.selection, 0)
+        app.key(curses.KEY_DOWN)
+        app.render()
+        self.assertEqual(app.selection, 1)
+        self.assertEqual(app.selected()['terminal_id'], second['terminal_id'])
+        selected_rows = [text[2:] for row, text in app.screen.rows.items()
+                         if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE]
+        self.assertTrue(selected_rows)
+        self.assertIn(second['alias'], ''.join(selected_rows))
+        self.assertIn('次の作業を確認します 🐦', ''.join(selected_rows))
+        app.key('\n')
+        self.assertEqual(app.detail['terminal_id'], second['terminal_id'])
+        app.key('\x1b')
+        app.key(curses.KEY_UP)
+        app.render()
+        self.assertEqual(app.selection, 0)
+        self.assertEqual(sum(attribute == curses.A_REVERSE for row, attribute in app.screen.attributes.items()
+                             if 3 <= row < 8), 4)
+        app.screen.height = 14
+        app.render()
+        self.assertEqual(app.scroll, 0)
+        self.assertIn('── ui-test', app.screen.rows[3])
+
+    def test_remote_stale_status_keeps_summary_and_missing_summary_placeholder(self):
+        self.now = 0
+        app = self.app()
+        remote = {**app.local['agents'][0], 'host': 'remote', 'alias': 'remote-worker',
+                  'terminal_id': 'remote-terminal', 'summary': '遠隔の長い作業状況 🐦 한국어 상태 ' * 4}
+        remote.pop('status_updated_at', None)
+        app.local['agents'] = []
+        app.local['peers'] = [{'canonical_name': 'remote', 'uuid': 'remote-uuid'}]
+        app.remote = {'remote': {'agents': [remote],
+                                 'hosts': [{'host': 'remote', 'uuid': 'remote-uuid'}]}}
+        app.remote_errors = {'remote': 'SSH unavailable'}
+        app.screen = Screen(80, 40)
+        app.render()
+        rendered = ''.join(text[2:] for row, text in sorted(app.screen.rows.items())
+                           if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE)
+        self.assertIn('遠隔の長い作業状況', rendered)
+        self.assertTrue(rendered.endswith('…'))
+        app.remote['remote']['agents'][0]['summary'] = ''
+        app.render()
+        rendered = ''.join(text[2:] for row, text in sorted(app.screen.rows.items())
+                           if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE)
+        self.assertTrue(rendered.rstrip().endswith('—'))
+        app.key('\n')
+        self.assertIn('Last updated: —', app.detail_lines())
+        self.assertIn('User border: unknown', app.detail_lines())
+        self.assertIn('Host: remote  STALE/offline', app.detail_lines())
+        self.assertIn('Unread: ?', app.detail_lines())
+
+    def test_status_detail_has_labeled_fields_and_full_wrapped_summary(self):
+        self.now = 0
+        summary = '전체 요약을 빠짐없이 확인합니다 🐦\n日本語の詳細も表示します ' * 3
+        for width in (40, 200):
+            with self.subTest(width=width):
+                app = self.app(wall_clock=lambda: 115.5)
+                agent = {**app.local['agents'][0], 'summary': summary, 'host': 'remote',
+                         'alias': 'remote-worker', 'role': 'worker', 'turn_state': 'working',
+                         'phase': 'review', 'extension_present': 1, 'unread': 3,
+                         'stale': True, 'user_border': True, 'is_main_checkout': 0,
+                         'status_updated_at': 103.5, 'last_seen': 102.5, 'first_seen': 100.5}
+                app.local['agents'] = [agent]
+                app.screen = Screen(100, width)
+                app.key('\n')
+                lines = app.detail_lines()
+                for expected in (
+                    'Address: remote/remote-worker', 'Alias: remote-worker',
+                    'Host: remote  STALE/offline', 'Role: worker', 'Client: codex',
+                    'Turn state: working', 'Phase: review', 'Summary: ' + summary,
+                    'Unread: 3', 'Receiver: ready', 'Extension present: yes',
+                    'Repo ID: ' + agent['repo_id'], 'Main checkout: no',
+                    'Workspace / pane: ' + agent['workspace_id'] + ' / ' + agent['pane_id'],
+                    'Terminal ID: ' + agent['terminal_id'],
+                    'Generation: ' + str(agent['generation']),
+                    'Session reference: ' + agent['session_ref'],
+                    'Last updated: ' + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(103.5)) + ' (12s ago)',
+                    'Last seen: ' + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(102.5)) + ' (13s ago)',
+                    'First seen: ' + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(100.5)) + ' (15s ago)',
+                    'User border: yes',
+                ):
+                    self.assertIn(expected, lines)
+                app.render()
+                rows = [text for row, text in sorted(app.screen.rows.items()) if 3 <= row < 98]
+                first = next(index for index, text in enumerate(rows) if text.startswith('Summary: '))
+                last = next(index for index, text in enumerate(rows) if text.startswith('Unread: '))
+                summary_rows = rows[first:last]
+                self.assertTrue(all(text.startswith(' ' * 9) for text in summary_rows[1:]))
+                displayed = summary_rows[0][9:] + ''.join(text[9:] for text in summary_rows[1:])
+                self.assertEqual(''.join(summary.split()), ''.join(displayed.split()))
+                self.assertTrue(all(display_width(text) <= width - 1
+                                    for row, text in app.screen.rows.items() if 3 <= row < 98))
+
+    def test_status_metadata_is_single_line_and_spaced_words_are_not_split(self):
+        self.now = 0
+        app = self.app()
+        app.local['agents'] = [{**app.local['agents'][0], 'role': 'worker',
+                                'summary': 'Review transport fixtures and preserve every status field.'}]
+        app.screen = Screen(24, 40)
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items())
+                if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE]
+        self.assertEqual(sum(text.startswith('› ') for text in rows), 1)
+        self.assertIn('worker', rows[0])
+        self.assertEqual(rows[1:], ['    Review transport fixtures and',
+                                   '    preserve every status field.'])
+        self.assertEqual(wrap_summary('word ' + 'x' * 45 + ' end', 20),
+                         ['word', 'x' * 20, 'x' * 20, 'xxxxx end'])
+        cjk = '日本語の連続した進捗情報を表示します🐦' * 3
+        parts = wrap_summary(cjk, 20)
+        self.assertEqual(''.join(parts), cjk)
+        self.assertTrue(all(display_width(part) <= 20 for part in parts))
+
+    def test_narrow_host_grouping_preserves_role_phase_and_unread(self):
+        self.now = 0
+        app = self.app()
+        app.local['agents'] = [
+            {**agent, 'host': 'status-summary-smoke',
+             'alias': alias, 'role': role, 'turn_state': 'idle', 'phase': phase, 'unread': unread}
+            for agent, alias, role, phase, unread in
+            zip(app.local['agents'], ('alpha-worker', 'beta-reviewer'),
+                ('worker', 'main'), ('implement', 'review'), (12, 3))]
+        app.screen = Screen(30, 40)
+        app.render()
+        body = list(app.screen.rows.values())
+        self.assertEqual(sum('status-summary-smoke' in row for row in body), 1)
+        selected = next(row for row in body if row.startswith('› '))
+        self.assertEqual(selected, '› alpha-worker worker idle/implement 12')
+        other = next(row for row in body if 'beta-reviewer' in row)
+        self.assertEqual(other, '  beta-reviewer main idle/review 3')
+        self.assertTrue(all(display_width(row) <= 39 for row in body))
+
+    def test_cjk_fills_lines_without_splitting_latin_words_or_starting_punctuation(self):
+        value = '日本語の進捗: 遠隔状態と受信の表示を確認します 🐦 Review transport fixtures.'
+        parts = wrap_summary(value, 35)
+        self.assertTrue(parts[0].startswith('日本語の進捗: 遠隔状態'))
+        self.assertGreaterEqual(display_width(parts[0]), 33)
+        self.assertEqual(''.join(value.split()), ''.join(''.join(parts).split()))
+        for word in ('Review', 'transport', 'fixtures.'):
+            self.assertTrue(any(word in part for part in parts))
+        parts = wrap_summary('確認します。日本語（続き）、終了。', 10)
+        self.assertTrue(all(not part.startswith(tuple('。、）')) for part in parts))
+        self.assertEqual(''.join(parts), '確認します。日本語（続き）、終了。')
+
+    def test_phone_width_keeps_fitting_hangul_words_intact(self):
+        self.now = 0
+        summary = ('한국어 작업 요약: 상태 보드와 긴 메시지 줄바꿈을 확인하고 다음 작업의 '
+                   '선택 위치까지 검토합니다 🐦 끝까지 보존')
+        for width in (40, 35, 30):
+            with self.subTest(width=width):
+                lines = wrap_summary(summary, width)
+                self.assertEqual(summary.split(), ' '.join(lines).split())
+                self.assertTrue(all(display_width(line) <= width for line in lines))
+                jamo = '각각 ㄱㅏㄱㅏ ꥠힰꥠힰ'
+                self.assertEqual(jamo.split(), ' '.join(wrap_summary(jamo, width)).split())
+        long_word = '가' * 25
+        lines = wrap_summary(long_word, 35)
+        self.assertEqual(''.join(lines), long_word)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(display_width(line) <= 35 for line in lines))
+        app = self.app()
+        app.local['agents'] = [{**app.local['agents'][0], 'summary': summary}]
+        app.screen = Screen(100, 40)
+        app.render()
+        preview = [text[4:] for row, text in sorted(app.screen.rows.items())
+                   if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE
+                   and text.startswith('    ')]
+        words = ' '.join(preview).rstrip('…').split()
+        self.assertEqual(words, summary.split()[:len(words)])
+        app.key('\n')
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items()) if 3 <= row < 98]
+        start = next(i for i, text in enumerate(rows) if text.startswith('Summary: '))
+        end = next(i for i, text in enumerate(rows) if text.startswith('Unread: '))
+        self.assertEqual(summary.split(), ' '.join(text[9:] for text in rows[start:end]).split())
+
+    def test_all_agent_detail_fields_have_hanging_indent_and_atomic_age(self):
+        self.now = 0
+        now = 1700000000
+        app = self.app(wall_clock=lambda: now)
+        app.detail = {**app.local['agents'][0], 'host': 'status-summary-smoke',
+                      'alias': 'alpha-worker', 'summary': 'Review full detail.',
+                      'status_updated_at': now - 1, 'last_seen': now - 3}
+        app.screen = Screen(100, 40)
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items()) if 3 <= row < 98]
+        field = None
+        for text in rows:
+            if not text.startswith(' '):
+                field = text.partition(': ')[0] + ': '
+            else:
+                self.assertIsNotNone(field)
+                self.assertTrue(text.startswith(' ' * len(field)), text)
+        address_end = next(i for i, text in enumerate(rows) if text.startswith('Alias: '))
+        address = rows[:address_end]
+        self.assertEqual(address, ['Address: status-summary-smoke/', '         alpha-worker'])
+        for label, age in (('Last updated: ', '(1s ago)'), ('Last seen: ', '(3s ago)')):
+            start = next(i for i, text in enumerate(rows) if text.startswith(label))
+            end = start + 1
+            while end < len(rows) and rows[end].startswith(' '):
+                end += 1
+            self.assertTrue(any(age in text for text in rows[start:end]))
+            self.assertTrue(all(text.startswith(' ' * len(label)) for text in rows[start + 1:end]))
+        self.assertTrue(all(display_width(text) <= 39 for text in rows))
+
+    def test_disconnected_empty_host_keeps_error_in_group_header(self):
+        self.now = 0
+        app = self.app()
+        app.local['agents'] = []
+        app.remote_errors = {'remote': 'SSH unavailable'}
+        app.screen = Screen(30, 40)
+        app.render()
+        body = ' '.join(text.strip() for row, text in sorted(app.screen.rows.items())
+                        if 3 <= row < 28)
+        for field in ('remote', 'STALE/offline', 'SSH unavailable'):
+            self.assertIn(field, body)
+        self.assertFalse(any(text.startswith('› ') for text in app.screen.rows.values()))
+
+    def test_status_summary_caps_three_lines_but_detail_keeps_full_text(self):
+        self.now = 0
+        app = self.app()
+        summary = 'Review transport fixtures and preserve every status field. ' * 8 + 'UNSEEN-END'
+        app.local['agents'] = [{**app.local['agents'][0], 'summary': summary}]
+        app.screen = Screen(24, 40)
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items())
+                if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(sum(text.startswith('› ') for text in rows), 1)
+        self.assertTrue(all(text.startswith('    ') for text in rows[1:]))
+        self.assertTrue(rows[-1].endswith('…'))
+        self.assertNotIn('UNSEEN-END', ''.join(rows))
+        app.key('\n')
+        self.assertIn('Summary: ' + summary, app.detail_lines())
+
+    def test_summary_outer_whitespace_does_not_create_false_truncation(self):
+        self.now = 0
+        app = self.app()
+        app.local['agents'] = [{**app.local['agents'][0], 'summary': 'Line1\nLine2\nLine3\n'}]
+        app.screen = Screen(24, 200)
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items())
+                if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE]
+        self.assertEqual(rows[1:], ['    Line1', '    Line2', '    Line3'])
+        app.local['agents'][0]['summary'] = ' \n '
+        app.render()
+        rows = [text for row, text in sorted(app.screen.rows.items())
+                if row >= 3 and app.screen.attributes[row] == curses.A_REVERSE]
+        self.assertEqual(rows[1:], ['    —'])
+        app.key('\n')
+        app.render()
+        self.assertIn('Summary: —', app.screen.rows.values())
+
+    def test_detail_times_use_injected_wall_clock_and_boolean_labels(self):
+        self.now = 0
+        now = 1700000000.25
+        app = self.app(wall_clock=lambda: now)
+        agent = {**app.local['agents'][0], 'status_updated_at': now - 12,
+                 'last_seen': now - 120, 'first_seen': now - 90000,
+                 'is_main_checkout': 1, 'extension_present': 0, 'user_border': False}
+        app.detail = agent
+        app.screen = Screen(40, 100)
+        app.render()
+        body = '\n'.join(app.screen.rows.values())
+        self.assertIn(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now - 12)) + ' (12s ago)', body)
+        self.assertIn('(2m ago)', body)
+        self.assertIn('(1d ago)', body)
+        self.assertIn('Main checkout: yes', body)
+        self.assertIn('Extension present: no', body)
+        self.assertIn('User border: no', body)
+        self.assertNotIn(str(now - 12), body)
+
+    def test_non_agent_details_keep_existing_thread_direct_and_outbox_layouts(self):
+        self.now = 0
+        app = self.app()
+        for item in ({'type': 'direct', 'host': 'remote', 'terminal_id': 'term-direct',
+                      'acceptance': 'unknown'},
+                     {'type': 'outbox', 'host': 'remote', 'terminal_id': 'term-outbox',
+                      'state': 'failed'},
+                     {'status': 'SSH unavailable', 'connection_errors': {'remote': 'offline'}}):
+            app.detail = item
+            self.assertEqual(app.detail_lines(), [json.dumps(item, ensure_ascii=False, indent=2)])
+        app.detail = {'type': 'thread', 'thread_id': 'thread-id', 'subject': 'Inspect', 'messages': []}
+        self.assertEqual(app.detail_lines()[0], 'Thread thread-id  Inspect')
+
+    def test_remote_job_uses_shared_per_host_board_with_verified_previous(self):
+        previous = {'agents': [], 'hosts': [{'host': 'remote', 'uuid': 'remote-uuid'}]}
+        board = {'agents': [], 'hosts': [{'host': 'remote', 'uuid': 'remote-uuid',
+                                         'error': {'code': 'offline', 'message': 'SSH unavailable'}}]}
+        with patch('mailbox_tui.status_board', return_value=board) as view:
+            result = execute_job({'operation': 'remote', 'repo_id': self.repo_id,
+                                  'host': 'remote', 'previous': previous}, self.environment)
+        self.assertIs(result, board)
+        self.assertEqual(view.call_args.kwargs,
+                         {'repo_id': self.repo_id, 'host': 'remote',
+                          'environment': self.environment, 'previous': previous})
+
+    def test_cached_remote_rows_require_current_verified_host_uuid(self):
+        self.now = 0
+        app = self.app()
+        remote = {**app.local['agents'][0], 'host': 'remote', 'terminal_id': 'remote-terminal'}
+        app.local['agents'] = []
+        app.local['peers'] = [{'canonical_name': 'remote', 'uuid': 'original-uuid'}]
+        app.remote = {'remote': {'agents': [remote],
+                                 'hosts': [{'host': 'remote', 'uuid': 'original-uuid'}]}}
+        app.remote_errors['remote'] = 'SSH unavailable'
+        self.assertTrue(app.agents()[0]['stale'])
+        self.assertEqual(app.agents()[0]['unread'], '?')
+        app.repo_id = 'another-repository'
+        self.assertEqual(app.agents(), [])
+        app.repo_id = self.repo_id
+        app.local['peers'][0]['uuid'] = 'replacement-uuid'
+        self.assertEqual(app.agents(), [])
+
+    def test_async_remote_arrival_and_peer_removal_preserve_selected_slot(self):
+        self.now = 0
+        app = self.app()
+        app.next_bell = 10
+        app.selection = 1
+        selected = app.selected()
+        app.local['peers'] = [{'canonical_name': 'aaa-peer', 'uuid': 'peer-uuid'}]
+        app.remote_due['aaa-peer'] = 30
+        remote = {**selected, 'host': 'aaa-peer', 'terminal_id': 'remote-terminal',
+                  'agent_id': 'remote-agent', 'summary': 'Remote task'}
+        app.start_job('remote:aaa-peer', 'remote', host='aaa-peer')
+        app.jobs['remote:aaa-peer'].result = {
+            'agents': [remote], 'hosts': [{'host': 'aaa-peer', 'uuid': 'peer-uuid', 'error': None}]}
+        app.tick()
+        self.assertEqual(app.selection, 2)
+        self.assertEqual(app.selected()['terminal_id'], selected['terminal_id'])
+        self.assertEqual(app.selected()['host'], selected['host'])
+        app.remote_errors['aaa-peer'] = 'SSH unavailable'
+        app.start_job('remote:aaa-peer', 'remote', host='aaa-peer')
+        pending = app.jobs['remote:aaa-peer']
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {**app.local, 'peers': []}
+        app.tick()
+        self.assertTrue(pending.closed)
+        self.assertNotIn('remote:aaa-peer', app.jobs)
+        self.assertEqual(app.remote, {})
+        self.assertEqual(app.remote_errors, {})
+        self.assertEqual(app.remote_due, {})
+        self.assertEqual(app.selection, 1)
+        self.assertEqual(app.selected()['terminal_id'], selected['terminal_id'])
 
 
 if __name__ == '__main__':

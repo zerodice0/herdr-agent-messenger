@@ -212,9 +212,13 @@ class RemoteLedger:
         return {"host": {"canonical_name": self.store.host, "uuid": self.store.host_uuid},
                 "agents": exported}
 
-    def query_status(self, host: str, repo_id: str | None = None) -> dict[str, Any]:
+    def query_status(self, host: str, repo_id: str | None = None, *,
+                     refresh: bool = True) -> dict[str, Any]:
         peer = self.peer(host)
-        result = self.transport.call(peer, "status-export", {"repo_id": repo_id})
+        payload: dict[str, Any] = {"repo_id": repo_id}
+        if not refresh:
+            payload["refresh"] = False
+        result = self.transport.call(peer, "status-export", payload)
         if result.get("host") != {"canonical_name": peer["canonical_name"], "uuid": peer["uuid"]}:
             raise LedgerError("peer_identity_conflict", "Live status endpoint identity has changed.")
         return result

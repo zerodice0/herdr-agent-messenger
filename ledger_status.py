@@ -387,7 +387,8 @@ class AgentRegistry:
 
     def list(self, repo_id: str | None = None) -> list[dict[str, Any]]:
         with self.store.read() as connection:
-            query = "SELECT a.*,s.turn_state,s.phase,s.summary FROM agents a JOIN agent_status s USING(agent_id) WHERE a.active=1"
+            query = ("SELECT a.*,s.turn_state,s.phase,s.summary,s.updated_at AS status_updated_at "
+                     "FROM agents a JOIN agent_status s USING(agent_id) WHERE a.active=1")
             parameters: tuple[Any, ...] = ()
             if repo_id is not None:
                 query += " AND a.repo_id=?"

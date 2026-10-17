@@ -7,13 +7,13 @@ description: Use HAM (Herdr Agent Messenger) for durable same-repository agent m
 
 ## Choose the operation
 
-- **Existing same-repository collaborator:** inspect `repo show` and `list`, copy the exact current address, then use `mail send`. Mail does not steer an ongoing turn. Use `--to main` only when a repository home/main has been configured by the user.
-- **New session, only when asked:** `spawn --message TEXT` or `spawn --message-file PATH` submits the first prompt once after readiness. Do not spawn and then send a separate legacy request for that first prompt. A missing existing label is an error, not permission to create a session or guess another label. Raw `herdr agent start` bypasses HAM labeling and initial-submission records.
+- **Existing same-repository collaborator:** inspect `repo show` and `list`, copy the exact address, then `mail send`. Mail does not steer an ongoing turn. `--to main` needs user-configured home/main.
+- **New session, only when asked:** one `spawn --message TEXT` or `spawn --message-file PATH` submits the first prompt after readiness; never follow with a separate legacy request. Missing labels are errors, not permission to guess/spawn. Raw `herdr agent start` bypasses HAM records.
 - **Receive or finish work:** `inbox read` is view-only. At a useful work boundary, inspect relevant messages, perform the work, then explicitly `inbox handle --message UUID`. A useful reply uses `mail send --reply-to UUID`; a receipt alone needs no reply. Do not create acknowledgement loops or token-spending polling loops.
 - **Several collaborators:** verify each recipient and assign non-overlapping work with separate tailored `mail send` operations. HAM stores messages; it does not split tasks or verify answers.
-- **Nonparticipating legacy traffic:** `request` / `send` / `batch` remain available where policy permits. In manual/auto, traffic between participating agents in the same repository is refused with `use_mailbox`; do not bypass it. Batch preflights every target before any submission. A failed lookup/refusal is not permission to submit to the other targets.
+- **Nonparticipating legacy traffic:** `request` / `send` / `batch` remain available where permitted. Manual/auto participating same-repo pairs get `use_mailbox`; never bypass it. Batch preflights all targets; any lookup/refusal prevents all submissions.
 
-Use the bundled CLI, not reconstructed SSH commands. Its path is `scripts/herdr_agent_messenger.py` **relative to this skill directory**; run there or use its absolute path. Agent operations run from the current Herdr agent terminal. Stable terminal/session identity, not an inherited pane ID alone, determines the sender after pane moves. Labels are host-scoped and must not be guessed. Only literal `local` selects local legacy transport; remote legacy hosts are concrete configured SSH aliases. Mail also accepts registered canonical host names or their SSH aliases.
+Use bundled `scripts/herdr_agent_messenger.py` relative to this skill directory, or its absolute path, not reconstructed SSH. Agent operations use verified stable terminal/session identity after pane moves, not an inherited pane ID alone. Never guess labels. Legacy transport uses literal `local` or concrete configured SSH aliases; mail also accepts registered canonical hosts.
 
 ## Mailbox and status commands
 
@@ -30,14 +30,30 @@ python3 scripts/herdr_agent_messenger.py mail send \
   --to CANONICAL_HOST/EXACT_LABEL --reply-to MESSAGE_UUID --kind fyi --body 'Findings and evidence.'
 python3 scripts/herdr_agent_messenger.py mail show --thread THREAD_UUID
 python3 scripts/herdr_agent_messenger.py mail withdraw --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py mail threads --limit 100
+python3 scripts/herdr_agent_messenger.py mail direct-list --repo 'git:host/stable/repo'
+python3 scripts/herdr_agent_messenger.py status board --repo --host local
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing mailbox boundaries'
 python3 scripts/herdr_agent_messenger.py status list --repo
 python3 scripts/herdr_agent_messenger.py status clear
 ```
 
-`--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` is required (nonblank UTF-8, at most 16 KiB). `action` can make a participating, eligible OMP receiver start a later turn; `fyi` alone never starts one. The sender command itself only stores/routes mail. `inbox handle --message` is repeatable and atomic. Reads, including subagent reads in the same pane, never acknowledge anything. Pull handling can record `handled` without any `delivered_at`. A reply atomically handles its addressed queued/delivered parent; do not claim unrelated messages handled.
+`--kind` defaults to `fyi`; use exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Only eligible OMP `action` can start a later turn; FYI alone cannot. Sending stores/routes mail, never starts a turn itself. Local mail normally waits queued; remote pending, withdrawal and terminal-closed final results are also possible. Handling is explicit/atomic; reads never ACK. Pull handling needs no delivered timestamp; replies handle their addressed queued/delivered parent. Repeated successful withdrawal stays `withdrawn:true`; a winning claim/other final result returns false.
 
 `status set` takes a **positional phase**, not `--phase`. Summary/phase reporting works even in off mode. Herdr owns turn state; do not invent it from phase text.
+
+### Read-only history and board
+
+`mail threads` and `mail direct-list` accept `[--repo REPO_ID] [--limit N] [--cursor TOKEN]`. Default is the verified caller's repo; explicit ID avoids Herdr caller-identity fetch. Limit100, range1–1000. Results are `{repo_id,threads|submissions,next_cursor}`; `null` ends traversal. They cover all participants' retained local-ledger sent/received records, including pending remote thread copies, not replicated all-host history. Direct-list reads user-direct evidence, never sends input.
+
+Pass HMAC-signed opaque cursors unchanged: bound to ledger/query/repo, invalid/tampered/wrong-scope tokens give `invalid_cursor`. Live keyset pages sort `updated_at DESC`, UUID ascending, not OFFSET or a frozen snapshot. Updates can move unseen rows before the boundary; restart the first page to see newer updates.
+
+`status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]` defaults to all local repos + registered peers. Bare `--repo` selects the caller's repo; explicit ID filters. Output `{repo_id,agents,hosts}` includes roles/turn/phase/summary/unread, receiver/placement/generation, status_updated_at, last_seen and stale. Status and registry-observation timestamps differ. Reads never refresh registry/status/display/claims; peers get `refresh=false`. Failed hosts have structured error, stale and unread `?`; stateless CLI invents no rows. TUI may retain verified prior rows stale. Existing `list` / local `status list` are narrower.
+Older peers may ignore `refresh=false` and perform their legacy refresh. A peer
+failure still exits with code 0: inspect `hosts[].error`, stale and unread.
+Unknown/ambiguous `--host` returns `peer_not_configured` with exit code 1.
+
+All three accept `-h` / `--help`, no `--verbose`, and emit one JSON object; domain errors use `{"error":{"code":"CODE","message":"TEXT"}}` (exit1), usage errors exit2. No read ACK or public settings/user-compose/direct-send/operator ACK bypass. See reference terminology for inbox, mixed TUI Threads, transport outbox, states and unread (`queued` + `delivering`, not a view flag).
 
 ## New labeled session and first prompt
 
@@ -52,17 +68,22 @@ python3 scripts/herdr_agent_messenger.py spawn \
   --message-file /path/to/assignment.txt -- --model MODEL
 ```
 
-Without a message flag, spawn only creates the session. With one, the immutable target/body and submission operation are persisted before transport. `initial_prompt.acceptance` is `accepted`, `unknown`, or `failed`; terminal acceptance is **not** native mailbox delivery, a response, or model understanding. Unknown/unfinished acceptance may already have entered the session: preserve the returned operation/submission evidence and usable pane, inspect rather than resending or creating a replacement. Running another spawn is a new invocation, not a safe retry of the old operation.
+No message flag means session creation only. Otherwise immutable target/body and operation are saved before transport. `initial_prompt.acceptance=accepted|unknown|failed` means terminal acceptance, not native delivery, response or understanding. Unknown/unfinished may already be submitted: preserve operation/pane evidence, inspect, never blindly resend or spawn a replacement. Another spawn is a new operation.
 
 ## Modes, receiving, and truth boundaries
 
-Only the **user** changes mode/main/manual members/thresholds in HAM Settings. `repo show` is read-only. Default `off` disables roles, automatic wakes and participating legacy rejection, **not** explicit reads or natural user-turn receipt. In `manual`, the user designates main and workers; nonmembers can receive naturally without waking. In `auto`, an explicit main wins; otherwise exactly one active main-checkout agent on the home host becomes main. Zero or multiple candidates means no default main; the other same-repository agents across registered hosts are workers. Home is fixed by initial activation/concurrent proposal convergence and displayed read-only, not an agent-editable field.
+Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only. Default `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt. `manual` uses designated main/workers; nonmembers cannot wake. `auto` prefers explicit main; otherwise exactly one active home main-checkout agent becomes main. Zero/multiple means none; other same-repo agents across registered hosts are workers. Home is fixed by activation/concurrent proposal convergence, not agent-editable.
 
-- **OMP:** separately opt-in receiver, Herdr root session only. Automatic action wake requires supported TUI empty-editor evidence, input quiet time, idle/no pending work, membership and configured coalescing/hour/hop limits. It uses agent-attributed `nextTurn` + `triggerTurn`, never steering. FYI and action can enter naturally at a valid turn boundary even off. Native ACK means exact same-session active-branch journal acceptance, not a later provider request or successful processing.
-- **Claude Code:** separately opt-in bounded `SessionStart` / `UserPromptSubmit` hooks; no idle wake or Stop extension. Hook stdout/exit success alone is not delivery. Native confirmation uses exact same-session SDK context plus fresh request correlation, or typed hook raw/rendered claim bytes/hash plus a causal native request witness. The latter proves host-context application, not exact provider-wire bytes, provider attestation or model understanding. Unresolved binding leaves mail queued; unknown acceptance remains held. A bounded actual TUI run confirmed current-generation SessionStart receiving and registered manual-worker/auto-main no-wake windows; it did not exercise unreported-identity bootstrap. Auxiliary provider traffic and processing outcomes are separate; see reference for scope.
+- **OMP:** opt-in root receiver. Action wake needs supported TUI empty editor, quiet/idle input, no pending work, eligible membership and coalescing/hour/hop guards. Uses agent-attributed `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves exact same-session active-branch journal acceptance, not provider success.
+- **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. Native ACK needs exact SDK context + fresh request correlation (`claude:api-request:`), or typed hook bytes/hash + causal native witness (`claude:accepted-journal:`). The latter proves host-context application, not exact provider-wire bytes, attestation or understanding. Stdout alone is not delivery. Bounded live SessionStart/no-wake observations exclude provider success and cold-unreported binding CAS (unit-only); see reference for limits and safe-launcher notes.
 - **Codex:** skill-guided pull at work boundaries, view-only `inbox read` followed by explicit handling. No automatic wake/receiver and no invented delivered receipt.
 
-Never automatically replay an uncertain `delivering` claim after a crash/session change. The user can inspect the old claim/agent/generation and evidence in Threads, then explicitly confirm applied/not-applied. That is **operator** evidence, not native ACK or handled work. User TUI direct input is a separate, potentially interrupting `Message from user (HAM):` submission, recorded as direct acceptance rather than mailbox delivery.
+Never replay uncertain `delivering` after crashes/session changes. Threads lets the user audit the old claim/agent/generation as applied/not-applied with evidence: **operator**, not native ACK or handled work. User direct input may interrupt (`Message from user (HAM):`); its acceptance is separate from mailbox delivery.
+TUI Status groups agents under host headers showing stale/error state. Each
+agent has one clipped metadata line and up to three indented Unicode-aware
+summary lines. Enter shows full labeled, hanging-wrapped detail fields and
+separate status/registry timestamps as local date/time plus relative age.
+Hangul/Latin preserve words; Han/Kana/emoji allow display-cell breaks.
 
 ## Legacy requests where policy permits
 
@@ -73,6 +94,6 @@ python3 scripts/herdr_agent_messenger.py request-status --request-id REQUEST_ID 
 python3 scripts/herdr_agent_messenger.py read --address CONFIGURED_HOST/EXACT_LABEL --lines 160 --max-bytes 65536
 ```
 
-Keep the original `request_id`. Focus-held `deferred` / `awaiting_decision` means HAM owns delivery, not permission to resend or ask the user to unfocus. Held Messages lets the user Push/Cancel after the default 180000 ms deadline; no automatic push. `submitted_working` / `submitted_unknown` likewise require observation, never blind resend. Self-send fails immediately. Exit `3` means nonsettled HAM-owned work; exit `1` does not prove non-delivery; usage errors exit `2`. Exit `0` or `submitted_settled` is not proof of answer correctness. Review actual evidence; terminal text/correlation/truncation is not a structured assistant-message API. Never bypass SSH host-key checks.
+Keep `request_id`; `deferred`/`awaiting_decision` means HAM owns delivery, not resend/unfocus. Held Messages offers Push/Cancel after default180000 ms; no auto-push. Observe `submitted_working|submitted_unknown`, never blindly resend. Self-send fails. Exit3 means nonsettled owned work; exit1 does not prove non-delivery; usage exits2. Exit0/settled proves no answer correctness. Terminal text is not a structured assistant-message API. Never bypass SSH host-key checks.
 
 Read `reference.md` for complete flags, legacy batch/results, host setup, per-host runtime install/status/uninstall, TUI controls, durable worker/recovery and deployment order. Skill installation does not install a receiving runtime or change global bindings.

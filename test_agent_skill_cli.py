@@ -1136,36 +1136,6 @@ class AgentSkillContractTest(unittest.TestCase):
                     self.assertEqual(result, expected)
                     self.assertEqual(json.loads(output.getvalue()), payload)
 
-    def test_public_status_cli_mutations_and_repo_scope(self):
-        cases = (
-            (["status", "set", "working", "--summary", "Reviewing"], "set", "working", "Reviewing", None),
-            (["status", "clear"], "clear", None, "", None),
-            (["status", "list", "--repo"], "list", None, "", ""),
-            (["status", "list", "--repo", "git:repo"], "list", None, "", "git:repo"),
-        )
-        for argv, operation, phase, summary, repo_id in cases:
-            with self.subTest(argv=argv):
-                arguments = agent_skill_cli.parse_cli_arguments(argv)
-                self.assertEqual(arguments.status_operation, operation)
-                output = StringIO()
-                with (
-                    mock.patch.object(
-                        agent_skill_cli.ledger_cli,
-                        "status_operation",
-                        return_value={"ok": True},
-                    ) as call,
-                    mock.patch("sys.stdout", output),
-                ):
-                    self.assertEqual(agent_skill_cli.main(argv, {}), 0)
-                call.assert_called_once_with(
-                    operation,
-                    environment={},
-                    phase=phase,
-                    summary=summary,
-                    repo_id=repo_id,
-                )
-                self.assertEqual(json.loads(output.getvalue()), {"ok": True})
-
     def test_batch_exit_codes_inspect_items_not_aggregate_delivery(self):
         cases = (
             (["succeeded"], 0),

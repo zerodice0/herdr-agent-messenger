@@ -112,16 +112,86 @@ python3 "$HAM_CLI" mail show --thread THREAD_UUID
 nonblank, 16 KiB maximum). `--kind fyi|action` defaults to `fyi`; `--subject`
 sets a new thread's subject (1024 UTF-8 bytes), and `--reply-to UUID` keeps the
 thread, increments hop, and atomically handles an addressed queued/delivered
-parent. Both kinds stay queued until explicit handling or a runtime claim.
-`mail send` itself does not start a model turn.
+parent. Accepted local mail ordinarily waits queued; remote copies may be pending,
+and withdrawal or terminal closure can make mail final without a runtime claim.
+Neither kind makes `mail send` itself start a model turn.
 
 `inbox read` accepts `--message UUID`, `--all`, and `--limit N` (default 100,
 1–1000). It never changes state/logs/bells, including when a task agent shares
 the calling pane. `inbox handle --message UUID` is repeatable and all-or-nothing;
 queued→handled does not invent a native delivered timestamp.
 `mail withdraw --message UUID` competes atomically with delivery claim and
-returns `withdrawn:false` once claimed/final. `mail show --thread UUID` reads the
-thread, and `repo show` reads this agent's repository/settings.
+returns `withdrawn:false` if a claim or another non-withdrawn final result wins.
+Repeating a successful withdrawal returns `withdrawn:true` and preserves its
+first receipt/time. `mail show --thread UUID` reads the thread, and `repo show`
+reads this agent's repository/settings.
+
+### Repository history and read-only board
+
+```text
+mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+```
+
+Run these after the same `python3 "$HAM_CLI"` prefix. Each accepts `-h` /
+`--help`, has no `--verbose`, and returns one JSON object. Domain errors use
+`{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; usage errors exit 2.
+These reads neither acknowledge mail nor change settings, status, last_seen,
+display or claims, and expose no user-compose/direct-send/operator ACK bypass.
+
+History lists default to the verified caller's repository. Explicit
+`--repo REPO_ID` avoids fetching Herdr caller identity. `--limit` defaults to 100
+(1–1000). Results are `{repo_id,threads,next_cursor}` or
+`{repo_id,submissions,next_cursor}`; `next_cursor:null` ends traversal.
+Records cover all participants in the selected repository on this local ledger:
+sent and received threads, including pending remote copies, and retained
+`via=direct` submissions, not `spawn_initial` or replicated all-host history.
+Pass the HMAC-signed opaque cursor unchanged. It is bound to ledger/query/repo;
+tampering or a scope mismatch produces `invalid_cursor`. Pages use
+`updated_at DESC` then UUID ascending keyset order, never OFFSET. This is live
+pagination, not a frozen snapshot: concurrent updates can move an unseen row
+before the boundary. Restart from the first page to see newer updates.
+
+`status board` defaults to all local repositories plus all registered peers.
+Bare `--repo` selects the caller's repo; explicit `--repo ID` filters it.
+`--host` restricts the board to local or one registered canonical name/SSH alias.
+The result `{repo_id,agents,hosts}` includes full role, turn_state, phase, summary,
+unread, extension_present, client, workspace_id, pane_id, generation,
+is_main_checkout, status_updated_at, last_seen and stale fields. The status
+timestamp is distinct from the registry observation time. It reads stored
+registry rows without refresh and requests peer `refresh=false`; it does not
+refresh or mutate either host's status/display/claims. Each host has
+`{host,uuid,local,stale,error,unread,agents}`. A failed peer has a structured
+error and unread `?`. The stateless CLI has no prior rows to invent; a TUI may
+retain a prior matching verified-host snapshot as stale. Existing `list` and
+local `status list` retain their narrower discovery/status semantics.
+Read-only remote behavior requires peers with this read API version; an older
+peer may ignore `refresh=false` and perform its legacy registry refresh.
+A peer failure still exits with code 0: inspect each host's `error`, `stale` and
+unread. An unknown/ambiguous `--host` returns `peer_not_configured` with exit code 1.
+
+### Mailbox terminology
+
+- **Mailbox / inbox:** durable recipient-slot mail, not terminal input.
+  `inbox read` selects only this host/caller terminal/repository, normally
+  `queued`, `delivering`, `delivered`; `--all` includes its retained final states,
+  and `--message UUID` can select one final message. Reading is not an ACK.
+- **Thread:** the root message UUID is its thread UUID. `--reply-to` inherits the
+  parent's thread/subject and increments its hop. `mail show --thread UUID`
+  reads a known retained thread, including sent mail, not just the inbox.
+- **TUI Threads:** mixed repo-filtered sent/received threads and direct results,
+  plus host-wide pending/failed OUTBOX jobs; not a single inbox/chat or remote
+  history replica. **Outbox** is FIFO transport (`message`, `receipt`, `setting`,
+  `withdraw`; `pending/sent/failed/cancelled`), not a sent-mail folder.
+- **Message states:** `pending` awaits an authoritative recipient result;
+  `queued` waits unclaimed; `delivering` is a reserved, possibly uncertain claim;
+  `delivered` confirms application with native or audited operator evidence,
+  not handling or understanding. `handled`, `withdrawn`, `undeliverable` are
+  final. Keep `confirmation_source=native|operator` distinct. Direct
+  `submitting/accepted/unknown/failed` is transport acceptance, not mailbox ACK.
+- **Unread:** counts `queued` + `delivering`, not whether anyone viewed the text;
+  delivered-but-unhandled mail is excluded. `fyi`/`action` are kinds, not states.
 
 Host identity is a canonical name plus a stable ledger UUID, not the machine's
 hostname, `local`, or an SSH alias. `local` maps to this ledger; a registered
@@ -230,9 +300,10 @@ python3 "$HAM_CLI" repo show
 change Herdr's `turn_state`. Phase is projected to `$recap`, summary to a
 HAM-owned pane border. An existing user border is preserved. Roles precede the
 alias in Agents and HAM-owned border content; status still works in off mode.
-`status list` without a filter lists current status; bare `--repo` selects the
-caller's repository and `--repo ID` selects that identity. Legacy
-`status --address HOST/LABEL` remains a recipient-status read.
+`status list` without a filter lists stored local status; bare `--repo` selects
+the caller's repository and `--repo ID` selects that identity. For the rich
+local/registered-peer read use `status board`, not a legacy parent `--host` flag
+on `status list`. Legacy `status --address HOST/LABEL` remains a recipient read.
 
 ### User TUI: settings, compose, and uncertain claims
 
@@ -248,6 +319,18 @@ Use `1` Status, `2` Threads, `3` Compose, and `4` Settings; Enter opens details
 or an editor, Esc backs out. On Status, `c` chooses the board recipient.
 On Settings, `m` designates that selected recipient as main and Space toggles
 manual membership.
+
+Status groups agents under per-host headers showing stale/error state. Each agent
+keeps alias/role/turn/unread first on one clipped metadata line, with an indented,
+word-aware summary capped at three Unicode-width-aware lines. Hangul/Latin preserve
+word boundaries; Han/Kana/emoji allow display-cell breaks. Overflow has an
+ellipsis and an empty summary is `—`. Enter opens full labeled agent details;
+every field uses hanging-indent wrapping, including the full summary, identity,
+role/client, turn/phase, unread/receiver, repository/main-checkout, location and
+generation/session. Status-update (`status_updated_at`) and registry-observation
+(`last_seen`/`first_seen`) times use local date/time plus relative age; flags are
+yes/no/unknown. User-border ownership is local-only, so unavailable remote
+evidence appears as unknown.
 
 Settings has exactly **seven mutable rows**:
 

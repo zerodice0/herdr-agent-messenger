@@ -185,50 +185,58 @@ class LedgerStore:
         chosen_name = canonical_name or values.get("HERDR_AGENT_CANONICAL_HOST")
         if chosen_name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", chosen_name):
             raise LedgerError("invalid_host", "Canonical host must be a nonempty simple host name.")
-        connection = self.connect()
-        try:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(_SCHEMA)
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
-            existing_version = int(existing[0]) if existing else 0
-            if existing and existing_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
-                raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
-            columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
-            if "confirmation_source" not in columns:
-                connection.execute("ALTER TABLE deliveries ADD COLUMN confirmation_source TEXT "
-                                   "CHECK(confirmation_source IN ('native','operator'))")
-                connection.execute(
-                    "UPDATE deliveries SET confirmation_source='operator' WHERE EXISTS ("
-                    "SELECT 1 FROM claim_resolutions r WHERE r.message_id=deliveries.message_id "
-                    "AND r.claim_id=deliveries.claim_id AND r.disposition='applied')")
-            native_columns = {row["name"] for row in connection.execute("PRAGMA table_info(native_claims)")}
-            for name, kind in (("transcript_path", "TEXT"), ("transcript_start_offset", "INTEGER"),
-                               ("content_bytes", "INTEGER")):
-                if name not in native_columns:
-                    connection.execute(f"ALTER TABLE native_claims ADD COLUMN {name} {kind}")
-            agent_columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
-            if "native_session_pid" not in agent_columns:
-                connection.execute("ALTER TABLE agents ADD COLUMN native_session_pid INTEGER")
-            default_name = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname().split('.')[0]) or "host"
-            connection.execute("INSERT INTO ledger_meta VALUES ('schema_version',?) "
-                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                               (str(SCHEMA_VERSION),))
-            for key, value in (("self_canonical_name", chosen_name or default_name),
-                               ("self_uuid", str(uuid.uuid4()))):
-                connection.execute("INSERT OR IGNORE INTO ledger_meta VALUES (?,?)", (key, value))
-            metadata = dict(connection.execute("SELECT key,value FROM ledger_meta"))
-            if chosen_name and chosen_name != metadata["self_canonical_name"]:
-                raise LedgerError("host_identity_conflict", "An existing ledger's canonical name cannot change.")
-            self.host = metadata["self_canonical_name"]
-            self.host_uuid = metadata["self_uuid"]
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        # Serialize the initial WAL switch as well as schema/identity setup.
+        with os.fdopen(os.open(self.directory / "bootstrap.lock", os.O_CREAT | os.O_RDWR, 0o600), "r+b") as bootstrap:
+            fcntl.flock(bootstrap.fileno(), fcntl.LOCK_EX)
+            connection = self.connect()
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.executescript(_SCHEMA)
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
+                existing_version = int(existing[0]) if existing else 0
+                if existing and existing_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
+                    raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
+                if "confirmation_source" not in columns:
+                    connection.execute("ALTER TABLE deliveries ADD COLUMN confirmation_source TEXT "
+                                       "CHECK(confirmation_source IN ('native','operator'))")
+                    connection.execute(
+                        "UPDATE deliveries SET confirmation_source='operator' WHERE EXISTS ("
+                        "SELECT 1 FROM claim_resolutions r WHERE r.message_id=deliveries.message_id "
+                        "AND r.claim_id=deliveries.claim_id AND r.disposition='applied')")
+                native_columns = {row["name"] for row in connection.execute("PRAGMA table_info(native_claims)")}
+                for name, kind in (("transcript_path", "TEXT"), ("transcript_start_offset", "INTEGER"),
+                                   ("content_bytes", "INTEGER")):
+                    if name not in native_columns:
+                        connection.execute(f"ALTER TABLE native_claims ADD COLUMN {name} {kind}")
+                agent_columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
+                if "native_session_pid" not in agent_columns:
+                    connection.execute("ALTER TABLE agents ADD COLUMN native_session_pid INTEGER")
+                default_name = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname().split('.')[0]) or "host"
+                connection.execute("INSERT INTO ledger_meta VALUES ('schema_version',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                   (str(SCHEMA_VERSION),))
+                for key, value in (("self_canonical_name", chosen_name or default_name),
+                                   ("self_uuid", str(uuid.uuid4())),
+                                   ("history_cursor_key", os.urandom(32).hex())):
+                    connection.execute("INSERT OR IGNORE INTO ledger_meta VALUES (?,?)", (key, value))
+                metadata = dict(connection.execute("SELECT key,value FROM ledger_meta"))
+                if chosen_name and chosen_name != metadata["self_canonical_name"]:
+                    raise LedgerError("host_identity_conflict", "An existing ledger's canonical name cannot change.")
+                self.host = metadata["self_canonical_name"]
+                self.host_uuid = metadata["self_uuid"]
+                cursor_key = metadata["history_cursor_key"]
+                if not re.fullmatch(r"[0-9a-f]{64}", cursor_key):
+                    raise LedgerError("invalid_metadata", "Ledger history cursor key is malformed.")
+                self._history_cursor_key = bytes.fromhex(cursor_key)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)

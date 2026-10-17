@@ -58,6 +58,11 @@ herdr plugin link "$PWD" --enabled
 [HAM TUI](docs/ko/ui-reference.md)는 Status, Threads, Compose, Settings 화면을
 제공합니다. 사용자 작성 화면에서는 일반 메일과 수신자의 작업을 중단할 수 있는
 직접 입력을 구분합니다. 직접 입력은 에이전트 간 협업용 전송 경로가 아닙니다.
+Status는 호스트별 헤더에 stale·오류 상태를 표시하고 그 아래 에이전트를 묶어
+보여 줍니다. 에이전트마다 잘라 표시한 메타데이터 한 줄과 들여쓴 최대 세 줄의
+요약을 볼 수 있습니다. Enter로 전체 상세 정보를 열면 모든 항목을 내어쓰기로
+줄바꿈하며, 상태 갱신·관찰 시각을 각각 현지 날짜·시간과 경과 시간으로 표시합니다.
+한글·라틴 문자는 단어 경계에서, 한자·가나·이모지는 표시 셀 경계에서 줄바꿈합니다.
 
 기존 **Send Prompt to Agents** 팝업의 코디네이터 위임과 다중 수신자 직접 전송은
 참여 정책이 허용하는 경우에 사용할 수 있습니다.
@@ -164,6 +169,52 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
 `mail show --thread UUID`로 대화를 확인하고,
 `mail withdraw --message UUID`로 철회를 요청합니다. 이미 전달 claim이
 생성된 메일을 단순히 회수할 수는 없습니다.
+
+### 저장소 이력과 상태 보드 조회
+
+위의 번들 CLI 경로 뒤에 다음 읽기 전용 명령을 붙입니다.
+
+```text
+mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+```
+
+이력 조회는 기본적으로 정체성을 검증한 호출자의 저장소를 선택합니다.
+`--repo REPO_ID`를 명시하면 Herdr에서 호출자 정체성을 조회하지 않습니다.
+선택한 저장소의 모든 참여자가 이 원장에 남긴 기록을 조회하므로 송신·수신 대화와
+원격 pending 사본도 포함하지만, 모든 호스트의 이력을 복제하지는 않습니다.
+직접 입력 이력은 사용자 직접 입력의 수락 증거를 읽는 기능이지 직접 전송 권한이
+아닙니다. `--limit`은 기본 100개이며 1~1000개를 받습니다. 결과에는 `repo_id`,
+`threads` 또는 `submissions`, 마지막 페이지에서 `null`인 `next_cursor`가 있습니다.
+HMAC 서명된 불투명 cursor는 원장·쿼리·저장소에 귀속되므로 그대로 전달하세요.
+정렬은 `updated_at DESC`, UUID 오름차순이며 OFFSET 대신 keyset 페이지를 씁니다.
+고정된 스냅샷이 아니므로 조회 사이의 갱신으로 기록이 경계 앞으로 이동할 수
+있습니다. 최신 갱신을 보려면 첫 페이지부터 다시 조회하세요. 변조하거나 범위가
+다른 token을 쓰면 `invalid_cursor`로 실패합니다.
+
+보드는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
+값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
+`--host`는 로컬 원장 또는 등록된 정규 호스트·SSH 별칭 하나만 선택합니다.
+결과는 `{repo_id,agents,hosts}`이며 역할·턴·phase·summary·unread와 수신 확장,
+배치 정보를 포함합니다. `status_updated_at`은 상태 갱신 시각이며 `last_seen`은
+레지스트리 관찰 시각입니다. 저장된 스냅샷을 읽을 뿐 레지스트리를 새로 수집하거나
+상태·표시·claim을 바꾸지 않으며, peer에도 `refresh=false`를 전달합니다.
+peer 조회에 실패하면 `hosts`에 구조화된 오류와 `stale:true`, unread `?`를 남깁니다.
+이전 스냅샷이 없는 CLI는 에이전트 행을 만들어 내지 않습니다. TUI는 검증된 이전
+행을 stale로 유지할 수 있습니다. 기존 `list`와 로컬 `status list`는 더 좁은
+범위의 조회로 유지됩니다.
+peer도 이 읽기 API를 지원해야 합니다. 이전 버전은 `refresh=false`를 무시하고
+기존 레지스트리 수집을 할 수 있습니다. 일부 peer에 실패해도 종료 코드는 0이므로
+호스트별 `error`, `stale`, unread를 확인하세요. `--host` 대상이 등록되지 않았거나 모호하면
+`peer_not_configured`와 종료 코드 1을 반환합니다.
+
+세 명령 모두 `-h` / `--help`를 지원하며 `--verbose`는 없습니다. 결과는 JSON 객체
+하나이고, 도메인 오류는 `{"error":{"code":"CODE","message":"TEXT"}}`와 종료 코드
+1을 반환합니다. 사용법 오류는 종료 코드 2입니다. 조회는 메일을 확인 처리하지
+않으며 설정 변경, 사용자 작성·직접 전송, 운영자 ACK를 우회하는 공개 명령도
+제공하지 않습니다. inbox·Threads·전송 outbox·상태·unread의 구분은
+[참고서 용어](.agents/skills/herdr-agent-messenger/reference.md#mailbox-terminology)를 참고하세요.
 
 ### 참여 모드와 역할
 

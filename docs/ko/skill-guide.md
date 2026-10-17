@@ -136,7 +136,9 @@ python3 "$HAM_CLI" mail show --thread THREAD_UUID
 `--subject TEXT`는 새 대화 제목을 정합니다(UTF-8 기준 최대 1024바이트).
 `--reply-to UUID`는 기존 대화와 이어지고 hop을 1 늘립니다. 답장자가 수신자인
 queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로 바뀝니다.
-종류가 action이어도 이 명령 자체는 모델을 깨우지 않습니다.
+접수된 로컬 메일은 보통 queued로 기다리지만 원격 사본은 pending일 수 있으며,
+철회나 terminal 종료로 claim 없이 최종 상태가 될 수도 있습니다.
+어느 종류든 `mail send` 자체가 모델 턴을 시작하지는 않습니다.
 
 `inbox read`는 `--message UUID`, `--all`, `--limit N`을 받습니다.
 기본 한도는 100개이며 1~1000개를 지정할 수 있습니다. 조회는 상태·로그·초인종을
@@ -144,8 +146,77 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 `inbox handle --message UUID`는 여러 번 지정할 수 있고 전체를 검증한 뒤
 한꺼번에 handled로 바꿉니다. queued 메시지를 처리해도 delivered 시각을 만들지
 않습니다. `mail withdraw --message UUID`는 아직 claim되지 않은 메시지를
-철회하며, 이미 claim됐거나 최종 상태이면 `withdrawn:false`를 반환합니다.
-`mail show --thread UUID`는 대화를, `repo show`는 저장소 설정을 조회합니다.
+철회합니다. claim이나 철회 이외의 최종 결과가 먼저 확정되면 `withdrawn:false`를
+반환하지만, 성공한 철회를 반복하면 `withdrawn:true`와 최초 수신 확인·시각을
+유지합니다. `mail show --thread UUID`는 대화를, `repo show`는 저장소 설정을 조회합니다.
+
+### 저장소 이력과 읽기 전용 보드
+
+```text
+mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+```
+
+위의 `python3 "$HAM_CLI"` 뒤에 붙여 실행합니다. 각 명령은 `-h` / `--help`를
+지원하며 `--verbose`는 없습니다. JSON 객체 하나를 반환하고, 도메인 오류는
+`{"error":{"code":"CODE","message":"TEXT"}}`와 종료 코드 1을 사용합니다.
+사용법 오류는 종료 코드 2입니다. 조회는 메일 확인, 설정·상태·last_seen·표시·claim
+변경을 하지 않으며 사용자 작성·직접 전송·운영자 ACK 우회 명령을 제공하지 않습니다.
+
+이력은 기본적으로 정체성을 검증한 호출자의 저장소를 선택합니다.
+`--repo REPO_ID`를 명시하면 Herdr에서 호출자 정체성을 가져오지 않습니다.
+`--limit`은 기본 100개이며 1~1000개를 받습니다. 결과는
+`{repo_id,threads,next_cursor}` 또는 `{repo_id,submissions,next_cursor}`이고,
+`next_cursor:null`이면 마지막 페이지입니다. 선택한 저장소의 모든 참여자가 이
+로컬 원장에 남긴 기록을 조회합니다. 송신·수신 대화와 원격 pending 사본,
+`via=direct` 기록을 포함하지만 `spawn_initial`이나 모든 호스트의 복제 이력은
+포함하지 않습니다. HMAC 서명된 불투명 cursor는 그대로 전달하세요. 원장·쿼리·저장소에
+귀속되므로 변조하거나 다른 범위에서 쓰면 `invalid_cursor`로 실패합니다.
+`updated_at DESC`, UUID 오름차순의 keyset 페이지이며 OFFSET을 쓰지 않습니다.
+고정된 스냅샷이 아니므로 동시 갱신으로 아직 읽지 않은 행이 경계 앞으로 이동할 수
+있습니다. 최신 갱신을 보려면 첫 페이지부터 다시 조회하세요.
+
+`status board`는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
+값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
+`--host`는 로컬 또는 등록된 정규 호스트·SSH 별칭 하나로 범위를 좁힙니다.
+결과 `{repo_id,agents,hosts}`의 행에는 role, turn_state, phase, summary, unread,
+extension_present, client, workspace_id, pane_id, generation, is_main_checkout,
+status_updated_at, last_seen, stale가 있습니다. 상태 갱신 시각과 레지스트리 관찰
+시각은 별개입니다. 저장된 레지스트리를 새로 수집하지 않고 읽으며 peer에도
+`refresh=false`를 요청합니다. 어느 호스트의 상태·표시·claim도 갱신하지 않습니다.
+호스트별 항목은 `{host,uuid,local,stale,error,unread,agents}`입니다. 실패한 peer는
+구조화된 오류와 unread `?`를 남깁니다. 이전 행이 없는 CLI는 행을 만들어 내지
+않습니다. TUI는 검증된 같은 호스트의 이전 스냅샷을 stale로 유지할 수 있습니다.
+기존 `list`와 로컬 `status list`는 더 좁은 탐색·상태 조회로 유지됩니다.
+원격 읽기 전용 동작을 보장하려면 peer도 이 읽기 API 버전이어야 합니다.
+이전 버전 peer는 `refresh=false`를 무시하고 기존 레지스트리 수집을 할 수 있습니다.
+일부 peer 조회에 실패해도 종료 코드는 0이므로 호스트별 `error`, `stale`,
+unread를 확인하세요. 알 수 없거나 모호한 `--host`는 `peer_not_configured`와
+종료 코드 1을 반환합니다.
+
+### 메일함 용어
+
+- **Mailbox / inbox:** 안정적인 수신 terminal 슬롯에 남기는 영속 메일이며 터미널
+  입력이 아닙니다. `inbox read`는 현재 호스트·호출자 terminal·저장소의
+  `queued`, `delivering`, `delivered`를 기본으로 읽습니다. `--all`은 같은 수신자의
+  보존된 최종 상태까지 포함하고 `--message UUID`도 최종 메시지를 선택할 수 있습니다.
+  조회는 ACK가 아닙니다.
+- **Thread:** 첫 메시지의 UUID가 대화 UUID입니다. `--reply-to`는 원문의 대화·제목을
+  이어받고 hop을 1 늘립니다. `mail show --thread UUID`는 받은 메일만이 아니라
+  송신 기록도 포함한, UUID를 아는 보존 대화를 읽습니다.
+- **TUI Threads:** 저장소별 송신·수신 대화와 직접 입력 결과, 호스트 전체의
+  pending/failed OUTBOX 작업을 함께 보여 줍니다. 하나의 inbox·채팅이나 원격 이력
+  복제본이 아닙니다. **Outbox**는 FIFO 전송 작업(`message`, `receipt`, `setting`,
+  `withdraw`; `pending/sent/failed/cancelled`)이며 보낸 메일 폴더가 아닙니다.
+- **메시지 상태:** `pending`은 수신자의 확정 결과를 기다리는 사본, `queued`는
+  claim 전 대기, `delivering`은 적용 여부가 불확실할 수 있는 예약 claim입니다.
+  `delivered`는 네이티브 또는 감사 기록을 남긴 운영자 증거로 적용을 확인한 상태이지
+  처리나 이해를 뜻하지 않습니다. `handled`, `withdrawn`, `undeliverable`은 최종
+  상태입니다. `confirmation_source=native|operator`를 구분하세요. 직접 입력의
+  `submitting/accepted/unknown/failed`는 전송 수락이며 메일함 ACK가 아닙니다.
+- **Unread:** 실제로 글을 봤는지가 아니라 `queued` + `delivering` 개수입니다.
+  delivered 상태로 미처리된 메일은 제외합니다. `fyi`/`action`은 상태가 아니라 종류입니다.
 
 호스트 정체성은 원장에 저장된 canonical 이름과 고정 UUID입니다. 기기 hostname,
 `local`, SSH 별칭과 구분하세요. `local`은 현재 원장을, 등록된 이름과 별칭은
@@ -252,9 +323,10 @@ python3 "$HAM_CLI" repo show
 `turn_state`는 바꾸지 않습니다. phase는 `$recap`에, summary는 HAM 소유 pane
 테두리에 표시합니다. 사용자가 지정한 기존 테두리는 보존합니다. 역할은 Agents의
 별칭과 HAM 소유 테두리 내용 앞에 표시하며, off에서도 상태 기능은 동작합니다.
-`status list`는 현재 상태를 나열합니다. 값 없는 `--repo`는 호출자의 저장소를,
-`--repo ID`는 해당 저장소를 선택합니다. 기존 `status --address HOST/LABEL`은
-선택한 수신자의 상태를 읽는 명령으로 유지합니다.
+`status list`는 저장된 로컬 상태를 나열합니다. 값 없는 `--repo`는 호출자의 저장소를,
+`--repo ID`는 해당 저장소를 선택합니다. 상세한 로컬·등록 peer 조회에는
+`status board`를 사용하며, `status list`에 기존 상위 명령의 `--host`를 붙여
+원격 보드로 대체하지 마세요. `status --address HOST/LABEL`은 수신자 상태 조회로 유지합니다.
 
 ### 사용자 TUI: 설정, 작성, 불확실한 claim 복구
 
@@ -269,6 +341,18 @@ ID로 찾아 재사용합니다. `q`로 닫을 때는 이 플러그인이 소유
 `1`은 Status, `2`는 Threads, `3`은 Compose, `4`는 Settings입니다. Enter로
 상세 화면이나 편집기를 열고 Esc로 돌아갑니다. Status에서 `c`로 수신자를 선택한
 뒤 Settings의 `m`으로 main을 지정하거나 Space로 manual 회원 여부를 바꿉니다.
+
+Status는 호스트별 헤더에 stale·오류 상태를 표시하고 그 아래 에이전트를 묶어
+보여 줍니다. 별칭·역할·턴·unread를 앞세운 메타데이터는 한 줄로 잘라 표시하고,
+요약은 들여쓴 최대 세 줄로 보여 줍니다. 한글·라틴 문자는 단어 경계에서,
+한자·가나·이모지는 표시 셀 경계에서 줄바꿈합니다.
+넘치는 내용에는 말줄임표를, 빈 요약에는 `—`를 표시합니다. Enter로 전체 상세
+정보를 열면 모든 항목을 내어쓰기로 줄바꿈합니다. 전체 요약, 식별자,
+역할·클라이언트, 턴·phase, unread·수신 확장, 저장소·메인 체크아웃 여부,
+위치, generation·세션 정보를 볼 수 있습니다. 상태 갱신 시각(`status_updated_at`)과
+레지스트리 관찰 시각(`last_seen`·`first_seen`)은 현지 날짜·시간과 경과 시간으로
+구분합니다. 플래그는 yes/no/unknown으로 표시합니다. 사용자 테두리 소유권은
+로컬에서만 관찰하므로 원격 증거가 없으면 unknown으로 표시합니다.
 
 Settings에서 **수정할 수 있는 행은 일곱 개**입니다.
 

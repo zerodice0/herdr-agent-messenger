@@ -1299,6 +1299,11 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     status_operations.add_parser("clear", help="Clear this agent's public status.")
     status_list = status_operations.add_parser("list", help="List current status by repository.")
     status_list.add_argument("--repo", nargs="?", const="", default=None)
+    status_board = status_operations.add_parser("board", help="Read local and registered-peer rich status without refreshing registry state.")
+    status_board.add_argument("--repo", nargs="?", const="", default=None,
+                              help="Optional exact repository; bare --repo selects the current caller repository.")
+    status_board.add_argument("--host", dest="board_host",
+                              help="Local/canonical/registered SSH alias; default: local and all registered peers.")
 
     send_parser = subparsers.add_parser(
         "send",
@@ -1459,6 +1464,7 @@ def main(
                     phase=getattr(arguments, "phase", None),
                     summary=getattr(arguments, "summary", ""),
                     repo_id=getattr(arguments, "repo", None),
+                    host=getattr(arguments, "board_host", None),
                 )
             else:
                 if arguments.label is None and arguments.route is None:

@@ -39,6 +39,14 @@ def add_parsers(subparsers: Any) -> None:
     withdraw.add_argument("--message", required=True, help="Message UUID.")
     show = mail_commands.add_parser("show", help="View a thread without changing delivery state.")
     show.add_argument("--thread", required=True, help="Thread UUID (first message ID).")
+    for operation, description in (
+        ("threads", "List retained repository threads from all senders and recipients."),
+        ("direct-list", "List this repository's retained user-direct submission results."),
+    ):
+        history = mail_commands.add_parser(operation, help=description)
+        history.add_argument("--repo", help="Exact repository identity; default: current verified caller repository.")
+        history.add_argument("--limit", type=int, default=100, help="Page size, 1..1000 (default 100).")
+        history.add_argument("--cursor", help="Opaque next_cursor from the same ledger, command and repository.")
 
     inbox = subparsers.add_parser("inbox", help="Read your terminal's mailbox and explicitly handle messages.")
     inbox_commands = inbox.add_subparsers(dest="inbox_command", required=True)
@@ -136,7 +144,7 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
     store = LedgerStore(environment=environment, canonical_name=name)
     payload = _dispatch(arguments, environment, store)
     values = os.environ if environment is None else environment
-    mutating = ((arguments.command == "mail" and arguments.mail_command != "show") or
+    mutating = ((arguments.command == "mail" and arguments.mail_command not in {"show", "threads", "direct-list"}) or
                 (arguments.command == "inbox" and arguments.inbox_command == "handle") or
                 (arguments.command == "ledger" and arguments.ledger_command in
                  {"reconcile", "event", "accept", "receipt", "setting", "withdraw", "retry", "agent-session", "delivery", "peer", "runtime"}))
@@ -150,15 +158,18 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
     return store.annotate(payload)
 def status_operation(operation: str, *, environment: Mapping[str, str] | None = None,
                      phase: str | None = None, summary: str = "",
-                     repo_id: str | None = None) -> dict[str, Any]:
+                     repo_id: str | None = None, host: str | None = None) -> dict[str, Any]:
     store = LedgerStore(environment=environment)
     registry = AgentRegistry(store)
-    if operation == "list":
+    if operation in {"list", "board"}:
         if repo_id == "":
             repo_id = registry.resolve_context(environment, live_snapshot(environment))["repo_id"]
+        if operation == "board":
+            from ledger_views import status_board
+            return status_board(store, repo_id=repo_id, host=host, environment=environment)
         return {"repo_id": repo_id, "agents": registry.list(repo_id)}
     if operation not in {"set", "clear"}:
-        raise LedgerError("invalid_status_operation", "Status operation must be set, clear, or list.")
+        raise LedgerError("invalid_status_operation", "Status operation must be set, clear, list, or board.")
     snapshot, _ = registry.refresh(environment)
     agent = registry.resolve_context(environment, snapshot)
     return registry.set_status(
@@ -208,9 +219,15 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         if command in {"reconcile", "event"}:
             return registry.refresh(environment)[1]
         if command in {"accept", "receipt", "setting", "withdraw"} or (command == "status-export" and arguments.wire):
+            envelope = _stdin_object()
             if command == "status-export":
-                registry.refresh(environment)
-            return remote.receive(command, _stdin_object())
+                _, payload = remote.authenticate(envelope)
+                refresh = payload.get("refresh", True)
+                if not isinstance(refresh, bool):
+                    raise LedgerError("invalid_request", "Status export refresh must be boolean.")
+                if refresh:
+                    registry.refresh(environment)
+            return remote.receive(command, envelope)
         if command == "status-export":
             registry.refresh(environment)
             return {"protocol": 1, **remote.status_export(arguments.repo)}
@@ -252,6 +269,14 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
             raise LedgerError("invalid_request", str(error)) from None
     if arguments.command == "mail" and arguments.mail_command == "show":
         return mailbox.show_thread(arguments.thread)
+    if arguments.command == "mail" and arguments.mail_command in {"threads", "direct-list"}:
+        repo_id = arguments.repo
+        if repo_id is None:
+            repo_id = _live_context(registry, live_snapshot(environment), environment)["repo_id"]
+        if not repo_id:
+            raise LedgerError("invalid_repo", "History requires a nonempty repository identity.")
+        method = mailbox.list_threads if arguments.mail_command == "threads" else mailbox.list_direct
+        return method(repo_id, arguments.limit, cursor=arguments.cursor)
     # Reads never refresh last_seen/status/bells. Mutations acquire the snapshot
     # before updating the registry under its serialization lock.
     mutating = arguments.command == "mail" or (arguments.command == "inbox" and arguments.inbox_command == "handle")

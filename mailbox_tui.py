@@ -13,11 +13,13 @@ import json
 import locale
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from typing import Any, Mapping, Sequence
 
 from agent_directory import (dispatch_user_prompts, herdr_executable, query_local_agents,
@@ -26,8 +28,9 @@ from agent_messenger import focused_pane_id, terminal_flow_control_disabled
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
-from ledger_status import AgentRegistry, repository_identity
+from ledger_status import repository_identity
 from ledger_store import LedgerError, LedgerStore, ledger_directory
+from ledger_views import status_board
 from terminal_text import (character_index_at_display_column, display_width,
                            wrap_display_text, wrap_message_lines)
 
@@ -172,15 +175,7 @@ def close_owned(environment: Mapping[str, str]) -> bool:
 def local_snapshot(store: LedgerStore, repo_id: str | None,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     settings = RepoSettings(store)
-    agents = AgentRegistry(store).list(repo_id)
-    with store.read() as connection:
-        unread = {(row["recipient_host"], row["recipient_terminal_id"]): row["n"] for row in connection.execute(
-            "SELECT recipient_host,recipient_terminal_id,count(*) n FROM deliveries d JOIN messages m USING(message_id) "
-            "WHERE d.state IN ('queued','delivering')" + (" AND m.repo_id=?" if repo_id else "") +
-            " GROUP BY recipient_host,recipient_terminal_id", (repo_id,) if repo_id else ())}
-    for agent in agents:
-        agent["role"] = settings.role(agent)
-        agent["unread"] = unread.get((agent["host"], agent["terminal_id"]), 0)
+    agents = status_board(store, repo_id=repo_id, host="local", environment=environment)["agents"]
     if environment is not None:
         try:
             result = herdr(["api", "snapshot"], environment)
@@ -270,7 +265,8 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
     if operation == "snapshot":
         return local_snapshot(store, repo_id, environment)
     if operation == "remote":
-        return RemoteLedger(store, environment).query_status(request["host"], repo_id)
+        return status_board(store, repo_id=repo_id, host=request["host"], environment=environment,
+                            previous=request.get("previous"))
     if operation == "send":
         return mail.send_user(repo_id, request["recipient"], body=request["body"], kind=request["kind"],
                               subject=request.get("subject", ""), reply_to=request.get("reply_to"))
@@ -398,14 +394,79 @@ def describe_message(message: Mapping[str, Any]) -> str:
     return f"{message['kind']} {state}{suffix}"
 
 
+def wrap_summary(value: str, width: int) -> list[str]:
+    """Wrap Hangul/Latin words, Han/Kana/emoji cells and parenthesized ages."""
+    width = max(1, width)
+    result: list[str] = []
+    for paragraph in (value.strip() or "—").split("\n"):
+        line = ""
+        for word in re.findall(r"\(\d+[smhd] ago\)|\S+", paragraph):
+            units: list[str] = []
+            run = ""
+            for character in word:
+                if units and not run and (unicodedata.combining(character) or
+                                          character in "。、，．）)]｝}】」』：:；;！？!?…"):
+                    units[-1] += character
+                elif display_width(character) == 2 and not unicodedata.name(character, "").startswith("HANGUL "):
+                    if run:
+                        units.append(run)
+                        run = ""
+                    units.append(character)
+                elif character == "/":
+                    units.append(run + character)
+                    run = ""
+                else:
+                    run += character
+            if run:
+                units.append(run)
+            for index, unit in enumerate(units):
+                gap = " " if index == 0 and line else ""
+                if line and display_width(line + gap + unit) > width:
+                    result.append(line)
+                    line = ""
+                    gap = ""
+                if display_width(unit) > width:
+                    parts = wrap_display_text(unit, width)
+                    result.extend(parts[:-1])
+                    line = parts[-1]
+                else:
+                    line += gap + unit
+        result.append(line)
+    return result
+
+
+def elide(value: str, width: int) -> str:
+    if display_width(value) <= width:
+        return value
+    prefix = clip(value, max(0, width - 1))
+    if " " in prefix and not value[len(prefix)].isspace():
+        prefix = prefix.rsplit(" ", 1)[0]
+    return prefix.rstrip() + "…"
+
+
+def status_time(value: float | None, now: float) -> str:
+    if value is None:
+        return "—"
+    age = max(0, int(now - value))
+    amount, unit = ((age, "s") if age < 60 else (age // 60, "m") if age < 3600 else
+                    (age // 3600, "h") if age < 86400 else (age // 86400, "d"))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value)) + f" ({amount}{unit} ago)"
+
+
+def yes_no(value: Any) -> str:
+    return "unknown" if value is None else "yes" if value else "no"
+
+
 class MailboxApp:
     """Four keyboard-first screens; every potentially blocking action is a Job."""
-    def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job, clock=time.monotonic):
+    def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job,
+                 clock=time.monotonic, wall_clock=time.time):
         self.screen = screen
         self.environment = dict(environment)
         self.repo_id = self.environment.get(REPO_ENV) or None
         self.store = LedgerStore(environment=environment)
         self.job_factory, self.clock = job_factory, clock
+        self.wall_clock = wall_clock
         self.jobs: dict[str, Any] = {}
         self.local: dict[str, Any] = {"agents": [], "threads": [], "submissions": [], "peers": [], "outbox": []}
         self.remote: dict[str, Any] = {}
@@ -451,20 +512,34 @@ class MailboxApp:
             job.close()
             del self.jobs[key]
             error = value.get("error") if isinstance(value, dict) else None
+            selected_agent = self.selected() if self.tab == 0 else None
             if key.startswith("remote:"):
                 host = key.split(":", 1)[1]
                 if error:
                     self.remote_errors[host] = str(error.get("message", error))
                 else:
                     self.remote[host] = value
-                    self.remote_errors.pop(host, None)
-                    self.refresh_detail()
+                    host_state = next((item for item in value["hosts"] if item["host"] == host), {})
+                    peer_error = host_state.get("error")
+                    if peer_error:
+                        self.remote_errors[host] = str(peer_error["message"])
+                    else:
+                        self.remote_errors.pop(host, None)
+                self.refresh_detail(selected_agent)
             elif key == "snapshot":
                 if error:
                     self.status = f"Local ledger: {error.get('code')}: {error.get('message')}"
                 else:
                     self.local = value
-                    self.refresh_detail()
+                    peers = {peer["canonical_name"] for peer in self.local.get("peers", [])}
+                    for cached in (self.remote, self.remote_errors, self.remote_due):
+                        for host in list(cached):
+                            if host not in peers:
+                                del cached[host]
+                    for pending in list(self.jobs):
+                        if pending.startswith("remote:") and pending.split(":", 1)[1] not in peers:
+                            self.jobs.pop(pending).close()
+                    self.refresh_detail(selected_agent)
                     mutation = self.jobs.get("mutation")
                     if mutation is None or mutation.operation != "setting":
                         self.status = "Local ledger updated. Read-only inspection does not acknowledge messages."
@@ -498,9 +573,14 @@ class MailboxApp:
             host = peer["canonical_name"]
             if now >= self.remote_due.get(host, 0):
                 self.remote_due[host] = now + REMOTE_INTERVAL
-                self.start_job(f"remote:{host}", "remote", host=host)
+                self.start_job(f"remote:{host}", "remote", host=host, previous=self.remote.get(host))
 
-    def refresh_detail(self) -> None:
+    def refresh_detail(self, selected_agent: Mapping[str, Any] | None = None) -> None:
+        if selected_agent is not None:
+            identity = (selected_agent["host"], selected_agent["terminal_id"])
+            self.selection = next((index for index, agent in enumerate(self.agents())
+                                   if (agent["host"], agent["terminal_id"]) == identity), self.selection)
+            self.selected()
         if not self.detail:
             return
         item = self.detail
@@ -517,11 +597,16 @@ class MailboxApp:
 
     def agents(self) -> list[dict[str, Any]]:
         values = list(self.local["agents"])
+        peers = {peer["canonical_name"]: peer["uuid"] for peer in self.local.get("peers", [])}
         for host, snapshot in self.remote.items():
+            if not any(item["host"] == host and item["uuid"] == peers.get(host)
+                       for item in snapshot.get("hosts", [])):
+                continue
             for agent in snapshot.get("agents", []):
-                values.append({**agent, "stale": host in self.remote_errors,
+                values.append({**agent, "stale": host in self.remote_errors or agent.get("stale", False),
                                "unread": "?" if host in self.remote_errors else agent.get("unread", "?")})
-        return sorted(values, key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+        return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
+                      key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
 
     def items(self) -> list[Any]:
         if self.tab == 0:
@@ -592,16 +677,38 @@ class MailboxApp:
         self.selected()
         lines: list[tuple[str, int]] = []
         if self.tab == 0:
-            lines.append(("HOST / ALIAS   ROLE   TURN / PHASE   UNREAD   RECEIVER", -1))
-            for index, agent in enumerate(items):
-                absent = "extension absent" if not agent.get("extension_present") else "receiver ready"
-                stale = " STALE/offline" if agent.get("stale") else ""
-                lines.append((f"{agent['host']}/{agent.get('alias') or agent['terminal_id']}  {agent.get('role') or '—'}  "
-                              f"{agent.get('turn_state', 'unknown')}/{agent.get('phase') or '—'}  "
-                              f"unread:{agent.get('unread', '?')}  {absent}{stale}"
-                              f"{'  user border preserved' if agent.get('user_border') else ''}", index))
-            for host, error in self.remote_errors.items():
-                lines.append((f"! {host}: disconnected — {error}", -1))
+            hosts = dict.fromkeys([agent["host"] for agent in items] + sorted(self.remote_errors))
+            for host in hosts:
+                group = [(index, agent) for index, agent in enumerate(items) if agent["host"] == host]
+                stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
+                heading = f"── {host}{'  STALE/offline' if stale else ''}"
+                if host in self.remote_errors:
+                    heading += f" — {self.remote_errors[host]}"
+                heading += " ──"
+                lines.extend((line, -1) for line in wrap_summary(heading, width - 3))
+                if group:
+                    lines.append(("ALIAS ROLE TURN/PHASE UNREAD RECEIVER" if width < 80 else
+                                  "ALIAS   ROLE   TURN / PHASE   UNREAD   RECEIVER   SUMMARY", -1))
+                for index, agent in group:
+                    unread = str(agent.get("unread", "?"))
+                    if width >= 80:
+                        unread = "unread:" + unread
+                    essential = (f"{agent.get('role') or '—'} "
+                                 f"{agent.get('turn_state', 'unknown')}/{agent.get('phase') or '—'} "
+                                 f"{unread}")
+                    alias_width = max(1, width - 4 - display_width(essential))
+                    text = f"{elide(agent.get('alias') or agent['terminal_id'], alias_width)} {essential}"
+                    tail = "extension absent" if not agent.get("extension_present") else "receiver ready"
+                    if agent.get("user_border"):
+                        tail += "  user border preserved"
+                    remaining = width - 3 - display_width(text)
+                    if remaining > 5:
+                        text += " " + elide(tail, remaining - 1)
+                    lines.append((elide(text, width - 3), index))
+                    summary = wrap_summary(agent.get("summary") or "—", width - 5)
+                    if len(summary) > 3:
+                        summary = [*summary[:2], elide(summary[2] + "…", width - 5)]
+                    lines.extend(("  " + line, index) for line in summary)
         elif self.tab == 1:
             for index, item in enumerate(items):
                 if item["type"] == "thread":
@@ -631,14 +738,19 @@ class MailboxApp:
         if not lines:
             lines = [("No entries. No message has been acknowledged by opening this view.", -1)]
         available = height - 5
-        chosen_line = next((index for index, (_line, item) in enumerate(lines) if item == self.selection), 0)
+        chosen_lines = [index for index, (_line, item) in enumerate(lines) if item == self.selection]
+        chosen_line = chosen_lines[0] if chosen_lines else 0
+        last_line = chosen_lines[-1] if chosen_lines else chosen_line
         if self.follow_selection:
             self.scroll = max(0, min(self.scroll, chosen_line))
-            if chosen_line >= self.scroll + available:
-                self.scroll = chosen_line - available + 1
+            if last_line >= self.scroll + available:
+                self.scroll = min(chosen_line, last_line - available + 1)
+            if self.tab == 0 and self.selection == 0 and last_line < available:
+                self.scroll = 0
         self.scroll = min(max(0, self.scroll), max(0, len(lines) - available))
         for row, (line, item) in enumerate(lines[self.scroll:self.scroll + available], 3):
-            self.put(row, ("› " if item == self.selection else "  ") + line,
+            continuation = self.tab == 0 and line.startswith("  ")
+            self.put(row, ("› " if item == self.selection and not continuation else "  ") + line,
                      curses.A_REVERSE if item == self.selection else 0)
 
     def render_compose(self, height: int, width: int) -> None:
@@ -679,11 +791,46 @@ class MailboxApp:
                                f"evidence:{message.get('evidence') or '—'}", message["body"]])
             result.append("a/n resolves the first uncertain claim in this thread; inspect its ID/evidence first.")
             return result
+        if item.get("host") and item.get("terminal_id") and not item.get("type"):
+            now = self.wall_clock()
+            return [
+                f"Address: {item['host']}/{item.get('alias') or item['terminal_id']}",
+                f"Alias: {item.get('alias') or '—'}",
+                f"Host: {item['host']}{'  STALE/offline' if item.get('stale') else ''}",
+                f"Role: {item.get('role') or '—'}",
+                f"Client: {item.get('client') or '—'}",
+                f"Turn state: {item.get('turn_state') or 'unknown'}",
+                f"Phase: {item.get('phase') or '—'}",
+                f"Summary: {item.get('summary') or '—'}",
+                f"Unread: {item.get('unread', '?')}",
+                f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
+                f"Extension present: {yes_no(item.get('extension_present'))}",
+                f"Repo ID: {item.get('repo_id') or '—'}",
+                f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
+                f"Workspace / pane: {item.get('workspace_id') or '—'} / {item.get('pane_id') or '—'}",
+                f"Terminal ID: {item['terminal_id']}",
+                f"Generation: {item.get('generation', '—')}",
+                f"Session reference: {item.get('session_ref') or '—'}",
+                f"Last updated: {status_time(item.get('status_updated_at'), now)}",
+                f"Last seen: {status_time(item.get('last_seen'), now)}",
+                f"First seen: {status_time(item.get('first_seen'), now)}",
+                f"User border: {yes_no(item.get('user_border'))}",
+            ]
         return [json.dumps(item, ensure_ascii=False, indent=2)]
 
     def render_detail(self, height: int, width: int) -> None:
-        lines = [part for line in self.detail_lines() for logical in line.split("\n")
-                 for part in wrap_display_text(logical, width - 1)]
+        lines: list[str] = []
+        agent = self.detail and self.detail.get("host") and self.detail.get("terminal_id") and not self.detail.get("type")
+        for line in self.detail_lines():
+            if agent:
+                label, _separator, value = line.partition(": ")
+                prefix = label + ": "
+                parts = wrap_summary(value, width - 1 - display_width(prefix))
+                lines.extend((prefix if index == 0 else " " * len(prefix)) + part
+                             for index, part in enumerate(parts))
+            else:
+                lines.extend(part for logical in line.split("\n")
+                             for part in wrap_display_text(logical, width - 1))
         self.scroll = min(max(0, self.scroll), max(0, len(lines) - (height - 5)))
         for row, line in enumerate(lines[self.scroll:self.scroll + height - 5], 3):
             self.put(row, line)

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
 import time
 from typing import Any, Mapping, Sequence
 import uuid
@@ -18,6 +22,63 @@ MAX_BODY_BYTES = 16 * 1024
 IMMUTABLE_FIELDS = ("message_id", "thread_id", "repo_id", "reply_to", "origin_host", "sender",
                     "sender_label", "kind", "hop", "body", "subject", "created_at",
                     "recipient_host", "recipient_terminal_id", "recipient_address")
+MAX_HISTORY_CURSOR_SIZE = 32768
+
+
+def _history_scope(repo_id: str | None, limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise LedgerError("invalid_limit", "History limit must be an integer between 1 and 1000.")
+    if repo_id is not None and (not isinstance(repo_id, str) or not repo_id or len(repo_id) > 4096):
+        raise LedgerError("invalid_repo", "History repository must be a bounded nonempty identity.")
+
+
+def _cursor_encode_part(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _cursor_decode_part(value: str) -> bytes:
+    decoded = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    if _cursor_encode_part(decoded) != value:
+        raise ValueError("Noncanonical cursor encoding.")
+    return decoded
+
+
+def _history_cursor(store: LedgerStore, kind: str, repo_id: str | None,
+                    updated_at: float, identity: str) -> str:
+    value = {"v": 1, "ledger": store.host_uuid, "kind": kind, "repo": repo_id,
+             "updated_at": updated_at, "id": identity}
+    payload = json_text(value).encode("utf-8")
+    signature = hmac.digest(store._history_cursor_key, payload, "sha256")
+    return _cursor_encode_part(payload) + "." + _cursor_encode_part(signature)
+
+
+def _history_boundary(store: LedgerStore, kind: str, repo_id: str | None,
+                      cursor: str | None) -> tuple[float, str] | None:
+    if cursor is None:
+        return None
+    try:
+        if (not isinstance(cursor, str) or len(cursor) > MAX_HISTORY_CURSOR_SIZE or
+                re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}", cursor) is None):
+            raise ValueError("Malformed cursor.")
+        encoded_payload, encoded_signature = cursor.split(".")
+        payload = _cursor_decode_part(encoded_payload)
+        signature = _cursor_decode_part(encoded_signature)
+        if not hmac.compare_digest(signature, hmac.digest(store._history_cursor_key, payload, "sha256")):
+            raise ValueError("Invalid cursor signature.")
+        value = json.loads(payload)
+        if (not isinstance(value, dict) or
+                set(value) != {"v", "ledger", "kind", "repo", "updated_at", "id"} or
+                type(value["v"]) is not int or value["v"] != 1 or
+                value["ledger"] != store.host_uuid or value["kind"] != kind or
+                value["repo"] != repo_id or
+                type(value["updated_at"]) not in (int, float) or
+                not math.isfinite(value["updated_at"]) or
+                not isinstance(value["id"], str) or str(uuid.UUID(value["id"])) != value["id"] or
+                json_text(value).encode("utf-8") != payload):
+            raise ValueError("Invalid cursor scope or schema.")
+        return value["updated_at"], value["id"]
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError, binascii.Error):
+        raise LedgerError("invalid_cursor", "History cursor is invalid for this ledger, query, or repository.") from None
 
 
 def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -223,10 +284,20 @@ class Mailbox:
             rows = connection.execute("SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) "
                                       "WHERE thread_id=? ORDER BY m.created_at,m.message_id", (thread_id,)).fetchall()
         return {**dict(thread), "messages": [dict(row) for row in rows]}
-    def list_threads(self, repo_id: str | None = None, limit: int = 100) -> dict[str, Any]:
-        if not 1 <= limit <= 1000:
-            raise LedgerError("invalid_limit", "Thread limit must be between 1 and 1000.")
+    def list_threads(self, repo_id: str | None = None, limit: int = 100, *,
+                     cursor: str | None = None) -> dict[str, Any]:
+        """Live keyset pages, not a retained historical snapshot.
+
+        Updates between calls can move rows across the cursor, skipping or
+        repeating changed rows. Deletions disappear; new rows after the boundary
+        can appear. An unchanged dataset has no omissions or duplicates.
+        """
+        _history_scope(repo_id, limit)
+        boundary = _history_boundary(self.store, "threads", repo_id, cursor)
         with self.store.read() as connection:
+            # Keep the selected thread summaries and their messages consistent
+            # within this call, without holding a transaction between pages.
+            connection.execute("BEGIN")
             query = ("SELECT t.thread_id,t.repo_id,t.subject,max(d.updated_at) AS updated_at "
                      "FROM threads t JOIN messages m USING(thread_id) "
                      "JOIN deliveries d USING(message_id)")
@@ -234,11 +305,16 @@ class Mailbox:
             if repo_id is not None:
                 query += " WHERE t.repo_id=?"
                 parameters.append(repo_id)
-            rows = connection.execute(query + " GROUP BY t.thread_id,t.repo_id,t.subject "
-                                       "ORDER BY updated_at DESC,t.thread_id LIMIT ?",
-                                       (*parameters, limit)).fetchall()
+            query += " GROUP BY t.thread_id,t.repo_id,t.subject"
+            if boundary is not None:
+                query += " HAVING (max(d.updated_at)<? OR (max(d.updated_at)=? AND t.thread_id>?))"
+                parameters.extend((boundary[0], boundary[0], boundary[1]))
+            rows = connection.execute(query + " ORDER BY updated_at DESC,t.thread_id LIMIT ?",
+                                      (*parameters, limit + 1)).fetchall()
+            more = len(rows) > limit
+            rows = rows[:limit]
             if not rows:
-                return {"threads": []}
+                return {"repo_id": repo_id, "threads": [], "next_cursor": None}
             thread_ids = [row["thread_id"] for row in rows]
             placeholders = ",".join("?" for _ in thread_ids)
             messages = connection.execute(
@@ -249,7 +325,11 @@ class Mailbox:
         grouped = {thread_id: [] for thread_id in thread_ids}
         for row in messages:
             grouped[row["thread_id"]].append(dict(row))
-        return {"threads": [{**dict(row), "messages": grouped[row["thread_id"]]} for row in rows]}
+        next_cursor = (_history_cursor(self.store, "threads", repo_id, rows[-1]["updated_at"],
+                                       rows[-1]["thread_id"]) if more else None)
+        return {"repo_id": repo_id,
+                "threads": [{**dict(row), "messages": grouped[row["thread_id"]]} for row in rows],
+                "next_cursor": next_cursor}
 
     @staticmethod
     def _submission_record(row: Any) -> dict[str, Any]:
@@ -316,18 +396,30 @@ class Mailbox:
             finished = self._finish_submission(connection, row, acceptance, evidence)
         return self._submission_record(finished)
 
-    def list_direct(self, repo_id: str | None = None, limit: int = 100) -> dict[str, Any]:
-        if not 1 <= limit <= 1000:
-            raise LedgerError("invalid_limit", "Direct submission limit must be between 1 and 1000.")
+    def list_direct(self, repo_id: str | None = None, limit: int = 100, *,
+                    cursor: str | None = None) -> dict[str, Any]:
+        """Live keyset pages, not a snapshot: concurrent updates can move rows
+        across the cursor and skip or repeat changed rows. Restart to refresh.
+        """
+        _history_scope(repo_id, limit)
+        boundary = _history_boundary(self.store, "direct", repo_id, cursor)
         with self.store.read() as connection:
             query = "SELECT * FROM submissions WHERE via='direct'"
             parameters: list[Any] = []
             if repo_id is not None:
                 query += " AND repo_id=?"
                 parameters.append(repo_id)
+            if boundary is not None:
+                query += " AND (updated_at<? OR (updated_at=? AND submission_id>?))"
+                parameters.extend((boundary[0], boundary[0], boundary[1]))
             rows = connection.execute(query + " ORDER BY updated_at DESC,submission_id LIMIT ?",
-                                      (*parameters, limit)).fetchall()
-        return {"submissions": [self._submission_record(row) for row in rows]}
+                                      (*parameters, limit + 1)).fetchall()
+        more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = (_history_cursor(self.store, "direct", repo_id, rows[-1]["updated_at"],
+                                       rows[-1]["submission_id"]) if more else None)
+        return {"repo_id": repo_id, "submissions": [self._submission_record(row) for row in rows],
+                "next_cursor": next_cursor}
 
     @staticmethod
     def _finish_submission(connection: Any, row: Any, acceptance: str, evidence: str) -> Any:

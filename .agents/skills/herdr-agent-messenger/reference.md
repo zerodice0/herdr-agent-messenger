@@ -4,7 +4,7 @@ Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloa
 
 ## Command and flag reference
 
-The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`) accept `-h` / `--help` and `--verbose` (full diagnostic JSON; default off). Mailbox/ledger/runtime commands and `status set|clear|list` also accept help but have no verbose flag. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
+The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`) accept `-h` / `--help` and `--verbose` (full diagnostic JSON; default off). Mailbox/ledger/runtime commands and `status set|clear|list|board` also accept `-h` / `--help` but have no verbose flag, including `mail threads` and `mail direct-list`. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
 
 ### Recipient selectors
 
@@ -51,15 +51,33 @@ python3 scripts/herdr_agent_messenger.py repo show
 | `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, or symbolic `main`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh same-repository status export. |
 | `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000). Without `--all`, shows queued, uncertain delivering, and delivered mail. Reads never change delivery, logs, or bells, even from subagents. |
 | `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
-| `mail show` | Required `--thread UUID`; returns retained bodies and delivery state. |
-| `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled mail is not withdrawn. Repetition preserves the first final receipt/time. |
+| `mail show` | Required `--thread UUID`; reads a known retained thread, including sent mail, without caller-recipient filtering. Returns retained bodies and delivery state from this ledger. |
+| `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; repository-wide retained sent/received threads, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
+| `mail direct-list` | Same `--repo REPO_ID`, `--limit N`, `--cursor TOKEN`; retained `via=direct` user-input submissions, not `spawn_initial`. Returns `{repo_id,submissions,next_cursor}`. Read-only, not a direct-send command. |
+| `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
+
+`mail threads` and `mail direct-list` default to the verified caller's repository.
+Explicit `--repo REPO_ID` avoids fetching Herdr caller identity. Both enumerate
+all participants' records for that repo on this local ledger, not only the
+caller's inbox and not replicated all-host history. They never claim, acknowledge,
+handle, refresh the registry, or change status/last_seen/display state.
+
+`next_cursor` is `null` at the end; otherwise pass it unchanged as `--cursor`.
+The opaque HMAC-signed token binds the ledger, query kind and repository; malformed,
+tampered or wrong-scope tokens fail with `invalid_cursor`. Keyset order is
+`updated_at DESC`, UUID ascending (`thread_id` or `submission_id`); no OFFSET.
+Pages are live, not a frozen snapshot. Concurrent updates can move unseen records
+before the boundary, and deletions disappear; restart at the first page to see
+newer updates. Thread summaries/messages are consistent within one call, not
+across calls.
 
 All commands return one JSON object. Errors use the existing CLI convention
 `{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; argparse usage errors exit 2.
 The legacy request lifecycle's `error_code` field is unchanged. Useful codes:
 `sender_unresolved`, `stale_session`, `recipient_absent`, `repo_mismatch`,
-`message_conflict`, `delivery_in_progress`, `body_too_large`.
+`message_conflict`, `delivery_in_progress`, `body_too_large`, `invalid_limit`,
+`invalid_repo`, `invalid_cursor` (including history tampering/scope mismatch).
 
 Messages use the stable terminal slot, not inherited pane IDs. The CLI matches
 its process ancestors against Herdr's public `pane process-info` shell PID;
@@ -82,6 +100,8 @@ isolated tests; `HERDR_AGENT_CANONICAL_HOST` sets a new ledger's fixed host name
 and reopening an existing ledger with a different name is rejected. Final
 message bodies expire after 90 days; permanent compact hashes/receipts prevent
 ID reuse even after deletion. Status/wake history expires after 30 days.
+Initial WAL/schema/host-identity setup is serialized by a private ledger-local
+bootstrap lock, including simultaneous first starts by separate CLI processes.
 
 Internal plugin/runtime services use the same launcher: `ledger doctor`,
 `ledger reconcile`, `ledger event`, `ledger retention`, `ledger agent-session`,
@@ -106,6 +126,35 @@ of later provider transforms or model understanding.
 Runtime installation is a separate, explicit per-host opt-in; plugin loading
 and skill copying do not install adapters. See [receiving runtimes](#receiving-runtimes)
 for both OMP and Claude ownership rules, commands and acceptance limits.
+
+#### Mailbox terminology
+
+- **Mailbox / inbox:** durable mail for a recipient's stable terminal slot.
+  `inbox read` filters this ledger host, caller terminal and current repository:
+  default `queued`, `delivering`, `delivered`; `--all` includes all retained
+  states for that same recipient, and `--message UUID` can read a final message.
+  Viewing never acknowledges application or work.
+- **Thread:** the root message UUID is the thread UUID. `--reply-to` retains the
+  parent thread/subject and increments its hop. `mail show --thread UUID` reads
+  a known thread; `mail threads` discovers repo-wide retained threads.
+- **TUI Threads:** mixed repo-filtered sent/received threads (including remote
+  pending copies) and direct results, plus host-wide pending/failed OUTBOX jobs.
+  It is not just an inbox, a single chat transcript, or remote history replication.
+- **Outbox:** per-peer FIFO transport jobs of kind `message`, `receipt`, `setting`
+  or `withdraw`, with separate `pending/sent/failed/cancelled` transport states.
+  `ledger outbox` can include completed jobs; the TUI selects pending/failed.
+  Neither is a complete sent-mail folder or a direct-input history.
+- **Message states:** `pending` awaits an authoritative recipient result;
+  `queued` waits unclaimed; `delivering` reserves an exact agent/generation but
+  may have unknown application (TUI `UNCERTAIN claim`, wire projects queued).
+  `delivered` confirms application with `confirmation_source=native` or an
+  audited `operator` resolution, not handling, provider success or understanding.
+  Final states are `handled`, `withdrawn`, `undeliverable`. Remote pending,
+  withdrawal and terminal closure mean neither kind must remain queued until a
+  runtime claim. Direct `submitting/accepted/unknown/failed` is distinct transport
+  acceptance, never a native mailbox ACK. `fyi`/`action` are kinds, not states.
+- **Unread:** the board counts `queued` + `delivering`, not an actual-view flag;
+  delivered-but-unhandled mail is excluded.
 
 #### Hosts, FIFO transport and worker
 
@@ -188,7 +237,7 @@ label. Success is one JSON object with `protocol:1`; errors retain
 | `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
 | `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target; a home relay adds `relay_home` → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
 | `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` (conditional close also has `expected_main`) → `{applied,...repo_settings}`. |
-| `status-export --wire` | Optional `{repo_id}` → `{host:{canonical_name,uuid},agents:[...]}` from a fresh local snapshot with roles. Plain `status-export [--repo ID]` provides the same local read. Remote rows are never inserted into local AGENTS. |
+| `status-export --wire` | Optional `{repo_id,refresh}` → `{host:{canonical_name,uuid},agents:[...]}` with roles. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation, as used by `status board`. Plain `status-export [--repo ID]` remains a fresh local export. Remote rows are never inserted into local AGENTS. |
 
 The Python settings service is `RepoSettings(store).mutate(repo_id,field,value)`;
 it is reserved for the user settings UI, with **no agent mutation CLI**.
@@ -246,11 +295,21 @@ herdr plugin action invoke mailbox-tab --plugin herdr.agent-messenger
 
 The workspace's live plugin pane is deduplicated by pane/terminal IDs, not its
 label. A shell opener is supported. Outside text entry, `q` closes only the
-owned mailbox pane; `Esc` leaves editors/details first. `1` Status shows local
-and live remote role/turn/phase/unread/extension state; disconnected remote rows
-are stale with unread `?`, not treated as closed. `2` Threads inspects messages,
-direct results and OUTBOX; `w` withdraws eligible origin mail and `t` retries
-the selected existing OUTBOX item. Views never acknowledge mail.
+owned mailbox pane; `Esc` leaves editors/details first. `1` Status groups agents
+under per-host headers showing stale/error state. Each agent keeps alias, role,
+turn and unread first on one clipped metadata line, with an indented, word-aware
+summary capped at three Unicode-width-aware lines. Hangul/Latin preserve word
+boundaries; Han/Kana/emoji allow display-cell breaks. Overflow has an ellipsis;
+empty summary is `—`. Enter opens full labeled details with hanging-indent
+wrapping for every field: identity, role/client, turn/phase, full summary,
+unread/receiver, repository/main-checkout, workspace/pane and generation/session.
+Status-update (`status_updated_at`) and observation (`last_seen`/`first_seen`)
+times use local date/time plus relative age; flags use yes/no/unknown.
+User-border evidence is local-only; unavailable remote evidence is unknown.
+Disconnected remote hosts are stale with
+unread `?`, not treated as closed. `2` Threads inspects messages, direct results
+and OUTBOX; `w` withdraws eligible origin mail and `t` retries the selected
+existing OUTBOX item. Views never acknowledge mail.
 
 `3` Compose always uses sender `user`. Select a board agent with `c`; `Tab`
 selects subject/body, `Ctrl+K` selects `fyi`/`action`, and `Ctrl+D` selects
@@ -394,7 +453,7 @@ agent settings or ACK escape hatch.
 | `ledger peer list` | No flags; canonical UUID, SSH alias, root and isolation overrides. |
 | `ledger peer add` | Required `--ssh-alias ALIAS`; optional `--remote-root ABS_PATH`, `--remote-ledger-dir ABS_PATH`, `--remote-socket ABS_PATH`, `--canonical-name NAME`, `--uuid UUID`. Discover/verify protocol/root/identity before registration; register reverse direction separately. |
 | `ledger status-export` | Optional `--repo ID`, `--wire`; fresh local status/roles. `--wire` requires authenticated JSON stdin. No remote AGENTS replication. |
-| `ledger outbox` | Optional `--limit N`, default 100; pending/sent/failed items and errors. |
+| `ledger outbox` | Optional `--limit N`, default 100, range 1–1000; host-wide pending/sent/failed/cancelled transport jobs and errors, not repo sent-mail history. |
 | `ledger retry` | Required `--item UUID`; retry that durable item, not a new message. |
 | `ledger worker ensure\|run\|once\|status` | No extra flags. Ensure detached singleton, run foreground, execute one bounded pass, or inspect worker state. |
 | `ledger reconcile`, `ledger event` | No flags; fresh complete serialized Herdr snapshot, not a partial closure inference. Event is one-shot. |
@@ -447,12 +506,15 @@ python3 scripts/herdr_agent_messenger.py status --address macbook-pro/purple-koa
 
 Flags: `--address HOST/LABEL` / `--label LABEL` / `--route TOKEN` (exactly one), `--host HOST` (default `local`), `--verbose`, `-h` / `--help`. Checks one recipient without listing its host. Default output: `address`, `status`, optional `stale: true`.
 
-Repository status is a distinct local service:
+Repository status uses distinct ledger subcommands:
 
 ```bash
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Checking mailbox contracts'
 python3 scripts/herdr_agent_messenger.py status clear
 python3 scripts/herdr_agent_messenger.py status list --repo
+python3 scripts/herdr_agent_messenger.py status board
+python3 scripts/herdr_agent_messenger.py status board --repo --host local
+python3 scripts/herdr_agent_messenger.py status board --repo 'git:host/stable/repo' --host REGISTERED_SSH_ALIAS
 ```
 
 | Subcommand | Arguments / result |
@@ -460,8 +522,36 @@ python3 scripts/herdr_agent_messenger.py status list --repo
 | `status set` | Required positional `phase` and `--summary TEXT`; no `--phase` flag. Reports the current agent's public phase/summary. |
 | `status clear` | No extra arguments; clear current phase/summary. |
 | `status list` | Optional `--repo [ID]`: absent lists all local repository statuses, bare `--repo` selects the caller's repo, explicit ID filters it. |
+| `status board` | Optional `--repo [ID]`, `--host local\|CANONICAL\|REGISTERED_SSH_ALIAS`. No repo flag selects all repositories; bare `--repo` resolves the caller's repository; explicit ID filters without fetching Herdr caller identity. No host flag selects local plus all registered peers; explicit host selects only that ledger. Returns `{repo_id,agents,hosts}`. |
 
-These subcommands have `-h`/`--help`, not legacy recipient selectors or verbose.
+These subcommands accept `-h` / `--help` and have no `--verbose`. `status board`
+has its own host selector; do not treat legacy `status --host HOST list` as
+remote board syntax. Legacy `list` and stored local `status list` remain
+available with narrower semantics.
+
+Board agent rows preserve the registry fields and include role, turn_state,
+phase, summary, unread, extension_present, client, workspace_id, pane_id,
+generation, is_main_checkout, status_updated_at, last_seen and stale.
+`status_updated_at` is the actual agent status update timestamp, separate from
+registry observation `last_seen`. Rows are stored snapshots, not proof of current
+native activity. The board does not refresh the registry or mutate status,
+last_seen, display, settings or claims; peer requests explicitly use
+`refresh=false`. It performs no AGENTS/history replication.
+Peers must run this read API version to honor `refresh=false`; an older peer
+may ignore it and perform its legacy registry refresh.
+
+Each `hosts` entry contains `{host,uuid,local,stale,error,unread,agents}`.
+Peer failures produce a structured per-host `{code,message}` error,
+`stale:true` and unread `"?"`, not a false closure or fabricated agents.
+The board envelope exits with code 0 even if a peer fails: inspect each host's
+`error`, `stale` and unread fields. An unknown/ambiguous `--host` instead returns
+the top-level `peer_not_configured` error and exits with code 1.
+The stateless CLI has no prior rows. A TUI using the optional previous-snapshot
+service input may retain prior rows for the same registered host UUID, marked
+stale with unread `"?"`; this does not create a durable remote cache.
+Board/history reads expose no public settings mutation, user-origin compose,
+direct send or operator-resolve/ACK command. Private UI services and native
+runtime evidence endpoints are not agent policy bypasses.
 
 ### `send`
 
