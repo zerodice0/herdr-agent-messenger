@@ -23,8 +23,8 @@ A verified route can refresh only when continuity checks identify one safe occup
 
 ### Local mailbox
 
-Mailbox messages are durable data, not terminal prompts. Local same-repository
-agents can exchange them without interrupting an ongoing turn:
+Mailbox messages are durable data, not terminal prompts. Same-repository local
+and registered remote agents can exchange them without interrupting an ongoing turn:
 
 ```bash
 python3 scripts/herdr_agent_messenger.py mail send \
@@ -38,11 +38,11 @@ python3 scripts/herdr_agent_messenger.py repo show
 
 | Command | Flags and semantics |
 | --- | --- |
-| `mail send` | Required `--to local/LABEL` (the canonical local host also works). `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered mail also marks that parent handled atomically. |
+| `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, or symbolic `main`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh same-repository status export. |
 | `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000). Without `--all`, shows queued, uncertain delivering, and delivered mail. Reads never change delivery, logs, or bells, even from subagents. |
 | `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
 | `mail show` | Required `--thread UUID`; returns retained bodies and delivery state. |
-| `mail withdraw` | Required `--message UUID`; originating terminal only. Withdraw races atomically with queued→delivering claim. Already-claimed/delivered/handled messages are not withdrawn; inspect the returned `withdrawn` flag. |
+| `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled mail is not withdrawn. Repetition preserves the first final receipt/time. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
 
 All commands return one JSON object. Errors use the existing CLI convention
@@ -86,6 +86,116 @@ hook return or terminal acceptance. `release` takes the same identity/evidence
 and `disposition` (`not_applied` to requeue, `unknown` to retain the uncertain
 claim). These APIs do not themselves prove native OMP/Claude admission; no
 automatic receiver/wake is enabled by the local mailbox commands.
+
+#### Hosts, FIFO transport and worker
+
+Use the same protocol-capable checkout on both hosts and retain the existing
+HAM concrete SSH-host allowlist. A peer is a canonical name+UUID with an SSH
+alias and absolute checkout root; aliases remain valid addresses but never
+become canonical host fields. Registration is bidirectional:
+
+```bash
+HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
+python3 "$HAM_CLI" ledger setup --name alpha
+python3 "$HAM_CLI" ledger doctor
+python3 "$HAM_CLI" ledger peer add --ssh-alias beta-ssh --canonical-name beta
+python3 "$HAM_CLI" ledger peer list
+python3 "$HAM_CLI" mail send --to beta-ssh/blue-owl --body 'Inspect when ready.'
+python3 "$HAM_CLI" ledger outbox --limit 100
+python3 "$HAM_CLI" ledger worker status
+python3 "$HAM_CLI" ledger retry --item OUTBOX_ITEM_UUID
+```
+
+Run the corresponding `setup --name beta` and reverse `peer add` on beta first.
+Without `--remote-root`, discovery reads only structured
+`herdr plugin list --json --plugin herdr.agent-messenger` →
+`result.plugins[0].plugin_root`, then verifies `ledger doctor` protocol 1,
+canonical name and UUID. `--uuid UUID` optionally pins the observed UUID.
+An old installed plugin is not treated as a new mailbox endpoint. Updating a
+registered root/SSH alias cannot silently replace its canonical name/UUID.
+
+For isolated work-copy verification add `--remote-root /ABS/SNAPSHOT
+--remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`.
+The local `HERDR_AGENT_LEDGER_DIR`, `HERDR_SOCKET_PATH`, HOME/XDG and legacy
+request directory must also point to private resources. Set
+`HERDR_AGENT_LEDGER_AUTOSTART=0` for finite transport tests: this suppresses
+implicit local workers and is propagated to explicitly isolated remote ledgers.
+Explicit `ledger worker once|run|ensure` still works. The optional remote socket
+is retained in the peer mapping and inherited by that endpoint's worker; the
+remote SSH config/allowlist remains the existing user's config. Never point a
+verification command at the default production ledger or old installed root.
+
+`ledger worker ensure` double-forks a code-only process; it rechecks the same
+per-ledger flock as `run` / `once`. Startup/reconcile events and mutating CLI
+commands ensure a worker only when maintenance is pending. Events themselves
+are finite one-shots. It owns FIFO outbox retries, receipt transport, terminal
+sweeps and retention; it exits when none remain. Failed Herdr reads do not
+invent terminal closure. Worker log/PID/lock stay within the ledger directory.
+There are no model calls, prompt submissions or AGENTS database replication.
+
+FIFO is per destination host. A transient SSH/unavailable/busy error blocks
+that peer until exponential backoff (capped at five minutes), not other peers.
+A permanent endpoint/protocol error marks that item `failed`, leaves the JSON
+error visible and lets later items progress. `ledger retry` retries the same
+outbox/message IDs; it never creates a replacement message. Lost ACKs replay
+the immutable payload and return its **current** resolved receipt. Hash
+conflicts are refused even after 90-day body deletion; compact receipts and
+withdrawal tombstones are permanent. Lower/reordered receipts never regress
+state, a final state cannot conflict-transition, and a resolved recipient
+terminal/address cannot change. Internal `delivering` is published as queued.
+
+A bell write can fail **after** a successful DB commit. Such a command still
+succeeds, with `warnings:[{code:"notification_failed",committed:true,...}]`;
+`doctor.notification_failures` retains the diagnosis. Do not resend with a new
+message ID. Events/safety sweeps recover notification loss.
+
+#### Wire and settings service
+
+SSH executes `python3 /ABS/CHECKOUT/ledger_cli.py ledger COMMAND`, sending one
+JSON envelope on stdin (1 MiB limit):
+
+```json
+{"protocol":1,"transport_host":"alpha","transport_uuid":"HOST_UUID","payload":{}}
+```
+
+The receiver validates a registered canonical host+UUID, not a human source
+label. Success is one JSON object with `protocol:1`; errors retain
+`{"error":{"code":"CODE","message":"TEXT"}}`, exit 1. Supported wire commands:
+
+| Command | `payload` / result |
+| --- | --- |
+| `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. A concrete target must equal the immutable target; only the symbolic home may relay `main`. |
+| `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
+| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target; a home relay adds `relay_home` → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
+| `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` (conditional close also has `expected_main`) → `{applied,...repo_settings}`. |
+| `status-export --wire` | Optional `{repo_id}` → `{host:{canonical_name,uuid},agents:[...]}` from a fresh local snapshot with roles. Plain `status-export [--repo ID]` provides the same local read. Remote rows are never inserted into local AGENTS. |
+
+The Python settings service is `RepoSettings(store).mutate(repo_id,field,value)`;
+it is reserved for the user settings UI, with **no agent mutation CLI**.
+Fields are `mode` (`off|manual|auto`), `main` (`null` or
+`{host,terminal_id}`), `members` (unique such targets), and `thresholds`
+(`idle_minutes:3,coalesce_seconds:30,wakes_per_hour:6,max_hop:10` defaults).
+Each field independently wins by `(version,origin_host)`; same-version
+different values record the deterministic canonical-name winner and conflict.
+Different fields' concurrent edits survive. `repo show` includes these stamps,
+conflicts and propagation-pending count.
+
+First enabling a repository creates a version-1 home proposal and immediately
+computes the local auto main; **offline peers do not prevent local use**.
+Only observed concurrent home proposals converge by canonical-name tie order.
+Computed-main publications carry their exact home stamp; stale former-home
+updates are ignored even at a higher version. No global replica/consensus is
+required. Auto default main is exactly one active main-checkout agent on the
+home host; zero/multiple means no main. An explicit main can be on another
+host. Only its own host can publish an exact-stamp conditional close clear;
+stale closes cannot erase a later designation, and SSH failure is not closure.
+
+`--to main` stores the symbolic home route without querying an offline home.
+The home resolves it once on acceptance and retains that resolution, including
+a relay to another host. Responses/receipts/withdrawal follow the saved route.
+Offline home leaves pending mail; an online home with no eligible main returns
+visible `main_unavailable` (failed item, explicit retry after configuration).
+
 
 ### `list`
 

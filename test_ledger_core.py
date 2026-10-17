@@ -278,6 +278,28 @@ class LedgerCoreTest(unittest.TestCase):
         self.assertEqual(self.store.doctor()["counts"]["messages"], 0)
         self.assertEqual(self.store.doctor()["counts"]["dedupe_receipts"], 1)
 
+    def test_bell_failure_after_commit_is_success_with_durable_notification_warning(self):
+        board = self.store.bell_directory / "_board"
+        board.unlink()
+        board.mkdir()
+        sent = self.send()
+        self.assertEqual(sent["state"], "queued")
+        self.assertEqual(sent["warnings"][0]["code"], "notification_failed")
+        self.assertTrue(sent["warnings"][0]["committed"])
+        self.assertEqual(self.store.doctor()["counts"]["messages"], 1)
+        self.assertTrue(self.store.doctor()["notification_failures"])
+        self.assertEqual(self.mail.read(self.recipient)["messages"][0]["message_id"], sent["message_id"])
+
+    def test_repeated_withdraw_preserves_original_final_timestamp_and_receipt(self):
+        sent = self.send()
+        first = self.mail.withdraw(sent["message_id"], sender=self.sender)
+        with self.store.read() as connection:
+            final_at = connection.execute("SELECT final_at FROM messages WHERE message_id=?", (sent["message_id"],)).fetchone()[0]
+        second = self.mail.withdraw(sent["message_id"], sender=self.sender)
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute("SELECT final_at FROM messages WHERE message_id=?", (sent["message_id"],)).fetchone()[0], final_at)
+        self.assertEqual(first, second)
+
     def test_invalid_body_rolls_back_thread_and_message(self):
         before = self.database_snapshot()
         for body in ("", "한" * 6000):

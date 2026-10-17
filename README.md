@@ -111,7 +111,7 @@ HAM can also be used with Herdr without enabling the plugin. See the
 [skill guide](docs/skill-guide.md#use-ham-without-the-plugin) for the
 source-backed standalone setup and its limitations.
 
-## Durable local mailbox
+## Durable mailbox
 
 The checkout also provides a non-interrupting local mailbox. From a registered
 Herdr agent pane, use `mail send --to local/LABEL --body TEXT`, then let the
@@ -120,9 +120,14 @@ mail delivered or handled, including reads from task agents sharing the pane.
 `mail show --thread UUID` shows the thread; `mail withdraw --message UUID`
 withdraws only mail that has not already been claimed.
 
-The current mailbox commands accept local, same-repository recipients. They do
-not submit a terminal prompt or wake a model. Existing `send`/`request`, Held
-Messages, and their remote behavior are unchanged. See the
+Mailbox commands also accept `--to CANONICAL_HOST/LABEL` (or the registered SSH
+alias) and `--to main`, resolved once by the repository's home host. Run
+`ledger setup --name HOST`, register each direction with `ledger peer add
+--ssh-alias ALIAS`, and inspect `ledger doctor` / `ledger outbox` for transport
+state. The detached flock worker retries transient link failures with the same
+message ID; permanent failures are visible and explicitly retriable without
+blocking unrelated mail. These commands do not submit a terminal prompt or wake
+a model. Existing `send`/`request`, Held Messages, and their behavior are unchanged. See the
 [mailbox command reference](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
 for flags, state/recovery rules, storage isolation, and identity configuration.
 

@@ -32,7 +32,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if value["recipient_terminal_id"] is not None and (
             not isinstance(value["recipient_terminal_id"], str) or not value["recipient_terminal_id"]):
         raise LedgerError("invalid_message", "recipient_terminal_id must be a terminal ID or null.")
-    if value["kind"] not in {"fyi", "action"}:
+    if not isinstance(value["kind"], str) or value["kind"] not in {"fyi", "action"}:
         raise LedgerError("invalid_kind", "Message kind must be fyi or action.")
     if not isinstance(value["hop"], int) or isinstance(value["hop"], bool) or value["hop"] < 0:
         raise LedgerError("invalid_message", "hop must be a nonnegative integer.")
@@ -66,14 +66,15 @@ class Mailbox:
                    "sender_label": sender["alias"] or sender["terminal_id"], "kind": kind, "hop": 0,
                    "body": body, "subject": subject, "created_at": time.time(),
                    "recipient_host": recipient["host"], "recipient_terminal_id": recipient["terminal_id"],
-                   "recipient_address": f"{recipient['host']}/{recipient['alias'] or recipient['terminal_id']}"}
+                   "recipient_address": recipient.get("recipient_address") or f"{recipient['host']}/{recipient['alias'] or recipient['terminal_id']}"}
         with self.store.transaction((recipient["terminal_id"], sender["terminal_id"])) as connection:
             check_generation(connection, self.store.host, sender["terminal_id"], sender["agent_id"], sender["generation"])
-            check_generation(connection, self.store.host, recipient["terminal_id"], recipient["agent_id"], recipient["generation"])
+            if recipient["host"] == self.store.host and recipient["terminal_id"]:
+                check_generation(connection, self.store.host, recipient["terminal_id"], recipient["agent_id"], recipient["generation"])
             parent = None
             if reply_to:
                 require_uuid(reply_to, "reply_to")
-                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.state FROM messages m "
+                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.state FROM messages m "
                                             "JOIN deliveries d USING(message_id) WHERE message_id=?", (reply_to,)).fetchone()
                 if parent is None or parent["repo_id"] != sender["repo_id"]:
                     raise LedgerError("reply_not_found", "Reply target is not a retained message in this repository.")
@@ -83,10 +84,12 @@ class Mailbox:
                 if parent["recipient_terminal_id"] == sender["terminal_id"] and parent["state"] == "delivering":
                     raise LedgerError("delivery_in_progress", "Resolve an uncertain delivery before marking it handled by reply.")
             value = validate_payload(payload)
-            result = self._enqueue(connection, value)
-            if parent and parent["recipient_terminal_id"] == sender["terminal_id"] and parent["state"] in {"queued", "delivered"}:
+            from ledger_remote import RemoteLedger
+            result = RemoteLedger(self.store).submit(connection, value)
+            if (parent and parent["recipient_host"] == self.store.host and parent["recipient_terminal_id"] == sender["terminal_id"]
+                    and parent["state"] in {"queued", "delivered"}):
                 self._handled(connection, reply_to, time.time())
-        return {"message_id": message_id, "thread_id": payload["thread_id"], **result}
+        return self.store.annotate({"message_id": message_id, "thread_id": payload["thread_id"], **result})
 
     def enqueue(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Idempotent local acceptance; remote authentication lives at the transport boundary."""
@@ -96,7 +99,9 @@ class Mailbox:
         with self.store.transaction((value["recipient_terminal_id"],)) as connection:
             return self._enqueue(connection, value)
 
-    def _enqueue(self, connection: Any, value: Mapping[str, Any]) -> dict[str, Any]:
+    def _enqueue(self, connection: Any, value: Mapping[str, Any], *,
+                 resolved: Mapping[str, Any] | None = None, upstream: str | None = None,
+                 forward: str | None = None) -> dict[str, Any]:
         digest = payload_hash(value)
         existing = connection.execute("SELECT payload_hash FROM dedupe_receipts WHERE message_id=?", (value["message_id"],)).fetchone()
         if existing:
@@ -106,6 +111,13 @@ class Mailbox:
         tombstone = connection.execute("SELECT origin_host FROM withdraw_tombstones WHERE message_id=?", (value["message_id"],)).fetchone()
         if tombstone and tombstone[0] != value["origin_host"]:
             raise LedgerError("message_conflict", "Withdrawal and message disagree about their origin.")
+        target = dict(resolved or {key: value[key] for key in
+                                  ("recipient_host", "recipient_terminal_id", "recipient_address")})
+        authoritative = target["recipient_host"] == self.store.host and target["recipient_terminal_id"] is not None
+        connection.execute("INSERT INTO message_routes VALUES (?,?,?,?,?,?,?,?,?)",
+                           (value["message_id"], value["recipient_host"], value["recipient_terminal_id"],
+                            value["recipient_address"], target["recipient_host"], target["recipient_terminal_id"],
+                            target["recipient_address"], upstream, forward))
         thread = connection.execute("SELECT repo_id,subject FROM threads WHERE thread_id=?", (value["thread_id"],)).fetchone()
         if thread and (thread["repo_id"] != value["repo_id"] or thread["subject"] != value["subject"]):
             raise LedgerError("thread_conflict", "Thread repository and subject are immutable.")
@@ -116,22 +128,22 @@ class Mailbox:
             tuple(value[key] for key in ("message_id", "thread_id", "repo_id", "reply_to", "origin_host", "sender", "sender_label",
                                         "kind", "hop", "body", "created_at")) + (digest,))
         slot = connection.execute("SELECT * FROM terminal_slots WHERE host=? AND terminal_id=?",
-                                  (self.store.host, value["recipient_terminal_id"])).fetchone()
-        state, hold = "queued", None
+                                  (self.store.host, target["recipient_terminal_id"])).fetchone() if authoritative else None
+        state, hold = ("queued" if authoritative else "pending"), None
         if tombstone:
             state = "withdrawn"
-        elif slot is None or not slot["present"]:
+        elif authoritative and (slot is None or not slot["present"]):
             state, hold = "undeliverable", "terminal_closed"
-        else:
-            target = connection.execute("SELECT repo_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
-                                        (self.store.host, value["recipient_terminal_id"])).fetchone()
-            hold = "recipient_absent" if target is None else ("recipient_changed" if target[0] != value["repo_id"] else None)
+        elif authoritative:
+            target_agent = connection.execute("SELECT repo_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                                             (self.store.host, target["recipient_terminal_id"])).fetchone()
+            hold = "recipient_absent" if target_agent is None else ("recipient_changed" if target_agent[0] != value["repo_id"] else None)
         at = time.time()
         connection.execute(
             "INSERT INTO deliveries(message_id,recipient_address,recipient_host,recipient_terminal_id,workspace_id,pane_id,"
-            "state,hold_reason,authoritative,updated_at) VALUES (?,?,?,?,?,?,?,?,1,?)",
-            (value["message_id"], value["recipient_address"], self.store.host, value["recipient_terminal_id"],
-             slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '', state, hold, at))
+            "state,hold_reason,authoritative,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (value["message_id"], target["recipient_address"], target["recipient_host"], target["recipient_terminal_id"],
+             slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '', state, hold, authoritative, at))
         if state in FINAL_STATES:
             connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, value["message_id"]))
         return save_receipt(connection, value["message_id"])
@@ -211,8 +223,13 @@ class Mailbox:
                     if owner is None or owner["terminal_id"] != sender["terminal_id"] or owner["repo_id"] != sender["repo_id"]:
                         raise LedgerError("not_sender", "Only the originating terminal can withdraw this message.")
                 terminals.append(row["recipient_terminal_id"])
+                if not row["authoritative"]:
+                    from ledger_remote import RemoteLedger
+                    return RemoteLedger(self.store).withdraw_copy(connection, message_id)
                 if row["state"] not in {"queued", "withdrawn"}:
                     return {**receipt(connection, message_id), "withdrawn": False, "reason": "already_claimed_or_final"}
+                if row["state"] == "withdrawn":
+                    return {**receipt(connection, message_id), "withdrawn": True}
                 at = time.time()
                 connection.execute("UPDATE deliveries SET state='withdrawn',hold_reason=NULL,updated_at=? "
                                    "WHERE message_id=? AND state='queued'", (at, message_id))
@@ -223,7 +240,10 @@ class Mailbox:
                 if with_retention:
                     if with_retention[0] != origin:
                         raise LedgerError("wrong_origin", "Only the original host can withdraw this message.")
-                    return {**receipt(connection, message_id), "withdrawn": False, "reason": "retained_final"}
+                    final = receipt(connection, message_id)
+                    if final["state"] == "withdrawn":
+                        return {**final, "withdrawn": True}
+                    return {**final, "withdrawn": False, "reason": "retained_final"}
                 result = {"message_id": message_id, "state": "withdrawn", "origin_host": origin}
             connection.execute("INSERT OR IGNORE INTO withdraw_tombstones VALUES (?,?,?)", (message_id, origin, time.time()))
         return {**result, "withdrawn": True}

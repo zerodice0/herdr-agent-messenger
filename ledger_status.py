@@ -161,6 +161,8 @@ class AgentRegistry:
         with self.store.lock("registry"):
             snapshot = live_snapshot(environment)
             result = self.reconcile(snapshot)
+            from ledger_settings import RepoSettings
+            RepoSettings(self.store).reconcile_local()
         return snapshot, result
 
     def reconcile(self, snapshot: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
@@ -337,8 +339,5 @@ class AgentRegistry:
             row = connection.execute("SELECT * FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
             if row is None:
                 raise LedgerError("repo_not_found", "No local agents have registered this repository.")
-            settings = {row["field"]: {"value": json.loads(row["value"]), "version": row["version"],
-                                       "origin_host": row["origin_host"], "changed_at": row["changed_at"]}
-                        for row in connection.execute("SELECT * FROM repo_settings WHERE repo_id=?", (repo_id,))}
-        return {"repo_id": repo_id, "home_host": row["home_host"], "mode": settings.get("mode", {}).get("value", "off"),
-                "settings": settings, "agents": self.list(repo_id)}
+        from ledger_settings import RepoSettings
+        return {**RepoSettings(self.store).show(repo_id), "agents": self.list(repo_id)}

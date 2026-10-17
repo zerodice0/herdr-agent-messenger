@@ -136,6 +136,58 @@ claim|started|release` share the Python store. See the
 for their JSON contracts and recovery/evidence requirements. The local mailbox
 does not change legacy prompt routing, Held Messages, or install any runtime.
 
+### Remote mail and code-only worker
+
+Register stable host identities and both SSH directions before using remote mail:
+
+```bash
+# On alpha (on beta use --name beta and alpha's configured SSH alias):
+python3 "$HAM_CLI" ledger setup --name alpha
+python3 "$HAM_CLI" ledger peer add --ssh-alias beta-ssh --canonical-name beta
+python3 "$HAM_CLI" ledger peer list
+python3 "$HAM_CLI" mail send --to beta-ssh/blue-owl --body 'Inspect when ready.'
+python3 "$HAM_CLI" ledger doctor
+python3 "$HAM_CLI" ledger outbox
+python3 "$HAM_CLI" ledger worker status
+# Explicit retry after fixing a permanent error; retains the message/item IDs:
+python3 "$HAM_CLI" ledger retry --item OUTBOX_ITEM_UUID
+```
+
+Only existing allowlisted concrete SSH aliases are accepted. Discovery uses
+structured `result.plugins[0].plugin_root`, then checks protocol 1 and the
+canonical UUID; do not run a new protocol against an old installed checkout.
+Canonical host names and SSH aliases both address the same registered peer.
+Remote status is queried live, not copied into local AGENTS.
+
+The detached worker holds a per-ledger flock, retries transient failures FIFO
+per peer (up to five-minute backoff), sends receipts, sweeps closed terminals
+and expires bodies/logs. It survives the launching CLI and exits when no work
+remains. A failed item is visible and does not block later items; another
+offline peer cannot block independent destinations. Repeated/lost-ACK accepts
+use the same immutable message ID and return current state, including permanent
+dedupe after body retention. A bell failure after commit is a successful store
+with a `notification_failed`, `committed:true` warning, not permission to resend.
+
+`--to main` is a symbolic address resolved once by the repository home on
+acceptance. An offline home leaves pending mail; an online home without a main
+returns a visible `main_unavailable` item for explicit retry. Resolved receipts
+and withdrawals follow the saved route, including a main on a third host.
+Mode/main/member/threshold mutations are reserved for the user UI service, not
+agent CLI. Each setting has its own version/origin; conflicting ties and pending
+propagation appear in `repo show`. Local auto bootstrap never waits for all
+peers. A stale close or former-home computed publication cannot overwrite a
+newer designation/home.
+
+Isolated verification can pin `peer add --remote-root /ABS/WORK_COPY
+--remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`.
+Use private local ledger/socket/HOME/XDG/request directories as well.
+`HERDR_AGENT_LEDGER_AUTOSTART=0` disables implicit workers (also for explicit
+remote-ledger overrides); `ledger worker once|run|ensure` remains explicit.
+See the [wire/setup reference](../.agents/skills/herdr-agent-messenger/reference.md#hosts-fifo-transport-and-worker)
+for exact JSON, error and isolation contracts. No runtime/global settings are
+installed by these commands.
+
+
 ## CLI commands and addressing
 
 The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.

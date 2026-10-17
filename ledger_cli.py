@@ -12,6 +12,8 @@ from typing import Any, Mapping
 from ledger_mail import Mailbox
 from ledger_status import AgentRegistry, live_snapshot, repository_identity
 from ledger_store import LedgerError, LedgerStore
+from ledger_remote import RemoteLedger, SSHTransport
+from ledger_worker import ensure_worker, run_worker, worker_status
 
 COMMANDS = frozenset({"mail", "inbox", "repo", "ledger"})
 
@@ -19,8 +21,8 @@ COMMANDS = frozenset({"mail", "inbox", "repo", "ledger"})
 def add_parsers(subparsers: Any) -> None:
     mail = subparsers.add_parser("mail", help="Leave immutable messages without interrupting an agent.")
     mail_commands = mail.add_subparsers(dest="mail_command", required=True)
-    send = mail_commands.add_parser("send", help="Queue a local same-repository message.")
-    send.add_argument("--to", required=True, help="Current local/LABEL or canonical-host/LABEL address.")
+    send = mail_commands.add_parser("send", help="Queue a local/remote same-repository message without interrupting work.")
+    send.add_argument("--to", required=True, help="Canonical-host/LABEL, configured SSH-alias/LABEL, local/LABEL, or symbolic main.")
     send.add_argument("--kind", choices=("fyi", "action"), default="fyi")
     send.add_argument("--reply-to", help="Retained message UUID; reply also marks an addressed parent handled.")
     send.add_argument("--subject", default="", help="New thread subject (up to 1024 UTF-8 bytes).")
@@ -47,6 +49,31 @@ def add_parsers(subparsers: Any) -> None:
     ledger = subparsers.add_parser("ledger", help="Internal Python-owned mailbox services (JSON stdin where needed).")
     commands = ledger.add_subparsers(dest="ledger_command", required=True)
     commands.add_parser("doctor", help="Show host identity, schema and counts without contacting Herdr.")
+    setup = commands.add_parser("setup", help="Create/check this ledger's fixed canonical host identity.")
+    setup.add_argument("--name", required=True, help="Canonical host name; existing identities cannot be renamed.")
+    peer = commands.add_parser("peer", help="Register canonical peers using the existing SSH allowlist.")
+    peer_commands = peer.add_subparsers(dest="peer_command", required=True)
+    peer_commands.add_parser("list", help="Show canonical UUID, transport alias, checkout root and isolated-ledger override.")
+    add_peer = peer_commands.add_parser("add", help="Discover a structured plugin_root and verify the remote protocol/identity.")
+    add_peer.add_argument("--ssh-alias", required=True)
+    add_peer.add_argument("--remote-root", help="Explicit absolute protocol-capable checkout (for isolated work-copy testing).")
+    add_peer.add_argument("--remote-ledger-dir", default="", help="Explicit absolute remote ledger directory for isolated testing.")
+    add_peer.add_argument("--remote-socket", default="", help="Explicit absolute remote Herdr socket for isolated testing.")
+    add_peer.add_argument("--canonical-name", help="Require this remote canonical name.")
+    add_peer.add_argument("--uuid", help="Require this remote host UUID.")
+    for name in ("accept", "receipt", "setting", "withdraw"):
+        commands.add_parser(name, help=f"JSON stdin protocol 1 peer envelope: {name}.")
+    export = commands.add_parser("status-export", help="Export live local agents/roles only; never replicates remote AGENTS.")
+    export.add_argument("--repo", help="Filter by exact repository identity.")
+    export.add_argument("--wire", action="store_true", help="Read an authenticated protocol envelope from stdin (SSH transport).")
+    outbox = commands.add_parser("outbox", help="Inspect FIFO pending, sent and failed items including error codes.")
+    outbox.add_argument("--limit", type=int, default=100)
+    retry = commands.add_parser("retry", help="Explicitly retry one failed/pending outbox item with its original identity.")
+    retry.add_argument("--item", required=True, help="Outbox item UUID.")
+    worker = commands.add_parser("worker", help="Detached per-ledger flock worker.")
+    worker_commands = worker.add_subparsers(dest="worker_command", required=True)
+    for operation in ("ensure", "run", "once", "status"):
+        worker_commands.add_parser(operation)
     commands.add_parser("reconcile", help="Register a complete live Herdr snapshot and sweep terminal slots.")
     commands.add_parser("event", help="One-shot plugin event: reconcile from a fresh complete snapshot.")
     commands.add_parser("retention", help="Delete expired bodies/logs while preserving compact dedupe receipts.")
@@ -87,17 +114,65 @@ def _live_context(registry: AgentRegistry, snapshot: Mapping[str, Any],
 
 
 def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-    store = LedgerStore(environment=environment)
-    registry = AgentRegistry(store)
-    mailbox = Mailbox(store)
+    name = arguments.name if arguments.command == "ledger" and arguments.ledger_command == "setup" else None
+    store = LedgerStore(environment=environment, canonical_name=name)
+    payload = _dispatch(arguments, environment, store)
+    values = os.environ if environment is None else environment
+    mutating = ((arguments.command == "mail" and arguments.mail_command != "show") or
+                (arguments.command == "inbox" and arguments.inbox_command == "handle") or
+                (arguments.command == "ledger" and arguments.ledger_command in
+                 {"reconcile", "event", "accept", "receipt", "setting", "withdraw", "retry", "agent-session", "delivery", "peer"}))
+    if mutating and values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") != "0":
+        try:
+            ensure_worker(store, environment)
+        except OSError as error:
+            payload = {**payload, "warnings": [*payload.get("warnings", []),
+                       {"code": "worker_start_failed", "message": str(error), "committed": True}]}
+    return store.annotate(payload)
+
+
+def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None,
+              store: LedgerStore) -> dict[str, Any]:
+    registry, mailbox = AgentRegistry(store), Mailbox(store)
+    remote = RemoteLedger(store, environment)
     if arguments.command == "ledger":
         command = arguments.ledger_command
-        if command == "doctor":
-            return store.doctor()
+        if command in {"doctor", "setup"}:
+            return {**store.doctor(), "peers": remote.peers(), "worker": worker_status(store)}
+        if command == "peer":
+            if arguments.peer_command == "list":
+                return {"peers": remote.peers()}
+            peer = SSHTransport(store, environment).discover(
+                arguments.ssh_alias, remote_root=arguments.remote_root, remote_ledger_dir=arguments.remote_ledger_dir,
+                remote_socket=arguments.remote_socket)
+            if ((arguments.canonical_name and peer["canonical_name"] != arguments.canonical_name) or
+                    (arguments.uuid and peer["uuid"] != arguments.uuid)):
+                raise LedgerError("peer_identity_conflict", "Discovered remote identity differs from the requested identity.")
+            return {"peer": remote.add_peer(**peer)}
+        if command == "worker":
+            operation = arguments.worker_command
+            if operation == "ensure":
+                return ensure_worker(store, environment)
+            if operation == "status":
+                return worker_status(store)
+            return run_worker(store, environment, once=operation == "once")
+        if command == "outbox":
+            if not 1 <= arguments.limit <= 1000:
+                raise LedgerError("invalid_limit", "Outbox limit must be 1..1000.")
+            return {"items": remote.outbox()[:arguments.limit]}
+        if command == "retry":
+            return remote.retry(arguments.item)
         if command == "retention":
             return store.retention()
         if command in {"reconcile", "event"}:
             return registry.refresh(environment)[1]
+        if command in {"accept", "receipt", "setting", "withdraw"} or (command == "status-export" and arguments.wire):
+            if command == "status-export":
+                registry.refresh(environment)
+            return remote.receive(command, _stdin_object())
+        if command == "status-export":
+            registry.refresh(environment)
+            return {"protocol": 1, **remote.status_export(arguments.repo)}
         data = _stdin_object()
         if command == "agent-session":
             registry.refresh(environment)
@@ -110,8 +185,8 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
             raise LedgerError("invalid_request", str(error)) from None
     if arguments.command == "mail" and arguments.mail_command == "show":
         return mailbox.show_thread(arguments.thread)
-    # Reads do not even refresh last_seen/status/bells. Events or explicit
-    # reconcile register sessions; process ancestry resolves moved CLI callers.
+    # Reads never refresh last_seen/status/bells. Mutations acquire the snapshot
+    # before updating the registry under its serialization lock.
     mutating = arguments.command == "mail" or (arguments.command == "inbox" and arguments.inbox_command == "handle")
     snapshot = registry.refresh(environment)[0] if mutating else live_snapshot(environment)
     sender = _live_context(registry, snapshot, environment)
@@ -123,17 +198,12 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
         return mailbox.handle(sender, arguments.message)
     if arguments.mail_command == "withdraw":
         return mailbox.withdraw(arguments.message, sender=sender)
-    address = arguments.to.split('/')
-    if len(address) != 2 or not all(address) or address[0] not in {"local", store.host}:
-        raise LedgerError("invalid_address", "This local mailbox slice requires local/LABEL or canonical-host/LABEL.")
-    candidates = [agent for agent in registry.list() if agent["alias"] == address[1]]
-    if len(candidates) != 1:
-        raise LedgerError("agent_not_found" if not candidates else "agent_ambiguous", "Recipient label must identify one current local agent.")
+    recipient = remote.resolve_recipient(arguments.to, sender)
     try:
         body = arguments.body if arguments.body is not None else Path(arguments.body_file).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise LedgerError("body_file_unreadable", str(error)) from None
-    return mailbox.send(sender, candidates[0], body=body, kind=arguments.kind,
+    return mailbox.send(sender, recipient, body=body, kind=arguments.kind,
                         reply_to=arguments.reply_to, subject=arguments.subject)
 
 

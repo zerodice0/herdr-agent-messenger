@@ -127,6 +127,20 @@ CREATE INDEX IF NOT EXISTS pending_outbox ON outbox(target_host,state,peer_seq);
 CREATE TABLE IF NOT EXISTS wake_log (
  seq INTEGER PRIMARY KEY, agent_id TEXT NOT NULL, at REAL NOT NULL,
  message_ids TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS peer_options (
+ canonical_name TEXT PRIMARY KEY REFERENCES peers(canonical_name) ON DELETE CASCADE,
+ remote_ledger_dir TEXT NOT NULL DEFAULT '', remote_socket TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS message_routes (
+ message_id TEXT PRIMARY KEY,
+ original_host TEXT NOT NULL, original_terminal TEXT, original_address TEXT NOT NULL,
+ resolution_host TEXT NOT NULL, resolution_terminal TEXT, resolution_address TEXT NOT NULL,
+ receipt_host TEXT, forward_host TEXT);
+CREATE TABLE IF NOT EXISTS notification_failures (
+ seq INTEGER PRIMARY KEY, at REAL NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS setting_conditions (
+ repo_id TEXT NOT NULL, field TEXT NOT NULL, version INTEGER NOT NULL,
+ origin_host TEXT NOT NULL, expected_main TEXT NOT NULL,
+ PRIMARY KEY(repo_id,field,version,origin_host));
 """
 
 
@@ -135,6 +149,7 @@ class LedgerStore:
                  environment: Mapping[str, str] | None = None,
                  canonical_name: str | None = None) -> None:
         self.directory = Path(directory) if directory is not None else ledger_directory(environment)
+        self.notification_errors: list[dict[str, Any]] = []
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory.chmod(0o700)
         self.path = self.directory / "ledger.sqlite3"
@@ -205,7 +220,20 @@ class LedgerStore:
         finally:
             connection.close()
         if changed:
-            self.ring(terminals)
+            try:
+                self.ring(terminals)
+            except OSError as error:
+                # The transaction is already durable. Never report a rollback or
+                # induce a new-message retry because the advisory bell failed.
+                warning = {"code": "notification_failed", "message": str(error),
+                           "committed": True, "recovery": "event_or_safety_sweep"}
+                self.notification_errors.append(warning)
+                try:
+                    with self.read() as recovery:
+                        recovery.execute("INSERT INTO notification_failures(at,detail) VALUES (?,?)",
+                                         (time.time(), str(error)))
+                except sqlite3.Error:
+                    pass
 
     def ring(self, terminals: Sequence[str] = ()) -> None:
         for name in {"_board", *(quote(terminal, safe="._-:") for terminal in terminals if terminal)}:
@@ -218,19 +246,37 @@ class LedgerStore:
         with self.read() as connection:
             counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("agents", "messages", "deliveries", "outbox", "dedupe_receipts")}
-        return {"schema_version": SCHEMA_VERSION, "directory": str(self.directory),
-                "host": {"canonical_name": self.host, "uuid": self.host_uuid}, "counts": counts}
+        with self.read() as connection:
+            failures = [dict(row) for row in connection.execute(
+                "SELECT * FROM notification_failures ORDER BY seq DESC LIMIT 10")]
+        return {"protocol": 1, "schema_version": SCHEMA_VERSION, "directory": str(self.directory),
+                "host": {"canonical_name": self.host, "uuid": self.host_uuid},
+                "counts": counts, "notification_failures": failures}
 
     def retention(self, *, now: float | None = None) -> dict[str, int]:
         at = time.time() if now is None else now
         with self.transaction() as connection:
+            # Final message payloads must not survive via sent/failed OUTBOX JSON.
+            connection.execute("DELETE FROM outbox WHERE message_id IN (SELECT message_id FROM messages WHERE "
+                               "final_at IS NOT NULL AND final_at<?) AND state IN ('sent','failed','cancelled')",
+                               (at - 90 * 86400,))
             expired = connection.execute(
                 "DELETE FROM messages WHERE final_at IS NOT NULL AND final_at<?",
                 (at - 90 * 86400,)).rowcount
             # Threads have no message bodies and remain useful as stable reply identities.
             status = connection.execute("DELETE FROM status_log WHERE at<?", (at - 30 * 86400,)).rowcount
             wake = connection.execute("DELETE FROM wake_log WHERE at<?", (at - 30 * 86400,)).rowcount
+            connection.execute("DELETE FROM notification_failures WHERE at<?", (at - 30 * 86400,))
         return {"messages": expired, "status_log": status, "wake_log": wake}
+
+    def annotate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(payload)
+        if self.notification_errors:
+            result["warnings"] = list(result.get("warnings", []))
+            for warning in self.notification_errors:
+                if warning not in result["warnings"]:
+                    result["warnings"].append(warning)
+        return result
 
     @contextmanager
     def lock(self, name: str) -> Iterator[None]:
@@ -254,21 +300,41 @@ def receipt(connection: sqlite3.Connection, message_id: str) -> dict[str, Any]:
         if old is None:
             raise LedgerError("message_not_found", "No message with that ID exists in this ledger.")
         return json.loads(old[0])
-    return {key: row[key] for key in (
+    result = {key: row[key] for key in (
         "message_id", "origin_host", "payload_hash", "recipient_address", "recipient_host",
         "recipient_terminal_id", "state", "hold_reason", "via", "delivered_agent_id",
         "delivered_at", "handled_at", "updated_at", "withdraw_requested", "authoritative")}
+    result["authoritative_host"] = row["recipient_host"] if row["state"] != "pending" else None
+    return result
+
+
+def queue_outbox(connection: sqlite3.Connection, target_host: str, kind: str,
+                 payload: Mapping[str, Any], message_id: str | None = None) -> str:
+    item_id = str(uuid.uuid4())
+    sequence = connection.execute("SELECT coalesce(max(peer_seq),0)+1 FROM outbox WHERE target_host=?",
+                                  (target_host,)).fetchone()[0]
+    connection.execute("INSERT INTO outbox(item_id,target_host,peer_seq,kind,message_id,payload,state,next_try_at) "
+                       "VALUES (?,?,?,?,?,?,'pending',?)",
+                       (item_id, target_host, sequence, kind, message_id, json_text(payload), time.time()))
+    return item_id
+
+
+def public_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    if result["state"] == "delivering":
+        result["state"], result["hold_reason"] = "queued", None
+    result["authoritative_host"] = result["recipient_host"] if result["state"] != "pending" else None
+    return result
 
 
 def save_receipt(connection: sqlite3.Connection, message_id: str) -> dict[str, Any]:
     current = receipt(connection, message_id)
-    # delivering is private; the last public receipt is still queued.
-    public = dict(current)
-    if public["state"] == "delivering":
-        public["state"] = "queued"
-        public["hold_reason"] = None
+    public = public_receipt(current)
     connection.execute(
         "INSERT INTO dedupe_receipts VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
         "receipt=excluded.receipt,updated_at=excluded.updated_at",
         (message_id, current["payload_hash"], current["origin_host"], json_text(public), current["updated_at"]))
+    route = connection.execute("SELECT receipt_host FROM message_routes WHERE message_id=?", (message_id,)).fetchone()
+    if route and route[0]:
+        queue_outbox(connection, route[0], "receipt", public, message_id)
     return current

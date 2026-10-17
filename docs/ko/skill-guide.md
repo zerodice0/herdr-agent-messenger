@@ -162,6 +162,56 @@ JSON과 복구·증거 계약은 [참고서](../../.agents/skills/herdr-agent-me
 정리되어 있습니다. 기존 prompt 전송과 Held Messages는 그대로이며, 로컬 메일함
 명령이 runtime 확장이나 전역 규칙을 설치하지 않습니다.
 
+### 원격 메일과 코드 전용 worker
+
+원격 메일을 쓰기 전에 양쪽의 고정 호스트 정체성과 SSH 연결을 등록합니다.
+
+```bash
+# alpha에서 실행합니다. beta에서는 --name beta와 alpha의 SSH 별칭을 씁니다.
+python3 "$HAM_CLI" ledger setup --name alpha
+python3 "$HAM_CLI" ledger peer add --ssh-alias beta-ssh --canonical-name beta
+python3 "$HAM_CLI" ledger peer list
+python3 "$HAM_CLI" mail send --to beta-ssh/blue-owl --body '준비되면 검토해 주세요.'
+python3 "$HAM_CLI" ledger doctor
+python3 "$HAM_CLI" ledger outbox
+python3 "$HAM_CLI" ledger worker status
+# 영구 오류의 원인을 고친 뒤 같은 메시지·항목 ID로 명시적으로 재시도합니다.
+python3 "$HAM_CLI" ledger retry --item OUTBOX_ITEM_UUID
+```
+
+기존 HAM 허용 목록에 있는 구체적인 SSH 별칭만 받습니다. 원격 root는
+구조화된 `result.plugins[0].plugin_root`에서 읽고, protocol 1과 고정 UUID를
+검사합니다. 설치된 구버전 checkout을 새 프로토콜 endpoint로 취급하지 않습니다.
+등록된 canonical 이름과 SSH 별칭 모두 같은 peer를 가리킵니다.
+원격 에이전트 상태는 실시간 조회하며 로컬 AGENTS에 복제하지 않습니다.
+
+독립 worker는 원장별 flock을 잡고 호스트별 FIFO 재시도(최대 5분 간격),
+수신 확인, 닫힌 terminal 확인과 보존 기간 정리를 처리합니다. 시작한 CLI가
+끝나도 유지되며 할 일이 없으면 종료합니다. 영구 실패 항목은 오류를 보여 주고
+다음 항목을 막지 않습니다. 한 호스트의 일시적 오류도 다른 호스트를 막지 않습니다.
+응답 유실 뒤 같은 메시지를 재접수하면 현재 상태를 돌려줍니다. 본문을 보존 기간
+뒤 삭제해도 ID·해시·최종 수신 확인은 남으므로 다른 본문으로 재사용할 수 없습니다.
+커밋 뒤 초인종 쓰기가 실패하면 저장은 성공하며 `notification_failed`,
+`committed:true` 경고가 나옵니다. 새 메시지로 다시 보내지 마세요.
+
+`--to main`은 저장소 home 호스트가 접수할 때 한 번만 해석합니다. home이
+오프라인이면 pending을 유지하고, 접속 가능하지만 main이 없으면
+`main_unavailable` 실패 항목으로 보여 명시적으로 재시도할 수 있습니다.
+다른 호스트의 main으로 중계해도 수신 확인과 철회는 저장된 경로를 따릅니다.
+mode/main/members/thresholds 변경은 사용자 UI 서비스 전용이며 agent CLI에는
+변경 명령이 없습니다. 설정별 version·origin, 동률 충돌과 전파 대기는
+`repo show`로 확인합니다. 로컬 auto 초기화는 모든 peer의 접속을 기다리지 않고,
+늦게 도착한 종료 알림이나 이전 home의 계산은 새 지정을 지우지 않습니다.
+
+격리 검증에는 `peer add --remote-root /ABS/WORK_COPY
+--remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`을
+사용합니다. 로컬 원장·소켓·HOME/XDG·기존 request 경로도 모두 격리하세요.
+`HERDR_AGENT_LEDGER_AUTOSTART=0`은 암시적인 worker 시작을 막고 명시적인 원격
+원장에도 전달합니다. `ledger worker once|run|ensure`는 계속 직접 실행할 수 있습니다.
+정확한 JSON·오류·격리 계약은 [영문 참고서](../../.agents/skills/herdr-agent-messenger/reference.md#hosts-fifo-transport-and-worker)에
+있습니다. 이 명령들은 runtime이나 전역 설정을 설치하지 않습니다.
+
+
 ## 주소 선택과 새 세션 생성
 
 항상 호스트가 포함된 정확한 Agent Labels 주소를 사용하세요. 리터럴 호스트
