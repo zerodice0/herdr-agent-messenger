@@ -10,15 +10,21 @@ import sys
 from typing import Any, Mapping
 
 from ledger_mail import Mailbox
-from ledger_status import AgentRegistry, live_snapshot, repository_identity
+from ledger_status import AgentRegistry, claude_foreground_pid, live_snapshot, repository_identity
 from ledger_store import LedgerError, LedgerStore
 from ledger_remote import RemoteLedger, SSHTransport
 from ledger_worker import ensure_worker, run_worker, worker_status
 
-COMMANDS = frozenset({"mail", "inbox", "repo", "ledger"})
+COMMANDS = frozenset({"mail", "inbox", "repo", "ledger", "runtime"})
 
 
 def add_parsers(subparsers: Any) -> None:
+    installer = subparsers.add_parser("runtime", help="Explicit ownership-checked opt-in runtime installation.")
+    install_commands = installer.add_subparsers(dest="runtime_operation", required=True)
+    for operation in ("install", "uninstall", "status"):
+        install = install_commands.add_parser(operation, help=f"{operation.title()} a HAM-owned client runtime.")
+        install.add_argument("client", choices=("omp", "claude"))
+        install.add_argument("--destination", help="Explicit client directory: omp defaults to ~/.omp/agent/extensions; claude to ~/.claude (settings.json).")
     mail = subparsers.add_parser("mail", help="Leave immutable messages without interrupting an agent.")
     mail_commands = mail.add_subparsers(dest="mail_command", required=True)
     send = mail_commands.add_parser("send", help="Queue a local/remote same-repository message without interrupting work.")
@@ -82,6 +88,10 @@ def add_parsers(subparsers: Any) -> None:
     operations = delivery.add_subparsers(dest="delivery_command", required=True)
     for operation in ("claim", "started", "release"):
         operations.add_parser(operation, help=f"JSON stdin: {operation} one runtime context-delivery claim.")
+    runtime = commands.add_parser("runtime", help="Root native receiver registration, bounded admission and journal ACK.")
+    runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
+    for operation in ("register", "inspect", "claim", "applied", "claude-hook"):
+        runtime_commands.add_parser(operation, help=f"JSON stdin native receiver {operation}.")
 
 
 def _stdin_object() -> dict[str, Any]:
@@ -108,12 +118,20 @@ def _live_context(registry: AgentRegistry, snapshot: Mapping[str, Any],
     reference = str(session.get("value") or '') if isinstance(session, dict) else ''
     reference = reference or "unreported"
     identity = repository_identity(str(live.get("cwd") or ''), registry.store.host)
-    if reference != agent["session_ref"] or live["agent"] != agent["client"] or identity["repo_id"] != agent["repo_id"]:
+    matching_session = reference == agent["session_ref"]
+    if (not matching_session and reference == "unreported"
+            and live["agent"] == agent["client"] == "claude"
+            and agent.get("native_session_pid") is not None):
+        matching_session = claude_foreground_pid(agent, environment) == agent["native_session_pid"]
+    if not matching_session or live["agent"] != agent["client"] or identity["repo_id"] != agent["repo_id"]:
         raise LedgerError("stale_session", "Run ledger reconcile for the current Herdr session before receiving mail.")
     return agent
 
 
 def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    if arguments.command == "runtime":
+        from runtime_installer import manage
+        return manage(arguments.runtime_operation, arguments.destination, client=arguments.client)
     name = arguments.name if arguments.command == "ledger" and arguments.ledger_command == "setup" else None
     store = LedgerStore(environment=environment, canonical_name=name)
     payload = _dispatch(arguments, environment, store)
@@ -121,14 +139,37 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
     mutating = ((arguments.command == "mail" and arguments.mail_command != "show") or
                 (arguments.command == "inbox" and arguments.inbox_command == "handle") or
                 (arguments.command == "ledger" and arguments.ledger_command in
-                 {"reconcile", "event", "accept", "receipt", "setting", "withdraw", "retry", "agent-session", "delivery", "peer"}))
+                 {"reconcile", "event", "accept", "receipt", "setting", "withdraw", "retry", "agent-session", "delivery", "peer", "runtime"}))
     if mutating and values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") != "0":
         try:
             ensure_worker(store, environment)
-        except OSError as error:
+        except (OSError, LedgerError) as error:
+            message = error.message if isinstance(error, LedgerError) else str(error)
             payload = {**payload, "warnings": [*payload.get("warnings", []),
-                       {"code": "worker_start_failed", "message": str(error), "committed": True}]}
+                       {"code": "worker_start_failed", "message": message, "committed": True}]}
     return store.annotate(payload)
+def status_operation(operation: str, *, environment: Mapping[str, str] | None = None,
+                     phase: str | None = None, summary: str = "",
+                     repo_id: str | None = None) -> dict[str, Any]:
+    store = LedgerStore(environment=environment)
+    registry = AgentRegistry(store)
+    if operation == "list":
+        if repo_id == "":
+            repo_id = registry.resolve_context(environment, live_snapshot(environment))["repo_id"]
+        return {"repo_id": repo_id, "agents": registry.list(repo_id)}
+    if operation not in {"set", "clear"}:
+        raise LedgerError("invalid_status_operation", "Status operation must be set, clear, or list.")
+    snapshot, _ = registry.refresh(environment)
+    agent = registry.resolve_context(environment, snapshot)
+    return registry.set_status(
+        agent,
+        phase="" if operation == "clear" else str(phase or ""),
+        summary="" if operation == "clear" else summary,
+        feature_invoked=True,
+        environment=environment,
+    )
+
+
 
 
 def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None,
@@ -173,6 +214,32 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         if command == "status-export":
             registry.refresh(environment)
             return {"protocol": 1, **remote.status_export(arguments.repo)}
+        if command == "runtime":
+            from ledger_runtime import NativeReceiver
+            data = _stdin_object()
+            receiver = NativeReceiver(store)
+            try:
+                if arguments.runtime_command == "register":
+                    snapshot = registry.refresh(environment)[0]
+                    agent = _live_context(registry, snapshot, environment)
+                    return receiver.register(agent, **data)
+                if arguments.runtime_command == "claude-hook":
+                    snapshot = registry.refresh(environment)[0]
+                    agent = _live_context(registry, snapshot, environment)
+                    subagent_id = data.get("agent_id")
+                    if subagent_id is not None and not isinstance(subagent_id, str):
+                        raise LedgerError("invalid_request", "Claude hook agent_id must be text.")
+                    return receiver.claude_hook(
+                        agent,
+                        hook_event_name=data.get("hook_event_name"),
+                        session_id=data.get("session_id"),
+                        transcript_path=data.get("transcript_path"),
+                        subagent_id=subagent_id,
+                        environment=environment,
+                    )
+                return getattr(receiver, arguments.runtime_command)(**data)
+            except TypeError as error:
+                raise LedgerError("invalid_request", str(error)) from None
         data = _stdin_object()
         if command == "agent-session":
             registry.refresh(environment)

@@ -7,7 +7,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
+from unittest import mock
 import uuid
 
 from ledger_mail import Mailbox
@@ -63,6 +66,7 @@ class RemoteLedgerTest(unittest.TestCase):
         ssh_config.write_text('Host a b c\n  HostName invalid.example.test\n')
         allowlist.write_text('a\nb\nc\n')
         self.environment = {**os.environ, 'HERDR_AGENT_LEDGER_AUTOSTART': '0', 'PYTHONDONTWRITEBYTECODE': '1',
+                            'HERDR_SOCKET_PATH': str(self.root/'herdr-isolated.sock'),
                             'HERDR_AGENT_MESSENGER_SSH_CONFIG': str(ssh_config),
                             'HERDR_AGENT_MESSENGER_SSH_HOSTS_FILE': str(allowlist)}
         self.environment.pop('HERDR_AGENT_CANONICAL_HOST', None)
@@ -75,7 +79,7 @@ class RemoteLedgerTest(unittest.TestCase):
                    'agent_session': {'value': 'session-'+host}, 'cwd': str(self.repo)}
             self.snapshots[host] = {'panes': [pane], 'agents': [raw]}
             registry = AgentRegistry(store)
-            registry.reconcile(self.snapshots[host])
+            registry.reconcile(self.snapshots[host], refresh_display=False)
             self.agents[host] = registry.list()[0]
         self.repo_id = self.agents['alpha']['repo_id']
         self.links = {host: CLITransport(store, self.stores, self.environment) for host, store in self.stores.items()}
@@ -86,6 +90,14 @@ class RemoteLedgerTest(unittest.TestCase):
                 if target != host:
                     service.add_peer(canonical_name=target, uuid=store.host_uuid, ssh_alias=aliases[target],
                                      remote_ham_root=str(ROOT), remote_ledger_dir=str(store.directory))
+
+    def settings_for(self, host):
+        return RepoSettings(self.stores[host], environment=self.environment,
+                            display_runner=self.display_runner)
+
+    @staticmethod
+    def display_runner(command):
+        return subprocess.CompletedProcess(list(command), 1, "", "isolated fixture")
 
     def send(self, source='alpha', target='beta', **options):
         return Mailbox(self.stores[source]).send(self.agents[source], self.agents[target], body='Immutable remote body 한글', **options)
@@ -232,6 +244,70 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(replay['state'], 'withdrawn')
         self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
 
+    def test_claim_winner_refuses_remote_withdraw_without_a_false_final_receipt(self):
+        sent = self.send()
+        item = next(item for item in self.services['alpha'].outbox() if item['kind']=='message')
+        withdrawal = public_receipt(self.current('alpha',sent['message_id']))
+        self.wire('beta','accept',self.services['alpha'].envelope(json.loads(item['payload'])))
+        agent = self.agents['beta']
+        mailbox = Mailbox(self.stores['beta'])
+        claim = mailbox.claim(terminal_id=agent['terminal_id'],agent_id=agent['agent_id'],
+                              generation=agent['generation'])
+        before = self.current('beta',sent['message_id'])
+        refused = self.wire('beta','withdraw',self.services['alpha'].envelope(withdrawal))
+        self.assertFalse(refused['withdrawn'])
+        self.assertEqual(refused['state'],'queued')  # delivering stays receiver-internal
+        self.assertEqual(refused['reason'],'already_claimed_or_final')
+        self.assertEqual(self.current('beta',sent['message_id']),before)
+        self.wire('alpha','receipt',self.services['beta'].envelope(refused))
+        self.assertEqual(self.current('alpha',sent['message_id'])['state'],'queued')
+        mailbox.started(**{key:claim[key] for key in ('claim_id','agent_id','generation')},
+                        evidence='fixture:accepted-after-withdraw-refusal')
+        mailbox.handle(agent,[sent['message_id']])
+        self.drain()
+        self.assertEqual(self.current('alpha',sent['message_id'])['state'],'handled')
+
+    def test_unknown_withdraw_atomically_binds_tombstone_hash_before_concurrent_accept(self):
+        sent = self.send()
+        item = next(item for item in self.services['alpha'].outbox() if item['kind']=='message')
+        payload = json.loads(item['payload'])
+        withdrawal = public_receipt(self.current('alpha',sent['message_id']))
+        store, service = self.stores['beta'], self.services['beta']
+        tombstone_written, accept_started, release = threading.Event(), threading.Event(), threading.Event()
+        original = Mailbox._withdraw
+        def pause_withdraw(mailbox,connection,message_id,**options):
+            result = original(mailbox,connection,message_id,**options)
+            if mailbox.store is store:
+                tombstone_written.set()
+                if not release.wait(5):
+                    raise AssertionError('withdraw scheduling seam was not released')
+            return result
+        def accept():
+            accept_started.set()
+            return service.receive('accept',self.services['alpha'].envelope(payload))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with mock.patch.object(Mailbox,'_withdraw',pause_withdraw):
+                withdrawn = executor.submit(service.receive,'withdraw',self.services['alpha'].envelope(withdrawal))
+                try:
+                    self.assertTrue(tombstone_written.wait(5))
+                    accepted = executor.submit(accept)
+                    self.assertTrue(accept_started.wait(5))
+                    # No other reader can observe a tombstone without its hash.
+                    with store.read() as connection:
+                        self.assertEqual(connection.execute('SELECT count(*) FROM withdraw_tombstones').fetchone()[0],0)
+                        self.assertEqual(connection.execute('SELECT count(*) FROM dedupe_receipts').fetchone()[0],0)
+                finally:
+                    release.set()
+                outcome = withdrawn.result(timeout=5)
+                replay = accepted.result(timeout=5)
+        self.assertTrue(outcome['withdrawn'])
+        self.assertEqual(replay['state'],'withdrawn')
+        self.assertEqual(replay['payload_hash'],sent['payload_hash'])
+        self.assertEqual(store.doctor()['counts']['messages'],0)
+        altered = {**payload,'message':{**payload['message'],'body':'Changed after atomic withdrawal'}}
+        conflict = self.wire('beta','accept',self.services['alpha'].envelope(altered),expected=1)
+        self.assertEqual(conflict['error']['code'],'message_conflict')
+
     def test_fifo_transient_blocks_one_peer_but_other_peer_progresses(self):
         first, second, other = self.send(), self.send(), self.send(target='gamma')
         self.links['alpha'].failures['beta'] = ['transient']
@@ -259,7 +335,7 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(self.services['alpha'].outbox()[0]['item_id'], failed['item_id'])
 
     def test_disjoint_settings_and_equal_version_ties_converge(self):
-        alpha, beta = RepoSettings(self.stores['alpha']), RepoSettings(self.stores['beta'])
+        alpha, beta = self.settings_for('alpha'), self.settings_for('beta')
         alpha.mutate(self.repo_id, 'mode', 'manual')
         beta.mutate(self.repo_id, 'thresholds', {**DEFAULT_THRESHOLDS, 'idle_minutes': 4})
         self.drain()
@@ -277,7 +353,7 @@ class RemoteLedgerTest(unittest.TestCase):
             self.assertTrue(current['conflicts'])
 
     def test_concurrent_initial_homes_converge_without_waiting_for_offline_peer(self):
-        alpha, beta = RepoSettings(self.stores['alpha']), RepoSettings(self.stores['beta'])
+        alpha, beta = self.settings_for('alpha'), self.settings_for('beta')
         a = alpha.mutate(self.repo_id, 'mode', 'auto')
         b = beta.mutate(self.repo_id, 'mode', 'auto')
         self.assertEqual(a['home_host'], 'alpha')
@@ -295,15 +371,15 @@ class RemoteLedgerTest(unittest.TestCase):
             self.assertEqual(beta.main(connection, self.repo_id)['host'], 'beta')
 
     def test_stale_main_close_cannot_clear_later_designation_and_only_main_host_clears(self):
-        settings = RepoSettings(self.stores['beta'])
+        settings = self.settings_for('beta')
         settings.mutate(self.repo_id, 'mode', 'manual')
         old = settings.mutate(self.repo_id, 'main', {'host':'beta','terminal_id':'term-beta'})['settings']['main']
         self.drain()
-        AgentRegistry(self.stores['beta']).reconcile({'panes':[], 'agents':[]})
-        self.assertFalse(RepoSettings(self.stores['alpha']).clear_closed_main(self.repo_id, stamp(old)))
+        AgentRegistry(self.stores['beta']).reconcile({'panes':[], 'agents':[]}, refresh_display=False)
+        self.assertFalse(self.settings_for('alpha').clear_closed_main(self.repo_id, stamp(old)))
         self.assertTrue(settings.clear_closed_main(self.repo_id, stamp(old)))
         clear = settings.show(self.repo_id)['settings']['main']
-        alpha = RepoSettings(self.stores['alpha'])
+        alpha = self.settings_for('alpha')
         alpha.mutate(self.repo_id, 'main', {'host':'gamma','terminal_id':'term-gamma'})
         # Delay the close packet until after a newer user designation.
         result = alpha.accept(clear, 'beta')
@@ -312,7 +388,7 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertFalse(settings.clear_closed_main(self.repo_id, stamp(old)))
 
     def test_home_offline_stays_pending_and_no_main_is_visible_permanent_failure(self):
-        home = RepoSettings(self.stores['beta'])
+        home = self.settings_for('beta')
         home.mutate(self.repo_id, 'mode', 'manual')
         self.drain()
         symbolic = self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
@@ -326,7 +402,7 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(json.loads(failed['last_error'])['code'], 'main_unavailable')
 
     def test_symbolic_home_relays_to_third_host_receipts_and_withdraw_follow_route(self):
-        home = RepoSettings(self.stores['beta'])
+        home = self.settings_for('beta')
         home.mutate(self.repo_id, 'mode', 'manual')
         home.mutate(self.repo_id, 'main', {'host':'gamma','terminal_id':'term-gamma'})
         self.drain()
@@ -345,15 +421,62 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'withdrawn')
         self.assertEqual(self.current('gamma', sent['message_id'])['state'], 'withdrawn')
 
+    def test_symbolic_home_can_return_to_another_terminal_on_origin_without_duplicate(self):
+        store = self.stores['alpha']
+        pane = {'terminal_id':'term-alpha-main','pane_id':'w1:p2','workspace_id':'w1'}
+        agent = {**pane,'agent':'omp','name':'origin-main','agent_status':'idle',
+                 'agent_session':{'value':'main-session'},'cwd':str(self.repo)}
+        AgentRegistry(store).reconcile(
+            {'panes':[*self.snapshots['alpha']['panes'],pane],
+             'agents':[*self.snapshots['alpha']['agents'],agent]}, refresh_display=False)
+        main = next(item for item in AgentRegistry(store).list() if item['terminal_id']==pane['terminal_id'])
+        home = self.settings_for('beta')
+        home.mutate(self.repo_id,'mode','manual')
+        home.mutate(self.repo_id,'main',{'host':'alpha','terminal_id':main['terminal_id']})
+        self.drain()
+        symbolic = self.services['alpha'].resolve_recipient('main',self.agents['alpha'])
+        sent = Mailbox(store).send(self.agents['alpha'],symbolic,body='Return to origin main')
+        self.drain()
+        current = self.current('alpha',sent['message_id'])
+        self.assertEqual(current['state'],'queued')
+        self.assertTrue(current['authoritative'])
+        self.assertEqual(current['recipient_terminal_id'],main['terminal_id'])
+        self.assertEqual(store.doctor()['counts']['messages'],1)
+        claim = Mailbox(store).claim(terminal_id=main['terminal_id'],agent_id=main['agent_id'],generation=main['generation'])
+        self.assertEqual([row['message_id'] for row in claim['messages']],[sent['message_id']])
+        with store.read() as connection:
+            claimed = dict(connection.execute('SELECT * FROM deliveries WHERE message_id=?',
+                                              (sent['message_id'],)).fetchone())
+        home_copy = public_receipt(self.current('beta',sent['message_id']))
+        for delayed in (sent,home_copy,{**home_copy,'updated_at':time.time()+10}):
+            result = self.wire('alpha','receipt',self.services['beta'].envelope(delayed))
+            self.assertEqual(result['state'],'queued')
+            self.assertIsNone(result['delivered_at'])
+            with store.read() as connection:
+                self.assertEqual(dict(connection.execute('SELECT * FROM deliveries WHERE message_id=?',
+                                                         (sent['message_id'],)).fetchone()),claimed)
+        Mailbox(store).started(claim_id=claim['claim_id'],agent_id=main['agent_id'],
+                              generation=main['generation'],evidence='fixture:accepted-origin-context')
+        Mailbox(store).handle(main,[sent['message_id']])
+        self.drain()
+        self.assertEqual(self.current('beta',sent['message_id'])['state'],'handled')
+        item = next(item for item in self.services['beta'].outbox() if item['kind']=='message')
+        replay = json.loads(item['payload'])
+        store.retention(now=time.time()+91*86400)
+        retained = self.wire('alpha','accept',self.services['beta'].envelope(replay))
+        self.assertEqual(retained['state'],'handled')
+        self.assertEqual(retained['payload_hash'],sent['payload_hash'])
+        self.assertEqual(store.doctor()['counts']['messages'],0)
+
     def test_worker_observes_designated_main_terminal_even_after_agent_returns_to_shell(self):
         store = self.stores['alpha']
-        settings = RepoSettings(store)
+        settings = RepoSettings(store, environment=self.environment, display_runner=self.display_runner)
         settings.mutate(self.repo_id,'mode','manual')
         settings.mutate(self.repo_id,'main',{'host':'alpha','terminal_id':'term-alpha'})
         self.drain()
-        AgentRegistry(store).reconcile({'panes':self.snapshots['alpha']['panes'],'agents':[]})
+        AgentRegistry(store).reconcile({'panes':self.snapshots['alpha']['panes'],'agents':[]}, refresh_display=False)
         self.assertTrue(maintenance_pending(store))
-        AgentRegistry(store).reconcile({'panes':[],'agents':[]})
+        AgentRegistry(store).reconcile({'panes':[],'agents':[]}, refresh_display=False)
         self.assertTrue(settings.clear_closed_main(self.repo_id,stamp(settings.show(self.repo_id)['settings']['main'])))
         self.drain()
         self.assertFalse(maintenance_pending(store))
@@ -373,6 +496,256 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(json.loads(result.stdout)['reason'],'no_pending_work')
         self.assertFalse((store.directory/'worker.pid').exists())
+
+    def test_settings_mutation_projects_only_after_commit_and_reports_failure(self):
+        store = self.stores['alpha']
+        observed = []
+
+        def runner(command):
+            with store.read() as connection:
+                observed.append(RepoSettings.fields(connection, self.repo_id)['mode']['value'])
+            return subprocess.CompletedProcess(list(command), 1, '', 'isolated display failure')
+
+        settings = RepoSettings(store, environment=self.environment, display_runner=runner)
+        result = settings.mutate(self.repo_id, 'mode', 'manual')
+        self.assertTrue(observed)
+        self.assertEqual(set(observed), {'manual'})
+        self.assertTrue(result['display']['failed'])
+        self.assertEqual(result['warnings'][0]['code'], 'display_refresh_failed')
+
+    def test_remote_setting_receipt_projects_after_commit(self):
+        store = self.stores['beta']
+        observed = []
+
+        def project(ledger, environment=None, *, runner=None):
+            with ledger.read() as connection:
+                observed.append(RepoSettings.fields(connection, self.repo_id)['mode']['value'])
+            return {'updated': [], 'failed': ['isolated-pane']}
+
+        setting = {
+            'repo_id': self.repo_id,
+            'field': 'mode',
+            'value': 'manual',
+            'version': 1,
+            'origin_host': 'alpha',
+            'changed_by': 'user',
+            'changed_at': time.time(),
+        }
+        envelope = self.services['alpha'].envelope(setting)
+        with mock.patch('ledger_display.refresh', side_effect=project):
+            result = self.services['beta'].receive('setting', envelope)
+        self.assertEqual(observed, ['manual'])
+        self.assertEqual(result['display']['failed'], ['isolated-pane'])
+        self.assertEqual(result['warnings'][0]['code'], 'display_refresh_failed')
+
+    def test_closed_main_projection_runs_after_settings_commit(self):
+        store = self.stores['beta']
+        observed = []
+
+        def runner(command):
+            with store.read() as connection:
+                fields = RepoSettings.fields(connection, self.repo_id)
+                observed.append(fields.get('main', {}).get('value'))
+            return subprocess.CompletedProcess(list(command), 1, '', 'isolated display failure')
+
+        pane = {'terminal_id': 'term-beta-secondary', 'pane_id': 'w2:p2', 'workspace_id': 'w2'}
+        raw = {**pane, 'agent': 'codex', 'name': 'beta-secondary', 'agent_status': 'idle',
+               'agent_session': {'value': 'secondary-session'}, 'cwd': str(self.repo)}
+        snapshot = {'panes': [*self.snapshots['beta']['panes'], pane],
+                    'agents': [*self.snapshots['beta']['agents'], raw]}
+        AgentRegistry(store).reconcile(snapshot, refresh_display=False)
+        self.snapshots['beta'] = snapshot
+        settings = RepoSettings(store, environment=self.environment, display_runner=runner)
+        settings.mutate(self.repo_id, 'mode', 'manual')
+        designated = settings.mutate(
+            self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']}
+        )['settings']['main']
+        remaining = {'panes': [pane], 'agents': [raw]}
+        AgentRegistry(store).reconcile(remaining, refresh_display=False)
+        observed.clear()
+
+        self.assertTrue(settings.clear_closed_main(self.repo_id, stamp(designated)))
+        self.assertTrue(observed)
+        self.assertEqual(set(observed), {None})
+
+    def test_reconcile_local_reports_deferred_redraw_after_commit(self):
+        store = self.stores['beta']
+        settings = self.settings_for('beta')
+        settings.mutate(self.repo_id, 'mode', 'manual')
+        settings.mutate(self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']})
+        AgentRegistry(store).reconcile({'panes': [], 'agents': []}, refresh_display=False)
+
+        result = settings.reconcile_local(refresh_display=False, environment=self.environment)
+        self.assertEqual(result, {'changed': True, 'display': None})
+        self.assertIsNone(settings.show(self.repo_id)['settings']['main']['value'])
+        self.assertEqual(settings.reconcile_local(refresh_display=False),
+                         {'changed': False, 'display': None})
+
+    def test_reconcile_local_returns_postcommit_display_result(self):
+        store = self.stores['beta']
+        settings = self.settings_for('beta')
+        settings.mutate(self.repo_id, 'mode', 'manual')
+        settings.mutate(self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']})
+        AgentRegistry(store).reconcile({'panes': [], 'agents': []}, refresh_display=False)
+        observed = []
+
+        def project(ledger, environment=None, *, runner=None):
+            with ledger.read() as connection:
+                observed.append(RepoSettings.fields(connection, self.repo_id)['main']['value'])
+            return {'updated': [], 'failed': ['isolated-pane']}
+
+        with mock.patch('ledger_display.refresh', side_effect=project):
+            result = settings.reconcile_local(environment=self.environment)
+        self.assertEqual(result, {'changed': True, 'display': {'updated': [], 'failed': ['isolated-pane']}})
+        self.assertEqual(observed, [None])
+
+    def test_status_export_counts_queued_and_delivering_by_repo_and_terminal(self):
+        beta_store = self.stores['beta']
+        first = self.send()
+        self.drain()
+        beta_agent = self.agents['beta']
+        claimed = Mailbox(beta_store).claim(
+            terminal_id=beta_agent['terminal_id'],
+            agent_id=beta_agent['agent_id'],
+            generation=beta_agent['generation'],
+        )
+        self.assertEqual([item['message_id'] for item in claimed['messages']], [first['message_id']])
+        second = self.send()
+        self.drain()
+
+        secondary_pane = {
+            'terminal_id': 'term-beta-secondary',
+            'pane_id': 'w2:p2',
+            'workspace_id': 'w2',
+        }
+        secondary_agent_data = {
+            **secondary_pane,
+            'agent': 'codex',
+            'name': 'beta-secondary',
+            'agent_status': 'idle',
+            'agent_session': {'value': 'secondary-session'},
+            'cwd': str(self.repo),
+        }
+        beta_snapshot = {
+            'panes': [*self.snapshots['beta']['panes'], secondary_pane],
+            'agents': [*self.snapshots['beta']['agents'], secondary_agent_data],
+        }
+        AgentRegistry(beta_store).reconcile(beta_snapshot, refresh_display=False)
+        self.snapshots['beta'] = beta_snapshot
+        secondary = next(
+            item for item in AgentRegistry(beta_store).list()
+            if item['terminal_id'] == secondary_pane['terminal_id']
+        )
+        third = Mailbox(self.stores['alpha']).send(
+            self.agents['alpha'], secondary, body='Other terminal unread'
+        )
+        self.drain()
+
+        other_repo = self.root/'other-repo'
+        subprocess.run(['git', 'init', '-q', str(other_repo)], check=True)
+        subprocess.run(['git', '-C', str(other_repo), 'remote', 'add', 'origin',
+                        'https://example.test/team/other.git'], check=True)
+        other_agents = {}
+        for host in ('alpha', 'beta'):
+            pane = {'terminal_id': f'term-{host}-other-repo',
+                    'pane_id': f'w{host}:p2', 'workspace_id': f'w{host}'}
+            raw = {**pane, 'agent': 'codex', 'name': host+'-other',
+                   'agent_status': 'idle', 'agent_session': {'value': host+'-other-session'},
+                   'cwd': str(other_repo)}
+            snapshot = {'panes': [*self.snapshots[host]['panes'], pane],
+                        'agents': [*self.snapshots[host]['agents'], raw]}
+            AgentRegistry(self.stores[host]).reconcile(snapshot, refresh_display=False)
+            self.snapshots[host] = snapshot
+            other_agents[host] = next(
+                item for item in AgentRegistry(self.stores[host]).list()
+                if item['terminal_id'] == pane['terminal_id']
+            )
+        fourth = Mailbox(self.stores['alpha']).send(
+            other_agents['alpha'], other_agents['beta'], body='Other repository unread'
+        )
+        self.drain()
+
+        repo_export = self.services['beta'].status_export(self.repo_id)
+        unread = {item['terminal_id']: item['unread'] for item in repo_export['agents']}
+        self.assertEqual(unread[beta_agent['terminal_id']], 2)
+        self.assertEqual(unread[secondary['terminal_id']], 1)
+        other_export = self.services['beta'].status_export(other_agents['beta']['repo_id'])
+        self.assertEqual([item['unread'] for item in other_export['agents']], [1])
+        self.assertEqual(self.current('beta', first['message_id'])['state'], 'delivering')
+        self.assertEqual(self.current('beta', second['message_id'])['state'], 'queued')
+        self.assertEqual(self.current('beta', third['message_id'])['state'], 'queued')
+        self.assertEqual(self.current('beta', fourth['message_id'])['state'], 'queued')
+        Mailbox(beta_store).started(
+            claim_id=claimed['claim_id'], agent_id=beta_agent['agent_id'],
+            generation=beta_agent['generation'], evidence='fixture:delivery-started',
+        )
+        Mailbox(beta_store).handle(beta_agent, [first['message_id']])
+        refreshed = self.services['beta'].status_export(self.repo_id)
+        updated = {item['terminal_id']: item['unread'] for item in refreshed['agents']}
+        self.assertEqual(updated[beta_agent['terminal_id']], 1)
+
+    def test_remote_receipt_preserves_operator_confirmation_and_original_claim(self):
+        sent = self.send()
+        self.drain()
+        recipient = self.agents['beta']
+        claim = Mailbox(self.stores['beta']).claim(
+            terminal_id=recipient['terminal_id'],
+            agent_id=recipient['agent_id'],
+            generation=recipient['generation'],
+        )
+        Mailbox(self.stores['beta']).started(
+            claim_id=claim['claim_id'], agent_id=recipient['agent_id'],
+            generation=recipient['generation'], evidence='journal-entry:original',
+        )
+        remote = self.current('beta', sent['message_id'])
+        operator_via = remote['via'] or 'wake'
+        operator_receipt = {
+            **remote,
+            'state': 'delivered',
+            'updated_at': time.time() + 100,
+            'via': operator_via,
+            'delivered_agent_id': remote['delivered_agent_id'] or recipient['agent_id'],
+            'confirmation_source': 'operator',
+            'evidence': 'user-confirmed-context-application',
+        }
+        origin = self.stores['alpha']
+        with origin.transaction() as connection:
+            self.services['alpha'].apply_receipt(connection, operator_receipt, 'beta')
+
+        later_native_receipt = {
+            **operator_receipt,
+            'state': 'handled',
+            'handled_at': time.time() + 200,
+            'updated_at': time.time() + 200,
+            'via': 'native-journal',
+            'delivered_agent_id': 'different-later-agent',
+            'confirmation_source': 'native',
+            'evidence': 'journal-entry:later',
+        }
+        with origin.transaction() as connection:
+            self.services['alpha'].apply_receipt(connection, later_native_receipt, 'beta')
+            current = receipt(connection, sent['message_id'])
+        self.assertEqual(current['state'], 'handled')
+        self.assertEqual(current['confirmation_source'], 'operator')
+        self.assertEqual(current['evidence'], 'user-confirmed-context-application')
+        self.assertEqual(current['via'], operator_via)
+        self.assertEqual(current['delivered_agent_id'], recipient['agent_id'])
+
+        stale_receipt = {
+            **later_native_receipt,
+            'updated_at': time.time() + 300,
+            'confirmation_source': None,
+            'evidence': None,
+            'via': None,
+            'delivered_agent_id': None,
+        }
+        with origin.transaction() as connection:
+            self.services['alpha'].apply_receipt(connection, stale_receipt, 'beta')
+            current = receipt(connection, sent['message_id'])
+        self.assertEqual(current['confirmation_source'], 'operator')
+        self.assertEqual(current['evidence'], 'user-confirmed-context-application')
+        self.assertEqual(current['via'], operator_via)
+        self.assertEqual(current['delivered_agent_id'], recipient['agent_id'])
 
     def test_peer_identity_alias_mapping_and_setup_are_public(self):
         peer = self.services['alpha'].peer('b')

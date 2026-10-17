@@ -43,7 +43,9 @@ class LedgerCoreTest(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.store = LedgerStore(self.root / "ledger", canonical_name="alpha")
-        self.registry = AgentRegistry(self.store)
+        self.registry = AgentRegistry(
+            self.store, display_runner=lambda command: subprocess.CompletedProcess(
+                command, 0, '{"result":{"pane":{"label":"manual fixture"}}}', ""))
         self.mail = Mailbox(self.store)
         self.registry.reconcile(snapshot(self.repo))
         self.sender, self.recipient = self.agents()

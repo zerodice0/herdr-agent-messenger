@@ -96,38 +96,50 @@ def ensure_worker(store: LedgerStore, environment: Mapping[str, str] | None = No
 
 def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None, *,
                once: bool = False, remote: RemoteLedger | None = None) -> dict[str, Any]:
-    with worker_lock(store) as acquired:
-        if not acquired:
-            return {"running": False, "reason": "already_running"}
-        pidfile = store.directory / "worker.pid"
-        descriptor = os.open(pidfile, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, 'w') as stream:
-            stream.write(str(os.getpid()))
-        service = remote or RemoteLedger(store, environment)
-        totals = {"sent": 0, "failed": 0, "deferred": 0}
-        last_retention = 0.0
-        try:
-            while True:
-                if time.monotonic() - last_retention > 3600:
-                    store.retention()
-                    last_retention = time.monotonic()
-                for key, value in service.pump().items():
-                    totals[key] += value
-                if maintenance_pending(store):
-                    try:
-                        AgentRegistry(store).refresh(environment)
-                    except LedgerError as error:
-                        # An unavailable Herdr is not evidence that terminals
-                        # closed. Pending mail remains durable and visible.
-                        with store.transaction() as connection:
-                            connection.execute("INSERT INTO notification_failures(at,detail) VALUES (?,?)",
-                                               (time.time(), "worker sweep: " + error.message))
-                if once or not maintenance_pending(store):
-                    break
-                time.sleep(5)
-        finally:
-            pidfile.unlink(missing_ok=True)
-        return {"running": False, "reason": "one_pass" if once else "no_pending_work", **totals}
+    from ledger_runtime import NativeReceiver
+    observer = NativeReceiver(store)
+    service = remote or RemoteLedger(store, environment)
+    totals = {"sent": 0, "failed": 0, "deferred": 0}
+    last_retention = 0.0
+    while True:
+        with worker_lock(store) as acquired:
+            if not acquired:
+                return {"running": False, "reason": "already_running", **totals}
+            pidfile = store.directory / "worker.pid"
+            descriptor = os.open(pidfile, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, 'w') as stream:
+                stream.write(str(os.getpid()))
+            try:
+                while True:
+                    if time.monotonic() - last_retention > 3600:
+                        store.retention()
+                        last_retention = time.monotonic()
+                    for key, value in service.pump().items():
+                        totals[key] += value
+                    if maintenance_pending(store):
+                        try:
+                            AgentRegistry(store).refresh(environment)
+                            observed = observer.observe_claude()
+                        except (LedgerError, OSError) as error:
+                            # An unavailable Herdr or transcript is not terminal-closure evidence.
+                            message = error.message if isinstance(error, LedgerError) else str(error)
+                            store.note_notification_failure("worker sweep: " + message)
+                        else:
+                            if observed["receipts"]:
+                                for key, value in service.pump().items():
+                                    totals[key] += value
+                    if once or not maintenance_pending(store):
+                        break
+                    time.sleep(5)
+            finally:
+                pidfile.unlink(missing_ok=True)
+        # Publish unlock BEFORE checking emptiness again. A sender committing
+        # before unlock may have observed our flock and declined to start a
+        # replacement; we resume that work ourselves. A later sender can acquire
+        # the now-free flock. No new process/autostart is needed for this handoff,
+        # and an explicit one-pass command never turns into a daemon.
+        if once or not maintenance_pending(store):
+            return {"running": False, "reason": "one_pass" if once else "no_pending_work", **totals}
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS agents (
  is_main_checkout INTEGER NOT NULL, alias TEXT NOT NULL,
  active INTEGER NOT NULL DEFAULT 1, extension_present INTEGER NOT NULL DEFAULT 0,
  last_ham_label TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+ native_session_pid INTEGER,
  UNIQUE(host,terminal_id,generation));
 CREATE TABLE IF NOT EXISTS terminal_slots (
  host TEXT NOT NULL, terminal_id TEXT NOT NULL, pane_id TEXT NOT NULL,
@@ -109,7 +110,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
  hold_reason TEXT, claim_id TEXT, claimed_agent_id TEXT, claimed_generation INTEGER,
  via TEXT, delivered_agent_id TEXT, authoritative INTEGER NOT NULL,
  delivered_at REAL, handled_at REAL, updated_at REAL NOT NULL,
- withdraw_requested INTEGER NOT NULL DEFAULT 0, evidence TEXT);
+ withdraw_requested INTEGER NOT NULL DEFAULT 0, evidence TEXT,
+ confirmation_source TEXT CHECK(confirmation_source IN ('native','operator')));
 CREATE INDEX IF NOT EXISTS inbox_slot ON deliveries(recipient_host,recipient_terminal_id,state);
 CREATE TABLE IF NOT EXISTS dedupe_receipts (
  message_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, origin_host TEXT NOT NULL,
@@ -141,6 +143,26 @@ CREATE TABLE IF NOT EXISTS setting_conditions (
  repo_id TEXT NOT NULL, field TEXT NOT NULL, version INTEGER NOT NULL,
  origin_host TEXT NOT NULL, expected_main TEXT NOT NULL,
  PRIMARY KEY(repo_id,field,version,origin_host));
+CREATE TABLE IF NOT EXISTS native_claims (
+ claim_id TEXT PRIMARY KEY, client TEXT NOT NULL, session_ref TEXT NOT NULL,
+ marker TEXT NOT NULL, content_sha256 TEXT NOT NULL, created_at REAL NOT NULL,
+ transcript_path TEXT, transcript_start_offset INTEGER, content_bytes INTEGER);
+CREATE TABLE IF NOT EXISTS submissions (
+ submission_id TEXT PRIMARY KEY, operation_id TEXT UNIQUE, repo_id TEXT,
+ via TEXT NOT NULL CHECK(via IN ('direct','spawn_initial')),
+ acceptance TEXT NOT NULL CHECK(acceptance IN ('submitting','accepted','unknown','failed')),
+ sender TEXT NOT NULL, sender_kind TEXT NOT NULL CHECK(sender_kind IN ('user','agent','non-agent','unknown')),
+ target TEXT NOT NULL, body TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+ body_sha256 TEXT NOT NULL, readiness_evidence TEXT NOT NULL DEFAULT '',
+ evidence TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS submissions_repo_updated ON submissions(repo_id,via,updated_at DESC);
+CREATE TABLE IF NOT EXISTS claim_resolutions (
+ seq INTEGER PRIMARY KEY, claim_id TEXT NOT NULL, message_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ disposition TEXT NOT NULL CHECK(disposition IN ('applied','not_applied')),
+ evidence TEXT NOT NULL, resolved_at REAL NOT NULL,
+ UNIQUE(claim_id,message_id));
+CREATE INDEX IF NOT EXISTS claim_resolution_lookup ON claim_resolutions(claim_id,seq);
 """
 
 
@@ -170,11 +192,30 @@ class LedgerStore:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
-            if existing and int(existing[0]) != SCHEMA_VERSION:
+            existing_version = int(existing[0]) if existing else 0
+            if existing and existing_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
                 raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
+            if "confirmation_source" not in columns:
+                connection.execute("ALTER TABLE deliveries ADD COLUMN confirmation_source TEXT "
+                                   "CHECK(confirmation_source IN ('native','operator'))")
+                connection.execute(
+                    "UPDATE deliveries SET confirmation_source='operator' WHERE EXISTS ("
+                    "SELECT 1 FROM claim_resolutions r WHERE r.message_id=deliveries.message_id "
+                    "AND r.claim_id=deliveries.claim_id AND r.disposition='applied')")
+            native_columns = {row["name"] for row in connection.execute("PRAGMA table_info(native_claims)")}
+            for name, kind in (("transcript_path", "TEXT"), ("transcript_start_offset", "INTEGER"),
+                               ("content_bytes", "INTEGER")):
+                if name not in native_columns:
+                    connection.execute(f"ALTER TABLE native_claims ADD COLUMN {name} {kind}")
+            agent_columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
+            if "native_session_pid" not in agent_columns:
+                connection.execute("ALTER TABLE agents ADD COLUMN native_session_pid INTEGER")
             default_name = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname().split('.')[0]) or "host"
-            for key, value in (("schema_version", str(SCHEMA_VERSION)),
-                               ("self_canonical_name", chosen_name or default_name),
+            connection.execute("INSERT INTO ledger_meta VALUES ('schema_version',?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                               (str(SCHEMA_VERSION),))
+            for key, value in (("self_canonical_name", chosen_name or default_name),
                                ("self_uuid", str(uuid.uuid4()))):
                 connection.execute("INSERT OR IGNORE INTO ledger_meta VALUES (?,?)", (key, value))
             metadata = dict(connection.execute("SELECT key,value FROM ledger_meta"))
@@ -227,13 +268,33 @@ class LedgerStore:
                 # induce a new-message retry because the advisory bell failed.
                 warning = {"code": "notification_failed", "message": str(error),
                            "committed": True, "recovery": "event_or_safety_sweep"}
-                self.notification_errors.append(warning)
+                if warning not in self.notification_errors:
+                    self.notification_errors.append(warning)
                 try:
-                    with self.read() as recovery:
-                        recovery.execute("INSERT INTO notification_failures(at,detail) VALUES (?,?)",
-                                         (time.time(), str(error)))
+                    self.note_notification_failure(str(error))
                 except sqlite3.Error:
                     pass
+
+    def note_notification_failure(self, detail: str) -> None:
+        """One last-seen row per diagnostic, retained by the existing 30-day policy.
+
+        Diagnostics bypass bells: reporting a broken bell must not recurse.
+        """
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT min(seq) FROM notification_failures WHERE detail=?", (detail,)).fetchone()
+            if row[0] is None:
+                connection.execute("INSERT INTO notification_failures(at,detail) VALUES (?,?)", (time.time(), detail))
+            else:
+                connection.execute("UPDATE notification_failures SET at=? WHERE seq=?", (time.time(), row[0]))
+                connection.execute("DELETE FROM notification_failures WHERE detail=? AND seq<>?", (detail, row[0]))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def ring(self, terminals: Sequence[str] = ()) -> None:
         for name in {"_board", *(quote(terminal, safe="._-:") for terminal in terminals if terminal)}:
@@ -263,6 +324,8 @@ class LedgerStore:
             expired = connection.execute(
                 "DELETE FROM messages WHERE final_at IS NOT NULL AND final_at<?",
                 (at - 90 * 86400,)).rowcount
+            connection.execute("DELETE FROM native_claims WHERE NOT EXISTS "
+                               "(SELECT 1 FROM deliveries d WHERE d.claim_id=native_claims.claim_id)")
             # Threads have no message bodies and remain useful as stable reply identities.
             status = connection.execute("DELETE FROM status_log WHERE at<?", (at - 30 * 86400,)).rowcount
             wake = connection.execute("DELETE FROM wake_log WHERE at<?", (at - 30 * 86400,)).rowcount
@@ -303,7 +366,8 @@ def receipt(connection: sqlite3.Connection, message_id: str) -> dict[str, Any]:
     result = {key: row[key] for key in (
         "message_id", "origin_host", "payload_hash", "recipient_address", "recipient_host",
         "recipient_terminal_id", "state", "hold_reason", "via", "delivered_agent_id",
-        "delivered_at", "handled_at", "updated_at", "withdraw_requested", "authoritative")}
+        "delivered_at", "handled_at", "updated_at", "withdraw_requested", "authoritative",
+        "confirmation_source", "evidence")}
     result["authoritative_host"] = row["recipient_host"] if row["state"] != "pending" else None
     return result
 

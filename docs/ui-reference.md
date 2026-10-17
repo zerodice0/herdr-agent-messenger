@@ -1,6 +1,108 @@
-# Popup UI reference
+# HAM mailbox and popup UI reference
 
 [한국어](ko/ui-reference.md) · English · [README](../README.md)
+
+## Open the mailbox
+
+**HAM: Mailbox (Right Split)** (`herdr.agent-messenger.mailbox-split`) opens a
+plugin-owned pane to the right of the opener. **HAM: Mailbox (Tab)**
+(`herdr.agent-messenger.mailbox-tab`) uses the same entrypoint in a tab. A shell
+pane can open it; the opener does not need to contain an agent. These actions do
+not change your keybindings or install a runtime.
+
+HAM remembers the actual mailbox pane and terminal IDs per workspace. Opening
+again focuses that live plugin pane, regardless of its label or another pane
+being named `HAM`. The opener pane and terminal are passed separately to the
+mailbox. Outside the editor, `q` closes only the plugin-owned mailbox pane;
+`Esc` first leaves an editor or detail view.
+
+### Four screens
+
+- **1 Status:** local and configured peer agents, canonical host, role, turn,
+  phase, unread count (`queued` or internally claimed), and extension presence.
+  Missing extension support is shown explicitly, not as a delivery failure.
+  A disconnected host retains its last snapshot marked stale, with unread shown
+  as `?`; no offline host is inferred to have closed its agents. `Enter` inspects
+  an agent. Select an agent and press `c` to choose its repository and compose.
+- **2 Threads:** retained message bodies and delivery/hold states, withdrawal
+  requests, direct submissions, and pending/failed OUTBOX entries. `Enter`
+  inspects the selected entry; arrows scroll details. Viewing does not deliver
+  or handle a message. `w` withdraws an eligible locally originated message;
+  `t` explicitly retries the selected OUTBOX item with its existing identity.
+- **3 Compose:** sender is always `user`. `Tab` switches subject/body; `Enter`
+  inserts a body newline. `Ctrl+K` switches `fyi`/`action`. `Ctrl+D` switches
+  mailbox/explicit **USER direct input**. `Ctrl+S` reviews the selected route;
+  a second `Ctrl+S` confirms. Ordinary letters and digits, including `q`, are
+  text while editing. `Esc` returns to the board.
+- **4 Settings:** exactly seven rows are editable with `Enter`: `mode`
+  (`off`/`manual`/`auto`), `main`, `members`, `idle_minutes`,
+  `coalesce_seconds`, `wakes_per_hour`, and `max_hop`. Main is a
+  canonical-host/terminal JSON target or `null`; members are an array of those
+  targets. After choosing a board agent with `c`, `m` designates that agent as
+  main and `Space` toggles its manual membership. Home (the canonical host where
+  the mode was first enabled), `computed_main`, version/origin stamps,
+  propagation pending and conflicts are intentionally read-only. These controls
+  call the internal settings service; agent `repo show` stays read-only.
+
+Only one settings save can be in flight. **Saving settings** marks the pending
+operation; further save submissions or toggles are rejected, not queued. Wait for
+the result, then retry the intended change. Text edits are retained if their save
+is rejected. Navigation remains responsive, and `q` still closes outside text
+editors while saving.
+The authoritative result is shown immediately, and stale snapshots cannot replace
+it.
+
+`Page Up` / `Page Down` scroll long details and settings metadata, including
+conflict records beyond the editable rows. Conflict metadata wraps without losing
+values, winners, versions or origins, so the full records remain available.
+Outside the composer, `?` opens the
+full current error/status and peer-connection details when a short footer clips
+them. Unsent draft edits made while a send is pending are retained.
+
+### Honest acceptance and uncertainty
+
+Mailbox composition follows normal native receiving rules. Direct input instead
+submits the exact `Message from user (HAM):` header through the existing verified
+terminal transport. It may interrupt the target, so it requires the explicit
+route selection and confirmation. HAM durably records `via=direct` and
+`submitting` before transport, then `accepted`, `unknown`, or `failed`; these are
+not native `delivered`/`handled` receipts. Inspect direct results in Threads.
+An interrupted `submitting` or `unknown` submission must be checked before
+another explicit send; HAM does not replay it automatically.
+
+An uncertain native claim remains held, including after a session replacement.
+In its thread, `a` confirms applied or `n` confirms not-applied. Both open a
+warning and require nonempty operator evidence before `Enter` confirms.
+Applied refers to the old claimed agent/generation and is labeled a **manual
+user confirmation**, not runtime-journal evidence or provider understanding.
+Not-applied releases exactly that claim; it does not itself resend anything.
+`Esc` cancels without changing the claim.
+
+The open TUI stats the local board bell once per second. Peer status queries
+run independently every 30 seconds in bounded child processes, never inside the
+keyboard read loop. Closing stops only its own workers. These are code-only
+checks and do not create model turns. Korean input, terminal-cell clipping,
+resize and compact-screen instructions use the same text helpers as the legacy
+messenger.
+
+### Role, phase and border ownership
+
+HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
+the alias remains addressable. A shared projection reports alias, color,
+display name and phase (`recap`) under the HAM metadata source. Device tokens
+such as `phone` and `emu` and other sources are not overwritten.
+
+When status/roles are invoked, summary supplies `[메인] summary` or
+`[워커] summary` on the border; off-mode status has no role prefix. HAM updates
+only a blank border, a verified legacy border, or its own last recorded border
+value. A differing user rename is preserved. The old `user:pane-recap` token is
+cleared only when the new status/role feature is invoked; this UI does not
+deploy or remove global recap rules.
+
+## Legacy direct-prompt popup
+
+The existing **Send Prompt to Agents** and **Held Messages** actions remain
+available. The sections below describe that older popup, not mailbox delivery.
 
 ## Open the messenger
 

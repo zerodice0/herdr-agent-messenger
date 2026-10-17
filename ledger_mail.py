@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import time
 from typing import Any, Mapping, Sequence
 import uuid
@@ -53,8 +55,9 @@ def payload_hash(payload: Mapping[str, Any]) -> str:
 
 
 class Mailbox:
-    def __init__(self, store: LedgerStore) -> None:
+    def __init__(self, store: LedgerStore, environment: Mapping[str, str] | None = None) -> None:
         self.store = store
+        self.environment = environment
 
     def send(self, sender: Mapping[str, Any], recipient: Mapping[str, Any], *, body: str,
              kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
@@ -66,30 +69,73 @@ class Mailbox:
                    "sender_label": sender["alias"] or sender["terminal_id"], "kind": kind, "hop": 0,
                    "body": body, "subject": subject, "created_at": time.time(),
                    "recipient_host": recipient["host"], "recipient_terminal_id": recipient["terminal_id"],
-                   "recipient_address": recipient.get("recipient_address") or f"{recipient['host']}/{recipient['alias'] or recipient['terminal_id']}"}
-        with self.store.transaction((recipient["terminal_id"], sender["terminal_id"])) as connection:
-            check_generation(connection, self.store.host, sender["terminal_id"], sender["agent_id"], sender["generation"])
-            if recipient["host"] == self.store.host and recipient["terminal_id"]:
-                check_generation(connection, self.store.host, recipient["terminal_id"], recipient["agent_id"], recipient["generation"])
+                   "recipient_address": recipient.get("recipient_address") or
+                   f"{recipient['host']}/{recipient['alias'] or recipient['terminal_id']}"}
+        return self._submit_message(payload, sender=sender, recipient=recipient, auto_handle_parent=True)
+
+    def send_user(self, repo_id: str, recipient: Mapping[str, Any], *, body: str,
+                  kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
+        if not repo_id or recipient.get("repo_id") != repo_id:
+            raise LedgerError("repo_mismatch", "Mailbox recipients must occupy the selected repository identity.")
+        message_id = str(uuid.uuid4())
+        payload = {"message_id": message_id, "thread_id": message_id, "repo_id": repo_id,
+                   "reply_to": reply_to, "origin_host": self.store.host, "sender": "user",
+                   "sender_label": "user", "kind": kind, "hop": 0, "body": body, "subject": subject,
+                   "created_at": time.time(), "recipient_host": recipient["host"],
+                   "recipient_terminal_id": recipient["terminal_id"],
+                   "recipient_address": recipient.get("recipient_address") or
+                   f"{recipient['host']}/{recipient.get('alias') or recipient['terminal_id']}"}
+        result = self._submit_message(payload, sender=None, recipient=recipient, auto_handle_parent=False)
+        values = os.environ if self.environment is None else self.environment
+        if values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") != "0":
+            try:
+                from ledger_worker import ensure_worker
+                ensure_worker(self.store, self.environment)
+            except (LedgerError, OSError) as error:
+                result = {**result, "warnings": [*result.get("warnings", []),
+                         {"code": "worker_start_failed", "message": str(error), "committed": True}]}
+        return result
+
+    def _submit_message(self, payload: dict[str, Any], *, sender: Mapping[str, Any] | None,
+                        recipient: Mapping[str, Any], auto_handle_parent: bool) -> dict[str, Any]:
+        sender_terminal = sender.get("terminal_id") if sender is not None else None
+        recipient_terminal = recipient.get("terminal_id")
+        terminals = tuple(terminal for terminal in (recipient_terminal, sender_terminal) if terminal)
+        with self.store.transaction(terminals) as connection:
+            if sender is not None:
+                check_generation(connection, self.store.host, sender["terminal_id"],
+                                 sender["agent_id"], sender["generation"])
+            if recipient["host"] == self.store.host and recipient_terminal:
+                check_generation(connection, self.store.host, recipient_terminal,
+                                 recipient["agent_id"], recipient["generation"])
             parent = None
+            reply_to = payload["reply_to"]
             if reply_to:
                 require_uuid(reply_to, "reply_to")
-                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.state FROM messages m "
-                                            "JOIN deliveries d USING(message_id) WHERE message_id=?", (reply_to,)).fetchone()
-                if parent is None or parent["repo_id"] != sender["repo_id"]:
+                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.state "
+                                            "FROM messages m JOIN deliveries d USING(message_id) "
+                                            "WHERE message_id=?", (reply_to,)).fetchone()
+                if parent is None or parent["repo_id"] != payload["repo_id"]:
                     raise LedgerError("reply_not_found", "Reply target is not a retained message in this repository.")
                 payload.update(thread_id=parent["thread_id"], hop=parent["hop"] + 1)
-                thread = connection.execute("SELECT subject FROM threads WHERE thread_id=?", (parent["thread_id"],)).fetchone()
+                thread = connection.execute("SELECT subject FROM threads WHERE thread_id=?",
+                                            (parent["thread_id"],)).fetchone()
                 payload["subject"] = thread[0]
-                if parent["recipient_terminal_id"] == sender["terminal_id"] and parent["state"] == "delivering":
-                    raise LedgerError("delivery_in_progress", "Resolve an uncertain delivery before marking it handled by reply.")
+                if (sender is not None and auto_handle_parent and
+                        parent["recipient_terminal_id"] == sender["terminal_id"] and
+                        parent["state"] == "delivering"):
+                    raise LedgerError("delivery_in_progress",
+                                      "Resolve an uncertain delivery before marking it handled by reply.")
             value = validate_payload(payload)
             from ledger_remote import RemoteLedger
-            result = RemoteLedger(self.store).submit(connection, value)
-            if (parent and parent["recipient_host"] == self.store.host and parent["recipient_terminal_id"] == sender["terminal_id"]
-                    and parent["state"] in {"queued", "delivered"}):
+            result = RemoteLedger(self.store, self.environment).submit(connection, value)
+            if (sender is not None and auto_handle_parent and parent and
+                    parent["recipient_host"] == self.store.host and
+                    parent["recipient_terminal_id"] == sender["terminal_id"] and
+                    parent["state"] in {"queued", "delivered"}):
                 self._handled(connection, reply_to, time.time())
-        return self.store.annotate({"message_id": message_id, "thread_id": payload["thread_id"], **result})
+        return self.store.annotate({"message_id": payload["message_id"],
+                                    "thread_id": payload["thread_id"], **result})
 
     def enqueue(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Idempotent local acceptance; remote authentication lives at the transport boundary."""
@@ -177,6 +223,201 @@ class Mailbox:
             rows = connection.execute("SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) "
                                       "WHERE thread_id=? ORDER BY m.created_at,m.message_id", (thread_id,)).fetchall()
         return {**dict(thread), "messages": [dict(row) for row in rows]}
+    def list_threads(self, repo_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+        if not 1 <= limit <= 1000:
+            raise LedgerError("invalid_limit", "Thread limit must be between 1 and 1000.")
+        with self.store.read() as connection:
+            query = ("SELECT t.thread_id,t.repo_id,t.subject,max(d.updated_at) AS updated_at "
+                     "FROM threads t JOIN messages m USING(thread_id) "
+                     "JOIN deliveries d USING(message_id)")
+            parameters: list[Any] = []
+            if repo_id is not None:
+                query += " WHERE t.repo_id=?"
+                parameters.append(repo_id)
+            rows = connection.execute(query + " GROUP BY t.thread_id,t.repo_id,t.subject "
+                                       "ORDER BY updated_at DESC,t.thread_id LIMIT ?",
+                                       (*parameters, limit)).fetchall()
+            if not rows:
+                return {"threads": []}
+            thread_ids = [row["thread_id"] for row in rows]
+            placeholders = ",".join("?" for _ in thread_ids)
+            messages = connection.execute(
+                f"SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) "
+                f"WHERE m.thread_id IN ({placeholders}) ORDER BY m.created_at,m.message_id",
+                thread_ids,
+            ).fetchall()
+        grouped = {thread_id: [] for thread_id in thread_ids}
+        for row in messages:
+            grouped[row["thread_id"]].append(dict(row))
+        return {"threads": [{**dict(row), "messages": grouped[row["thread_id"]]} for row in rows]}
+
+    @staticmethod
+    def _submission_record(row: Any) -> dict[str, Any]:
+        record = dict(row)
+        via = record["via"]
+        sender: Any = record["sender"]
+        if via == "spawn_initial":
+            sender = json.loads(sender)
+        acceptance = record["acceptance"]
+        return {
+            "submission_id": record["submission_id"],
+            "operation_id": record["operation_id"],
+            "repo_id": record["repo_id"],
+            "via": via,
+            "acceptance": acceptance,
+            "sender": sender,
+            "sender_kind": record["sender_kind"],
+            "target": json.loads(record["target"]),
+            "body": record["body"],
+            "subject": record["subject"],
+            "body_hash": record["body_sha256"],
+            "readiness_evidence": record["readiness_evidence"],
+            "evidence": record["evidence"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        }
+
+    def begin_direct(self, repo_id: str, recipient: Mapping[str, Any], *,
+                     body: str, subject: str = "") -> dict[str, Any]:
+        if not isinstance(repo_id, str) or not repo_id:
+            raise LedgerError("invalid_repo", "Direct submission needs a repository identity.")
+        if not isinstance(recipient, Mapping):
+            raise LedgerError("invalid_target", "Direct submission target must be an object.")
+        if not isinstance(body, str) or not body.strip():
+            raise LedgerError("invalid_body", "A direct submission body must not be empty.")
+        if not isinstance(subject, str) or len(subject.encode("utf-8")) > 1024:
+            raise LedgerError("invalid_subject", "Direct subject must fit within 1024 UTF-8 bytes.")
+        target = dict(recipient)
+        created = time.time()
+        submission_id = str(uuid.uuid4())
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        with self.store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO submissions(submission_id,operation_id,repo_id,via,acceptance,sender,sender_kind,"
+                "target,body,subject,body_sha256,created_at,updated_at) "
+                "VALUES (?,NULL,?,'direct','submitting','user','user',?,?,?,?,?,?)",
+                (submission_id, repo_id, json_text(target), body, subject, digest, created, created),
+            )
+            row = connection.execute("SELECT * FROM submissions WHERE submission_id=?",
+                                     (submission_id,)).fetchone()
+        return self._submission_record(row)
+
+    def finish_direct(self, submission_id: str, *, acceptance: str, evidence: str) -> dict[str, Any]:
+        require_uuid(submission_id, "submission_id")
+        if acceptance not in {"accepted", "unknown", "failed"}:
+            raise LedgerError("invalid_acceptance", "Direct acceptance must be accepted, unknown, or failed.")
+        if not isinstance(evidence, str):
+            raise LedgerError("invalid_evidence", "Direct submission evidence must be text.")
+        with self.store.transaction() as connection:
+            row = connection.execute("SELECT * FROM submissions WHERE submission_id=? AND via='direct'",
+                                     (submission_id,)).fetchone()
+            if row is None:
+                raise LedgerError("submission_not_found", "No direct submission with that ID exists.")
+            finished = self._finish_submission(connection, row, acceptance, evidence)
+        return self._submission_record(finished)
+
+    def list_direct(self, repo_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+        if not 1 <= limit <= 1000:
+            raise LedgerError("invalid_limit", "Direct submission limit must be between 1 and 1000.")
+        with self.store.read() as connection:
+            query = "SELECT * FROM submissions WHERE via='direct'"
+            parameters: list[Any] = []
+            if repo_id is not None:
+                query += " AND repo_id=?"
+                parameters.append(repo_id)
+            rows = connection.execute(query + " ORDER BY updated_at DESC,submission_id LIMIT ?",
+                                      (*parameters, limit)).fetchall()
+        return {"submissions": [self._submission_record(row) for row in rows]}
+
+    @staticmethod
+    def _finish_submission(connection: Any, row: Any, acceptance: str, evidence: str) -> Any:
+        if row["acceptance"] == "accepted" or row["acceptance"] == acceptance:
+            return row
+        connection.execute("UPDATE submissions SET acceptance=?,evidence=?,updated_at=? WHERE submission_id=? "
+                           "AND acceptance<>'accepted'",
+                           (acceptance, evidence, time.time(), row["submission_id"]))
+        return connection.execute("SELECT * FROM submissions WHERE submission_id=?",
+                                  (row["submission_id"],)).fetchone()
+
+    def claim_spawn_submission(self, operation_id: str, *, target: Mapping[str, Any], body: str,
+                               sender: Mapping[str, Any], readiness_evidence: str) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 4096:
+            raise LedgerError("invalid_operation", "Spawn operation ID must be a bounded nonempty string.")
+        if not isinstance(target, Mapping) or not isinstance(sender, Mapping):
+            raise LedgerError("invalid_submission", "Spawn target and sender must be objects.")
+        target_value = dict(target)
+        required_target = {"transport_host", "host", "local", "terminal_id", "session_ref",
+                           "client", "pane_id", "address", "workspace_id", "tab_id", "created"}
+        if required_target - target_value.keys():
+            raise LedgerError("invalid_target", "Spawn target is missing a bound Herdr identity field.")
+        if not isinstance(body, str) or not body.strip():
+            raise LedgerError("invalid_body", "Spawn prompt body must not be empty.")
+        if not isinstance(readiness_evidence, str) or not readiness_evidence.strip():
+            raise LedgerError("missing_evidence", "Actual Herdr readiness evidence is required.")
+        sender_value = dict(sender)
+        sender_kind = sender_value.get("kind")
+        if sender_kind == "agent":
+            required_sender = ("host", "terminal_id", "session_ref", "client", "agent_id")
+            if any(not isinstance(sender_value.get(key), str) or not sender_value[key]
+                   for key in required_sender):
+                raise LedgerError("invalid_sender", "Agent spawn initiator must include its verified identity.")
+        elif sender_kind in {"unknown", "non-agent"}:
+            pass
+        else:
+            raise LedgerError("invalid_sender", "Spawn initiator kind must be agent, non-agent, or unknown.")
+        target_text = json_text(target_value)
+        sender_text = json_text(sender_value)
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        repo_id = sender_value.get("repo_id") or target_value.get("repo_id")
+        with self.store.transaction() as connection:
+            existing = connection.execute("SELECT * FROM submissions WHERE operation_id=?",
+                                          (operation_id,)).fetchone()
+            if existing is not None:
+                if (existing["via"] != "spawn_initial" or existing["target"] != target_text or
+                        existing["body_sha256"] != digest or existing["sender"] != sender_text):
+                    raise LedgerError("submission_conflict",
+                                      "This spawn operation ID is already bound to different immutable inputs.")
+                return {"submission_id": existing["submission_id"], "should_submit": False,
+                        "record": self._submission_record(existing)}
+            submission_id = str(uuid.uuid4())
+            created = time.time()
+            connection.execute(
+                "INSERT INTO submissions(submission_id,operation_id,repo_id,via,acceptance,sender,sender_kind,"
+                "target,body,subject,body_sha256,readiness_evidence,created_at,updated_at) "
+                "VALUES (?,?,?,'spawn_initial','submitting',?,?,?,?,'',?,?,?,?)",
+                (submission_id, operation_id, repo_id, sender_text, sender_kind, target_text, body,
+                 digest, readiness_evidence, created, created),
+            )
+            row = connection.execute("SELECT * FROM submissions WHERE submission_id=?",
+                                     (submission_id,)).fetchone()
+        return {"submission_id": submission_id, "should_submit": True,
+                "record": self._submission_record(row)}
+
+    def finish_spawn_submission(self, operation_id: str, *, acceptance: str,
+                                evidence: str) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise LedgerError("invalid_operation", "Spawn operation ID must be nonempty.")
+        if acceptance not in {"accepted", "unknown", "failed"}:
+            raise LedgerError("invalid_acceptance", "Spawn acceptance must be accepted, unknown, or failed.")
+        if not isinstance(evidence, str):
+            raise LedgerError("invalid_evidence", "Spawn submission evidence must be text.")
+        with self.store.transaction() as connection:
+            row = connection.execute("SELECT * FROM submissions WHERE operation_id=? AND via='spawn_initial'",
+                                     (operation_id,)).fetchone()
+            if row is None:
+                raise LedgerError("submission_not_found", "No initial spawn submission with that operation ID exists.")
+            finished = self._finish_submission(connection, row, acceptance, evidence)
+        return self._submission_record(finished)
+
+    def get_spawn_submission(self, operation_id: str) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise LedgerError("invalid_operation", "Spawn operation ID must be nonempty.")
+        with self.store.read() as connection:
+            row = connection.execute("SELECT * FROM submissions WHERE operation_id=? AND via='spawn_initial'",
+                                     (operation_id,)).fetchone()
+        if row is None:
+            raise LedgerError("submission_not_found", "No initial spawn submission with that operation ID exists.")
+        return self._submission_record(row)
 
     def handle(self, agent: Mapping[str, Any], message_ids: Sequence[str]) -> dict[str, Any]:
         if not message_ids:
@@ -212,40 +453,51 @@ class Mailbox:
         origin = origin_host or self.store.host
         terminals: list[str] = []
         with self.store.transaction(terminals) as connection:
-            row = connection.execute("SELECT m.origin_host,m.sender,d.* FROM messages m JOIN deliveries d USING(message_id) "
-                                     "WHERE message_id=?", (message_id,)).fetchone()
-            if row is not None:
-                if row["origin_host"] != origin:
+            result = self._withdraw(connection, message_id, origin_host=origin, sender=sender)
+            if result.get("recipient_terminal_id"):
+                terminals.append(result["recipient_terminal_id"])
+        return result
+
+    def _withdraw(self, connection: Any, message_id: str, *, origin_host: str,
+                  sender: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Arbitrate withdrawal inside the caller's serialized write transaction."""
+        row = connection.execute("SELECT m.origin_host,m.sender,d.* FROM messages m JOIN deliveries d USING(message_id) "
+                                 "WHERE message_id=?", (message_id,)).fetchone()
+        if row is not None:
+            if row["origin_host"] != origin_host:
+                raise LedgerError("wrong_origin", "Only the original host can withdraw this message.")
+            if sender is not None:
+                check_generation(connection, self.store.host, sender["terminal_id"], sender["agent_id"], sender["generation"])
+                owner = connection.execute("SELECT terminal_id,repo_id FROM agents WHERE agent_id=?", (row["sender"],)).fetchone()
+                if owner is None or owner["terminal_id"] != sender["terminal_id"] or owner["repo_id"] != sender["repo_id"]:
+                    raise LedgerError("not_sender", "Only the originating terminal can withdraw this message.")
+            if not row["authoritative"]:
+                from ledger_remote import RemoteLedger
+                return RemoteLedger(self.store).withdraw_copy(connection, message_id)
+            if row["state"] not in {"queued", "withdrawn"}:
+                return {**receipt(connection, message_id), "withdrawn": False, "reason": "already_claimed_or_final"}
+            if row["state"] == "withdrawn":
+                return {**receipt(connection, message_id), "withdrawn": True}
+            at = time.time()
+            connection.execute("UPDATE deliveries SET state='withdrawn',hold_reason=NULL,updated_at=? "
+                               "WHERE message_id=? AND state='queued'", (at, message_id))
+            connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, message_id))
+            result = save_receipt(connection, message_id)
+        else:
+            with_retention = connection.execute("SELECT origin_host FROM dedupe_receipts WHERE message_id=?", (message_id,)).fetchone()
+            if with_retention:
+                if with_retention[0] != origin_host:
                     raise LedgerError("wrong_origin", "Only the original host can withdraw this message.")
-                if sender is not None:
-                    check_generation(connection, self.store.host, sender["terminal_id"], sender["agent_id"], sender["generation"])
-                    owner = connection.execute("SELECT terminal_id,repo_id FROM agents WHERE agent_id=?", (row["sender"],)).fetchone()
-                    if owner is None or owner["terminal_id"] != sender["terminal_id"] or owner["repo_id"] != sender["repo_id"]:
-                        raise LedgerError("not_sender", "Only the originating terminal can withdraw this message.")
-                terminals.append(row["recipient_terminal_id"])
-                if not row["authoritative"]:
-                    from ledger_remote import RemoteLedger
-                    return RemoteLedger(self.store).withdraw_copy(connection, message_id)
-                if row["state"] not in {"queued", "withdrawn"}:
-                    return {**receipt(connection, message_id), "withdrawn": False, "reason": "already_claimed_or_final"}
-                if row["state"] == "withdrawn":
-                    return {**receipt(connection, message_id), "withdrawn": True}
-                at = time.time()
-                connection.execute("UPDATE deliveries SET state='withdrawn',hold_reason=NULL,updated_at=? "
-                                   "WHERE message_id=? AND state='queued'", (at, message_id))
-                connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, message_id))
-                result = save_receipt(connection, message_id)
-            else:
-                with_retention = connection.execute("SELECT origin_host FROM dedupe_receipts WHERE message_id=?", (message_id,)).fetchone()
-                if with_retention:
-                    if with_retention[0] != origin:
-                        raise LedgerError("wrong_origin", "Only the original host can withdraw this message.")
-                    final = receipt(connection, message_id)
-                    if final["state"] == "withdrawn":
-                        return {**final, "withdrawn": True}
-                    return {**final, "withdrawn": False, "reason": "retained_final"}
-                result = {"message_id": message_id, "state": "withdrawn", "origin_host": origin}
-            connection.execute("INSERT OR IGNORE INTO withdraw_tombstones VALUES (?,?,?)", (message_id, origin, time.time()))
+                final = receipt(connection, message_id)
+                if final["state"] == "withdrawn":
+                    return {**final, "withdrawn": True}
+                return {**final, "withdrawn": False, "reason": "retained_final"}
+            tombstone = connection.execute("SELECT origin_host FROM withdraw_tombstones WHERE message_id=?",
+                                           (message_id,)).fetchone()
+            if tombstone and tombstone[0] != origin_host:
+                raise LedgerError("wrong_origin", "Withdrawal origin does not match the existing tombstone.")
+            result = {"message_id": message_id, "state": "withdrawn", "origin_host": origin_host}
+        connection.execute("INSERT OR IGNORE INTO withdraw_tombstones VALUES (?,?,?)", (message_id, origin_host, time.time()))
         return {**result, "withdrawn": True}
 
     def claim(self, *, terminal_id: str, agent_id: str, generation: int,
@@ -254,7 +506,6 @@ class Mailbox:
             raise LedgerError("invalid_kind", "Claim kinds must contain fyi and/or action.")
         if via not in {"wake", "before_agent_start", "hook"}:
             raise LedgerError("invalid_via", "Only runtime adapters can claim native context delivery.")
-        claim_id = str(uuid.uuid4())
         with self.store.transaction((terminal_id,)) as connection:
             agent = check_generation(connection, self.store.host, terminal_id, agent_id, generation)
             placeholders = ','.join('?' for _ in kinds)
@@ -263,13 +514,22 @@ class Mailbox:
                 "d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' AND m.repo_id=? "
                 f"AND m.kind IN ({placeholders}) ORDER BY m.created_at,m.message_id LIMIT 100",
                 (self.store.host, terminal_id, agent["repo_id"], *kinds)).fetchall()
-            for row in rows:
-                changed = connection.execute(
-                    "UPDATE deliveries SET state='delivering',claim_id=?,claimed_agent_id=?,claimed_generation=?,"
-                    "via=?,hold_reason='acceptance_unknown',updated_at=? WHERE message_id=? AND state='queued'",
-                    (claim_id, agent_id, generation, via, time.time(), row["message_id"])).rowcount
-                if changed != 1:
-                    raise LedgerError("claim_conflict", "Delivery state changed during claim.")
+            result = self._claim_messages(connection, rows, agent_id, generation, via)
+        return result
+
+    @staticmethod
+    def _claim_messages(connection: Any, rows: Sequence[Any], agent_id: str,
+                        generation: int, via: str) -> dict[str, Any]:
+        """Shared atomic claim writer; caller owns selection/generation transaction."""
+        claim_id = str(uuid.uuid4())
+        for row in rows:
+            changed = connection.execute(
+                "UPDATE deliveries SET state='delivering',claim_id=?,claimed_agent_id=?,claimed_generation=?,"
+                "via=?,hold_reason='acceptance_unknown',confirmation_source=NULL,evidence=NULL,updated_at=? "
+                "WHERE message_id=? AND state='queued'",
+                (claim_id, agent_id, generation, via, time.time(), row["message_id"])).rowcount
+            if changed != 1:
+                raise LedgerError("claim_conflict", "Delivery state changed during claim.")
         return {"claim_id": claim_id if rows else None, "agent_id": agent_id, "generation": generation,
                 "messages": [dict(row) for row in rows]}
 
@@ -287,7 +547,8 @@ class Mailbox:
             for row in rows:
                 terminals.append(row["recipient_terminal_id"])
                 connection.execute("UPDATE deliveries SET state='delivered',delivered_at=?,updated_at=?,hold_reason=NULL,"
-                                   "delivered_agent_id=?,evidence=? WHERE message_id=? AND state='delivering'",
+                                   "delivered_agent_id=?,evidence=?,confirmation_source='native' "
+                                   "WHERE message_id=? AND state='delivering'",
                                    (at, at, agent_id, evidence, row["message_id"]))
                 result.append(save_receipt(connection, row["message_id"]))
             if rows and rows[0]["via"] == "wake":
@@ -314,6 +575,75 @@ class Mailbox:
                                        (evidence, row["message_id"]))
         return {"released": len(rows) if disposition == "not_applied" else 0,
                 "uncertain": len(rows) if disposition == "unknown" else 0}
+    def resolve_claim(self, *, claim_id: str, agent_id: str, generation: int,
+                      disposition: str, evidence: str) -> dict[str, Any]:
+        require_uuid(claim_id, "claim_id")
+        if disposition not in {"applied", "not_applied"}:
+            raise LedgerError("invalid_disposition", "Operator resolution must be applied or not_applied.")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise LedgerError("missing_evidence", "Operator resolution needs explicit nonempty evidence.")
+        with self.store.transaction() as connection:
+            prior = connection.execute("SELECT * FROM claim_resolutions WHERE claim_id=? ORDER BY seq",
+                                       (claim_id,)).fetchall()
+            if prior:
+                if any(row["agent_id"] != agent_id or row["generation"] != generation or
+                       row["disposition"] != disposition or row["evidence"] != evidence for row in prior):
+                    raise LedgerError("claim_resolution_conflict", "This claim already has a different operator resolution.")
+                return {"receipts": [receipt(connection, row["message_id"]) for row in prior]}
+            rows = connection.execute(
+                "SELECT d.*,m.repo_id FROM deliveries d JOIN messages m USING(message_id) "
+                "WHERE d.claim_id=? ORDER BY d.message_id", (claim_id,),
+            ).fetchall()
+            if not rows:
+                raise LedgerError("claim_not_found", "Claim is absent or was already released.")
+            if any(row["claimed_agent_id"] != agent_id or row["claimed_generation"] != generation or
+                   row["state"] != "delivering" for row in rows):
+                raise LedgerError("stale_claim", "Claim agent/generation/state does not match the pending claim.")
+            at = time.time()
+            durable_evidence = f"operator:{disposition}:{evidence}"
+            result = []
+            for row in rows:
+                connection.execute(
+                    "INSERT INTO claim_resolutions(claim_id,message_id,agent_id,generation,disposition,evidence,resolved_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (claim_id, row["message_id"], agent_id, generation, disposition, evidence, at),
+                )
+                if disposition == "applied":
+                    connection.execute(
+                        "UPDATE deliveries SET state='delivered',delivered_at=?,updated_at=?,hold_reason=NULL,"
+                        "delivered_agent_id=?,evidence=?,confirmation_source='operator' "
+                        "WHERE message_id=? AND state='delivering'",
+                        (at, at, row["claimed_agent_id"], durable_evidence, row["message_id"]),
+                    )
+                else:
+                    slot = connection.execute(
+                        "SELECT * FROM terminal_slots WHERE host=? AND terminal_id=?",
+                        (row["recipient_host"], row["recipient_terminal_id"]),
+                    ).fetchone()
+                    if slot is None or not slot["present"]:
+                        state, hold = "undeliverable", "terminal_closed"
+                    else:
+                        occupant = connection.execute(
+                            "SELECT repo_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                            (row["recipient_host"], row["recipient_terminal_id"]),
+                        ).fetchone()
+                        state = "queued"
+                        hold = ("recipient_absent" if occupant is None else
+                                "recipient_changed" if occupant["repo_id"] != row["repo_id"] else None)
+                    connection.execute(
+                        "UPDATE deliveries SET state=?,claim_id=NULL,claimed_agent_id=NULL,claimed_generation=NULL,"
+                        "via=NULL,hold_reason=?,workspace_id=?,pane_id=?,evidence=?,"
+                        "confirmation_source='operator',updated_at=? "
+                        "WHERE message_id=? AND state='delivering'",
+                        (state, hold, slot["workspace_id"] if slot else "",
+                         slot["pane_id"] if slot else "", durable_evidence, at, row["message_id"]),
+                    )
+                    if state == "undeliverable":
+                        connection.execute("UPDATE messages SET final_at=coalesce(final_at,?) WHERE message_id=?",
+                                           (at, row["message_id"]))
+                result.append(save_receipt(connection, row["message_id"]))
+        return {"receipts": result}
+
 
     @staticmethod
     def _claim_rows(connection: Any, claim_id: str, agent_id: str, generation: int) -> list[Any]:

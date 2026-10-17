@@ -2,7 +2,7 @@
 
 [한국어](ko/skill-guide.md) · English · [README](../README.md)
 
-HAM lets Codex, Claude Code, and omp message current Herdr agents **and start new labeled interactive sessions** without opening the popup. The canonical skill name is `herdr-agent-messenger`; **HAM** is its shorter user-facing name.
+HAM lets Codex, Claude Code, and omp exchange durable repository mail, inspect coordination status, and **start new labeled interactive Herdr sessions**. Existing-agent prompt routing remains available for nonparticipating traffic. The canonical skill name is `herdr-agent-messenger`; **HAM** is its shorter user-facing name.
 
 ## Install with the plugin
 
@@ -54,12 +54,15 @@ Use HAM to start a new omp agent in a new tab for this project, send it a
 focused code-review assignment, and wait for its response.
 ```
 
-These are different operations: a missing requested label is reported, never guessed or automatically created. When asked to start/open a session and message it, the agent must use HAM `spawn`, then `request --address` with the returned address. Raw `herdr agent start <name>` bypasses HAM label selection and metadata reporting and is not a substitute.
+These are different operations: a missing requested label is reported, never guessed or automatically created. When asked to start/open a session with an assignment, use one HAM `spawn --message TEXT` or `spawn --message-file PATH` operation. HAM persists the initial submission and sends it once after readiness; do not follow it with a separate legacy `request`. Raw `herdr agent start <name>` bypasses HAM label selection and metadata reporting and is not a substitute.
 
-### Claude Code verification and scope caveats
+### Historical Claude skill observations and scope caveats
 
-Verified on winmini with Claude Code **2.1.301** and Herdr **0.9.5** on
-2026-10-16 ([issue #5](https://github.com/zerodice0/herdr-agent-messenger/issues/5)):
+The following observations are from the **older legacy workflow**, on winmini
+with Claude Code **2.1.301** and Herdr **0.9.5**, 2026-10-16
+([issue #5](https://github.com/zerodice0/herdr-agent-messenger/issues/5)).
+They document skill discovery/installation, not today's mailbox receiving
+recipe or native runtime acceptance.
 
 | Check | Observed result |
 | --- | --- |
@@ -67,7 +70,7 @@ Verified on winmini with Claude Code **2.1.301** and Herdr **0.9.5** on
 | Project install | **HAM Skill** → **Project / Claude** copied the complete bundle; the command appeared as `(project)` in that project before user installation. |
 | Checkout bridge | With no user copy installed, Claude followed `.claude/skills/herdr-agent-messenger/SKILL.md` and read the canonical `.agents/skills/herdr-agent-messenger/SKILL.md`. |
 | Invocation | User, project, and checkout runs executed the bundled CLI's `list --host local` with exit 0. |
-| New session | Claude used `spawn --kind omp --placement tab`, then `request --address` with the returned address; the correlated, settled reply was collected without a resend. |
+| Historical new session | The older run used separate spawn and request operations and collected a correlated settled reply without resending. That sequence is not the current initial-assignment recipe; use atomic `spawn --message` instead. |
 | Natural-language selection | Separate fresh requests mentioning HAM or only a real `local/<label>` address selected the `Skill` tool, both in the checkout before user installation and outside it after installation. |
 
 **Same-name precedence:** this Claude Code version selected the **user** copy
@@ -78,7 +81,7 @@ same-named user copy. Restart the client after changing installations.
 
 **Interactive startup:** Claude's folder-trust dialog (and first-run UI
 questions) can block a HAM `spawn --kind claude` readiness check. In this
-verification, blocked starts returned `agent_start_failed` / `agent_not_ready`
+observation, blocked starts returned `agent_start_failed` / `agent_not_ready`
 and reported that the created tab was closed. Handle trust interactively in
 the intended directory before automated startup; inspect cleanup details
 before retrying. Print mode skips the trust dialog, so `claude -p` alone is not
@@ -90,10 +93,12 @@ over SSH while their macOS Keychains were unavailable to non-GUI sessions
 (`User interaction is not allowed`). That observed host/session condition is
 not evidence of a missing skill or a general Claude authentication failure.
 
-## Local mailbox
+## Mailbox commands and identity
 
-Use the local mailbox when a message must remain available without submitting a
-prompt or waking the recipient. Run from a registered Herdr agent pane:
+Use the mailbox to leave durable messages without injecting a prompt into a busy
+agent. Receiving runtimes may admit them at a natural user boundary; only eligible
+OMP action mail can cause an automatic turn under the rules below. Run from a
+registered Herdr agent pane:
 
 ```bash
 HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
@@ -107,8 +112,8 @@ python3 "$HAM_CLI" mail show --thread THREAD_UUID
 nonblank, 16 KiB maximum). `--kind fyi|action` defaults to `fyi`; `--subject`
 sets a new thread's subject (1024 UTF-8 bytes), and `--reply-to UUID` keeps the
 thread, increments hop, and atomically handles an addressed queued/delivered
-parent. Both kinds remain queued until explicitly handled or claimed by a
-runtime receiver. The local command does not wake a model.
+parent. Both kinds stay queued until explicit handling or a runtime claim.
+`mail send` itself does not start a model turn.
 
 `inbox read` accepts `--message UUID`, `--all`, and `--limit N` (default 100,
 1–1000). It never changes state/logs/bells, including when a task agent shares
@@ -118,12 +123,18 @@ queued→handled does not invent a native delivered timestamp.
 returns `withdrawn:false` once claimed/final. `mail show --thread UUID` reads the
 thread, and `repo show` reads this agent's repository/settings.
 
+Host identity is a canonical name plus a stable ledger UUID, not the machine's
+hostname, `local`, or an SSH alias. `local` maps to this ledger; a registered
+canonical name or configured alias maps to its peer. The terminal's stable ID
+identifies the recipient slot, while native session identity determines its
+generation. A pane move changes location, not the session.
+
 The CLI resolves moved terminals through process ancestry and Herdr's public
-`pane process-info` shell PID, without requiring a TTY or inherited terminal
-variable. It refuses an unprovable/stale-pane identity. Native session references
-determine generations; a display/status revision does not create a new session.
-Queued mail can move to a new session in the same repository; other-repository
-or shell occupants hold it. Uncertain delivering claims are never auto-replayed.
+`pane process-info` shell PID, without requiring a TTY or trusting an inherited
+terminal variable as proof. It refuses an unprovable/stale-pane identity.
+Display/status revisions do not create a new generation. Queued mail can move
+to a new session in the same repository; other-repository or shell occupants
+hold it. Uncertain old-generation claims are never automatically replayed.
 
 Git HTTPS/SSH/scp origins normalize to a host/path identity. Preserve a planned
 origin rename explicitly with `git config ham.repo-id 'git:host/stable/repo'`.
@@ -133,8 +144,10 @@ creating a new ledger. Internal `ledger doctor`, `ledger reconcile`, `ledger
 event`, `ledger retention`, `ledger agent-session` and `ledger delivery
 claim|started|release` share the Python store. See the
 [reference](../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
-for their JSON contracts and recovery/evidence requirements. The local mailbox
-does not change legacy prompt routing, Held Messages, or install any runtime.
+for their JSON contracts and recovery/evidence requirements. Mailbox commands
+do not install a runtime. Legacy prompt routing and Held Messages remain for
+nonparticipating traffic; participating same-repository traffic follows the
+mailbox policy below.
 
 ### Remote mail and code-only worker
 
@@ -159,24 +172,27 @@ canonical UUID; do not run a new protocol against an old installed checkout.
 Canonical host names and SSH aliases both address the same registered peer.
 Remote status is queried live, not copied into local AGENTS.
 
-The detached worker holds a per-ledger flock, retries transient failures FIFO
-per peer (up to five-minute backoff), sends receipts, sweeps closed terminals
-and expires bodies/logs. It survives the launching CLI and exits when no work
-remains. A failed item is visible and does not block later items; another
-offline peer cannot block independent destinations. Repeated/lost-ACK accepts
-use the same immutable message ID and return current state, including permanent
-dedupe after body retention. A bell failure after commit is a successful store
-with a `notification_failed`, `committed:true` warning, not permission to resend.
+The detached code-only worker holds a per-ledger flock, retries transient
+failures FIFO per peer (up to five-minute backoff), sends receipts, sweeps closed
+terminals and expires bodies/logs. It survives the launching CLI and exits when
+no pending maintenance remains. Failed Herdr access is not proof that a terminal
+closed. A failed item is visible and does not block later items; an offline peer
+cannot block independent destinations. Explicit retry retains item/message IDs.
+Repeated/lost-ACK accepts use the same immutable message ID and return current
+state, including permanent dedupe after body retention. A bell failure after
+commit is a successful store with a `notification_failed`, `committed:true`
+warning, not permission to resend.
 
 `--to main` is a symbolic address resolved once by the repository home on
 acceptance. An offline home leaves pending mail; an online home without a main
 returns a visible `main_unavailable` item for explicit retry. Resolved receipts
 and withdrawals follow the saved route, including a main on a third host.
-Mode/main/member/threshold mutations are reserved for the user UI service, not
-agent CLI. Each setting has its own version/origin; conflicting ties and pending
-propagation appear in `repo show`. Local auto bootstrap never waits for all
-peers. A stale close or former-home computed publication cannot overwrite a
-newer designation/home.
+The home is the first enabled canonical host and is deliberately read-only in
+the user UI. Mode/main/member/threshold mutations belong to the user UI service,
+not the agent CLI; there is no `repo set` or home-changing command. Local auto
+bootstrap does not wait for all peers. Observed concurrent initial home proposals
+converge deterministically; stale former-home computations cannot overwrite the
+winning home stamp.
 
 Isolated verification can pin `peer add --remote-root /ABS/WORK_COPY
 --remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`.
@@ -187,12 +203,245 @@ See the [wire/setup reference](../.agents/skills/herdr-agent-messenger/reference
 for exact JSON, error and isolation contracts. No runtime/global settings are
 installed by these commands.
 
+### Modes, roles, and public status
+
+The default mode is **off**. It creates no main/worker roles, no automatic wake,
+and no participating-traffic legacy restriction. Explicit reads and natural
+user-boundary receiving remain available.
+
+- **manual:** the explicitly designated main is main; chosen members are workers,
+  excluding main. Nonmembers may receive naturally but cannot be auto-woken.
+- **auto:** an explicit main wins. Otherwise exactly one active main-checkout
+  agent at the home becomes main; zero or two-or-more candidates produce no
+  computed main. All other same-repository agents across hosts are workers.
+  A worktree is not a main checkout.
+
+Public status is independent of coordination mode:
+
+```bash
+python3 "$HAM_CLI" status set review --summary 'Checking the mailbox boundary'
+python3 "$HAM_CLI" status list --repo
+python3 "$HAM_CLI" status list --repo 'git:host/stable/repo'
+python3 "$HAM_CLI" status clear
+python3 "$HAM_CLI" repo show
+```
+
+`status set PHASE --summary TEXT` updates the caller's phase/summary; it does not
+change Herdr's `turn_state`. Phase is projected to `$recap`, summary to a
+HAM-owned pane border. An existing user border is preserved. Roles precede the
+alias in Agents and HAM-owned border content; status still works in off mode.
+`status list` without a filter lists current status; bare `--repo` selects the
+caller's repository and `--repo ID` selects that identity. Legacy
+`status --address HOST/LABEL` remains a recipient-status read.
+
+### User TUI: settings, compose, and uncertain claims
+
+Open **HAM: Mailbox (Right Split)** or **HAM: Mailbox (Tab)** from the command
+palette (`mailbox-split` / `mailbox-tab`, plugin `herdr.agent-messenger`).
+This does not change the user's global `prefix+m` binding. Only after upgrading
+the plugin on every host should a user optionally bind one of these actions.
+The workspace's existing mailbox view is reused by stable workspace/pane IDs,
+not by a matching display label. Closing with `q` closes only the owned mailbox
+pane, not another pane or an entire workspace.
+
+Use `1` Status, `2` Threads, `3` Compose, and `4` Settings; Enter opens details
+or an editor, Esc backs out. On Status, `c` chooses the board recipient.
+On Settings, `m` designates that selected recipient as main and Space toggles
+manual membership.
+
+Settings has exactly **seven mutable rows**:
+
+| Row | Value / default |
+| --- | --- |
+| `mode` | `off`, `manual`, or `auto`; default `off` |
+| `main` | `{"host":"canonical","terminal_id":"term_…"}` or `null` |
+| `members` | Unique array of those targets; default empty |
+| `idle_minutes` | `3` minutes |
+| `coalesce_seconds` | `30` seconds |
+| `wakes_per_hour` | `6` wakes per hour |
+| `max_hop` | `10` hops |
+
+Each threshold is an integer from 0 to 10000. The four threshold rows are saved
+as one versioned `thresholds` field. Home, computed main, version/origin stamps,
+conflicts and propagation pending are **read-only**, not hidden extra editors.
+Each independently versioned field chooses the greatest `(version, canonical
+origin)` pair; equal-version competing origins use the lexically greater
+canonical origin. A new edit allocates a newer observed version. Conflict
+details wrap without dropping their contents.
+
+Saving is single-flight and visibly pending. You may open a text editor while
+a save is pending, but a second save submission or member/main toggle is
+rejected, not silently queued; the edit buffer is retained. Navigation and
+closing remain responsive. The authoritative result is applied immediately,
+and an older snapshot cannot overwrite it. Remote propagation can remain
+pending while a peer is offline; local saving does not require all peers online.
+
+Compose uses Tab for subject/body, Ctrl+K for `fyi`/`action`, Ctrl+D for
+mailbox/direct, and Ctrl+S to review, then Ctrl+S again to send. Text entry owns
+printable keys (including `q`); Esc leaves that context. User mail has
+`sender=user` and ordinary mailbox receipts. **Direct input may interrupt** and
+uses the exact header `Message from user (HAM):`; its separate
+accepted/unknown/failed transport record is never a native delivered receipt.
+
+In Threads, `a` / `n` resolve an uncertain claim as operator-confirmed applied /
+not-applied. Supply nonempty evidence and inspect the exact old claim, agent and
+generation even if the terminal now has a new session. Applied preserves that
+old claim; not-applied releases only that claim without submitting it again.
+This is an audited **operator** decision, not native request/journal proof,
+model understanding, or handling. Do not automatically replay an unknown claim
+or send a replacement message while its application remains uncertain.
+
+### Receiving clients and evidence limits
+
+**OMP:** opt-in receiving is limited to the root Herdr session and a supported
+native session file; the extension delegates ledger work to Python. In a
+supported TUI, automatic wake needs an empty editor, quiet input for
+`idle_minutes`, an idle agent with no pending message, `willContinue`, or retry
+hold, an eligible action and participating role, plus coalescing/hourly/hop
+limits. Eligibility is rechecked in the same tick immediately before enqueue.
+It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself
+does not block this wake; it is not the legacy focused-pane hold.
+
+FYI alone never starts a turn. Natural user turns can receive action and FYI
+even in off mode or for manual nonmembers. An action wake includes eligible
+FYI in the same bounded bundle: at most eight messages / 8 KiB total, with each
+body bounded to 2 KiB and exact-message-ID read instructions for truncation.
+The runtime watches the local bell with `fs.watch` and has a five-minute
+code-only safety check. Its ACK proves exact claimed content/hash in the
+same-session active-branch journal, **not** provider-request inclusion, model
+understanding, or handled work.
+
+**Claude Code:** opt-in receiving uses bounded **SessionStart** and
+**UserPromptSubmit** hooks only. There is no Stop hook, idle wake, or worker
+that starts a Claude turn. Outside Herdr, the hook returns before reading input,
+discovering the plugin, or opening the ledger. Activation environment variables
+are not identity: receiving requires verified foreground-root process ancestry,
+the native transcript UUID and current generation. An unresolved identity
+leaves mail queued; unknown claims stay held.
+
+Hook stdout/exit 0, an attachment, or emitted `additionalContext` alone is not
+a delivered receipt. Native confirmation has two evidence paths:
+
+- SDK system-blob evidence requires the exact bundle in the same-session native
+  request blob plus fresh `api-request.tail` correlation
+  (`claude:api-request:`).
+- The typed ordinary-TUI observer requires raw/rendered native hook records
+  matching the exact claim bytes/hash and a native causal request witness
+  (`claude:accepted-journal:`). This proves **host-context application**, not
+  exact provider-wire bytes, provider attestation, model self-report, or
+  understanding.
+
+Both paths record `confirmation_source=native`; an operator decision remains
+`operator`. The authorized saved run `functional-live-b57ae929e8a7/result.json`
+completed in 21.69 seconds with pinned native Claude 2.1.301. Actual production
+SessionStart context and the current-generation worker produced a persisted
+`delivered`, `via=hook`, native `claude:accepted-journal:` ACK. In the same live
+registered process, manual-worker and auto-main windows each lasted 6.02 seconds
+with ten samples: the code worker remained active, action + FYI stayed queued,
+and no additional primary turn or claim appeared.
+
+This run used one authorized harmless prompt and one primary root request.
+Auxiliary `quota_check` / `prompt_suggestion` traffic was tracked separately;
+this is not a zero-all-provider-traffic claim. The returned mail-only nonce was
+a separate functional response check, never the ACK basis. Herdr already knew
+the session UUID: cold-unreported binding CAS has unit evidence only, **not
+actual-live proof**. The original closed case remains held, with no retroactive
+ACK. The observed host-context application does not attest exact provider-wire
+bytes or establish blanket runtime/provider success or deployment.
+Provider/session-limit failures are
+separate and do not prove successful model processing. Actual OMP and physical
+cross-host integration acceptance is also in flight; these mechanics are not
+a whole-stage PASS or deployment claim.
+
+**Native Claude smoke safety:** keeping the real HOME/auth while isolating
+`XDG_DATA_HOME` does not isolate the native updater: it has repointed the global
+`~/.local/bin/claude` alias into disposable work-storage. Launch through a
+**private symlink named `claude`** whose target is the pre-proven absolute
+versioned executable and original inode (the accepted run used 2.1.301).
+Launching the numeric `2.1.301` basename directly failed Herdr client detection;
+do not fake metadata or use `exec -a` to hide that failure. Set documented
+per-process `DISABLE_AUTOUPDATER=1` before launch. Record the original global
+alias's `lstat`, owner, link target and inode baseline, then verify it unchanged
+afterward. Keep existing HOME/auth only; never copy credentials. Preserve and
+report drift rather than repairing unrelated state. Separately authorized
+recovery must compare-and-swap only the exact owned alias target: the observed
+updater side effect was repaired atomically to the original 2.1.301 launcher,
+private 2.1.302 data was preserved, and the accepted run left the alias unchanged.
+Record the binary/version: SDK and TUI 2.1.301 emit different native evidence
+formats, and stdout alone never acknowledges a claim.
+
+**Codex:** use the skill at work boundaries: `inbox read`, do the relevant work,
+then explicitly `inbox handle --message UUID`. Reads by any client or subagent
+are view-only. Handling can move queued → handled without a delivered timestamp;
+replying atomically handles an addressed parent. There is no Codex automatic
+receiver/wake adapter, and a pull read must never be reported as native delivery.
+
+### Opt-in runtime installation and deployment order
+
+Installing the **skill** copies client instructions. It does **not** install the
+receiving runtime, enable coordination, or change global bindings. On each host,
+use the supported commands separately for the clients you actually select:
+
+```bash
+python3 "$HAM_CLI" runtime install omp
+python3 "$HAM_CLI" runtime status omp
+python3 "$HAM_CLI" runtime install claude
+python3 "$HAM_CLI" runtime status claude
+# Later, remove only the selected HAM-owned runtime:
+python3 "$HAM_CLI" runtime uninstall omp
+python3 "$HAM_CLI" runtime uninstall claude
+```
+
+All three operations accept `--destination DIR`. OMP defaults to
+`~/.omp/agent/extensions` and owns only `ham-mailbox.ts` and
+`ham-mailbox.install.json`; it leaves Herdr's extension alone. Claude defaults
+to `CLAUDE_CONFIG_DIR`, or `~/.claude`, and owns `hooks/ham-mailbox.py`, its
+manifest, and the exact HAM SessionStart/UserPromptSubmit entries in
+`settings.json`. Install merges and uninstall removes only those owned entries,
+preserving unrelated hooks and configuration. Ownership/checksum validation
+refuses foreign, modified, or symlinked managed targets; do not delete another
+integration to overcome a conflict. Restart/reload only selected sessions.
+An installed-file status is not proof that a receiving session is ready.
+
+Deploy in this order, separately on every participating host:
+
+1. Upgrade the protocol-capable **plugin first**; do not point new peers at an
+   old installed endpoint.
+2. Install/update the matching skill and opt-in receiving runtime. Confirm
+   selected receivers' identity/readiness before enabling participating policy.
+   Codex uses the explicit pull workflow rather than an invented runtime.
+3. Enable the intended repository mode/main/members in the user TUI, then
+   migrate the user-chosen global action binding and status/recap instructions
+   last. These are deployment instructions, not a claim they were executed.
+
+Storage uses a private 0700 state directory, 0600 SQLite database and WAL.
+Final message bodies expire after 90 days; wake/status logs after 30 days.
+Dedupe hashes, compact receipts and withdrawal tombstones remain. The UI checks
+the local bell every second and remote live status every 30 seconds
+independently; these and worker/OMP safety checks are code-only, not model
+polling. There is no database replica, ASR router, urgent channel, or ownership
+framework.
+
+### Participating policy versus legacy prompt traffic
+
+For same-repository traffic where **both sender and recipient participate** in
+manual/auto coordination, legacy `send`, `request`, and `batch` refuse with
+`use_mailbox`; use `mail send` instead. A batch resolves and preflights **all**
+targets before any submission: one refusal or failed lookup produces zero
+submissions. This prevents accidents, not adversarial access.
+
+Off-mode, other-repository and otherwise nonparticipating legacy traffic keeps
+the prompt/hold/lifecycle behavior described below. User direct input is a
+separate explicit path, not an agent policy bypass. New-session initial
+assignment uses atomic spawn, not a legacy request to the new recipient.
+
+
 
 ## CLI commands and addressing
 
-The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with complete flag/default/unit/range tables for all eight commands: `list`, `status`, `send`, `batch`, `read`, `request`, `request-status`, and `spawn`. Every command supports `-h` / `--help`.
+The bundled skill is split into a short [SKILL.md](../.agents/skills/herdr-agent-messenger/SKILL.md) for common workflows and an on-demand [reference.md](../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference) with exhaustive flags/defaults/units/ranges. Commands include `mail`, `inbox`, `repo`, `ledger`, `runtime`, status operations, and the retained legacy routing commands. Every command supports `-h` / `--help`; the detailed legacy tables below do not replace the mailbox/runtime reference.
 
-The following examples run **from the plugin/checkout root**; for another working directory use the absolute path to the bundled script. An installed skill also has `scripts/herdr_agent_messenger.py` relative to its own directory.
+The following legacy prompt examples apply only where the participating policy permits them. Run **from the plugin/checkout root**; for another working directory use the absolute path to the bundled script. An installed skill also has `scripts/herdr_agent_messenger.py` relative to its own directory.
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py list --host local
@@ -208,11 +457,11 @@ Copy `list` → `address` → `--address` directly; it works for `status`, `send
 
 Only literal `local` selects the current Herdr server. Every other host must be a concrete configured SSH alias—even a hostname matching this machine still means SSH. Never use a bare label as a global address: labels can repeat across hosts and be mistaken for a client's own subagent names. Every operation resolves the current occupant again; a label does not promise continuity after restart.
 
-All eight commands return compact output by default; `--verbose` restores full diagnostic payloads. `list` returns each agent's `address`, `status`, and `workspace`; `status` returns `address` and `status` (plus `stale: true` when needed). Compact request results omit routes and agent/baseline metadata, and expose cleaned reply text as `response.text`. TUI borders, status footers, and echoed prompts are removed. Use `--verbose` for raw/full response fields such as `response.output`. The `list --legacy` alias still selects verbose output.
+The eight original routing commands return compact output by default; `--verbose` restores full diagnostic payloads. `list` returns each agent's `address`, `status`, and `workspace`; legacy recipient `status` returns `address` and `status` (plus `stale: true` when needed). Compact request results omit routes and agent/baseline metadata, and expose cleaned reply text as `response.text`. TUI borders, status footers, and echoed prompts are removed. Use `--verbose` for raw/full response fields such as `response.output`. The `list --legacy` alias still selects verbose output.
 
 | Flag | Commands | Default and meaning |
 | --- | --- | --- |
-| `--verbose` | All eight commands | Off; show full payloads instead of compact views. |
+| `--verbose` | The eight original routing commands | Off; show full payloads instead of compact views. |
 | `--defer-timeout MS` | `request`, `send`, `batch` | `180000` milliseconds (3 minutes); time to hold a focused recipient before requiring a decision. This is separate from the command's `--timeout` wait budget. |
 | `--wait MS` | `request-status` | `0` (one observation); otherwise stops on a state, phase or `error_code` change, a terminal state, or the deadline, not response-text growth. This numeric option differs from the boolean `--wait` on `send` and `batch`. |
 
@@ -220,15 +469,24 @@ All eight commands return compact output by default; `--verbose` restores full d
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py spawn \
-  --kind omp --cwd /path/to/project --placement tab
-# Use the address returned above, not an invented color-animal name:
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py request \
-  --address RETURNED_HOST/RETURNED_LABEL --message 'Review the project and report blockers.'
+  --kind omp --cwd /path/to/project --placement tab \
+  --message 'Review the project and report blockers.'
 ```
+
+The optional `--message TEXT` and `--message-file PATH` are mutually exclusive.
+The file is UTF-8 and caller-local, including when the new session is remote.
+Keep HAM flags before `--`; arguments after it belong to the new agent.
+Without either message option, spawn starts a session without an assignment.
+With one, readiness and the initial submission are one persisted operation:
+the immutable target/body and submitting state are saved before transport.
+Accepted input is not native mailbox delivery or a completed reply. An unknown
+result may already have submitted; preserve its operation ID and usable
+placement for inspection. Never resend, issue a follow-up legacy initial
+request, or spawn a replacement merely because acceptance is unknown.
 
 The default placement is a right split from local `HERDR_PANE_ID`. For an SSH split, provide `--from-pane` and `--cwd` explicitly. Local cwd defaults to the invocation directory; SSH cwd is always required and refers to a path on that host. `--placement tab` can use `--workspace`; absent that, HAM infers the source workspace from `--from-pane` or local `HERDR_PANE_ID` when available, otherwise leaves the choice to Herdr. `--placement workspace` creates a separate workspace. New placements are not focused automatically.
 
-`--label` chooses an explicit nonblank name without `/`; otherwise HAM picks a free `color-animal` label. `--workspace-label` controls a new tab/workspace label; its default is the explicit or generated agent label. `--direction right|down` only affects splits. `--timeout` is readiness time in milliseconds (default 90000, range 1–300000), not time to answer the future prompt. Agent-specific flags must follow `--`:
+`--label` chooses an explicit nonblank name without `/`; otherwise HAM picks a free `color-animal` label. `--workspace-label` controls a new tab/workspace label; its default is the explicit or generated agent label. `--direction right|down` only affects splits. `--timeout` is readiness time in milliseconds (default 90000, range 1–300000), not time to answer the initial prompt. Agent-specific flags must follow `--`:
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py spawn \
@@ -242,9 +500,9 @@ Compact spawn results contain `address`, palette `marker`, `created` (`pane`/`ta
 
 The popup's coordinator prompt supplies an absolute CLI path and host-qualified addresses, so it works even without a globally installed skill. For GUI selections supplied as opaque route tokens, follow the supplied `--route` commands directly; do not decode or modify tokens or replace them with guessed Herdr commands. Compact results use addresses rather than exposing routes; `--verbose` includes routes for diagnostic/GUI-style routing. If `route_refreshed: true`, retain the returned token. Refresh is allowed only when conservative continuity checks identify one safe current occupant; otherwise report `route_expired`. See [route safety](ssh-and-routing.md#route-safety).
 
-## Request lifecycle and exit codes
+## Legacy request lifecycle and exit codes
 
-Prefer `request` for ordinary messaging. Run it from the coordinator's active Herdr agent pane so the sender can be verified. Once delivery is allowed, HAM captures a baseline, submits once without Herdr's ambiguous lower-level `--wait`, observes a fresh requested working→settled cycle, and returns bounded new output. If the recipient was already working, its first settlement is only an old-turn boundary; HAM requires a second working→settled cycle.
+For policy-permitted existing-agent prompt traffic, prefer `request` to lower-level `send`. Run it from the coordinator's active Herdr agent pane so the sender can be verified. Once delivery is allowed, HAM captures a baseline, submits once without Herdr's ambiguous lower-level `--wait`, observes a fresh requested working→settled cycle, and returns bounded new output. If the recipient was already working, its first settlement is only an old-turn boundary; HAM requires a second working→settled cycle. This lifecycle is not a mailbox native-delivery receipt.
 
 ### Focus-based delivery holds
 
@@ -297,7 +555,7 @@ Replies are scraped from the recipient's TUI, not a structured assistant-message
 
 ## Batch coordination
 
-First list and verify each requested host/label. Decompose work into non-overlapping assignments and send only the context each worker needs unless the user explicitly requests direct broadcast. HAM mechanically dispatches the already-tailored messages; it does not interpret, split, or rewrite them.
+For participating workers use mailbox messages, not legacy batch. For a policy-permitted legacy batch, first list and verify each requested host/label; all targets must pass lookup/policy before any submission. Decompose work into non-overlapping assignments and send only the context each worker needs unless the user explicitly requests direct broadcast. HAM mechanically dispatches the already-tailored messages; it does not interpret, split, or rewrite them.
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py batch \
@@ -326,6 +584,7 @@ The [complete error code catalog](../.agents/skills/herdr-agent-messenger/refere
 
 | Error codes / category | Recovery / retryability |
 | --- | --- |
+| `use_mailbox` | Both endpoints participate in same-repository manual/auto coordination. Use `mail send`, not a legacy prompt or bypass. A batch policy/lookup preflight failure submitted no targets. |
 | `invalid_address`, `conflicting_address`, `invalid_defer_timeout`, other `invalid_*` input codes, `empty_message`, `empty_batch`, `missing_address`, `duplicate_route` | Fix rejected input; `--defer-timeout` requires positive integer milliseconds. Retry only the undelivered operation/items. Never invent IDs or routes. |
 | `agent_not_found`, `agent_ambiguous`, `invalid_route`, `route_expired`, `route_ambiguous`, `resolve_failed`, `recipient_is_sender` | Relist/reselect rather than guess. A post-submission resolution error means resume observation, not resubmit. Create only when asked. |
 | `host_not_configured`, `host_unavailable` | Restore authorized SSH/Herdr connectivity. Local sandbox/socket denial requires socket access; failed discovery does not mean missing agent. |
@@ -342,7 +601,7 @@ The [complete error code catalog](../.agents/skills/herdr-agent-messenger/refere
 
 Local socket access is needed even for a remote request because HAM verifies the sender locally. For a batch `sender_probe_failed`, retry only those failed items after granting access; never replay delivered, submitted, unknown, or timed-out items. Do not bypass SSH host-key verification or alter trust settings to make a request succeed.
 
-## Lower-level send and read
+## Legacy lower-level send and read
 
 `send` defaults to `--wait` and Herdr's completion signal, unless the recipient is focused: then it returns a deferred lifecycle record immediately, even with `--no-wait`, and HAM owns later delivery. An immediate send returns compact `sent`, `address`, and `waited`, plus nonempty `warnings`; `--verbose` restores full details. A recipient already working produces `recipient_already_working` and, in verbose output, `wait_can_track_submitted_turn: false`; its completion signal may belong to old work. Prefer lifecycle `request`. An immediate `send --no-wait` only confirms acceptance and provides no lifecycle request ID. SSH loss/process interruption after acceptance can produce `prompt_acceptance_unknown`; inspect the recipient before retrying.
 

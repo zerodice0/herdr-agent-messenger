@@ -261,12 +261,15 @@ def dispatch_batch(
     max_workers: int = DEFAULT_BATCH_WORKERS,
     cancel_event: threading.Event | None = None,
     resolve_request: Callable[[BatchRequest], tuple[BatchRequest, str]] | None = None,
+    before_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Dispatch valid items concurrently and return results in input order.
 
     The optional resolver converts addresses to routes and supplies a target
     identity for duplicate detection before any prompt is submitted. Transport
     and request lifecycle semantics belong to the injected single-request sender.
+    The optional pre-submit gate runs after all resolution and before workers or
+    submission side effects. Its exception aborts the entire batch, not one item.
     """
 
     if isinstance(max_workers, bool) or not isinstance(max_workers, int):
@@ -286,6 +289,8 @@ def dispatch_batch(
         )
 
     result_slots, ready = _prepare_requests(items, resolve_request, cancel_event)
+    if before_dispatch is not None:
+        before_dispatch()
     pending: queue.Queue[tuple[int, BatchRequest]] = queue.Queue()
     for prepared in ready:
         pending.put(prepared)

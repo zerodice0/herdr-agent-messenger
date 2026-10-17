@@ -389,6 +389,54 @@ class AgentBatchDispatchTest(unittest.TestCase):
         self.assertEqual(payload["results"][1]["status"], "succeeded")
         self.assertEqual([request.route for request in sent], ["valid"])
 
+    def test_pre_dispatch_gate_observes_all_resolutions_before_any_submission(self):
+        resolved = []
+        sent = []
+
+        def resolve(request):
+            resolved.append(request.route)
+            return request, request.route
+
+        def gate():
+            self.assertEqual(resolved, ["one", "two", "three"])
+            self.assertEqual(sent, [])
+
+        payload = agent_batch_dispatch.dispatch_batch(
+            [{"route": route, "message": "work"} for route in ("one", "two", "three")],
+            lambda request: (
+                sent.append(request.route)
+                or agent_batch_dispatch.DispatchOutcome(agent_batch_dispatch.SUBMITTED)
+            ),
+            resolve_request=resolve, before_dispatch=gate,
+        )
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertCountEqual(sent, ["one", "two", "three"])
+
+    def test_pre_dispatch_exception_aborts_peers_despite_per_item_resolution_failure(self):
+        resolved = []
+        sent = []
+
+        def resolve(request):
+            resolved.append(request.route)
+            if request.route == "blocked":
+                raise CodedError("use_mailbox", "Use mailbox")
+            return request, request.route
+
+        refusal = CodedError("use_mailbox", "Use mailbox")
+
+        def gate():
+            self.assertEqual(resolved, ["allowed", "blocked", "also-allowed"])
+            raise refusal
+
+        with self.assertRaises(CodedError) as caught:
+            agent_batch_dispatch.dispatch_batch(
+                [{"route": route, "message": "work"} for route in ("allowed", "blocked", "also-allowed")],
+                lambda request: sent.append(request), resolve_request=resolve,
+                before_dispatch=gate,
+            )
+        self.assertIs(caught.exception, refusal)
+        self.assertEqual(sent, [])
+
     def test_json_parser_accepts_array_and_requests_wrapper(self):
         expected = [{"route": "one", "message": "instruction"}]
         self.assertEqual(

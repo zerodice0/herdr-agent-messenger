@@ -12,10 +12,9 @@ import sys
 from typing import Any, Iterator, NamedTuple
 
 from agent_directory import herdr_executable
+from ledger_display import LEGACY_SOURCE, SOURCE, report_agent_metadata
 
 
-SOURCE = "herdr.agent-messenger"
-LEGACY_SOURCE = "herdr.agent-labels"
 SEED_HASH_BYTES = 4
 # Coprime with the current alias count, so every alias is visited exactly once.
 CANDIDATE_STRIDE = 37
@@ -190,6 +189,8 @@ def clear_agent_label_metadata(pane_id: str) -> bool:
             "alias",
             "--clear-token",
             "color",
+            "--clear-token",
+            "recap",
         )
         if result.returncode != 0:
             report_command_failure(
@@ -207,44 +208,11 @@ def report_agent_label_metadata(
     marker: str,
     color: str,
 ) -> bool:
-    succeeded = True
-    cleared = run_herdr(
-        "pane",
-        "report-metadata",
-        pane_id,
-        "--source",
-        LEGACY_SOURCE,
-        "--clear-display-agent",
-        "--clear-token",
-        "alias",
-        "--clear-token",
-        "color",
+    return report_agent_metadata(
+        pane_id, agent, alias, marker, color,
+        runner=lambda command: run_herdr(*command),
+        on_failure=report_command_failure,
     )
-    if cleared.returncode != 0:
-        report_command_failure(
-            f"clear legacy label metadata for {pane_id}",
-            cleared,
-        )
-        succeeded = False
-    reported = run_herdr(
-        "pane",
-        "report-metadata",
-        pane_id,
-        "--source",
-        SOURCE,
-        "--agent",
-        agent,
-        "--display-agent",
-        f"{marker} {alias}",
-        "--token",
-        f"alias={alias}",
-        "--token",
-        f"color={color}",
-    )
-    if reported.returncode != 0:
-        report_command_failure(f"report label metadata for {pane_id}", reported)
-        succeeded = False
-    return succeeded
 
 
 def candidates(seed: str) -> Iterator[Alias]:
@@ -259,12 +227,17 @@ def assign_label(pane_id: str) -> int:
     info = fetch_agent_info(pane_id)
     if not info:
         return 0
-    if info.get("name") or info.get("agent_name"):
-        return 0
-
     agent = str(info.get("agent") or "")
     if not agent:
         return 0
+    name = str(info.get("name") or info.get("agent_name") or "")
+    if name:
+        palette = next((alias for alias in ALIASES if alias.name == name), None)
+        return 0 if report_agent_label_metadata(
+            pane_id, agent, name,
+            palette.marker if palette else "", palette.color if palette else "",
+        ) else 1
+
     session_data = info.get("agent_session")
     session = session_data if isinstance(session_data, dict) else {}
     terminal_id = str(info.get("terminal_id") or pane_id)
@@ -285,8 +258,14 @@ def assign_label(pane_id: str) -> int:
             return 0 if metadata_reported else 1
         if "agent_name_taken" in renamed.stderr:
             current = fetch_agent_info(pane_id)
-            if current.get("name") or current.get("agent_name"):
-                return 0
+            current_name = str(current.get("name") or current.get("agent_name") or "")
+            if current_name:
+                palette = next((alias for alias in ALIASES if alias.name == current_name), None)
+                reported = report_agent_label_metadata(
+                    pane_id, str(current.get("agent") or agent), current_name,
+                    palette.marker if palette else "", palette.color if palette else "",
+                )
+                return 0 if reported else 1
             continue
         report_command_failure(f"agent rename {pane_id}", renamed)
         return 1
@@ -307,8 +286,6 @@ def reconcile_labels() -> int:
             not pane_id
             or pane_id in visited
             or not info.get("agent")
-            or info.get("name")
-            or info.get("agent_name")
         ):
             continue
         visited.add(pane_id)

@@ -7,18 +7,21 @@
 [한국어](README.ko.md) · English
 
 HAM is an agent-labeling and multi-agent messaging plugin for Herdr. It gives
-unnamed agents memorable `color-animal` names, starts new labeled sessions, and
-routes prompts from a keyboard-first popup, Codex, Claude Code, or omp.
+unnamed agents memorable `color-animal` names, starts new labeled sessions with
+an optional atomic first prompt, and provides a durable same-repository mailbox
+for coordination across local and SSH hosts.
 
 ## What HAM provides
 
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
-- Coordinator delegation and direct multi-recipient delivery
+- Durable same-repository threads, explicit handling, and `off` / `manual` / `auto` participation modes
+- A keyboard-first mailbox/status TUI, with separate user mailbox and direct-input composition
 - A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp, split into short `SKILL.md` and on-demand `reference.md`
-- Labeled interactive-session creation with `spawn`, plus safe request, wait, read, batch, and rollout helpers
-- Focus-based holds for agent messages, with a 3-minute default timeout and explicit Push/Cancel in **HAM: Held Messages**
-- Compact CLI output by default, with `--verbose` diagnostics and `request-status --wait` follow-up
+- Labeled interactive-session creation with `spawn --message`, plus standalone and permitted legacy request, wait, read, batch, and rollout helpers
+- Separately opt-in omp and Claude receiving runtimes; Codex uses explicit inbox reads at work boundaries
+- Focus-based holds for permitted legacy agent prompts, with a 3-minute default timeout and explicit Push/Cancel in **HAM: Held Messages**
+- Compact legacy CLI output by default, with `--verbose` diagnostics and `request-status --wait` follow-up
 
 Manually named agents are left unchanged. Agent addresses are always
 host-qualified, for example `local/blue-otter` or
@@ -50,8 +53,14 @@ Follow the [migration guide](docs/migration.md) before removing the old plugin.
 
 ## Use
 
-Open **Send Prompt to Agents** from a Herdr agent pane to select recipients and
-choose coordinator delegation or direct delivery.
+Use the [durable mailbox](#durable-mailbox) for participating agents coordinating
+within the same repository. The [HAM TUI](docs/ui-reference.md) provides Status,
+Threads, Compose, and Settings views. Its user composer distinguishes ordinary
+mailbox messages from direct input that may interrupt the recipient; direct
+input is not the agent-to-agent coordination path.
+
+The legacy **Send Prompt to Agents** popup still supports coordinator delegation
+and direct multi-recipient delivery where participation policy permits it.
 
 Codex users can type `$ham` and select **HAM — Herdr Agent Messenger**. Claude
 Code users can invoke `/herdr-agent-messenger` or make a matching natural-language
@@ -63,21 +72,38 @@ $ham Ask local/yellow-falcon what language label dxp-ui uses. Wait for the
 reply, then align this work and its defaults with that answer.
 ```
 
-Use `local/LABEL` for this machine, not its hostname, and a configured SSH alias
-for remote recipients. A bare label can collide across hosts or be mistaken for
-a client's own subagent.
+Always use a host-qualified address. Legacy discovery and prompt-routing commands
+use `local/LABEL` for this machine and a configured SSH alias for a remote host.
+Mailbox commands also accept registered canonical host names. A bare label can
+collide across hosts or be mistaken for a client's own subagent.
 
-To start a new agent and message it, ask HAM explicitly to create the session.
-HAM uses `spawn`, then `request --address` with the returned address; it does not
-silently create a session when an existing label is missing. From a checkout:
+### New sessions
+
+Ask HAM explicitly to create a session. `spawn --message` creates the labeled
+session and durably records a single initial-prompt operation, submitting only
+after interactive readiness. Do not split this into `spawn` followed by a
+legacy `request`. From a checkout:
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py spawn \
-  --kind omp --cwd "$PWD" --placement tab
-# Copy the returned address, then:
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py request \
-  --address RETURNED_HOST/RETURNED_LABEL --message 'Review this project.'
+  --kind omp --cwd "$PWD" --placement tab --message 'Review this project.'
 ```
+
+Use `--message-file PATH` instead for a caller-local UTF-8 file; put HAM flags
+before `--` when forwarding agent arguments. Omit both message flags to create
+a session without a first prompt. Missing existing labels never cause HAM to
+silently create replacement sessions. An `unknown` initial-prompt acceptance
+may already have submitted: preserve its operation ID and pane, and do not
+resend or spawn a replacement. Terminal acceptance is not native mailbox
+delivery or evidence of successful model processing.
+
+### Permitted legacy prompts
+
+In `manual` or `auto`, legacy `send`, `request`, and `batch` refuse participating
+same-repository sender/recipient pairs with `use_mailbox`. Batch preflights every
+target: a refusal or lookup failure causes zero submissions. This prevents
+accidental bypasses; it is not a security boundary. Nonparticipating traffic
+retains the legacy workflow, including the following hold and observation rules.
 
 CLI messages to a focused recipient are held; do not resend. After the default
 3-minute hold deadline, choose Push or Cancel in **HAM: Held Messages** on the
@@ -91,8 +117,11 @@ is focused, and is never held.
 terminal state, or the deadline, not response-text growth. Compact
 `response.truncated` is true only when reply text itself was cut by output
 bounds or a failed read, not merely when older history was omitted or baseline
-overlap was lost. See the [skill guide](docs/skill-guide.md) for flags and errors,
-including `invalid_defer_timeout` for a nonpositive or invalid hold timeout.
+overlap was lost. See the [command reference](.agents/skills/herdr-agent-messenger/reference.md)
+for exhaustive flags and errors, including `invalid_defer_timeout` for a
+nonpositive or invalid hold timeout.
+
+### Install the client skill
 
 Install or update the bundled skill from **HAM Skill** in Herdr's command
 palette, or run:
@@ -113,23 +142,109 @@ source-backed standalone setup and its limitations.
 
 ## Durable mailbox
 
-The checkout also provides a non-interrupting local mailbox. From a registered
-Herdr agent pane, use `mail send --to local/LABEL --body TEXT`, then let the
-recipient use `inbox read` and `inbox handle --message UUID`. A read never marks
-mail delivered or handled, including reads from task agents sharing the pane.
-`mail show --thread UUID` shows the thread; `mail withdraw --message UUID`
-withdraws only mail that has not already been claimed.
+Participating agents use durable same-repository mail instead of terminal prompt
+injection. From a registered Herdr agent pane:
 
-Mailbox commands also accept `--to CANONICAL_HOST/LABEL` (or the registered SSH
-alias) and `--to main`, resolved once by the repository's home host. Run
-`ledger setup --name HOST`, register each direction with `ledger peer add
---ssh-alias ALIAS`, and inspect `ledger doctor` / `ledger outbox` for transport
-state. The detached flock worker retries transient link failures with the same
-message ID; permanent failures are visible and explicitly retriable without
-blocking unrelated mail. These commands do not submit a terminal prompt or wake
-a model. Existing `send`/`request`, Held Messages, and their behavior are unchanged. See the
-[mailbox command reference](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
-for flags, state/recovery rules, storage isolation, and identity configuration.
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py mail send \
+  --to local/blue-owl --kind action --subject 'Review' --body 'Review this project.'
+# At the recipient's work boundary:
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py inbox read
+# After doing the relevant work:
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py inbox handle \
+  --message MESSAGE_UUID
+```
+
+`fyi` is informational; `action` can qualify for an omp idle wake. FYI alone does
+not start a turn. Reads are view-only, including reads by subagents sharing a
+pane. Explicit handling can mark queued mail handled without inventing a
+delivered timestamp. Replies to mail addressed to the current recipient
+atomically handle that parent. Use `mail show --thread UUID` to inspect the
+thread and `mail withdraw --message UUID` to request withdrawal; already-claimed
+mail cannot simply be recalled.
+
+### Participation and roles
+
+Choose participation in the TUI Settings view, not through an agent mutation
+command:
+
+| Mode | Roles and automatic behavior |
+| --- | --- |
+| `off` (default) | No roles, automatic wakes, or participating legacy rejection. Explicit inbox reads and receiving at natural user-turn boundaries remain possible. |
+| `manual` | An explicitly selected main coordinates selected worker members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
+| `auto` | An explicit main wins. Otherwise, exactly one active main-checkout agent at the repository's home becomes main; zero or multiple candidates means no computed main. All other same-repository agents across hosts are workers. |
+
+The home is the canonical host established when participation is first enabled;
+it is read-only in Settings. A canonical host name plus UUID is distinct from an
+SSH alias or hostname. Agents use stable terminal slots with session generations;
+pane moves do not change the slot. Uncertain claims from an old generation are
+never automatically replayed. The TUI's evidence-based operator resolution is
+an audit decision, not native delivery proof or completion of the work.
+
+### Remote transport and receiving runtimes
+
+Mailbox targets may be `local/LABEL`, `CANONICAL_HOST/LABEL`, a registered
+`SSH_ALIAS/LABEL`, or `main`. The home resolves `main` once; when the home is
+offline, mail stays pending rather than using a cached substitute. Initialize
+each host with `ledger setup --name HOST`, then register each direction with
+`ledger peer add --ssh-alias ALIAS`. `ledger doctor` and `ledger outbox` expose
+transport state. A detached, code-only flock worker retries transient failures
+with the same message IDs; permanent failures remain visible for explicit retry.
+It does not run model polling or replicate databases.
+
+Skill installation does **not** install a receiving runtime. Opt in separately
+on each host with `runtime install omp` or `runtime install claude`; inspect or
+remove it with the corresponding `runtime status` / `runtime uninstall` command.
+Restart only the selected sessions. The installers own only HAM's extension or
+hook entries and preserve unrelated Herdr/client configuration.
+
+- **omp:** The root Herdr session can receive at a natural turn boundary.
+  Automatic action wakes additionally require an eligible role, supported empty
+  editor, quiet input, idle session, and the configured coalescing/rate limits.
+  Focus alone does not hold mail. ACK means the exact bundle was observed in the
+  same session's active-branch journal, not provider acceptance or understanding.
+- **Claude Code:** Bounded `SessionStart` and `UserPromptSubmit` hooks receive
+  mail; there is no Stop/idle wake or code-worker-created Claude turn. Hook
+  output alone is not delivery. Native ACK supports two evidence paths: an exact
+  bundle in the SDK system/request blob plus a fresh request trace
+  (`claude:api-request:`), or typed native hook raw/rendered records matching the
+  exact claim bytes/hash plus a native causal request witness
+  (`claude:accepted-journal:`). The latter proves host-context application, not
+  exact provider-wire bytes, provider attestation, model self-report, or
+  understanding. Both use `confirmation_source=native`; operator resolutions
+  remain `operator`.
+- **Codex:** Pull with `inbox read` at work boundaries, do the relevant work,
+  then explicitly `inbox handle`. There is no automatic receiving adapter or wake.
+
+Delivery is not handling. Direct user input separately records terminal
+acceptance, never native mailbox delivery; its header is
+`Message from user (HAM):`.
+
+A bounded live check on Claude Code 2.1.301 observed production SessionStart
+context and the current-generation worker's persisted `delivered` receipt with
+`via=hook`, native confirmation, and `claude:accepted-journal:` evidence.
+The same registered process added no primary turn or claim during separate
+6.02-second manual-worker and auto-main idle windows, with the worker active and
+action/FYI mail queued. Auxiliary `quota_check` / `prompt_suggestion` requests are
+separate; this is not a claim of zero provider traffic. Herdr already knew the
+session UUID: cold-unreported binding CAS is unit-proved, not live-proved.
+These bounded observations do not establish whole-runtime or provider success.
+
+See the [mailbox command reference](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
+for exhaustive flags, identity, storage, receipt/recovery semantics, and runtime
+installation; see the [UI reference](docs/ui-reference.md) for Settings, composing,
+and uncertain-claim recovery.
+
+## Deployment order
+
+Upgrade the protocol-capable plugin on **each host first**. Make the matching
+skill and receiving runtime ready before enabling participating policy, so
+legacy coordination is not refused before recipients can receive mail. Codex
+uses its skill-driven pull workflow instead of a runtime adapter. Only afterward
+should the user choose any global binding and migrate status/recap conventions.
+No global binding is changed automatically. This is deployment guidance, not a
+claim that hosts or sessions have already been upgraded. See the
+[rollout guide](docs/rollout.md) for the detailed procedure.
 
 ## Documentation
 

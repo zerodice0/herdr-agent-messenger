@@ -9,11 +9,11 @@ import re
 import sqlite3
 import subprocess
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 import uuid
 
-from agent_directory import agent_label, herdr_executable
+from agent_directory import agent_label, herdr_executable, run_bounded_command
 from ledger_store import LedgerError, LedgerStore, save_receipt
 
 
@@ -134,6 +134,66 @@ def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
         return None
 
+def _claude_ancestor_pid() -> int | None:
+    """Return the nearest actual native root, not a foreground grandparent."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="],
+                                capture_output=True, text=True, check=False, timeout=5)
+        if result.returncode:
+            return None
+        processes = {int(parts[0]): (int(parts[1]), parts[2])
+                     for line in result.stdout.splitlines()
+                     if len(parts := line.split(None, 2)) == 3}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    seen: set[int] = set()
+    current = os.getpid()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        process = processes.get(current)
+        if process is None:
+            return None
+        if Path(process[1]).name == "claude":
+            return current
+        current = process[0]
+    return None
+
+
+def claude_foreground_pid(agent: Mapping[str, Any],
+                          environment: Mapping[str, str] | None = None, *,
+                          require_ancestor: bool = True) -> int | None:
+    """Verify the actual foreground root, never a hook/env-claimed process ID."""
+    try:
+        def query(*arguments: str) -> Mapping[str, Any]:
+            result = run_bounded_command(
+                [herdr_executable(environment), *arguments], timeout=5, environment=environment)
+            payload = json.loads(result.stdout[result.stdout.index('{'):])
+            if result.returncode or payload.get("error") or payload.get("ok") is False:
+                raise ValueError("Unreadable native process")
+            return payload["result"]
+        pane = query("pane", "get", str(agent["pane_id"]))["pane"]
+        if (pane["pane_id"] != agent["pane_id"]
+                or pane["terminal_id"] != agent["terminal_id"]):
+            return None
+        info = query("pane", "process-info", "--pane", str(agent["pane_id"]))["process_info"]
+        group = info["foreground_process_group_id"]
+        if (info["pane_id"] != agent["pane_id"] or not isinstance(group, int)
+                or isinstance(group, bool) or group <= 1):
+            return None
+        roots = [process for process in info["foreground_processes"]
+                 if process.get("name") == "claude"
+                 or (isinstance(process.get("argv"), list) and process["argv"]
+                     and Path(str(process["argv"][0])).name == "claude")]
+        if len(roots) != 1:
+            return None
+        pid = roots[0]["pid"]
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            return None
+        return pid if not require_ancestor or _claude_ancestor_pid() == pid else None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+        return None
+
+
 
 def current_agent(connection: sqlite3.Connection, host: str, terminal_id: str) -> dict[str, Any]:
     row = connection.execute("SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1",
@@ -152,20 +212,43 @@ def check_generation(connection: sqlite3.Connection, host: str, terminal_id: str
 
 
 class AgentRegistry:
-    def __init__(self, store: LedgerStore) -> None:
+    def __init__(self, store: LedgerStore, *,
+                 display_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None) -> None:
         self.store = store
+        self.display_runner = display_runner
 
-    def refresh(self, environment: Mapping[str, str] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    def refresh(self, environment: Mapping[str, str] | None = None, *,
+                refresh_display: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
         # Lock BEFORE snapshot acquisition: an older event cannot overwrite a
         # newer session snapshot merely because its Git probes took longer.
         with self.store.lock("registry"):
             snapshot = live_snapshot(environment)
-            result = self.reconcile(snapshot)
+            changed_panes: set[str] = set()
+            result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment)
             from ledger_settings import RepoSettings
-            RepoSettings(self.store).reconcile_local()
+            settings = RepoSettings(self.store, environment=environment).reconcile_local(
+                refresh_display=False, environment=environment)
+            if refresh_display:
+                if settings["changed"]:
+                    changed_panes.update(row["pane_id"] for row in self.list()
+                                         if row["host"] == self.store.host)
+                if changed_panes:
+                    self._refresh_display(changed_panes, environment=environment)
         return snapshot, result
 
-    def reconcile(self, snapshot: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    def reconcile(self, snapshot: Mapping[str, Any], *, now: float | None = None,
+                  refresh_display: bool = True,
+                  environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """Commit a snapshot, then project changed panes; DB-only callers may opt out."""
+        changed_panes: set[str] = set()
+        result = self._reconcile(snapshot, now=now, changed_panes=changed_panes, environment=environment)
+        if refresh_display and changed_panes:
+            self._refresh_display(changed_panes, environment=environment)
+        return result
+
+    def _reconcile(self, snapshot: Mapping[str, Any], *, changed_panes: set[str],
+                   now: float | None = None,
+                   environment: Mapping[str, str] | None = None) -> dict[str, Any]:
         at = time.time() if now is None else now
         panes = snapshot.get("panes")
         raw_agents = snapshot.get("agents")
@@ -180,6 +263,10 @@ class AgentRegistry:
                 raise LedgerError("invalid_snapshot", "Duplicate terminal in snapshot.")
             locations[terminal] = {key: str(raw.get(key) or '') for key in ("terminal_id", "pane_id", "workspace_id")}
         # Resolve Git outside the write lock. Never accept caller-injected repo_id from events.
+        with self.store.read() as connection:
+            pending = {row["terminal_id"]: dict(row) for row in connection.execute(
+                "SELECT * FROM agents WHERE host=? AND active=1 AND client='claude' "
+                "AND native_session_pid IS NOT NULL", (self.store.host,))}
         observed: dict[str, dict[str, Any]] = {}
         for raw in raw_agents:
             if not isinstance(raw, dict) or not raw.get("agent"):
@@ -189,10 +276,17 @@ class AgentRegistry:
                 raise LedgerError("invalid_snapshot", "An agent has no matching terminal pane.")
             session = raw.get("agent_session")
             session_ref = str(session.get("value") or '') if isinstance(session, dict) else ''
+            native_session_pid = None
             # Detection/display revisions are not session identities: status and
             # metadata reports may change them without replacing the client.
             if not session_ref:
                 session_ref = "unreported"
+                binding = pending.get(terminal)
+                if (binding and raw["agent"] == "claude"
+                        and claude_foreground_pid({**binding, **locations[terminal]}, environment,
+                                                  require_ancestor=False) == binding["native_session_pid"]):
+                    session_ref = binding["session_ref"]
+                    native_session_pid = binding["native_session_pid"]
             cwd = str(raw.get("cwd") or '')
             if not cwd:
                 raise LedgerError("invalid_snapshot", "An agent must report its working directory.")
@@ -200,7 +294,8 @@ class AgentRegistry:
             alias, _target = agent_label(raw)
             observed[terminal] = {**locations[terminal], **identity, "session_ref": session_ref,
                                   "client": str(raw["agent"]), "alias": alias,
-                                  "turn_state": str(raw.get("agent_status") or 'unknown')}
+                                  "turn_state": str(raw.get("agent_status") or 'unknown'),
+                                  "native_session_pid": native_session_pid}
         with self.store.transaction(tuple(locations)) as connection:
             old_terminals = {row[0] for row in connection.execute(
                 "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (self.store.host,))}
@@ -226,10 +321,16 @@ class AgentRegistry:
                 same = old and all(old[key] == value[key] for key in ("session_ref", "client", "repo_id"))
                 if same:
                     agent_id = old["agent_id"]
+                    if any(old[key] != value[key] for key in
+                           ("workspace_id", "pane_id", "alias", "is_main_checkout")):
+                        changed_panes.add(value["pane_id"])
                     connection.execute(
-                        "UPDATE agents SET workspace_id=?,pane_id=?,alias=?,is_main_checkout=?,last_seen=? WHERE agent_id=?",
-                        (value["workspace_id"], value["pane_id"], value["alias"], value["is_main_checkout"], at, agent_id))
+                        "UPDATE agents SET workspace_id=?,pane_id=?,alias=?,is_main_checkout=?,last_seen=?,"
+                        "native_session_pid=? WHERE agent_id=?",
+                        (value["workspace_id"], value["pane_id"], value["alias"], value["is_main_checkout"], at,
+                         value["native_session_pid"], agent_id))
                 else:
+                    changed_panes.add(value["pane_id"])
                     generation = connection.execute(
                         "SELECT coalesce(max(generation),0)+1 FROM agents WHERE host=? AND terminal_id=?",
                         (self.store.host, terminal)).fetchone()[0]
@@ -242,7 +343,8 @@ class AgentRegistry:
                          generation, value["client"], value["repo_id"], value["is_main_checkout"], value["alias"], at, at))
                     connection.execute("INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,?,?)",
                                        (agent_id, "unknown", at))
-                self._status(connection, agent_id, "turn_state", value["turn_state"], at)
+                if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
+                    changed_panes.add(value["pane_id"])
             changed_ids: list[str] = []
             for row in connection.execute(
                     "SELECT d.message_id,d.recipient_terminal_id,m.repo_id,d.state FROM deliveries d "
@@ -272,7 +374,7 @@ class AgentRegistry:
         return {"agents": self.list(), "terminals": len(locations)}
 
     @staticmethod
-    def _status(connection: sqlite3.Connection, agent_id: str, field: str, value: str, at: float) -> None:
+    def _status(connection: sqlite3.Connection, agent_id: str, field: str, value: str, at: float) -> bool:
         # Field is selected by internal code, never interpolated from external input.
         if field not in {"turn_state", "phase", "summary"}:
             raise LedgerError("invalid_status_field", "Unknown agent status field.")
@@ -280,6 +382,8 @@ class AgentRegistry:
         if old is not None and old[0] != value:
             connection.execute(f"UPDATE agent_status SET {field}=?,updated_at=? WHERE agent_id=?", (value, at, agent_id))
             connection.execute("INSERT INTO status_log(agent_id,field,value,at) VALUES (?,?,?,?)", (agent_id, field, value, at))
+            return True
+        return False
 
     def list(self, repo_id: str | None = None) -> list[dict[str, Any]]:
         with self.store.read() as connection:
@@ -316,23 +420,135 @@ class AgentRegistry:
             return current_agent(connection, self.store.host, terminal)
 
     def agent_session(self, *, terminal_id: str, session_ref: str, client: str,
-                      repo_id: str, extension_present: bool = True) -> dict[str, Any]:
-        with self.store.transaction((terminal_id,)) as connection:
-            agent = current_agent(connection, self.store.host, terminal_id)
-            if any(agent[key] != value for key, value in (("session_ref", session_ref), ("client", client), ("repo_id", repo_id))):
-                raise LedgerError("stale_session", "Runtime registration does not match the current Herdr session.")
-            connection.execute("UPDATE agents SET extension_present=? WHERE agent_id=?",
-                               (bool(extension_present), agent["agent_id"]))
-            agent["extension_present"] = bool(extension_present)
+                      repo_id: str, extension_present: bool = True,
+                      expected_agent_id: str | None = None, expected_generation: int | None = None,
+                      environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+        # A native hook may fill only an unreported UUID, never replace a known
+        # session. Serialize that narrow upgrade with snapshot reconciliation.
+        with self.store.lock("registry"):
+            native_pid = None
+            if client == "claude":
+                with self.store.read() as connection:
+                    candidate = current_agent(connection, self.store.host, terminal_id)
+                native_pid = claude_foreground_pid(candidate, environment)
+                if native_pid is None:
+                    raise LedgerError("native_root_unverified", "Only the current foreground Claude root may register.")
+                if candidate["session_ref"] == "unreported" and session_ref != "unreported":
+                    latest = live_snapshot(environment)
+                    current = next((raw for raw in latest["agents"]
+                                    if raw.get("terminal_id") == terminal_id
+                                    and raw.get("pane_id") == candidate["pane_id"]
+                                    and raw.get("agent") == "claude"), None)
+                    if current is None:
+                        raise LedgerError("native_root_unverified", "The current Claude root is no longer reported.")
+                    reported = current.get("agent_session")
+                    reference = reported.get("value") if isinstance(reported, dict) else None
+                    if reference and reference != session_ref:
+                        raise LedgerError("stale_session", "A different native session is already reported.")
+            with self.store.transaction((terminal_id,)) as connection:
+                agent = current_agent(connection, self.store.host, terminal_id)
+                if expected_agent_id is not None or expected_generation is not None:
+                    check_generation(connection, self.store.host, terminal_id,
+                                     expected_agent_id, expected_generation)
+                if agent["client"] != client or agent["repo_id"] != repo_id:
+                    raise LedgerError("stale_session", "Runtime registration does not match the current Herdr session.")
+                if agent["session_ref"] != session_ref:
+                    if (client != "claude" or agent["session_ref"] != "unreported"
+                            or expected_agent_id is None or expected_generation is None):
+                        raise LedgerError("stale_session", "Runtime registration cannot replace a reported native session.")
+                    try:
+                        if str(uuid.UUID(session_ref)) != session_ref:
+                            raise ValueError
+                    except (ValueError, TypeError, AttributeError):
+                        raise LedgerError("invalid_session", "Claude registration requires its real canonical hook UUID.") from None
+                    connection.execute("UPDATE agents SET session_ref=?,native_session_pid=? WHERE agent_id=?",
+                                       (session_ref, native_pid, agent["agent_id"]))
+                    agent["session_ref"] = session_ref
+                    agent["native_session_pid"] = native_pid
+                elif (client == "claude" and agent["native_session_pid"] is not None
+                      and agent["native_session_pid"] != native_pid):
+                    raise LedgerError("stale_session", "The pending native root process has changed.")
+                connection.execute("UPDATE agents SET extension_present=? WHERE agent_id=?",
+                                   (bool(extension_present), agent["agent_id"]))
+                agent["extension_present"] = bool(extension_present)
         return agent
 
-    def set_status(self, agent: Mapping[str, Any], *, phase: str, summary: str) -> dict[str, Any]:
+    def set_status(self, agent: Mapping[str, Any], *, phase: str, summary: str,
+                   feature_invoked: bool = False,
+                   environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """Publish committed status; explicit feature use also refreshes unchanged values."""
         with self.store.transaction((agent["terminal_id"],)) as connection:
-            check_generation(connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
+            current = check_generation(
+                connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
             at = time.time()
-            self._status(connection, agent["agent_id"], "phase", phase, at)
-            self._status(connection, agent["agent_id"], "summary", summary, at)
-        return {"agent_id": agent["agent_id"], "phase": phase, "summary": summary}
+            phase_changed = self._status(connection, agent["agent_id"], "phase", phase, at)
+            summary_changed = self._status(connection, agent["agent_id"], "summary", summary, at)
+        result = {"agent_id": agent["agent_id"], "phase": phase, "summary": summary}
+        if phase_changed or summary_changed or feature_invoked:
+            result["display"] = self._refresh_display(
+                {current["pane_id"]}, environment=environment, feature_invoked=feature_invoked)
+        return result
+
+    def _refresh_display(self, pane_ids: set[str], *,
+                         environment: Mapping[str, str] | None = None,
+                         feature_invoked: bool = False) -> dict[str, list[str]]:
+        # Import lazily: the projector reads this registry, but never reconciles it.
+        # It alone owns border ownership checks and last_ham_label compare-and-set.
+        result: dict[str, list[str]] = {"updated": [], "failed": []}
+        try:
+            from ledger_display import LedgerDisplay
+            runner = self.display_runner
+            if runner is None:
+                runner = lambda command: run_bounded_command(
+                    [herdr_executable(environment), *command], timeout=10, environment=environment)
+            display = LedgerDisplay(self.store, runner=runner)
+            for pane_id in sorted(pane_ids):
+                refreshed = display.refresh(pane_id, feature_invoked=feature_invoked)
+                for key in result:
+                    result[key].extend(refreshed[key])
+        except Exception as error:
+            # The registry transaction has committed. A failed projection cannot
+            # truthfully be reported as a failed/rolled-back status mutation.
+            result["failed"].extend(sorted(pane_ids - set(result["updated"]) - set(result["failed"])))
+            self._display_failure(str(error))
+        else:
+            if result["failed"]:
+                self._display_failure("Could not refresh panes: " + ", ".join(result["failed"]))
+        return result
+
+    def _display_failure(self, detail: str) -> None:
+        message = "HAM display refresh failed after commit: " + detail
+        warning = {"code": "notification_failed", "message": message,
+                   "committed": True, "recovery": "event_or_safety_sweep"}
+        if warning not in self.store.notification_errors:
+            self.store.notification_errors.append(warning)
+        try:
+            self.store.note_notification_failure(message)
+        except Exception:
+            # Even persisting the diagnostic is advisory after the durable write.
+            pass
+
+    def set_display_label(self, agent_id: str, expected_last: str | None,
+                          label: str) -> dict[str, Any]:
+        if not isinstance(agent_id, str) or not agent_id or (
+                expected_last is not None and not isinstance(expected_last, str)) or not isinstance(label, str):
+            raise LedgerError("invalid_display_label", "Agent ID, compare value, and label must be text.")
+        desired = label
+        with self.store.transaction() as connection:
+            row = connection.execute("SELECT host,terminal_id,active,last_ham_label FROM agents "
+                                     "WHERE agent_id=?", (agent_id,)).fetchone()
+            if row is None:
+                return {"updated": False, "last_ham_label": None}
+            current = connection.execute("SELECT agent_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                                         (row["host"], row["terminal_id"])).fetchone()
+            last = row["last_ham_label"]
+            if not row["active"] or current is None or current["agent_id"] != agent_id or last != expected_last:
+                return {"updated": False, "last_ham_label": last}
+            changed = connection.execute(
+                "UPDATE agents SET last_ham_label=? WHERE agent_id=? AND active=1 AND last_ham_label IS ?",
+                (desired, agent_id, expected_last),
+            ).rowcount
+            return {"updated": changed == 1, "last_ham_label": desired if changed == 1 else last}
 
     def repo_show(self, repo_id: str) -> dict[str, Any]:
         with self.store.read() as connection:

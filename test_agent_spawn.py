@@ -6,12 +6,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import agent_spawn
 from agent_directory import SSH_CONFIG_ENV, SSH_HOSTS_FILE_ENV, parse_agent_payload
-from agent_labels import ALIASES, LEGACY_SOURCE, SOURCE, candidates
+from agent_labels import ALIASES, candidates
 from agent_route import resolve_agent_route
+from ledger_display import build_display, report_metadata
+from ledger_mail import Mailbox
+from ledger_store import LedgerError, LedgerStore
 
 
 class FakeHerdr:
@@ -37,6 +41,15 @@ class FakeHerdr:
         self.tab_id = "tab-new"
         self.pane_id = "pane-new"
         self.terminal_id = "terminal-new"
+        self.prompts = []
+        self.prompt_error = ""
+        self.prompt_exception = None
+        self.prompt_response = None
+        self.before_prompt = None
+        self.ready = True
+        self.native_session = "session-new"
+        self.before_list = None
+        self.list_calls = 0
 
     def __call__(self, command, **kwargs):
         self.transports.append(list(command))
@@ -54,6 +67,9 @@ class FakeHerdr:
             )
 
         if operation == ("agent", "list"):
+            self.list_calls += 1
+            if self.before_list:
+                self.before_list(self)
             return response({"result": {
                 "agents": self.agents,
                 "workspaces": [{"workspace_id": self.workspace_id, "label": self.workspace_label}],
@@ -92,9 +108,20 @@ class FakeHerdr:
                 "name": label, "pane_id": self.pane_id,
                 "terminal_id": self.terminal_id, "workspace_id": self.workspace_id,
                 "agent": arguments[arguments.index("--kind") + 1], "agent_status": "idle",
-                "agent_session": {"value": "session-new"}, "cwd": self.cwd,
+                "agent_session": {"value": self.native_session}, "cwd": self.cwd,
             })
-            return response({"result": {"ready": True}})
+            return response({"result": {"ready": self.ready}})
+        if operation == ("agent", "prompt"):
+            if self.before_prompt:
+                self.before_prompt()
+            self.prompts.append({"pane_id": arguments[2], "body": arguments[3]})
+            if self.prompt_exception:
+                raise self.prompt_exception
+            if self.prompt_response is not None:
+                return subprocess.CompletedProcess(command, 0, self.prompt_response, "")
+            if self.prompt_error:
+                return response({"error": {"code": "agent_blocked"}}, 1, self.prompt_error)
+            return response({"result": {"accepted": True}})
         if operation == ("pane", "report-metadata"):
             if self.metadata_error:
                 return response({}, 1, "metadata unavailable")
@@ -126,11 +153,18 @@ class AgentSpawnTest(unittest.TestCase):
         return parser.parse_args(["spawn", "--kind", "codex", *options])
 
     def spawn(self, backend, *options, environment=None):
-        return agent_spawn.spawn_command(
-            self.arguments(*options),
-            {"HERDR_PANE_ID": "pane-source"} if environment is None else environment,
-            command_runner=backend,
-        )
+        # Display authority has its own ledger-backed integration tests. Keep
+        # this stateful spawn fixture model-free and isolated from live Herdr.
+        with mock.patch.object(
+            agent_spawn, "_report_metadata",
+            side_effect=lambda run, pane, kind, alias, **_: report_metadata(
+                run, pane, build_display(kind, alias.name, alias.marker, alias.color)),
+        ):
+            return agent_spawn.spawn_command(
+                self.arguments(*options),
+                {"HERDR_PANE_ID": "pane-source"} if environment is None else environment,
+                command_runner=backend,
+            )
 
     def test_auto_label_skips_both_registered_name_fields(self):
         backend = FakeHerdr()
@@ -145,15 +179,6 @@ class AgentSpawnTest(unittest.TestCase):
         self.assertEqual(len(backend.agents), 2)
         self.assertEqual(backend.agents[0]["name"], first.name)
         self.assertNotIn("label_metadata_reported", result)
-        self.assertEqual(backend.metadata[backend.pane_id], {
-            "source": SOURCE,
-            "display_agent": f"{third.marker} {third.name}",
-            "tokens": [f"alias={third.name}", f"color={third.color}"],
-        })
-        self.assertTrue(any(
-            "--clear-display-agent" in command and LEGACY_SOURCE in command
-            for command in backend.commands
-        ))
 
     def test_name_taken_retries_the_next_candidate_in_the_same_pane(self):
         backend = FakeHerdr()
@@ -166,14 +191,13 @@ class AgentSpawnTest(unittest.TestCase):
         self.assertEqual(len(backend.agents), 1)
         self.assertEqual(result["pane_id"], backend.pane_id)
 
-    def test_custom_label_is_verbatim_and_skips_palette_metadata(self):
+    def test_custom_label_is_preserved_verbatim_without_a_palette_marker(self):
         backend = FakeHerdr()
         result = self.spawn(backend, "--label", "Review Worker")
         self.assertEqual(result["address"], "local/Review Worker")
         self.assertEqual(result["marker"], "")
-        self.assertFalse(result["label_metadata_reported"])
-        self.assertEqual(backend.metadata, {})
-        self.assertFalse(any(command[:2] == ["pane", "report-metadata"] for command in backend.commands))
+        self.assertNotIn("label_metadata_reported", result)
+        self.assertEqual(backend.agents[0]["name"], "Review Worker")
 
     def test_explicit_palette_label_receives_metadata(self):
         backend = FakeHerdr()
@@ -426,6 +450,267 @@ class AgentSpawnTest(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class InitialMessageSpawnTest(unittest.TestCase):
+    arguments = AgentSpawnTest.arguments
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.environment = {
+            "HERDR_PANE_ID": "pane-source",
+            "HERDR_AGENT_LEDGER_DIR": str(self.root / "ledger"),
+            "HERDR_AGENT_LEDGER_AUTOSTART": "0",
+        }
+        self.store = LedgerStore(environment=self.environment)
+        self.mailbox = Mailbox(self.store)
+        metadata = mock.patch.object(agent_spawn, "_report_metadata", return_value=True)
+        metadata.start()
+        self.addCleanup(metadata.stop)
+        sender = mock.patch.object(
+            agent_spawn.AgentRegistry, "refresh",
+            side_effect=LedgerError("sender_unresolved", "Non-agent shell fixture"),
+        )
+        sender.start()
+        self.addCleanup(sender.stop)
+
+    def spawn(self, backend, *options):
+        return agent_spawn.spawn_command(
+            self.arguments(*options), self.environment, command_runner=backend,
+        )
+
+    def record(self, result):
+        return self.mailbox.get_spawn_submission(result["initial_prompt"]["operation_id"])
+
+    def test_message_is_durable_before_one_prompt_and_retains_readiness(self):
+        backend = FakeHerdr()
+        observed = []
+
+        def before_prompt():
+            # Inspect through the service after claim committed, before input.
+            observed.append(self.mailbox.get_spawn_submission(operation))
+
+        operation = "6d77a820-2e51-4e45-9f9f-1101ec761169"
+        backend.before_prompt = before_prompt
+        with mock.patch.object(agent_spawn.uuid, "uuid4", return_value=operation):
+            result = self.spawn(backend, "--message", "Initial assignment 한글")
+        self.assertEqual(len(backend.prompts), 1)
+        self.assertEqual(backend.prompts[0], {"pane_id": "pane-new", "body": "Initial assignment 한글"})
+        self.assertEqual(observed[0]["acceptance"], "submitting")
+        self.assertEqual(observed[0]["via"], "spawn_initial")
+        self.assertEqual(observed[0]["sender"], {"kind": "unknown"})
+        self.assertEqual(observed[0]["target"]["terminal_id"], "terminal-new")
+        self.assertEqual(observed[0]["target"]["session_ref"], "session-new")
+        self.assertTrue(json.loads(observed[0]["readiness_evidence"])["ready"])
+        self.assertEqual(result["initial_prompt"]["acceptance"], "accepted")
+        self.assertEqual(self.record(result)["acceptance"], "accepted")
+        self.assertEqual(result["pane_id"], "pane-new")
+        self.assertTrue(backend.created)
+        self.assertNotIn("Initial assignment 한글", json.dumps(result))
+
+    def test_file_reads_caller_local_utf8_and_flags_are_mutually_exclusive(self):
+        body = self.root / "initial.txt"
+        body.write_text("File assignment 한글", encoding="utf-8")
+        backend = FakeHerdr()
+        result = self.spawn(backend, "--message-file", str(body))
+        self.assertEqual(backend.prompts[0]["body"], "File assignment 한글")
+        self.assertEqual(result["initial_prompt"]["acceptance"], "accepted")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
+            self.arguments("--message", "one", "--message-file", str(body))
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_invalid_body_and_file_fail_before_creating_any_resource(self):
+        bad = self.root / "bad.txt"
+        bad.write_bytes(b"\xff")
+        cases = [("--message", " \n"), ("--message-file", str(bad)),
+                 ("--message-file", str(self.root / "missing"))]
+        for options in cases:
+            with self.subTest(options=options):
+                backend = FakeHerdr()
+                with self.assertRaises(agent_spawn.SpawnError):
+                    self.spawn(backend, *options)
+                self.assertEqual(backend.commands, [])
+
+    def test_not_ready_or_missing_native_session_never_prompts_or_closes(self):
+        for field, value in (("ready", False), ("native_session", "")):
+            with self.subTest(field=field):
+                backend = FakeHerdr()
+                setattr(backend, field, value)
+                result = self.spawn(backend, "--message", "Initial assignment")
+                self.assertEqual(result["initial_prompt"]["acceptance"], "failed")
+                self.assertEqual(backend.prompts, [])
+                self.assertTrue(backend.created)
+                self.assertEqual(result["pane_id"], "pane-new")
+
+    def test_possible_acceptance_never_closes_or_replays(self):
+        for fault in ("timeout", "response-loss", "invalid-response", "signal"):
+            with self.subTest(fault=fault):
+                backend = FakeHerdr()
+                if fault == "timeout":
+                    backend.prompt_exception = subprocess.TimeoutExpired(["herdr"], 1)
+                elif fault == "response-loss":
+                    backend.prompt_exception = OSError("Response pipe lost")
+                elif fault == "invalid-response":
+                    backend.prompt_response = ""
+                else:
+                    backend.prompt_exception = KeyboardInterrupt()
+                if fault == "signal":
+                    # The real bounded runner reports a signalled child as a
+                    # negative exit, not a Python control-flow interrupt.
+                    backend.prompt_exception = None
+                    original = backend.__call__
+
+                    def runner(command, **options):
+                        response = original(command, **options)
+                        if command[1:3] == ["agent", "prompt"]:
+                            return subprocess.CompletedProcess(command, -15, "", "")
+                        return response
+                else:
+                    runner = backend
+                result = agent_spawn.spawn_command(
+                    self.arguments("--message", "Initial assignment"), self.environment,
+                    command_runner=runner,
+                )
+                self.assertEqual(result["initial_prompt"]["acceptance"], "unknown")
+                self.assertEqual(self.record(result)["acceptance"], "unknown")
+                self.assertEqual(len(backend.prompts), 1)
+                self.assertTrue(backend.created)
+
+    def test_confirmed_refusal_keeps_pane_and_records_failed(self):
+        backend = FakeHerdr()
+        backend.prompt_error = "agent_blocked"
+        result = self.spawn(backend, "--message", "Initial assignment")
+        self.assertEqual(result["initial_prompt"]["acceptance"], "failed")
+        self.assertEqual(self.record(result)["acceptance"], "failed")
+        self.assertEqual(len(backend.prompts), 1)
+        self.assertTrue(backend.created)
+
+    def test_ledger_failure_before_permission_never_prompts(self):
+        backend = FakeHerdr()
+        with mock.patch.object(Mailbox, "claim_spawn_submission", side_effect=OSError("disk unavailable")):
+            result = self.spawn(backend, "--message", "Initial assignment")
+        self.assertEqual(result["initial_prompt"]["acceptance"], "failed")
+        self.assertEqual(backend.prompts, [])
+        self.assertTrue(backend.created)
+
+    def test_finish_write_failure_preserves_uncertain_durable_record_and_pane(self):
+        backend = FakeHerdr()
+        with mock.patch.object(Mailbox, "finish_spawn_submission", side_effect=OSError("disk unavailable")):
+            result = self.spawn(backend, "--message", "Initial assignment")
+        self.assertEqual(result["initial_prompt"]["acceptance"], "unknown")
+        self.assertEqual(self.record(result)["acceptance"], "submitting")
+        self.assertEqual(len(backend.prompts), 1)
+        self.assertTrue(backend.created)
+
+    def test_recipient_session_change_after_claim_is_failed_before_input(self):
+        backend = FakeHerdr()
+
+        def replace_session(current):
+            if current.list_calls == 3:
+                current.agents[0]["agent_session"]["value"] = "replacement-session"
+
+        backend.before_list = replace_session
+        result = self.spawn(backend, "--message", "Initial assignment")
+        self.assertEqual(result["initial_prompt"]["error_code"], "recipient_changed")
+        self.assertEqual(self.record(result)["acceptance"], "failed")
+        self.assertEqual(backend.prompts, [])
+
+    def test_same_operation_is_observe_only_after_acceptance_or_uncertainty(self):
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain):
+                backend = FakeHerdr()
+                if uncertain:
+                    backend.prompt_exception = OSError("Response lost")
+                first = self.spawn(backend, "--message", "Initial assignment", "--verbose")
+                row = self.record(first)
+                target = parse_agent_payload(
+                    {"result": {"agents": backend.agents}}, host="local", local=True,
+                )[0]
+                placement = agent_spawn._Placement("pane", backend.pane_id, backend.terminal_id,
+                                                   backend.workspace_id, backend.tab_id)
+                repeated = agent_spawn._initial_submission(
+                    first["initial_prompt"]["operation_id"], "Initial assignment", target, placement,
+                    address=first["address"], readiness_evidence=row["readiness_evidence"],
+                    environment=self.environment,
+                    run=lambda *args, **options: self.fail("Duplicate prompt transport"),
+                    discover=lambda: self.fail("Duplicate submission must not rediscover or submit"),
+                )
+                self.assertEqual(repeated["acceptance"], "unknown" if uncertain else "accepted")
+                self.assertEqual(len(backend.prompts), 1)
+
+    def test_verified_agent_sender_is_not_recorded_as_user(self):
+        backend = FakeHerdr()
+        sender = {"host": "alpha", "terminal_id": "sender-terminal", "session_ref": "sender-session",
+                  "client": "codex", "agent_id": "sender-agent"}
+        with (
+            mock.patch.object(agent_spawn.AgentRegistry, "refresh", return_value=({}, {})),
+            mock.patch.object(agent_spawn.AgentRegistry, "resolve_context", return_value=sender),
+        ):
+            result = self.spawn(backend, "--message", "Initial assignment")
+        self.assertEqual(self.record(result)["sender"], {**sender, "kind": "agent"})
+        self.assertEqual(self.record(result)["via"], "spawn_initial")
+
+    def test_start_timeout_preserves_created_pane_without_initial_submission(self):
+        backend = FakeHerdr()
+
+        def runner(command, **options):
+            if command[1:3] == ["agent", "start"]:
+                raise subprocess.TimeoutExpired(command, 1)
+            return backend(command, **options)
+
+        result = agent_spawn.spawn_command(
+            self.arguments("--message", "Initial assignment"), self.environment,
+            command_runner=runner,
+        )
+        self.assertEqual(result["initial_prompt"]["acceptance"], "failed")
+        self.assertEqual(result["pane_id"], backend.pane_id)
+        self.assertEqual(backend.prompts, [])
+        self.assertTrue(backend.created)
+
+    def test_remote_spawn_preserves_transport_alias_and_unknown_canonical_without_peer(self):
+        backend = FakeHerdr()
+        config = self.root / "ssh-config"
+        config.write_text("Host remote-alias\n  HostName example.invalid\n", encoding="utf-8")
+        self.environment.update({SSH_CONFIG_ENV: str(config),
+                                 SSH_HOSTS_FILE_ENV: str(self.root / "ssh-hosts")})
+        result = self.spawn(
+            backend, "--host", "remote-alias", "--cwd", "/remote/project",
+            "--from-pane", "remote-pane", "--message", "Initial assignment",
+        )
+        target = self.record(result)["target"]
+        self.assertIsNone(target["host"])
+        self.assertEqual(target["transport_host"], "remote-alias")
+        self.assertEqual(result["initial_prompt"]["acceptance"], "accepted")
+        self.assertEqual(len(backend.prompts), 1)
+
+    def test_registered_isolated_remote_socket_is_used_for_creation_verify_and_prompt(self):
+        backend = FakeHerdr()
+        config = self.root / "ssh-config"
+        config.write_text("Host remote-alias\n  HostName example.invalid\n", encoding="utf-8")
+        self.environment.update({SSH_CONFIG_ENV: str(config),
+                                 SSH_HOSTS_FILE_ENV: str(self.root / "ssh-hosts")})
+        peer = {"canonical_name": "beta", "remote_socket": "/private-disk/ham.sock"}
+        with mock.patch.object(agent_spawn.RemoteLedger, "peer", return_value=peer):
+            result = self.spawn(
+                backend, "--host", "remote-alias", "--cwd", "/remote/project",
+                "--from-pane", "remote-pane", "--message", "Initial assignment",
+            )
+        self.assertEqual(self.record(result)["target"]["host"], "beta")
+        self.assertEqual(self.record(result)["target"]["transport_host"], "remote-alias")
+        self.assertTrue(backend.transports)
+        for command in backend.transports:
+            script = shlex.split(command[-1])[2]
+            self.assertIn("export HERDR_SOCKET_PATH=/private-disk/ham.sock;", script)
+        self.assertEqual(len(backend.prompts), 1)
+
+    def test_no_message_does_not_open_initial_submission_ledger(self):
+        backend = FakeHerdr()
+        with mock.patch.object(agent_spawn, "LedgerStore", side_effect=AssertionError("unexpected ledger")):
+            result = self.spawn(backend)
+        self.assertNotIn("initial_prompt", result)
+        self.assertEqual(backend.prompts, [])
 
 
 if __name__ == "__main__":

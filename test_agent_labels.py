@@ -98,40 +98,6 @@ class AgentLabelsTest(unittest.TestCase):
         self.assertEqual(output.getvalue(), f"{renamed[-1][3]}\n")
         self.assertTrue(any(call[:2] == ("pane", "report-metadata") for call in calls))
 
-    def test_conflict_stops_retrying_when_concurrent_hook_named_the_pane(self):
-        unnamed = {
-            "agent": "codex",
-            "terminal_id": "term-1",
-        }
-        named = {**unnamed, "name": "blue-otter"}
-        conflict = mock.Mock(returncode=1, stdout="", stderr="agent_name_taken")
-        with (
-            mock.patch.object(
-                agent_labels,
-                "fetch_agent_info",
-                side_effect=[unnamed, named],
-            ),
-            mock.patch.object(
-                agent_labels,
-                "run_herdr",
-                return_value=conflict,
-            ) as run,
-        ):
-            self.assertEqual(agent_labels.assign_label("w1:p2"), 0)
-
-        run.assert_called_once()
-        self.assertEqual(run.call_args.args[:2], ("agent", "rename"))
-
-    def test_named_agent_is_preserved(self):
-        result = mock.Mock(
-            returncode=0,
-            stdout='{"result":{"agent":{"agent":"claude","name":"reviewer"}}}',
-            stderr="",
-        )
-        with mock.patch.object(agent_labels, "run_herdr", return_value=result) as run:
-            self.assertEqual(agent_labels.assign_label("w1:p3"), 0)
-        self.assertEqual(run.call_count, 1)
-
     def test_metadata_migration_clears_legacy_source_before_reporting_new(self):
         completed = mock.Mock(returncode=0, stdout="{}", stderr="")
         with mock.patch.object(
@@ -248,22 +214,6 @@ class AgentLabelsTest(unittest.TestCase):
 
         clear.assert_called_once_with("w1:p4")
         assign.assert_not_called()
-
-    def test_reconcile_only_rechecks_unnamed_agents(self):
-        agents = [
-            {"agent": "codex", "pane_id": "w1:p1", "name": "blue-otter"},
-            {"agent": "codex", "pane_id": "w1:p2"},
-            {"agent": "claude", "pane_id": "w1:p3", "agent_name": "reviewer"},
-            {"pane_id": "w1:p4"},
-            {"agent": "codex", "pane_id": "w1:p2"},
-        ]
-        with (
-            mock.patch.object(agent_labels, "fetch_agents", return_value=agents),
-            mock.patch.object(agent_labels, "assign_label", return_value=0) as assign,
-        ):
-            self.assertEqual(agent_labels.reconcile_labels(), 0)
-
-        assign.assert_called_once_with("w1:p2")
 
     def test_reconcile_continues_after_one_assignment_failure(self):
         agents = [

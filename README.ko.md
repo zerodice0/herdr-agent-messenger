@@ -7,19 +7,21 @@
 한국어 · [English](README.md)
 
 HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러그인입니다.
-이름 없는 에이전트에 기억하기 쉬운 `color-animal` 이름을 붙이고, 키보드
-중심 팝업이나 Codex, Claude Code, omp에서 해당 에이전트로 프롬프트를 전달합니다.
-기존 에이전트에 메시지를 보내는 것뿐 아니라 `spawn`으로 새 세션도 시작할 수 있습니다.
+이름 없는 에이전트에 기억하기 쉬운 `color-animal` 이름을 붙이고, 새 세션과
+첫 프롬프트를 하나의 작업으로 생성합니다. 같은 저장소에서 작업하는 로컬·SSH
+에이전트는 영속 메일함으로 협업할 수 있습니다.
 
 ## 주요 기능
 
 - `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
 - `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
-- 코디네이터 위임과 다중 수신자 직접 전송을 지원합니다.
+- 같은 저장소의 대화 이력과 명시적 처리 기록, `off` / `manual` / `auto` 참여 모드를 제공합니다.
+- 키보드 중심 메일함·상태 TUI에서 사용자 메일과 직접 입력을 구분해 작성할 수 있습니다.
 - Codex, Claude Code, omp용 스킬을 짧은 `SKILL.md`와 필요할 때 읽는 `reference.md`로 제공합니다.
-- 안전한 요청·대기·읽기·배치·세션 생성·원격 배포 도구를 제공합니다.
-- 포커스가 있는 pane으로 오는 에이전트 메시지를 보류하고, 기본 3분 후 **HAM: Held Messages**에서 Push 또는 Cancel을 선택하도록 합니다.
-- 간결한 CLI 출력, `--verbose` 진단 정보, `request-status --wait`를 통한 후속 관찰을 지원합니다.
+- `spawn --message`로 라벨이 있는 세션과 첫 프롬프트를 생성하며, 단독 사용과 정책이 허용하는 기존 요청·대기·읽기·배치·원격 배포 도구도 지원합니다.
+- omp와 Claude 수신 런타임은 별도로 선택해 설치합니다. Codex는 작업 경계에서 받은 메일을 명시적으로 읽습니다.
+- 정책이 허용하는 기존 에이전트 프롬프트는 수신 pane에 포커스가 있으면 보류하고, 기본 3분 후 **HAM: Held Messages**에서 Push 또는 Cancel을 선택하도록 합니다.
+- 기존 CLI는 간결한 출력, `--verbose` 진단 정보, `request-status --wait`를 통한 후속 관찰을 지원합니다.
 
 사용자가 직접 붙인 이름은 변경하지 않습니다. 에이전트 주소는
 `local/blue-otter`, `macbook-pro/purple-koala`처럼 항상 호스트를
@@ -52,8 +54,13 @@ herdr plugin link "$PWD" --enabled
 
 ## 사용
 
-Herdr 에이전트 pane에서 **Send Prompt to Agents**를 열어 수신자를 선택하고
-코디네이터 위임 또는 직접 전송 방식을 고릅니다.
+같은 저장소의 참여 에이전트끼리는 [영속 메일함](#영속-메일함)으로 협업합니다.
+[HAM TUI](docs/ko/ui-reference.md)는 Status, Threads, Compose, Settings 화면을
+제공합니다. 사용자 작성 화면에서는 일반 메일과 수신자의 작업을 중단할 수 있는
+직접 입력을 구분합니다. 직접 입력은 에이전트 간 협업용 전송 경로가 아닙니다.
+
+기존 **Send Prompt to Agents** 팝업의 코디네이터 위임과 다중 수신자 직접 전송은
+참여 정책이 허용하는 경우에 사용할 수 있습니다.
 
 Codex에서는 `$ham`을 입력한 뒤 **HAM — Herdr Agent Messenger**를 선택합니다.
 Claude Code에서는 `/herdr-agent-messenger`를 명시적으로 호출하거나 자연어로
@@ -65,15 +72,41 @@ $ham local/yellow-falcon에게 dxp-ui에서 사용하는 언어 라벨을 물어
 응답을 기다린 다음 현재 작업과 기본값을 그 답변에 맞춰줘.
 ```
 
-현재 기기는 호스트 이름 대신 `local/LABEL`로 지정하고, 원격 기기는 설정된
-SSH 별칭을 사용하세요. 라벨만 쓰면 다른 호스트의 에이전트와 충돌하거나
+주소에는 항상 호스트를 포함하세요. 기존 탐색·프롬프트 전송 명령은 현재 기기에
+`local/LABEL`을, 원격 기기에 설정된 SSH 별칭을 사용합니다. 메일함 명령은 등록된
+정규 호스트 이름도 받습니다. 라벨만 쓰면 다른 호스트의 에이전트와 충돌하거나
 AI 클라이언트 자체 서브에이전트로 오인될 수 있습니다.
 
-새 에이전트 세션을 열고 메시지를 보내라는 요청에는 `spawn`을 사용한 뒤 반환된
-`address`로 `request --address HOST/LABEL`을 실행하세요. 직접
-`herdr agent start <name>`을 실행하면 HAM의 라벨 선택과 메타데이터 처리를
-우회합니다. 기존 라벨이 없다는 이유만으로 새 세션을 만들거나 라벨을 추측하지 마세요.
-전체 옵션과 예시는 [스킬 가이드](docs/ko/skill-guide.md)를 참고하세요.
+### 새 세션
+
+새 에이전트 세션이 필요하면 HAM에 생성을 명시적으로 요청하세요.
+`spawn --message`는 라벨이 있는 세션을 만들고 첫 프롬프트 작업을 영속적으로
+기록한 뒤, 대화형 세션이 준비되면 한 번 제출합니다. 세션을 먼저 만든 뒤
+별도의 기존 `request`로 첫 프롬프트를 보내지 마세요. 체크아웃에서는 다음과
+같이 실행합니다.
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py spawn \
+  --kind omp --cwd "$PWD" --placement tab --message '이 프로젝트를 검토해 주세요.'
+```
+
+호출하는 기기의 UTF-8 파일을 읽으려면 대신 `--message-file PATH`를 사용하세요.
+에이전트 인수를 전달할 때는 HAM 옵션을 `--` 앞에 둡니다. 메시지 옵션을 모두
+생략하면 첫 프롬프트 없이 세션만 만듭니다. 기존 라벨이 없다는 이유로 새 세션을
+자동 생성하지는 않습니다. 직접 `herdr agent start <name>`을 실행하면 HAM의
+라벨 선택과 메타데이터 처리를 우회합니다.
+
+첫 프롬프트의 수락 상태가 `unknown`이면 이미 제출됐을 수 있습니다. 작업 ID와
+pane을 보존하고, 메시지를 다시 보내거나 대체 세션을 만들지 마세요. 터미널의
+입력 수락은 메일함의 네이티브 전달이나 모델의 성공적인 처리를 뜻하지 않습니다.
+
+### 정책이 허용하는 기존 프롬프트
+
+`manual` 또는 `auto`에서 같은 저장소의 송신자와 수신자가 모두 참여하면
+기존 `send`, `request`, `batch`는 `use_mailbox`로 거부합니다. 배치는 모든
+수신자를 먼저 확인하므로, 정책 거부나 조회 실패가 하나라도 있으면 아무것도
+제출하지 않습니다. 이는 실수 방지 장치이지 보안 경계는 아닙니다.
+비참여 통신에는 다음 보류·관찰 규칙을 포함한 기존 절차를 사용할 수 있습니다.
 
 CLI 메시지의 수신자 pane에 포커스가 있으면 전송을 보류하므로 다시 보내지
 마세요. 기본 보류 제한인 3분이 지나면 송신 호스트의 **HAM: Held Messages**에서
@@ -89,7 +122,9 @@ Push 또는 Cancel을 선택하세요. 보류 후 전송하거나 Push로 전송
 출력 한도나 읽기 실패로 응답 텍스트 자체가 잘렸을 때만 `true`입니다. 오래된
 이력을 생략했거나 기준 화면과의 연속성을 잃었다는 이유만으로는 설정하지 않습니다.
 잘못된 보류 제한을 나타내는 `invalid_defer_timeout`을 비롯한 오류와 전체 옵션은
-[스킬 가이드](docs/ko/skill-guide.md)를 참고하세요.
+[명령 참고서](.agents/skills/herdr-agent-messenger/reference.md)를 참고하세요.
+
+### 클라이언트 스킬 설치
 
 Herdr 명령 팔레트의 **HAM Skill**에서 번들 스킬을 설치·갱신하거나 다음 명령을
 실행합니다.
@@ -108,22 +143,112 @@ HAM 플러그인을 활성화하지 않고 Herdr와 스킬만 사용할 수도 �
 
 ## 영속 메일함
 
-등록된 Herdr 에이전트 pane에서 `mail send --to local/LABEL --body TEXT`로
-진행 중인 작업을 방해하지 않고 메시지를 남길 수 있습니다. 받는 쪽은
-`inbox read`로 조회하고 `inbox handle --message UUID`로 처리를 기록합니다.
-같은 pane을 쓰는 서브에이전트가 조회해도 전달·처리 상태는 바뀌지 않습니다.
-`mail show --thread UUID`는 대화와 상태를 보여 주며,
-`mail withdraw --message UUID`는 아직 전달 claim이 없는 메시지를 철회합니다.
+참여 에이전트는 터미널에 프롬프트를 직접 넣는 대신 같은 저장소의 영속 메일을
+사용합니다. 등록된 Herdr 에이전트 pane에서 다음과 같이 실행합니다.
 
-메일함은 같은 저장소의 원격 `--to CANONICAL_HOST/LABEL`과 등록된 SSH 별칭도
-받습니다. `--to main`은 저장소 home 호스트가 접수할 때 한 번만 해석합니다.
-`ledger setup --name HOST`로 호스트 정체성을 고정한 뒤 양쪽에서
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py mail send \
+  --to local/blue-owl --kind action --subject '검토' --body '이 프로젝트를 검토해 주세요.'
+# 수신자는 작업 경계에서 조회합니다.
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py inbox read
+# 관련 작업을 마친 뒤 처리 상태를 기록합니다.
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py inbox handle \
+  --message MESSAGE_UUID
+```
+
+`fyi`는 참고 정보이며, `action`은 조건에 맞으면 omp의 유휴 세션에서 턴을
+시작할 수 있습니다. FYI만으로는 턴을 시작하지 않습니다. 같은 pane을 쓰는
+서브에이전트가 읽어도 조회는 전달·처리 상태를 바꾸지 않습니다. 명시적 처리는
+대기 중인 메일을 네이티브 전달 시각 없이 처리 완료로 바꿀 수 있습니다.
+현재 수신자에게 온 메일에 답장하면 해당 원문도 같은 트랜잭션에서 처리됩니다.
+`mail show --thread UUID`로 대화를 확인하고,
+`mail withdraw --message UUID`로 철회를 요청합니다. 이미 전달 claim이
+생성된 메일을 단순히 회수할 수는 없습니다.
+
+### 참여 모드와 역할
+
+참여 설정은 에이전트용 변경 명령이 아니라 TUI의 Settings 화면에서 선택합니다.
+
+| 모드 | 역할과 자동 동작 |
+| --- | --- |
+| `off` (기본값) | 역할, 자동 턴 시작, 참여 정책에 따른 기존 전송 거부가 없습니다. 명시적 받은 메일 조회와 일반 사용자 턴 경계에서의 수신은 가능합니다. |
+| `manual` | 명시적으로 선택한 main이 협업을 조율하고, 선택한 멤버는 main을 제외하고 worker가 됩니다. 비멤버도 일반 턴 경계에서 수신할 수 있지만 자동으로 턴을 시작하지 않습니다. |
+| `auto` | 명시적 main 지정이 우선합니다. 지정이 없으면 저장소 home의 메인 체크아웃에서 활성 에이전트가 정확히 하나일 때만 main이 됩니다. 후보가 없거나 여럿이면 자동 main은 없습니다. 그 밖의 모든 호스트에 있는 같은 저장소의 에이전트는 worker가 됩니다. |
+
+home은 참여를 처음 활성화할 때 정해지는 정규 호스트이며, Settings에서
+읽기 전용으로 표시됩니다. 정규 호스트 이름과 UUID는 SSH 별칭이나 호스트
+이름과 구별됩니다. 에이전트는 안정적인 터미널 슬롯과 세션 세대로 식별하므로
+pane을 옮겨도 슬롯은 유지됩니다. 이전 세대의 불확실한 claim은 자동 재전송하지
+않습니다. TUI에서 증거를 남기고 수행하는 운영자 판정은 감사 기록이며,
+네이티브 전달 증거나 작업 완료를 뜻하지 않습니다.
+
+### 원격 전송과 수신 런타임
+
+수신자는 `local/LABEL`, `CANONICAL_HOST/LABEL`, 등록된 `SSH_ALIAS/LABEL`,
+또는 `main`으로 지정합니다. home은 `main`을 한 번만 해석합니다. home이
+오프라인이면 저장된 대체 대상을 쓰지 않고 메일을 pending 상태로 유지합니다.
+각 호스트에서 `ledger setup --name HOST`로 정체성을 고정한 뒤 양쪽에서
 `ledger peer add --ssh-alias ALIAS`로 연결을 등록합니다. 전송 상태는
-`ledger doctor`, `ledger outbox`로 확인합니다. 독립 flock worker는 일시적 오류를
-같은 메시지 ID로 재시도합니다. 영구 오류는 다른 메시지를 막지 않으며 명시적으로
-다시 시도할 수 있습니다. 메일함 명령은 터미널에 프롬프트를 넣거나 모델을
-깨우지 않습니다. 기존 `send`/`request`와 Held Messages도 그대로입니다.
-플래그, 저장 위치와 격리 방법은 [스킬 가이드](docs/ko/skill-guide.md#로컬-메일함)를 참고하세요.
+`ledger doctor`와 `ledger outbox`로 확인합니다. 모델을 호출하지 않는 독립
+flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. 영구 오류는
+명시적으로 재시도할 수 있도록 표시됩니다. 모델 폴링이나 데이터베이스 복제는
+하지 않습니다.
+
+스킬 설치는 수신 런타임을 설치하지 **않습니다**. 각 호스트에서 별도로
+`runtime install omp` 또는 `runtime install claude`를 선택해 실행합니다.
+같은 대상의 `runtime status`로 상태를 확인하고 `runtime uninstall`로 제거합니다.
+선택한 세션만 다시 시작하세요. 설치기는 HAM 확장이나 훅 항목만 관리하며,
+관련 없는 Herdr·클라이언트 설정은 보존합니다.
+
+- **omp:** Herdr의 루트 세션은 일반 턴 경계에서 메일을 받을 수 있습니다.
+  action으로 자동 턴을 시작하려면 역할, 지원되는 빈 입력창, 입력 유휴 시간,
+  세션 유휴 상태, 설정된 묶음 처리·빈도 제한 조건을 모두 충족해야 합니다.
+  포커스만으로 메일을 보류하지는 않습니다. ACK는 같은 세션의 활성 분기
+  저널에서 정확한 메일 묶음을 관찰했다는 뜻이지, 제공자의 수락이나 모델의
+  이해를 뜻하지 않습니다.
+- **Claude Code:** 제한된 `SessionStart`와 `UserPromptSubmit` 훅에서 수신합니다.
+  Stop·유휴 훅으로 턴을 시작하지 않으며 코드 worker도 Claude 턴을 만들지
+  않습니다. 훅 출력만으로는 전달이 아닙니다. 네이티브 ACK는 두 증거 경로를
+  지원합니다. 하나는 SDK의 system/request blob에 정확한 메일 묶음이 있고
+  새 요청 추적과 연관된 경우(`claude:api-request:`)입니다. 다른 하나는 타입이
+  지정된 네이티브 훅의 원본·렌더링 기록이 정확한 claim 바이트·해시와 일치하고
+  인과관계를 입증하는 네이티브 요청 기록이 있는 경우(`claude:accepted-journal:`)입니다.
+  후자는 호스트 컨텍스트에 적용됐다는 증거이며, 제공자에게 전송된 정확한
+  바이트나 제공자의 증명, 모델의 자기 보고·이해를 뜻하지 않습니다.
+  두 경로 모두 `confirmation_source=native`를 사용하며, 운영자 판정은
+  `operator`로 구별합니다.
+- **Codex:** 작업 경계에서 `inbox read`로 읽고 관련 작업을 수행한 뒤
+  `inbox handle`로 명시적으로 처리합니다. 자동 수신 어댑터나 턴 시작 기능은 없습니다.
+
+전달과 처리는 다릅니다. 사용자 직접 입력은 터미널의 수락 상태를 별도로
+기록하며 네이티브 메일함 전달로 표시하지 않습니다. 직접 입력의 헤더는
+`Message from user (HAM):`입니다.
+
+Claude Code 2.1.301의 제한된 실제 실행에서 프로덕션 SessionStart 컨텍스트와
+현재 세대 worker가 영속 기록한 `delivered` 상태를 확인했습니다. 해당 기록은
+`via=hook`, 네이티브 확인, `claude:accepted-journal:` 증거를 포함합니다.
+동일한 등록 프로세스에서 worker가 실행되고 action·FYI 메일이 대기하는 동안,
+manual-worker와 auto-main 각각 6.02초의 유휴 구간에 추가 주 턴이나 claim이
+생기지 않았습니다. 보조 `quota_check` / `prompt_suggestion` 요청은 별개이므로
+제공자 통신이 전혀 없었다는 뜻은 아닙니다. 이 실행에서는 Herdr가 세션 UUID를
+이미 알고 있었습니다. 콜드 시작의 미보고 상태에서 수행하는 바인딩 CAS는
+단위 검증만 통과했으며 실제 실행으로 입증하지는 않았습니다. 이 제한된 관찰은
+전체 런타임이나 제공자의 성공을 뜻하지 않습니다.
+
+전체 옵션과 정체성·저장 위치·수신 확인·복구·런타임 설치 규칙은
+[메일함 명령 참고서](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)를,
+설정·작성·불확실한 claim 복구 조작은 [UI 참고서](docs/ko/ui-reference.md)를 참고하세요.
+
+## 배포 순서
+
+먼저 **각 호스트의 플러그인**을 해당 프로토콜을 지원하는 코드로 업그레이드합니다.
+그다음 일치하는 스킬과 수신 런타임을 준비하고 나서 참여 정책을 활성화하세요.
+수신 준비 전에 기존 협업 전송부터 거부되는 상황을 피해야 합니다. Codex는
+런타임 어댑터 대신 스킬을 통한 명시적 조회 절차를 사용합니다. 마지막으로
+사용자가 전역 단축키 연결 여부를 선택하고 상태·recap 규칙을 이전합니다.
+전역 단축키는 자동으로 바꾸지 않습니다. 이는 배포 절차 안내이며, 호스트나
+세션의 업그레이드를 이미 마쳤다는 뜻은 아닙니다.
+자세한 절차는 [원격 배포 가이드](docs/ko/rollout.md)를 참고하세요.
 
 ## 문서
 

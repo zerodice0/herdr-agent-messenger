@@ -279,6 +279,13 @@ def compact_spawn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("label_metadata_reported", "placement_label_reported"):
         if payload.get(key) is False:
             compact[key] = False
+    initial = payload.get("initial_prompt")
+    if isinstance(initial, Mapping):
+        compact["initial_prompt"] = {
+            key: initial[key]
+            for key in ("operation_id", "submission_id", "acceptance", "evidence", "error_code", "error")
+            if key in initial
+        }
     return compact
 
 

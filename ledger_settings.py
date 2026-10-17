@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
+from collections.abc import Callable, Sequence
 from typing import Any, Mapping
 
 from ledger_store import LedgerError, LedgerStore, json_text, queue_outbox
@@ -61,8 +63,24 @@ def validate_setting(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class RepoSettings:
-    def __init__(self, store: LedgerStore) -> None:
+    def __init__(self, store: LedgerStore, *,
+                 environment: Mapping[str, str] | None = None,
+                 display_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None) -> None:
         self.store = store
+        self.environment = environment
+        self.display_runner = display_runner
+
+    def _refresh_display(self, environment: Mapping[str, str] | None = None) -> dict[str, list[str]]:
+        from ledger_display import refresh
+        return refresh(self.store, self.environment if environment is None else environment,
+                       runner=self.display_runner)
+
+    def _display_result(self, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+        display = self._refresh_display(environment)
+        result: dict[str, Any] = {"display": display}
+        if display["failed"]:
+            result["warnings"] = [{"code": "display_refresh_failed", "panes": display["failed"]}]
+        return result
 
     @staticmethod
     def fields(connection: Any, repo_id: str) -> dict[str, dict[str, Any]]:
@@ -166,7 +184,7 @@ class RepoSettings:
                        "changed_by": "user", "changed_at": time.time()}
             self._apply(connection, setting)
             self._compute(connection, repo_id)
-        return self.show(repo_id)
+        return {**self.show(repo_id), **self._display_result()}
 
     def accept(self, setting: Mapping[str, Any], source: str) -> dict[str, Any]:
         if setting.get("repo_id", "").startswith("local:"):
@@ -174,7 +192,7 @@ class RepoSettings:
         with self.store.transaction() as connection:
             changed = self._apply(connection, setting, source=source)
             self._compute(connection, setting["repo_id"])
-        return {"applied": changed, **self.show(setting["repo_id"])}
+        return {"applied": changed, **self.show(setting["repo_id"]), **self._display_result()}
 
     def _compute(self, connection: Any, repo_id: str) -> None:
         fields = self.fields(connection, repo_id)
@@ -194,31 +212,42 @@ class RepoSettings:
                                  "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
                                  "changed_by": "home", "changed_at": time.time()})
 
-    def clear_closed_main(self, repo_id: str, expected: Mapping[str, Any]) -> bool:
+    def clear_closed_main(self, repo_id: str, expected: Mapping[str, Any], *,
+                          refresh_display: bool = True,
+                          environment: Mapping[str, str] | None = None) -> bool:
+        changed = False
         with self.store.transaction() as connection:
             fields = self.fields(connection, repo_id)
             main = fields.get("main")
-            if not main or stamp(main) != dict(expected) or not main["value"] or main["value"]["host"] != self.store.host:
-                return False
-            terminal = connection.execute("SELECT present FROM terminal_slots WHERE host=? AND terminal_id=?",
-                                          (self.store.host, main["value"]["terminal_id"])).fetchone()
-            if terminal is None or terminal[0]:
-                return False
-            self._apply(connection, {"repo_id": repo_id, "field": "main", "value": None,
-                                     "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
-                                     "changed_by": "main_host", "changed_at": time.time(), "expected_main": dict(expected)})
-            self._compute(connection, repo_id)
-        return True
+            if main and stamp(main) == dict(expected) and main["value"] and main["value"]["host"] == self.store.host:
+                terminal = connection.execute("SELECT present FROM terminal_slots WHERE host=? AND terminal_id=?",
+                                              (self.store.host, main["value"]["terminal_id"])).fetchone()
+                if terminal is None or not terminal[0]:
+                    self._apply(connection, {"repo_id": repo_id, "field": "main", "value": None,
+                                             "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
+                                             "changed_by": "main_host", "changed_at": time.time(), "expected_main": dict(expected)})
+                    self._compute(connection, repo_id)
+                    changed = True
+        if changed and refresh_display:
+            self._display_result(environment)
+        return changed
 
-    def reconcile_local(self) -> None:
+    def reconcile_local(self, *, refresh_display: bool = True,
+                        environment: Mapping[str, str] | None = None) -> dict[str, Any]:
         with self.store.read() as connection:
             repos = [row[0] for row in connection.execute("SELECT repo_id FROM repos")]
+        changed = False
         for repo_id in repos:
             current = self.show(repo_id)["settings"].get("main")
-            if current:
-                self.clear_closed_main(repo_id, stamp(current))
+            if current and self.clear_closed_main(repo_id, stamp(current), refresh_display=False):
+                changed = True
             with self.store.transaction() as connection:
+                before = self.fields(connection, repo_id)
                 self._compute(connection, repo_id)
+                after = self.fields(connection, repo_id)
+                changed = changed or before != after
+        display = self._refresh_display(environment) if changed and refresh_display else None
+        return {"changed": changed, "display": display}
 
     def main(self, connection: Any, repo_id: str) -> dict[str, str] | None:
         fields = self.fields(connection, repo_id)
