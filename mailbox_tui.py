@@ -472,6 +472,9 @@ class MailboxApp:
         self.selections = {"agents": 0, "threads": 0}
         self.scrolls = {"agents": 0, "threads": 0, "detail": 0}
         self.detail: dict[str, Any] | None = None
+        self.detail_identity: Any = None
+        self.detail_technical = False
+        self.detail_available, self.detail_total = 0, 0
         self.diagnostics = False
         self.status, self.input_error = "", ""
         self.status_level, self.last_error = "info", ""
@@ -583,6 +586,12 @@ class MailboxApp:
                                                if self.identity(item) == identity), self.selections[region])
                 self.selected(region)
         if not self.diagnostics:
+            identity = self.identity(self.selected(self.preview))
+            if identity != self.detail_identity:
+                self.detail_identity = identity
+                self.detail_technical = False
+                self.scrolls["detail"] = 0
+                self.detail_total = 0
             self.detail = self.selected(self.preview)
 
     def tick(self) -> None:
@@ -1170,15 +1179,17 @@ class MailboxApp:
             self.focus = self.REGIONS[(self.REGIONS.index(self.focus) + direction) % len(self.REGIONS)]
             if self.focus != "detail":
                 self.preview, self.diagnostics = self.focus, False
-                self.scrolls["detail"] = 0
             self.refresh_detail()
         elif key in (curses.KEY_UP, curses.KEY_DOWN, "j", "k", curses.KEY_PPAGE,
                      curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
             direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
-            amount = max(1, self.screen.getmaxyx()[0] - 6) if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+            amount = 1
             if self.focus == "detail":
-                self.scrolls["detail"] = (0 if key == curses.KEY_HOME else 10**9 if key == curses.KEY_END
-                                         else max(0, self.scrolls["detail"] + direction * amount))
+                if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                    amount = max(1, self.detail_available - 1)
+                self.scrolls["detail"] = self.clamp_detail(
+                    0 if key == curses.KEY_HOME else self.detail_total if key == curses.KEY_END
+                    else self.scrolls["detail"] + direction * amount)
             else:
                 if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
                     visible = {value for _, target, value in self.hit_map if target == "list-row"
@@ -1191,7 +1202,6 @@ class MailboxApp:
                                                self.selections[self.focus] + direction * amount)
                 self.selected()
                 self.preview, self.diagnostics = self.focus, False
-                self.scrolls["detail"] = 0
                 self.refresh_detail()
         elif key == "\r":
             if self.focus == "agents":
@@ -1213,6 +1223,9 @@ class MailboxApp:
             self.scrolls["detail"] = 0
         elif key == "r":
             self.refresh()
+        elif key == "t" and self.focus == "detail" and self.technical_supported():
+            self.detail_technical = not self.detail_technical
+            self.scrolls["detail"] = 0
         elif self.focus == "threads" and key in ("w", "t", "a", "n"):
             self.thread_action(key)
 
@@ -1248,13 +1261,12 @@ class MailboxApp:
                 return
             region = next((value for _, target, value in hits if target == "region"), None)
             if region == "detail":
-                self.scrolls["detail"] = max(0, self.scrolls["detail"] + amount)
+                self.scrolls["detail"] = self.clamp_detail(self.scrolls["detail"] + amount)
             elif region is not None:
                 self.selections[region] += amount
                 self.selected(region)
                 if self.preview == region:
                     self.diagnostics = False
-                    self.scrolls["detail"] = 0
                     self.refresh_detail()
             return
         if event.action != "press":
@@ -1290,7 +1302,6 @@ class MailboxApp:
         self.focus = region
         if region != "detail":
             self.preview, self.diagnostics = region, False
-            self.scrolls["detail"] = 0
             row = next((value for _, target, value in hits if target == "list-row"), None)
             if row is not None and region == "threads":
                 row = next((index for index, item in enumerate(self.items(region))
@@ -1401,7 +1412,7 @@ class MailboxApp:
             return ["Esc close", "↑↓ scroll", "PgUp/PgDn", "F1 close"]
         context = (["Enter send"] if self.focus == "agents" else
                    ["Enter reply", "w withdraw", "t retry", "a/n recover"] if self.focus == "threads" else
-                   ["↑↓ scroll", "PgUp/PgDn"])
+                   ["↑↓ scroll", "PgUp/PgDn"] + (["t technical"] if self.technical_supported() else []))
         return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
 
     def region_rects(self, top: int, height: int, width: int) -> dict[str, tuple[int, int, int, int]]:
@@ -1682,37 +1693,91 @@ class MailboxApp:
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", self.identity(items[_index]))
 
-    def thread_detail(self) -> list[tuple[str, int]]:
+    def technical_supported(self) -> bool:
+        return not self.diagnostics and (self.detail or {}).get("type") in {"thread", "direct", "outbox"}
+
+    def clamp_detail(self, offset: int) -> int:
+        return min(max(0, offset), max(0, self.detail_total - self.detail_available))
+
+    def thread_detail(self, width: int = 100) -> list[tuple[str, int]]:
         item = self.detail or {}
+        result: list[tuple[str, int]] = []
+
+        def header(record: Mapping[str, Any], index: int, total: int,
+                   sender: str, recipient: str) -> str:
+            metadata = f"Message {index}/{total} · {status_time(record.get('created_at'), self.wall_clock())}"
+            prefix = metadata + " · "
+            # On narrow panels reserve a separate participant row rather than
+            # allowing the timestamp to consume both ends of the direction.
+            separate = width < display_width(prefix) + 19
+            room = max(2, width - (0 if separate else display_width(prefix)) - 3)
+            sender = " ".join(sender.splitlines())
+            recipient = " ".join(recipient.splitlines())
+            sender_room = min(display_width(sender), max(1, room // 2))
+            recipient_room = max(1, room - sender_room)
+            direction = (truncate_display_text(sender, sender_room) + " → " +
+                         truncate_display_text(recipient, recipient_room))
+            return (truncate_display_text(metadata, width) + "\n" + direction if separate else prefix + direction)
+
         if item.get("type") == "thread":
-            result = [(f"Thread {item['thread_id']}  {item.get('subject') or ''}", 0)]
-            for message in item["messages"]:
+            messages = item["messages"]
+            for index, message in enumerate(messages, 1):
                 state, palette = self.thread_state(message["state"])
-                kind, kind_palette = self.thread_kind(message["kind"])
+                kind, _ = self.thread_kind(message["kind"])
+                summary = f"{kind} · {state}"
+                if message.get("confirmation_source") == "operator":
+                    summary += " · operator NOT native ACK"
+                elif message.get("confirmation_source") == "native":
+                    summary += " · native confirmation"
+                if message.get("withdraw_requested"):
+                    summary += " · withdrawal requested"
+                if message.get("hold_reason"):
+                    summary += " · HOLD"
+                if index > 1:
+                    result.append(("", 0))
                 result.extend([
-                    ("", 0), (f"{message['sender_label']} → {message['recipient_address']}", 0),
-                    (f"Kind: {kind}", self.state_style(kind_palette)),
-                    (state + " · " + describe_message(message), self.state_style(palette)),
-                    *((line, 0) for line in self.message_target(message)),
-                    (f"via: {message.get('via') or '—'}", 0),
-                    (f"confirmation source: {message.get('confirmation_source') or '—'}", 0),
-                    (f"evidence: {message.get('evidence') or '—'}", 0), (message["body"], 0)])
-            return result
-        if item.get("type") == "direct":
+                    (header(message, index, len(messages), str(message.get("sender_label") or "—"),
+                            str(message.get("recipient_address") or "—")), curses.A_BOLD),
+                    (summary,
+                     self.state_style("working" if message.get("confirmation_source") == "operator" else palette)
+                     | curses.A_BOLD),
+                    (message["body"], 0)])
+                if self.detail_technical:
+                    result.extend((line, curses.A_DIM) for line in [
+                        *self.message_target(message), describe_message(message),
+                        f"via: {message.get('via') or '—'}",
+                        f"confirmation source: {message.get('confirmation_source') or '—'}",
+                        f"evidence: {message.get('evidence') or '—'}"])
+        elif item.get("type") == "direct":
             state, palette = self.thread_state(item["acceptance"], direct=True)
-            return [
-                (state, self.state_style(palette)),
-                ("> direct · user terminal input; acceptance ≠ native delivery/handled",
-                 self.state_style("done")),
-                (f"user → {self.address(item.get('target'))}", 0),
-                (json.dumps(item, ensure_ascii=False, indent=2), 0)]
-        if item.get("type") == "outbox":
+            result = [
+                (header(item, 1, 1, str(item.get("sender") or "—"), self.address(item.get("target"))),
+                 curses.A_BOLD),
+                (state + " · acceptance ≠ native delivery/handled",
+                 self.state_style(palette) | curses.A_BOLD),
+                (item.get("body") or "", 0)]
+        elif item.get("type") == "outbox":
             state, palette = self.thread_state(item["state"])
-            kind, kind_palette = self.outbox_operation(item["kind"])
-            return [("OUTBOX " + state, self.state_style(palette)),
-                    ("Transport operation: " + kind, self.state_style(kind_palette)),
-                    (json.dumps(item, ensure_ascii=False, indent=2), 0)]
-        return []
+            kind, _ = self.outbox_operation(item["kind"])
+            result = [
+                (f"OUTBOX {state} · Transport operation: {kind}",
+                 self.state_style(palette) | curses.A_BOLD),
+                (f"→ {item.get('target_host') or '—'} · transport, NOT native ACK",
+                 curses.A_BOLD)]
+            # Outbox stores a JSON string: only accept's nested immutable message is mail.
+            payload = item.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (ValueError, TypeError):
+                    payload = None
+            message = payload.get("message") if isinstance(payload, dict) else None
+            if item["kind"] == "message" and isinstance(message, dict) and isinstance(message.get("body"), str):
+                result.append((message["body"], 0))
+        if item.get("type") in {"thread", "direct", "outbox"} and self.detail_technical:
+            result.extend([("Technical · full recorded source", curses.A_DIM),
+                           (json.dumps(item, ensure_ascii=False, indent=2), curses.A_DIM)])
+        return result
 
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
@@ -1747,20 +1812,33 @@ class MailboxApp:
     def render_detail(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
         x, width = x + 1, width - 1
+        self.detail_available = max(0, height - 1)
         if height <= 0 or width <= 0:
+            self.detail_total = 0
+            self.scrolls["detail"] = 0
             return
-        self.put(y, x, truncate_display_text("Read-only · viewing does not ACK", width), curses.A_DIM)
         agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
         wrap = wrap_summary if agent and not self.diagnostics else wrap_display_text
-        entries = (self.thread_detail() if not self.diagnostics and (self.detail or {}).get("type")
+        entries = (self.thread_detail(width) if not self.diagnostics and (self.detail or {}).get("type")
                    else [(line, 0) for line in self.detail_lines()])
         lines = [(part, attribute) for line, attribute in entries for logical in line.split("\n")
                  for part in wrap(logical, max(1, width))]
-        available = max(0, height - 1)
-        self.scrolls["detail"] = min(self.scrolls["detail"], max(0, len(lines) - available))
-        for row, (text, attr) in enumerate(lines[self.scrolls["detail"]:self.scrolls["detail"] + available], y + 1):
-            if "UNCERTAIN" in text or "NOT native ACK" in text:
-                attr = self.style(3, curses.A_BOLD)
+        self.detail_total = len(lines)
+        self.scrolls["detail"] = self.clamp_detail(self.scrolls["detail"])
+        first = self.scrolls["detail"]
+        last = min(len(lines), first + self.detail_available)
+        position = f"{first + 1}-{last}/{len(lines)}" if last > first else f"0-0/{len(lines)}"
+        more = (" ↑more" if first else "") + (" ↓more" if last < len(lines) else "")
+        toggle = f" · t technical:{'on' if self.detail_technical else 'off'}" if self.technical_supported() else ""
+        notices = [
+            f"Read-only · viewing does not ACK · {position}{more}{toggle}",
+            f"Read-only/no ACK · {position}{more.replace('more', '')}" +
+            (f" · t tech:{'on' if self.detail_technical else 'off'}" if toggle else ""),
+            f"no ACK {position}{more.replace('more', '').replace(' ', '')}" +
+            (f" t:{'on' if self.detail_technical else 'off'}" if toggle else "")]
+        notice = next((text for text in notices if display_width(text) <= width), notices[-1])
+        self.put(y, x, truncate_display_text(notice, width), curses.A_DIM)
+        for row, (text, attr) in enumerate(lines[first:last], y + 1):
             self.put(row, x, truncate_display_text(text, width), attr)
             if agent and not self.diagnostics and text.startswith("Turn state: "):
                 self.put(row, x + len("Turn state: "), clip(text[len("Turn state: "):], width - len("Turn state: ")),
@@ -1856,6 +1934,8 @@ class MailboxApp:
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
+                    "Detail: t toggles technical source (messages only); toggle restarts at top.",
+                    "Detail PgUp/PgDn: viewport page with one row overlap; range + ↑/↓ show more.",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
                     "Thread states: . queued/pending · > submitting · + accepted/delivered · = handled",
@@ -1973,7 +2053,8 @@ class MailboxApp:
             return ["Agents: Enter opens quick send"]
         if self.focus == "threads":
             return ["Threads: Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
-        return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"]
+        return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (
+            ["t technical details (restart at top)"] if self.technical_supported() else [])
 
     def run(self) -> int:
         curses.nonl()

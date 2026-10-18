@@ -2291,6 +2291,402 @@ class MailboxUiTest(unittest.TestCase):
                               if target == 'region' and value == 'detail')
                 self.assertTrue(8 <= detail[2] <= 12)
 
+    def test_compact_initial_native_body_paragraphs_and_followup_remain_readable(self):
+        now = 1700000000
+        first_body = 'FIRST-BODY\n\nSECOND-PARAGRAPH\n' + '\n'.join(f'Original line {i}' for i in range(20))
+        for height, width in ((35, 110), (50, 200)):
+            with self.subTest(height=height, width=width):
+                app = self.app(wall_clock=lambda: now)
+                thread = self.thread_fixture('native-original', 'delivering', 'delivered')
+                thread['subject'] = 'Long subject ' * 100
+                thread['messages'][0].update(
+                    body=first_body, created_at=now - 60, sender_label='sender-' * 100,
+                    recipient_address='host/recipient-' * 100, hold_reason='Long routing reason ' * 100)
+                thread['messages'][1].update(
+                    body='FOLLOWUP-BODY', sender_label='actual-second-sender',
+                    recipient_address='actual-second-recipient', created_at=now)
+                app.local['threads'] = [thread]
+                app.focus, app.preview = 'detail', 'threads'
+                snapshot = self.capture(app, height, width)
+                rect = next(rect for rect, target, region in app.hit_map
+                            if target == 'region' and region == 'detail')
+                y, _, outer_height, _ = rect
+                visible = snapshot.lines()[y + 2:y + outer_height - 1]
+                text = '\n'.join(visible)
+                self.assertEqual(app.scrolls['detail'], 0)
+                self.assertIn('Message 1/2', visible[0])
+                self.assertIn(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now - 60)), visible[0])
+                self.assertIn('→', visible[0])
+                self.assertIn('UNCERTAIN delivering', visible[1])
+                self.assertIn('fyi', visible[1])
+                self.assertIn('FIRST-BODY', visible[2])
+                self.assertEqual(visible[3].strip(' │'), '')
+                self.assertIn('SECOND-PARAGRAPH', visible[4])
+                self.assertNotIn('native-original-0', text)
+                self.assertTrue(snapshot.cells[y + 2][2].attribute & curses.A_BOLD)
+                self.assertFalse(snapshot.cells[y + 4][2].attribute & (curses.A_BOLD | curses.A_DIM))
+                seen = []
+                while True:
+                    snapshot = self.capture(app, height, width)
+                    seen.extend(snapshot.lines()[y + 2:y + outer_height - 1])
+                    before = app.scrolls['detail']
+                    app.key(curses.KEY_NPAGE)
+                    if app.scrolls['detail'] == before:
+                        break
+                all_text = '\n'.join(seen)
+                for original in first_body.splitlines():
+                    self.assertIn(original, all_text)
+                for value in ('Message 2/2', 'actual-second-sender', 'actual-second-recipient', 'FOLLOWUP-BODY'):
+                    self.assertIn(value, all_text)
+                self.assertLess(all_text.index('FIRST-BODY'), all_text.index('FOLLOWUP-BODY'))
+                self.assertEqual(app.jobs, {})
+
+    def test_compact_direct_body_preserves_real_and_literal_newlines_and_actual_sender(self):
+        body = 'DIRECT-FIRST\n\nLiteral \\n stays literal\nDIRECT-LAST'
+        for height, width in ((35, 110), (50, 200)):
+            for acceptance in ('accepted', 'unknown', 'failed'):
+                with self.subTest(height=height, acceptance=acceptance):
+                    app = self.app()
+                    app.local['submissions'] = [{
+                        'submission_id': 'direct-original', 'acceptance': acceptance,
+                        'body': body, 'sender': 'actual-origin', 'target': self.recipient,
+                        'subject': 'Long hidden subject ' * 100, 'evidence': 'Direct transport evidence'}]
+                    app.focus, app.preview = 'detail', 'threads'
+                    snapshot = self.capture(app, height, width)
+                    y, _, outer_height, _ = next(rect for rect, target, value in app.hit_map
+                                               if target == 'region' and value == 'detail')
+                    lines = snapshot.lines()[y + 2:y + outer_height - 1]
+                    self.assertIn('actual-origin', lines[0])
+                    self.assertIn('→', lines[0])
+                    self.assertIn('DIRECT ' + acceptance, lines[1])
+                    self.assertIn('acceptance ≠ native delivery/handled', lines[1])
+                    self.assertIn('DIRECT-FIRST', lines[2])
+                    self.assertEqual(lines[3].strip(' │'), '')
+                    self.assertIn('Literal \\n stays literal', lines[4])
+                    self.assertNotIn('Direct transport evidence', '\n'.join(lines))
+                    app.key(curses.KEY_END)
+                    snapshot = self.capture(app, height, width)
+                    self.assertIn('DIRECT-LAST', '\n'.join(snapshot.lines()[y + 2:y + outer_height - 1]))
+                    app.key('t')
+                    self.assertEqual(app.scrolls['detail'], 0)
+                    self.capture(app, height, width)
+                    for value in ('direct-original', 'Direct transport evidence', 'Long hidden subject'):
+                        self.assertIn(value, '\n'.join(app.detail_lines()))
+                    app.key('t')
+                    self.assertNotIn('Direct transport evidence', '\n'.join(app.detail_lines()))
+                    self.assertEqual(app.jobs, {})
+
+    def test_detail_pages_use_actual_compact_viewport_and_show_range_and_more(self):
+        for height, width, available in ((35, 110, 5), (50, 200, 9)):
+            with self.subTest(height=height):
+                app = self.app()
+                thread = self.thread_fixture('paging', 'queued')
+                thread['messages'][0]['body'] = '\n'.join(f'Page body {i}' for i in range(30))
+                app.local['threads'] = [thread]
+                app.focus, app.preview = 'detail', 'threads'
+                snapshot = self.capture(app, height, width)
+                y = next(rect[0] for rect, target, region in app.hit_map
+                         if target == 'region' and region == 'detail')
+                self.assertIn(f'1-{available}/32', snapshot.line(y + 1))
+                self.assertNotIn('↑', snapshot.line(y + 1))
+                self.assertIn('↓', snapshot.line(y + 1))
+                self.assertIn('t technical', snapshot.line(y + 1))
+                app.key(curses.KEY_NPAGE)
+                snapshot = self.capture(app, height, width)
+                self.assertEqual(app.scrolls['detail'], available - 1)
+                self.assertIn(f'{available}-{2 * available - 1}/32', snapshot.line(y + 1))
+                self.assertIn('↑', snapshot.line(y + 1))
+                self.assertIn('↓', snapshot.line(y + 1))
+                app.key(curses.KEY_PPAGE)
+                self.assertEqual(app.scrolls['detail'], 0)
+                app.key(curses.KEY_END)
+                snapshot = self.capture(app, height, width)
+                self.assertIn(f'{33 - available}-32/32', snapshot.line(y + 1))
+                self.assertIn('↑', snapshot.line(y + 1))
+                self.assertNotIn('↓', snapshot.line(y + 1))
+                app.key('j')
+                self.assertEqual(app.scrolls['detail'], 32 - available)
+                app.key('k')
+                self.assertEqual(app.scrolls['detail'], 31 - available)
+                app.key(curses.KEY_HOME)
+                app.key('k')
+                self.assertEqual(app.scrolls['detail'], 0)
+
+    def test_empty_detail_range_and_narrow_notice_keep_ack_position_and_toggle(self):
+        app = self.app()
+        app.detail = {'type': 'thread', 'thread_id': 'empty', 'messages': []}
+        app.screen = Screen(8, 110)
+        app.render_detail((0, 0, 6, 108))
+        notice = app.screen.snapshot().line(0)
+        self.assertIn('0-0/0', notice)
+        self.assertIn('does not ACK', notice)
+        self.assertIn('t technical', notice)
+        self.assertNotIn('↑', notice)
+        self.assertNotIn('↓', notice)
+        app.focus = 'detail'
+        app.key('t')
+        self.assertIn('empty', '\n'.join(app.detail_lines()))
+        app.key('t')
+        app.detail = {'type': 'thread', **self.thread_fixture('narrow', 'queued')}
+        app.detail['messages'][0]['body'] = '\n'.join('content' for _ in range(20))
+        app.screen = Screen(8, 40)
+        app.render_detail((0, 0, 6, 39))
+        notice = app.screen.snapshot().line(0)
+        for value in ('ACK', '1-5/22', '↓', 't:off'):
+            self.assertIn(value, notice)
+        self.assertEqual(app.screen.out_of_bounds, [])
+        app.screen = Screen(8, 110)
+        app.render_detail((0, 0, 1, 108))
+        self.assertIn('0-0/22', app.screen.snapshot().line(0))
+        self.assertEqual(app.detail_available, 0)
+
+    def test_narrow_detail_preserves_direction_and_full_truth_warnings_without_expanding(self):
+        for width in (32, 40, 48, 56, 60):
+            for kind in ('operator', 'delivering', 'direct', 'outbox'):
+                with self.subTest(width=width, kind=kind):
+                    app = self.app(wall_clock=lambda: 1700000000)
+                    app.focus, app.preview = 'detail', 'threads'
+                    if kind in {'operator', 'delivering'}:
+                        thread = self.thread_fixture('narrow-warning', 'delivered' if kind == 'operator'
+                                                     else 'delivering')
+                        thread['messages'][0].update(
+                            created_at=1700000000, sender_label='origin-agent',
+                            recipient_address='peer/receiver', body='Visible ordinary body',
+                            confirmation_source='operator' if kind == 'operator' else None)
+                        app.local['threads'] = [thread]
+                    elif kind == 'direct':
+                        app.local['submissions'] = [{
+                            'submission_id': 'direct-warning', 'acceptance': 'accepted',
+                            'sender': 'origin-agent', 'created_at': 1700000000,
+                            'target': {'host': 'peer', 'alias': 'receiver', 'terminal_id': 'receiver'},
+                            'body': 'Visible ordinary body'}]
+                    else:
+                        app.local['outbox'] = [{
+                            'item_id': 'outbox-warning', 'state': 'failed', 'kind': 'receipt',
+                            'target_host': 'a-long-canonical-target-host-' * 4, 'payload': '{}'}]
+                    snapshot = self.capture(app, 35, width)
+                    y, _, height, _ = next(rect for rect, target, value in app.hit_map
+                                          if target == 'region' and value == 'detail')
+                    content = snapshot.lines()[y + 2:y + height - 1]
+                    # Ignore visual wrap boundaries, not warning content. The body
+                    # contains no warning text, so it cannot mask a missing state cue.
+                    text = ''.join(''.join(line.strip(' │') for line in content).split())
+                    if kind == 'operator':
+                        self.assertIn('delivered', text)
+                        self.assertIn('operatorNOTnativeACK', text)
+                    elif kind == 'delivering':
+                        self.assertIn('UNCERTAINdelivering', text)
+                    elif kind == 'direct':
+                        self.assertIn('DIRECTaccepted', text)
+                        self.assertIn('acceptance≠nativedelivery/handled', text)
+                    else:
+                        self.assertIn('OUTBOX', text)
+                        self.assertIn('failed', text)
+                        self.assertIn('receipt', text)
+                        self.assertIn('NOTnativeACK', text)
+                    if kind != 'outbox':
+                        direction = next(line for line in content if '→' in line)
+                        self.assertIn('origin-agent', direction)
+                        self.assertIn('peer/receiver', direction)
+                        self.assertIn('Message 1/1', content[0])
+                        self.assertIn('Visibleordinarybody', text)
+                    self.assertFalse(app.detail_technical)
+                    self.assertEqual(app.scrolls['detail'], 0)
+                    self.assertEqual(app.jobs, {})
+
+    def test_technical_toggle_snapshot_selection_resize_and_clamp_policy(self):
+        app = self.app()
+        thread = self.thread_fixture('canonical', 'delivering')
+        message = thread['messages'][0]
+        message.update(body='TECH-FIRST\n' + '\n'.join('wide words ' * 15 for _ in range(20)),
+                       sender_label='CANONICAL-SENDER-' * 30, recipient_address='CANONICAL-RECIPIENT-' * 30,
+                       claim_id='canonical-claim', claimed_agent_id='old-agent-identity',
+                       claimed_generation=17, via='relay-canonical', confirmation_source='operator',
+                       evidence='EXACT EVIDENCE\nsecond evidence line', opaque={'original': 'UNMODIFIED-SOURCE'})
+        app.local['threads'] = [thread, self.thread_fixture('other', 'queued')]
+        app.focus, app.preview = 'detail', 'threads'
+        self.capture(app, 35, 110)
+        self.assertFalse(app.detail_technical)
+        self.assertNotIn('canonical-claim', '\n'.join(app.detail_lines()))
+        app.key(curses.KEY_END)
+        self.assertGreater(app.scrolls['detail'], 0)
+        app.key('t')
+        self.assertTrue(app.detail_technical)
+        self.assertEqual(app.scrolls['detail'], 0)
+        self.capture(app, 35, 110)
+        technical = '\n'.join(app.detail_lines())
+        for value in ('canonical-claim', 'old-agent-identity', '17', 'relay-canonical',
+                      'operator', 'EXACT EVIDENCE', 'second evidence line', 'UNMODIFIED-SOURCE',
+                      message['sender_label'], message['recipient_address']):
+            self.assertIn(value, technical)
+        app.key(curses.KEY_NPAGE)
+        offset = app.scrolls['detail']
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {**app.local, 'threads': [
+            {**thread, 'messages': [{**message, 'hold_reason': 'Updated routing hold'}]},
+            self.thread_fixture('other', 'queued')]}
+        app.tick()
+        self.capture(app, 35, 110)
+        self.assertTrue(app.detail_technical)
+        self.assertEqual(app.scrolls['detail'], offset)
+        app.key(curses.KEY_END)
+        self.capture(app, 50, 200)
+        self.assertEqual(app.scrolls['detail'], app.detail_total - app.detail_available)
+        # A shorter same-identity snapshot clamps rather than retaining an invalid offset.
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {**app.local, 'threads': [
+            self.thread_fixture('canonical', 'queued'), self.thread_fixture('other', 'queued')]}
+        app.tick()
+        self.capture(app, 35, 110)
+        self.assertLessEqual(app.scrolls['detail'], app.detail_total - app.detail_available)
+        app.key('t')
+        snapshot = self.capture(app, 35, 110)
+        self.assertFalse(app.detail_technical)
+        self.assertEqual(app.scrolls['detail'], 0)
+        app.key('t')
+        app.key(SHIFT_TAB)
+        app.key('j')
+        app.key('\t')
+        self.capture(app, 35, 110)
+        self.assertEqual(app.detail['thread_id'], 'other')
+        self.assertFalse(app.detail_technical)
+        self.assertEqual(app.scrolls['detail'], 0)
+
+    def test_outbox_only_real_nested_message_payload_exposes_body_and_keeps_raw_evidence(self):
+        payload = {'message': {
+            'message_id': '00000000-0000-4000-8000-000000000001',
+            'thread_id': '00000000-0000-4000-8000-000000000001',
+            'repo_id': self.repo_id, 'reply_to': None, 'origin_host': self.store.host,
+            'sender': 'user', 'sender_label': 'user', 'kind': 'action', 'hop': 0,
+            'body': 'TRANSPORT-BODY\n\nTRANSPORT-LAST', 'subject': '', 'created_at': 1700000000,
+            'recipient_host': 'remote', 'recipient_terminal_id': 'terminal',
+            'recipient_address': 'remote/actual-recipient'},
+                   'resolved': {'recipient_host': 'remote', 'recipient_terminal_id': 'terminal',
+                                'recipient_address': 'remote/actual-recipient'}}
+        for operation in ('message', 'receipt', 'setting', 'withdraw'):
+            # A real accept payload is mail only for message operations; even a
+            # misleading nested body in another operation must not become a reply.
+            with self.subTest(operation=operation):
+                app = self.app()
+                app.local['outbox'] = [{
+                    'item_id': 'transport-original', 'state': 'failed', 'kind': operation,
+                    'target_host': 'remote', 'last_error': 'EXACT TRANSPORT ERROR',
+                    'payload': json.dumps(payload)}]
+                app.focus, app.preview = 'detail', 'threads'
+                snapshot = self.capture(app, 35, 110)
+                y, _, height, _ = next(rect for rect, target, value in app.hit_map
+                                       if target == 'region' and value == 'detail')
+                visible = '\n'.join(snapshot.lines()[y + 2:y + height - 1])
+                self.assertIn('OUTBOX', visible)
+                self.assertIn('failed', visible)
+                self.assertIn('Transport operation:', visible)
+                self.assertIn(operation, visible)
+                self.assertIn('NOT native ACK', visible)
+                self.assertNotIn('! action', visible)
+                if operation == 'message':
+                    self.assertIn('TRANSPORT-BODY', visible)
+                    self.assertIn('TRANSPORT-LAST', visible)
+                else:
+                    self.assertNotIn('TRANSPORT-BODY', visible)
+                app.key('t')
+                technical = '\n'.join(app.detail_lines())
+                for value in ('EXACT TRANSPORT ERROR', 'transport-original', 'TRANSPORT-BODY'):
+                    self.assertIn(value, technical)
+                self.assertEqual(app.jobs, {})
+        for invalid in ('not JSON', '[]', json.dumps({'body': 'MISLEADING-BODY'}),
+                        json.dumps({'message': {'body': ['MISLEADING-BODY']}})):
+            app.detail = {'type': 'outbox', 'item_id': 'bad-payload', 'state': 'pending',
+                          'kind': 'message', 'target_host': 'remote', 'payload': invalid}
+            app.detail_technical = False
+            self.assertNotIn('MISLEADING-BODY', '\n'.join(app.detail_lines()))
+
+    def test_technical_key_scope_keeps_input_retry_confirmation_and_diagnostics_unchanged(self):
+        app = self.app()
+        self.capture(app, 35, 110)
+        app.key('t')
+        self.assertFalse(app.detail_technical)
+        app.key('\r')
+        app.key('t')
+        self.assertEqual(app.body, 't')
+        app.key(ESCAPE)
+        app.local['outbox'] = [{'item_id': 'retry-canonical', 'kind': 'receipt', 'state': 'failed',
+                               'target_host': 'remote', 'claim_id': 'retry-claim',
+                               'claimed_agent_id': 'retry-old-agent', 'claimed_generation': 9}]
+        app.focus = app.preview = 'threads'
+        app.refresh_detail()
+        app.key('t')
+        self.assertEqual(app.mode, 'confirm')
+        self.assertEqual(app.confirm['choice'], 0)
+        target = '\n'.join(app.confirm['lines'])
+        for value in ('retry-canonical', 'retry-claim', 'retry-old-agent', '9', 'failed'):
+            self.assertIn(value, target)
+        app.key('t')
+        self.assertFalse(app.detail_technical)
+        self.assertNotIn('mutation', app.jobs)
+        app.key(ESCAPE)
+        app.key('e')
+        app.key('t')
+        self.assertFalse(app.detail_technical)
+        app.key(ESCAPE)
+        app.key('?')
+        app.key('t')
+        self.assertEqual(app.mode, 'help')
+        self.assertFalse(app.detail_technical)
+        app.key(ESCAPE)
+        app.key('s')
+        app.key('t')
+        self.assertEqual(app.mode, 'settings')
+        self.assertFalse(app.detail_technical)
+        app.key(ESCAPE)
+        thread = self.thread_fixture('evidence-entry', 'delivering')
+        thread['messages'][0].update(claim_id='claim', claimed_agent_id='old', claimed_generation=1)
+        app.local['threads'], app.local['outbox'] = [thread], []
+        app.focus = app.preview = 'threads'
+        app.refresh_detail()
+        app.key('a')
+        app.key('t')
+        self.assertEqual(app.mode, 'evidence')
+        self.assertEqual(app.edit['text'], 't')
+        self.assertFalse(app.detail_technical)
+        self.assertNotIn('mutation', app.jobs)
+        app.key(ESCAPE)
+        app.focus, app.preview = 'detail', 'agents'
+        app.refresh_detail()
+        app.key('t')
+        self.assertFalse(app.detail_technical)
+
+    def test_technical_evidence_is_dim_but_normal_body_and_headers_survive_no_color(self):
+        app = self.app()
+        app.environment['NO_COLOR'] = ''
+        app.initialize_colors()
+        app.local['threads'] = [self.thread_fixture('dim-evidence', 'delivered')]
+        app.local['threads'][0]['messages'][0].update(
+            confirmation_source='operator', evidence='EXACT-TECHNICAL-EVIDENCE',
+            body='Normal body includes UNCERTAIN and NOT native ACK')
+        app.focus, app.preview = 'detail', 'threads'
+        snapshot = self.capture(app, 35, 110)
+        y = next(rect[0] for rect, target, value in app.hit_map
+                 if target == 'region' and value == 'detail')
+        self.assertIn('operator NOT native ACK', snapshot.line(y + 3))
+        self.assertTrue(snapshot.cells[y + 2][2].attribute & curses.A_BOLD)
+        self.assertFalse(snapshot.cells[y + 4][2].attribute & (curses.A_DIM | curses.A_BOLD))
+        app.key('t')
+        # Scroll within the same compact panel until the canonical evidence is visible.
+        found = False
+        while True:
+            snapshot = self.capture(app, 35, 110)
+            rows = snapshot.rows_containing('evidence: EXACT-TECHNICAL-EVIDENCE')
+            if rows:
+                self.assertTrue(snapshot.cells[rows[0]][2].attribute & curses.A_DIM)
+                found = True
+                break
+            before = app.scrolls['detail']
+            app.key(curses.KEY_NPAGE)
+            if before == app.scrolls['detail']:
+                break
+        self.assertTrue(found)
+        self.assertFalse(any(call.attribute & curses.A_COLOR for call in snapshot.draw_calls))
+
     def test_thread_uncertainty_is_not_hidden_by_a_later_delivered_message(self):
         app = self.app()
         app.local['threads'] = [{
@@ -2331,9 +2727,10 @@ class MailboxUiTest(unittest.TestCase):
                 app.screen = Screen(20, 100)
                 app.render_detail((0, 0, 20, 100))
                 detail = app.screen.snapshot()
-                self.assertIn(f'{glyph} DIRECT {acceptance}', detail.line(1))
-                self.assertIn('user terminal input; acceptance ≠ native delivery/handled', detail.line(2))
-                self.assertEqual(detail.cells[1][1].attribute & curses.A_COLOR, pair << 8)
+                state_row = detail.rows_containing(f'DIRECT {acceptance}')[0]
+                self.assertIn('acceptance ≠ native delivery/handled', '\n'.join(detail.lines()))
+                self.assertIn('Explicit user input', '\n'.join(detail.lines()))
+                self.assertEqual(detail.cells[state_row][1].attribute & curses.A_COLOR, pair << 8)
                 self.assertEqual(app.jobs, {})
 
     def test_outbox_transport_operations_cover_pending_and_failed_without_inventing_mail_kind(self):
@@ -2367,10 +2764,10 @@ class MailboxUiTest(unittest.TestCase):
                     app.screen = Screen(20, 100)
                     app.render_detail((0, 0, 20, 100))
                     detail = app.screen.snapshot()
-                    self.assertIn(f'OUTBOX {state_glyph} {state}', detail.line(1))
-                    self.assertIn(f'Transport operation: {glyph} {operation}', detail.line(2))
-                    self.assertEqual(detail.cells[1][1].attribute & curses.A_COLOR, state_pair << 8)
-                    self.assertEqual(detail.cells[2][1].attribute & curses.A_COLOR, 1 << 8)
+                    state_row = detail.rows_containing(f'OUTBOX {state_glyph} {state}')[0]
+                    self.assertIn(f'Transport operation: {glyph} {operation}', '\n'.join(detail.lines()))
+                    self.assertIn('NOT native ACK', '\n'.join(detail.lines()))
+                    self.assertEqual(detail.cells[state_row][1].attribute & curses.A_COLOR, state_pair << 8)
                     self.assertEqual(app.jobs, {})
 
     def test_selected_narrow_thread_rows_keep_suffix_geometry_and_no_color_cues(self):
@@ -2412,7 +2809,7 @@ class MailboxUiTest(unittest.TestCase):
 
     def test_thread_detail_state_kind_and_operator_evidence_keep_their_meaning(self):
         app = self.app()
-        message = {'state': 'delivered', 'kind': 'action', 'body': 'Body remains plain',
+        message = {'state': 'delivered', 'kind': 'action', 'body': 'Body says UNCERTAIN and NOT native ACK',
                    'message_id': 'evidence', 'sender_label': 'user', 'recipient_address': 'host/recipient',
                    'confirmation_source': 'operator', 'evidence': 'Checked old claim'}
         app.detail = {'type': 'thread', 'thread_id': 'evidence', 'messages': [message]}
@@ -2421,13 +2818,13 @@ class MailboxUiTest(unittest.TestCase):
             app.screen = Screen(30, 110)
             app.render_detail((0, 0, 30, 110))
         snapshot = app.screen.snapshot()
-        kind_row = snapshot.rows_containing('Kind: ! action')[0]
-        self.assertEqual(snapshot.cells[kind_row][1].attribute & curses.A_COLOR, 3 << 8)
-        status_row = snapshot.rows_containing('+ delivered · action delivered')[0]
-        self.assertEqual(snapshot.cells[status_row][1].attribute & curses.A_COLOR, 3 << 8)
-        self.assertIn('NOT native ACK', '\n'.join(snapshot.lines()))
-        body_row = snapshot.rows_containing('Body remains plain')[0]
-        self.assertFalse(snapshot.cells[body_row][1].attribute & curses.A_COLOR)
+        status_row = snapshot.rows_containing('delivered')[0]
+        self.assertIn('action', snapshot.line(status_row))
+        self.assertTrue(snapshot.cells[status_row][1].attribute & curses.A_BOLD)
+        self.assertIn('operator', snapshot.line(status_row))
+        self.assertIn('NOT native ACK', snapshot.line(status_row))
+        body_row = snapshot.rows_containing('Body says UNCERTAIN')[0]
+        self.assertFalse(snapshot.cells[body_row][1].attribute & (curses.A_BOLD | curses.A_DIM))
         self.assertEqual(app.jobs, {})
 
     def test_detail_and_empty_list_content_have_one_column_left_padding(self):
@@ -2691,6 +3088,12 @@ class MailboxUiTest(unittest.TestCase):
             snapshot = self.capture(app, width=160)
             app.key(curses.KEY_NPAGE)
             app.render()
+            app.key('t')
+            self.capture(app, height=35, width=110)
+            app.key(curses.KEY_END)
+            app.key(curses.KEY_HOME)
+            app.key('t')
+            self.capture(app, height=35, width=110)
             self.assertNotIn('mutation', app.jobs)
         self.assertIn('Read-only · viewing does not ACK', '\n'.join(snapshot.lines()))
         self.assertEqual(self.mail.show_thread(sent['thread_id'])['messages'][0]['state'], 'queued')

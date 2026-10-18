@@ -69,8 +69,9 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 | --- | --- |
 | `Tab` / `Shift+Tab`, `←` / `→`, `h` / `l` | Move focus between regions: `Tab` follows Agents → Threads → Detail → Agents; `Shift+Tab` reverses it. In single mode, this reveals the focused region. |
 | `↑` / `↓`, `j` / `k` | Move the list selection; arrows scroll when Detail is focused. |
-| `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. |
+| `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
+| `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; restart reading at the top. Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
 | `s` | Open Settings. |
 | `?` | Open help, with contextual keys followed by the full keymap. |
 | `e` | Show diagnostics (connection errors and pending operations) in Detail. |
@@ -172,6 +173,38 @@ including full agent summaries and separate status-update/observation timestamps
 in local time with relative age. **Detail is read-only: viewing never ACKs,
 delivers, handles or resolves mail.** Threads includes message histories, direct
 submissions and pending/failed OUTBOX entries; `delivering` is **UNCERTAIN**.
+
+Message Detail starts with a bounded **message i/N, local timestamp/age and
+recorded sender → recipient** header, then a compact kind/state summary and the
+body in normal brightness. Native histories keep their chronological order.
+Long participant labels are shortened only in these reading headers. On narrow
+panels, participants and direction get their own header row rather than being
+displaced by the message number/timestamp row; that metadata row may be shortened.
+Full canonical values remain in technical information. Kind/state, acceptance
+and transport warnings wrap to preserve their complete meaning instead of being
+cut off. Subjects and UUIDs do not take space before the first body line.
+Native and DIRECT bodies preserve their original paragraphs, real newlines and
+literal `\n` text, wrapping only to the panel width. OUTBOX remains a transport
+operation, not a conversational reply or native ACK: only a message operation
+with a body in its nested message payload exposes a body.
+
+Technical information is collapsed initially. In NAV with Detail focused, `t`
+reveals the full recorded source, canonical identifiers/targets, claim and old
+agent/generation, routing, confirmation source, evidence and errors in dim text.
+The compact state still shows unresolved `delivering` as UNCERTAIN, operator
+confirmation as **NOT native ACK**, and DIRECT acceptance as **not native
+delivery/handled**, even while technical information is hidden.
+Both toggling directions restart at the top. Selecting a different item starts
+collapsed at the top; refreshing the same item preserves its toggle and reading
+offset, clamping when content or wrapping changes.
+
+The existing read-only notice also shows the current visible line range/total,
+`↑more`/`↓more` when content remains above/below, and the technical toggle state.
+Narrow panels shorten the notice but keep the no-ACK warning, position and
+toggle hint; no extra content row is reserved. Counts include wrapped headers,
+body paragraphs and any expanded technical lines. PgUp/PgDn move by the actual
+content viewport minus one row (minimum one), so adjacent pages overlap by one
+row. Arrow keys, Home/End, the wheel, resize and toggling use the same bounds.
 
 ### Inline input and replies
 
