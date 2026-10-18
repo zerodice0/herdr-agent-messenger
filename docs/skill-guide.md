@@ -385,6 +385,12 @@ limits. Eligibility is rechecked in the same tick immediately before enqueue.
 It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself
 does not block this wake; it is not the legacy focused-pane hold.
 
+For OMP registration, `native_session_pending` means Herdr's native-session
+publication has not arrived. The receiver shows waiting during its bounded
+retry window and clears its own status on success; exhaustion shows unavailable.
+HAM never publishes that path itself. Conflicting reported paths remain
+`stale_session`.
+
 FYI alone never starts a turn. Natural user turns can receive action and FYI
 even in off mode or for manual nonmembers. An action wake includes eligible
 FYI in the same bounded bundle: at most eight messages / 8 KiB total, with each

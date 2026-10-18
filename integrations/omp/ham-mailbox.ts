@@ -91,6 +91,12 @@ export function parseReply<O extends Operation>(operation: O, raw: unknown): Rec
   return parsed as ReceiverReplies[O];
 }
 
+class ReceiverError extends Error {
+  constructor(readonly code: string, message: string) {
+    super("HAM CLI: " + code + ": " + message);
+  }
+}
+
 async function runJSON(program: string, args: string[], input?: Request): Promise<unknown> {
   const { promise, resolve, reject } = Promise.withResolvers<unknown>();
   const child = spawn(program, args, { env: process.env, stdio: ["pipe", "pipe", "pipe"], timeout: 15000 });
@@ -108,11 +114,11 @@ async function runJSON(program: string, args: string[], input?: Request): Promis
       const result: unknown = JSON.parse(stdout), response = record(result);
       if (code !== 0 || response.error !== undefined) {
         const error = record(response.error);
-        throw new Error(string(error.code) + ": " + string(error.message));
+        throw new ReceiverError(string(error.code), string(error.message));
       }
       resolve(result);
     } catch (error) {
-      reject(new Error("HAM CLI: " + (stdout ? String(error) : stderr || "no JSON response")));
+      reject(error instanceof ReceiverError ? error : new Error("HAM CLI: " + (stdout ? String(error) : stderr || "no JSON response")));
     }
   });
   child.stdin.on("error", () => undefined);
@@ -279,6 +285,7 @@ export class MailboxAdapter {
         const result = await this.call("register", { session_ref: session, client: "omp" });
         if (epoch !== this.epoch || !this.belongs(ctx) || ctx.sessionManager.getSessionFile() !== session) return undefined;
         this.registration = result; this.refreshNeeded = false; this.lastError = ""; this.registrationFailures = 0;
+        ctx.ui.setStatus("ham-mailbox", undefined);
         for (const claim of result.pending_claims || []) {
           if (!this.pending.has(claim.claim_id)) this.pending.set(claim.claim_id, { ...claim, phase: "unknown" });
         }
@@ -294,8 +301,11 @@ export class MailboxAdapter {
         return result;
       } catch (error) {
         if (epoch === this.epoch && this.belongs(ctx)) {
-          this.report(ctx, error);
           this.registrationFailures++;
+          if (error instanceof Error && "code" in error && error.code === "native_session_pending" &&
+              this.registrationFailures < 10) {
+            ctx.ui.setStatus("ham-mailbox", "HAM: waiting for native session");
+          } else this.report(ctx, error);
           if (this.registrationFailures < 10) this.schedule(ctx, Math.min(1000, 250 * this.registrationFailures));
         }
         return undefined;

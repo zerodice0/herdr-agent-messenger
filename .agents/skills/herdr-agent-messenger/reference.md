@@ -75,9 +75,14 @@ across calls.
 All commands return one JSON object. Errors use the existing CLI convention
 `{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; argparse usage errors exit 2.
 The legacy request lifecycle's `error_code` field is unchanged. Useful codes:
-`sender_unresolved`, `stale_session`, `recipient_absent`, `repo_mismatch`,
+`sender_unresolved`, `stale_session`, `native_session_pending`, `recipient_absent`, `repo_mismatch`,
 `message_conflict`, `delivery_in_progress`, `body_too_large`, `invalid_limit`,
 `invalid_repo`, `invalid_cursor` (including history tampering/scope mismatch).
+`native_session_pending` means Herdr has not yet published the OMP native session.
+The receiver waits within its existing bounded registration retries, without
+publishing the path itself; success removes HAM's waiting/unavailable status.
+Exhausting the retries shows unavailable. A different already-reported path remains
+`stale_session`, not a retryable identity replacement.
 
 Messages use the stable terminal slot, not inherited pane IDs. The CLI matches
 its process ancestors against Herdr's public `pane process-info` shell PID;
@@ -784,6 +789,7 @@ Codes can occur as envelope `error.code`, lifecycle `error_code`, or per-item er
 | State: `request_not_found`, `request_state_invalid`, `request_state_unavailable` | Verify ID, original sender host/state location, and permissions. Storage failure can occur after submission; do not resend until delivery checked. |
 | Coordination: `use_mailbox` | Same-repository participating prompt traffic is refused before legacy submission. Use durable mail; no CLI bypass. Coordinated batch lookup/preflight failure aborts all submissions. |
 | Mail/native: `sender_unresolved`, `stale_session`, `repo_mismatch`, `message_conflict`, `delivery_in_progress`, `invalid_setting` | Preserve immutable IDs and generation evidence, repair the actual identity/input/configuration problem; do not manufacture ACK or replay unknown claims. Settings are user-TUI only. |
+| Native startup: `native_session_pending` | Herdr has not published the OMP session yet. Wait within the receiver's bounded retry window; never publish or replace native identity through HAM. Exhaustion is unavailable; a genuine reported-path conflict remains `stale_session`. |
 | Initial spawn: `prompt_acceptance_unknown`, `spawn_state_unavailable` | Possible first-prompt acceptance; preserve operation/submission/placement and inspect. Never automatically repeat spawn or its first prompt. |
 | Spawn input: `cwd_required`, `sender_pane_unavailable`, `label_unavailable` | Supply remote cwd/source pane or an available valid label, then retry startup. |
 | Spawn execution: `placement_failed`, `agent_start_failed` | Inspect Herdr failure and cleanup result. Check already-created sessions/resources before retrying; unsuccessful cleanup may leave one behind. |

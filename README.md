@@ -248,6 +248,12 @@ remove it with the corresponding `runtime status` / `runtime uninstall` command.
 Restart only the selected sessions. The installers own only HAM's extension or
 hook entries and preserve unrelated Herdr/client configuration.
 
+During OMP startup, `native_session_pending` means Herdr has not yet published
+its native session path. HAM waits within its bounded registration retries
+without changing that identity. Successful registration clears HAM's waiting or
+unavailable status; exhausted retries remain unavailable. A genuinely conflicting
+reported path is still rejected as `stale_session`.
+
 - **omp:** The root Herdr session can receive at a natural turn boundary.
   Automatic action wakes additionally require an eligible role, supported empty
   editor, quiet input, idle session, and the configured coalescing/rate limits.

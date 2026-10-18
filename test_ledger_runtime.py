@@ -68,6 +68,37 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(result['agent']['session_ref'],self.session)
         self.assertEqual(result['bell_name'],'term-b')
 
+    def test_unreported_omp_waits_for_authoritative_native_session_without_mutation(self):
+        fresh = LedgerStore(self.root/'fresh-ledger',canonical_name='alpha')
+        registry = AgentRegistry(fresh)
+        unpublished = snapshot(self.repo)
+        unpublished['agents'][1].pop('agent_session')
+        registry.reconcile(unpublished, refresh_display=False)
+        before = registry.list()
+        recipient = next(a for a in before if a['terminal_id']=='term-b')
+        receiver = NativeReceiver(fresh)
+        with self.assertRaises(LedgerError) as caught:
+            receiver.register(recipient,session_ref=self.session)
+        self.assertEqual(caught.exception.code,'native_session_pending')
+        self.assertEqual(registry.list(),before)
+        self.assertEqual(recipient['session_ref'],'unreported')
+        self.assertFalse(recipient['extension_present'])
+
+        registry.reconcile(snapshot(self.repo,recipient_session=self.session), refresh_display=False)
+        published = next(a for a in registry.list() if a['terminal_id']=='term-b')
+        self.assertEqual(published['generation'],recipient['generation']+1)
+        registered = receiver.register(published,session_ref=self.session)['agent']
+        self.assertEqual(registered['session_ref'],self.session)
+        self.assertEqual(registered['generation'],published['generation'])
+        self.assertTrue(registered['extension_present'])
+
+    def test_conflicting_reported_omp_path_does_not_mutate_registration(self):
+        before = self.registry.list()
+        with self.assertRaises(LedgerError) as caught:
+            self.receiver.register(self.recipient,session_ref=str(self.root/'conflicting.jsonl'))
+        self.assertEqual(caught.exception.code,'stale_session')
+        self.assertEqual(self.registry.list(),before)
+
     def test_off_and_manual_nonmember_still_receive_at_ordinary_user_boundary(self):
         for mode in ('off','manual'):
             self.settings.mutate(self.recipient['repo_id'],'mode',mode)

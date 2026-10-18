@@ -424,8 +424,8 @@ class AgentRegistry:
                       repo_id: str, extension_present: bool = True,
                       expected_agent_id: str | None = None, expected_generation: int | None = None,
                       environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-        # A native hook may fill only an unreported UUID, never replace a known
-        # session. Serialize that narrow upgrade with snapshot reconciliation.
+        # OMP waits for Herdr's authoritative path. A Claude hook may fill only
+        # an unreported UUID; serialize that narrow upgrade with reconciliation.
         with self.store.lock("registry"):
             native_pid = None
             if client == "claude":
@@ -454,6 +454,8 @@ class AgentRegistry:
                 if agent["client"] != client or agent["repo_id"] != repo_id:
                     raise LedgerError("stale_session", "Runtime registration does not match the current Herdr session.")
                 if agent["session_ref"] != session_ref:
+                    if client == "omp" and agent["session_ref"] == "unreported":
+                        raise LedgerError("native_session_pending", "Waiting for Herdr to report the native OMP session.")
                     if (client != "claude" or agent["session_ref"] != "unreported"
                             or expected_agent_id is None or expected_generation is None):
                         raise LedgerError("stale_session", "Runtime registration cannot replace a reported native session.")
