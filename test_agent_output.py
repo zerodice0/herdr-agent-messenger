@@ -449,6 +449,34 @@ class CompactPayloadTest(unittest.TestCase):
             ],
         )
 
+    def test_spawn_initial_prompt_keeps_acceptance_and_location_without_private_body(self):
+        for acceptance in ("accepted", "unknown", "failed"):
+            with self.subTest(acceptance=acceptance):
+                initial = {
+                    "operation_id": "operation", "submission_id": "submission",
+                    "acceptance": acceptance, "evidence": "transport observation",
+                    "error_code": "prompt_failed" if acceptance == "failed" else None,
+                    "body": "Private initial assignment", "body_hash": "private-hash",
+                    "sender": {"identity": "private-sender"},
+                }
+                original = json.dumps(initial)
+                payload = {
+                    "address": "remote/blue", "marker": "", "created": "tab",
+                    "pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+                    "initial_prompt": initial,
+                }
+                compact = agent_output.compact_spawn_payload(payload)
+                self.assertEqual(compact["pane_id"], "w1:p2")
+                self.assertEqual(compact["tab_id"], "w1:t2")
+                self.assertEqual(compact["workspace_id"], "w1")
+                self.assertEqual(compact["address"], "remote/blue")
+                self.assertEqual(compact["initial_prompt"], {
+                    key: initial[key] for key in
+                    ("operation_id", "submission_id", "acceptance", "evidence", "error_code")
+                })
+                self.assertNotIn("Private initial assignment", json.dumps(compact))
+                self.assertEqual(json.dumps(initial), original)
+
     def test_status_only_keeps_address_status_and_true_stale_warning(self):
         payload = {
             "agent": {"address": "remote/blue", "status": "working", "stale": False},

@@ -1379,6 +1379,22 @@ class AgentSkillContractTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue()), payload)
 
+    def test_spawn_initial_prompt_outcome_keeps_placement_and_truthful_exit(self):
+        for acceptance in ("accepted", "unknown", "failed"):
+            with self.subTest(acceptance=acceptance):
+                payload = {"address": "local/new-worker", "created": "pane", "pane_id": "new-pane",
+                           "initial_prompt": {"operation_id": "operation", "submission_id": "submission",
+                                              "acceptance": acceptance, "evidence": "Observed transport outcome"}}
+                output = StringIO()
+                with mock.patch.object(agent_skill_cli, "spawn_command", return_value=payload), \
+                        mock.patch("sys.stdout", output):
+                    code = agent_skill_cli.main(["spawn", "--kind", "codex", "--message", "Work"], {})
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, 0 if acceptance == "accepted" else 1)
+                self.assertEqual(result["pane_id"], "new-pane")
+                self.assertEqual(result["address"], "local/new-worker")
+                self.assertEqual(result["initial_prompt"]["acceptance"], acceptance)
+
 
 class FocusDeferredCliTest(unittest.TestCase):
     def setUp(self):

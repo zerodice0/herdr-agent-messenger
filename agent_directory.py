@@ -330,6 +330,7 @@ def _run_command(
     *,
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if cancel_event is not None and cancel_event.is_set():
         return subprocess.CompletedProcess(list(command), 1, "", "cancelled")
@@ -339,6 +340,7 @@ def _run_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=None if environment is None else dict(environment),
         )
     except OSError as error:
         return subprocess.CompletedProcess(list(command), 1, "", str(error))
@@ -373,10 +375,12 @@ def run_bounded_command(
     *,
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess with the directory's timeout, cancellation, and output cap."""
 
-    return _run_command(command, timeout=timeout, cancel_event=cancel_event)
+    return _run_command(command, timeout=timeout, cancel_event=cancel_event,
+                        environment=environment)
 
 
 def query_local_agents(
@@ -544,8 +548,12 @@ def ssh_hosts(environment: Mapping[str, str] | None = None) -> list[str]:
     return [host for host in configured_hosts if host in allowed]
 
 
-def _remote_herdr_command(arguments: Sequence[str]) -> str:
+def _remote_herdr_command(arguments: Sequence[str], *, remote_socket: str | None = None) -> str:
     quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
+    socket_override = (
+        f"export HERDR_SOCKET_PATH={shlex.quote(remote_socket)}; "
+        if remote_socket else ""
+    )
     script = (
         "if command -v herdr >/dev/null 2>&1; then herdr_bin=$(command -v herdr); "
         "elif [ -x \"$HOME/.local/bin/herdr\" ]; then herdr_bin=\"$HOME/.local/bin/herdr\"; "
@@ -554,7 +562,7 @@ def _remote_herdr_command(arguments: Sequence[str]) -> str:
         "elif [ -x \"$HOME/.local/share/mise/shims/herdr\" ]; then "
         "herdr_bin=\"$HOME/.local/share/mise/shims/herdr\"; "
         "else exit 127; fi; "
-        f'exec "$herdr_bin" {quoted_arguments}'
+        f"{socket_override}exec \"$herdr_bin\" {quoted_arguments}"
     )
     return f"sh -c {shlex.quote(script)}"
 
@@ -596,10 +604,11 @@ def ssh_command(
     arguments: Sequence[str],
     *,
     config_path: Path,
+    remote_socket: str | None = None,
 ) -> list[str]:
     return _ssh_transport_command(
         host,
-        _remote_herdr_command(arguments),
+        _remote_herdr_command(arguments, remote_socket=remote_socket),
         config_path=config_path,
     )
 
@@ -631,11 +640,19 @@ def query_remote_agents(
     config_path: Path,
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None = None,
+    remote_sockets: Mapping[str, str] | None = None,
 ) -> ProbeResult:
     result = _run_command(
-        ssh_command(host, ["api", "snapshot"], config_path=config_path),
+        ssh_command(
+            host,
+            ["api", "snapshot"],
+            config_path=config_path,
+            remote_socket=(remote_sockets or {}).get(host) or None,
+        ),
         timeout=timeout,
         cancel_event=cancel_event,
+        environment=environment,
     )
     if result.returncode != 0:
         return ProbeResult(host, (), False, result.stderr.strip() or "unavailable")
@@ -980,6 +997,7 @@ def _send_local_prompt(
     result = _run_command(
         [herdr_executable(environment), "agent", "prompt", target.target, prompt],
         cancel_event=cancel_event,
+        environment=environment,
     )
     return SendResult(
         target, result.returncode == 0, result.stderr.strip(),
@@ -993,14 +1011,18 @@ def _send_remote_prompt(
     *,
     config_path: Path,
     cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None = None,
+    remote_socket: str | None = None,
 ) -> SendResult:
     result = _run_command(
         ssh_command(
             target.host,
             ["agent", "prompt", target.target, prompt],
             config_path=config_path,
+            remote_socket=remote_socket,
         ),
         cancel_event=cancel_event,
+        environment=environment,
     )
     return SendResult(
         target, result.returncode == 0, result.stderr.strip(),
@@ -1008,34 +1030,42 @@ def _send_remote_prompt(
     )
 
 
+def user_prompt_text(message: str) -> str:
+    """Render the exact persisted user-origin text sent by direct dispatch."""
+    return f"Message from user (HAM):\n\n{message}"
+
+
 def _dispatch_host_group(
     host: str,
     targets: Sequence[AgentRecord],
     *,
-    sender: AgentRecord,
+    sender: AgentRecord | None,
     message: str,
     config_path: Path,
     environment: Mapping[str, str] | None,
     cancel_event: threading.Event | None,
+    remote_sockets: Mapping[str, str] | None,
 ) -> list[SendResult]:
     if cancel_event is not None and cancel_event.is_set():
         return []
     if targets[0].local:
-        current = query_local_agents(
-            environment,
-            cancel_event=cancel_event,
-        )
+        current = query_local_agents(environment, cancel_event=cancel_event)
     else:
         probe = query_remote_agents(
             host,
             config_path=config_path,
             cancel_event=cancel_event,
+            environment=environment,
+            remote_sockets=remote_sockets,
         )
         if not probe.success:
             return [SendResult(target, False, "host_unavailable") for target in targets]
         current = list(probe.agents)
 
-    prompt = f"Message from {sender.qualified_name}:\n\n{message}"
+    prompt = user_prompt_text(message) if sender is None else (
+        f"Message from {sender.qualified_name}:\n\n{message}"
+    )
+    remote_socket = (remote_sockets or {}).get(host) or None
     results: list[SendResult] = []
     send_tasks: list[Callable[[], SendResult]] = []
     for selected in targets:
@@ -1046,10 +1076,7 @@ def _dispatch_host_group(
         if selected.local:
             send_tasks.append(
                 lambda target=verified: _send_local_prompt(
-                    target,
-                    prompt,
-                    environment,
-                    cancel_event,
+                    target, prompt, environment, cancel_event,
                 )
             )
         else:
@@ -1059,6 +1086,8 @@ def _dispatch_host_group(
                     prompt,
                     config_path=config_path,
                     cancel_event=cancel_event,
+                    environment=environment,
+                    remote_socket=remote_socket,
                 )
             )
     results.extend(
@@ -1071,14 +1100,15 @@ def _dispatch_host_group(
     return results
 
 
-def dispatch_prompts(
-    sender: AgentRecord,
+def _dispatch_prompt_groups(
+    sender: AgentRecord | None,
     recipients: Sequence[AgentRecord],
     message: str,
     *,
     config_path: Path,
-    environment: Mapping[str, str] | None = None,
-    cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None,
+    cancel_event: threading.Event | None,
+    remote_sockets: Mapping[str, str] | None,
 ) -> list[SendResult]:
     groups: dict[tuple[bool, str], list[AgentRecord]] = {}
     for recipient in recipients:
@@ -1095,6 +1125,7 @@ def dispatch_prompts(
                 config_path=config_path,
                 environment=environment,
                 cancel_event=cancel_event,
+                remote_sockets=remote_sockets,
             )
         )
     results: list[SendResult] = []
@@ -1105,3 +1136,44 @@ def dispatch_prompts(
     ):
         results.extend(group_results)
     return results
+
+
+def dispatch_prompts(
+    sender: AgentRecord,
+    recipients: Sequence[AgentRecord],
+    message: str,
+    *,
+    config_path: Path,
+    environment: Mapping[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[SendResult]:
+    return _dispatch_prompt_groups(
+        sender,
+        recipients,
+        message,
+        config_path=config_path,
+        environment=environment,
+        cancel_event=cancel_event,
+        remote_sockets=None,
+    )
+
+
+def dispatch_user_prompts(
+    recipients: Sequence[AgentRecord],
+    message: str,
+    *,
+    config_path: Path,
+    environment: Mapping[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
+    remote_sockets: Mapping[str, str] | None = None,
+) -> list[SendResult]:
+    """Send a user-origin message through the same verified Herdr transport."""
+    return _dispatch_prompt_groups(
+        None,
+        recipients,
+        message,
+        config_path=config_path,
+        environment=environment,
+        cancel_event=cancel_event,
+        remote_sockets=remote_sockets,
+    )

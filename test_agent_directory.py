@@ -679,6 +679,58 @@ class AgentDirectoryTest(unittest.TestCase):
         send_local.assert_called_once()
         send_remote.assert_called_once()
 
+    def test_user_dispatch_uses_only_the_configured_remote_socket(self):
+        target = agent_directory.AgentRecord(
+            "shared", "worker", "w1:p2", "w1", "work", "idle", "selected-session", "/work", False,
+            revision=2, agent_kind="codex", terminal_id="term-selected",
+        )
+        snapshot = {"result": {"snapshot": {
+            "agents": [{
+                "agent": "codex", "agent_session": {"value": "selected-session"},
+                "agent_status": "idle", "cwd": "/work", "name": "worker",
+                "pane_id": "w1:p2", "revision": 2, "terminal_id": "term-selected",
+                "workspace_id": "w1",
+            }],
+            "panes": [{"pane_id": "w1:p2", "terminal_id": "term-selected"}],
+        }}}
+        results = [
+            subprocess.CompletedProcess(["ssh"], 0, json.dumps(snapshot), ""),
+            subprocess.CompletedProcess(["ssh"], 0, "", ""),
+        ]
+        selected_socket = "/var/tmp/ham-selected.sock"
+        default_socket = "/var/tmp/default-server.sock"
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "HERDR_SOCKET_PATH": default_socket,
+        }
+        with mock.patch.object(agent_directory, "_run_command", side_effect=results) as run:
+            sent = agent_directory.dispatch_user_prompts(
+                [target], "exact user body",
+                config_path=Path("/owned/ssh-config"),
+                environment=environment,
+                remote_sockets={"shared": selected_socket},
+            )
+
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].success)
+        self.assertEqual(run.call_count, 2)
+        expected_prompt = agent_directory.user_prompt_text("exact user body")
+        for call in run.call_args_list:
+            command = call.args[0]
+            self.assertEqual(command[0], "ssh")
+            _, _, remote_script = shlex.split(command[-1])
+            self.assertIn(f"export HERDR_SOCKET_PATH={shlex.quote(selected_socket)};", remote_script)
+            self.assertNotIn(default_socket, remote_script)
+        _, _, prompt_script = shlex.split(run.call_args_list[1].args[0][-1])
+        self.assertIn(shlex.quote(expected_prompt), prompt_script)
+
+    def test_bounded_command_uses_explicit_environment(self):
+        result = agent_directory.run_bounded_command(
+            [sys.executable, "-c", "import os; print(os.environ['HAM_TEST_VALUE'])"],
+            environment={"PATH": os.environ.get("PATH", ""), "HAM_TEST_VALUE": "isolated"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "isolated")
     def test_sessionless_agent_requires_full_occupant_fingerprint(self):
         selected = agent_directory.AgentRecord(
             "local", "", "w:p1", "w", "project", "idle", "", "/work", True,

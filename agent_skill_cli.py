@@ -16,6 +16,11 @@ from dataclasses import asdict
 from typing import Any
 
 import agent_delivery
+import ledger_cli
+from collaboration_policy import CollaborationPolicy
+from ledger_settings import RepoSettings
+from ledger_status import AgentRegistry, repository_identity
+from ledger_store import LedgerError, LedgerStore
 import request_lifecycle
 from agent_batch_dispatch import (
     CANCELLED,
@@ -276,6 +281,46 @@ def current_sender(
     return sender
 
 
+def _legacy_policy(
+    sender: AgentRecord, environment: Mapping[str, str] | None,
+) -> CollaborationPolicy | None:
+    """Check local opt-in first; ordinary off traffic needs no peer setup."""
+    store = LedgerStore(environment=environment)
+    repo_id = repository_identity(sender.cwd, store.host)["repo_id"]
+    if RepoSettings(store).show(repo_id)["mode"] == "off":
+        return None
+    registry = AgentRegistry(store)
+    snapshot, _ = registry.refresh(environment)
+    current = registry.resolve_context(environment, snapshot)
+    if (current["terminal_id"] != sender.terminal_id
+            or current["session_ref"] != (sender.session_id or "unreported")
+            or current["client"] != sender.agent_kind or current["repo_id"] != repo_id):
+        raise LedgerError("policy_unverifiable", "The current coordination sender changed; no prompts were submitted.")
+    return CollaborationPolicy(store, current, environment=environment)
+
+
+def _preflight_resolver(
+    resolver: Callable[[], AgentRecord | RouteResolution], policy: CollaborationPolicy | None,
+) -> Callable[[], AgentRecord | RouteResolution]:
+    if policy is None or not policy.active:
+        return resolver
+    # Resolve before RequestLifecycleMachine can save even its initial record.
+    initial = resolver()
+    policy.check(initial.agent if isinstance(initial, RouteResolution) else initial)
+    first = True
+
+    def resolve() -> AgentRecord | RouteResolution:
+        nonlocal first
+        if first:
+            first = False
+            return initial
+        current = resolver()
+        policy.check(current.agent if isinstance(current, RouteResolution) else current)
+        return current
+
+    return resolve
+
+
 def _agent_command(
     agent: AgentRecord,
     arguments: Sequence[str],
@@ -473,6 +518,7 @@ def send_command(
     environment: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
     on_report: Callable[[Callable[[], None]], None] | None = None,
+    _policy: CollaborationPolicy | None = None,
 ) -> dict[str, Any]:
     if not message.strip():
         raise SkillCommandError("empty_message", "The message must not be empty.")
@@ -484,11 +530,15 @@ def send_command(
     _validate_defer_timeout(defer_timeout_ms)
 
     sender = current_sender(environment)
+    policy = _policy or _legacy_policy(sender, environment)
+    recipient_resolver = _preflight_resolver(
+        lambda: resolve_or_refresh_recipient(
+            host=host, label=label, route=route, environment=environment,
+        ), policy,
+    )
     prompt = f"Message from {sender.qualified_name}:\n\n{message.strip()}"
     transport = AgentRequestTransport(
-        resolver=lambda: resolve_or_refresh_recipient(
-            host=host, label=label, route=route, environment=environment,
-        ),
+        resolver=recipient_resolver,
         sender_identity=sender.identity,
         environment=environment,
         command_runner=run_bounded_command,
@@ -690,24 +740,51 @@ def batch_command(
         )
     _validate_defer_timeout(defer_timeout_ms)
     items = parse_batch_json(requests_json)
+    policy: CollaborationPolicy | None = None
+    policy_initialized = False
+    resolution_errors: list[Exception] = []
 
     def resolve_request(request: BatchRequest) -> tuple[BatchRequest, str]:
-        if request.address:
-            host, label = parse_agent_address(request.address)
-            resolution = resolve_or_refresh_recipient(
-                host=host,
-                label=label,
-                route=None,
-                environment=environment,
-            )
-        else:
-            resolution = resolve_or_refresh_routed_agent(request.route, environment)
+        nonlocal policy, policy_initialized
+        try:
+            if request.address:
+                host, label = parse_agent_address(request.address)
+                resolution = resolve_or_refresh_recipient(
+                    host=host, label=label, route=None, environment=environment,
+                )
+            else:
+                resolution = resolve_or_refresh_routed_agent(request.route, environment)
+        except Exception as error:
+            resolution_errors.append(error)
+            raise
+        if not policy_initialized:
+            try:
+                # An entirely off ledger preserves ordinary per-item resolution
+                # without a new sender/peer prerequisite for invalid batches.
+                with LedgerStore(environment=environment).read() as connection:
+                    enabled = connection.execute(
+                        "SELECT 1 FROM repo_settings WHERE field='mode' AND "
+                        "json_extract(value,'$') IN ('manual','auto') LIMIT 1").fetchone()
+                if enabled:
+                    policy = _legacy_policy(current_sender(environment), environment)
+                policy_initialized = True
+            except Exception as error:
+                resolution_errors.append(error)
+                raise
+        if policy is not None:
+            policy.check(resolution.agent)
         return (
             BatchRequest(
                 resolution.route, request.message, address=agent_address(resolution.agent)
             ),
             resolution.agent.identity,
         )
+
+    def before_dispatch() -> None:
+        if policy is not None:
+            for error in resolution_errors:
+                policy.record_error(error)
+            policy.before_dispatch()
 
     def send_one(request: BatchRequest) -> DispatchOutcome:
         try:
@@ -724,6 +801,7 @@ def batch_command(
                     environment=environment,
                     cancel_event=cancel_event,
                     on_report=lambda acknowledge: None,
+                    _policy=policy,
                 )
             else:
                 payload = send_command(
@@ -737,6 +815,7 @@ def batch_command(
                     environment=environment,
                     cancel_event=cancel_event,
                     on_report=lambda acknowledge: None,
+                    _policy=policy,
                 )
         except SkillCommandError as error:
             if error.code == "prompt_timeout":
@@ -762,6 +841,7 @@ def batch_command(
         max_workers=max_workers,
         cancel_event=cancel_event,
         resolve_request=resolve_request,
+        before_dispatch=before_dispatch,
     )
     if not verbose:
         payload["results"] = [compact_batch_item(item) for item in payload["results"]]
@@ -858,6 +938,7 @@ def request_command(
     sleep: Callable[[float], None] = time.sleep,
     cancel_event: threading.Event | None = None,
     on_report: Callable[[Callable[[], None]], None] | None = None,
+    _policy: CollaborationPolicy | None = None,
 ) -> dict[str, Any]:
     """Run one prompt through submission, observation, and bounded output read."""
 
@@ -891,6 +972,8 @@ def request_command(
             environment=environment,
         )
     )
+    policy = _policy or _legacy_policy(sender, environment)
+    recipient_resolver = _preflight_resolver(recipient_resolver, policy)
     transport = AgentRequestTransport(
         resolver=recipient_resolver,
         sender_identity=sender.identity,
@@ -1168,15 +1251,14 @@ def _public_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return ordered
 
 
-def _add_recipient_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_recipient_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
     parser.add_argument(
         "--host", default="local", help="Herdr host: local or a configured SSH alias."
     )
-    address = parser.add_mutually_exclusive_group(required=True)
+    address = parser.add_mutually_exclusive_group(required=required)
     address.add_argument("--label", help="Exact current agent label on --host.")
     address.add_argument("--route", help="Opaque verified route returned by HAM.")
     address.add_argument("--address", help="Exact HOST/LABEL address returned by list.")
-
 
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1204,12 +1286,24 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         "status",
         help="Read one resolved agent's current status.",
     )
-    _add_recipient_arguments(status_parser)
+    _add_recipient_arguments(status_parser, required=False)
     status_parser.add_argument(
         "--verbose",
         action="store_true",
         help="Include the full AgentRecord-compatible payload.",
     )
+    status_operations = status_parser.add_subparsers(dest="status_operation")
+    status_set = status_operations.add_parser("set", help="Set this agent's public status.")
+    status_set.add_argument("phase")
+    status_set.add_argument("--summary", required=True)
+    status_operations.add_parser("clear", help="Clear this agent's public status.")
+    status_list = status_operations.add_parser("list", help="List current status by repository.")
+    status_list.add_argument("--repo", nargs="?", const="", default=None)
+    status_board = status_operations.add_parser("board", help="Read local and registered-peer rich status without refreshing registry state.")
+    status_board.add_argument("--repo", nargs="?", const="", default=None,
+                              help="Optional exact repository; bare --repo selects the current caller repository.")
+    status_board.add_argument("--host", dest="board_host",
+                              help="Local/canonical/registered SSH alias; default: local and all registered peers.")
 
     send_parser = subparsers.add_parser(
         "send",
@@ -1336,6 +1430,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
             help="Hold focused-recipient delivery before asking for a decision in ms (default: 180000).",
         )
     add_spawn_parser(subparsers)
+    ledger_cli.add_parsers(subparsers)
     return parser.parse_args(argv)
 
 
@@ -1353,20 +1448,34 @@ def main(
             arguments.host, arguments.label = parse_agent_address(
                 arguments.address, arguments.host
             )
-        if arguments.command == "list":
+        if arguments.command in ledger_cli.COMMANDS:
+            payload = ledger_cli.dispatch(arguments, environment)
+        elif arguments.command == "list":
             payload = list_command(
                 arguments.host,
                 environment,
                 verbose=arguments.verbose,
             )
         elif arguments.command == "status":
-            payload = status_command(
-                host=arguments.host,
-                label=arguments.label,
-                route=arguments.route,
-                verbose=arguments.verbose,
-                environment=environment,
-            )
+            if getattr(arguments, "status_operation", None) is not None:
+                payload = ledger_cli.status_operation(
+                    arguments.status_operation,
+                    environment=environment,
+                    phase=getattr(arguments, "phase", None),
+                    summary=getattr(arguments, "summary", ""),
+                    repo_id=getattr(arguments, "repo", None),
+                    host=getattr(arguments, "board_host", None),
+                )
+            else:
+                if arguments.label is None and arguments.route is None:
+                    raise SkillCommandError("missing_address", "Use status --address HOST/LABEL or status set|clear|list.")
+                payload = status_command(
+                    host=arguments.host,
+                    label=arguments.label,
+                    route=arguments.route,
+                    verbose=arguments.verbose,
+                    environment=environment,
+                )
         elif arguments.command == "send":
             payload = send_command(
                 host=arguments.host,
@@ -1436,6 +1545,9 @@ def main(
             )
         elif arguments.command == "spawn":
             payload = spawn_command(arguments, environment)
+            initial_prompt = payload.get("initial_prompt")
+            if isinstance(initial_prompt, Mapping) and initial_prompt.get("acceptance") != "accepted":
+                exit_code = 1
         else:  # pragma: no cover - argparse rejects unknown commands
             raise SkillCommandError("invalid_command", "Unsupported command.")
         if command in {"request", "request-status"} or (
@@ -1455,7 +1567,7 @@ def main(
             for report in reports:
                 report()
         return exit_code
-    except (BatchDispatchError, SkillCommandError, SpawnError) as error:
+    except (BatchDispatchError, SkillCommandError, SpawnError, LedgerError) as error:
         _write_json(
             {"error": {"code": error.code, "message": error.message}},
             compact=command == "batch",

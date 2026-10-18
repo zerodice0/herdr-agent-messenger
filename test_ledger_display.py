@@ -1,0 +1,519 @@
+"""Display ownership tests with a private real ledger and injected Herdr only."""
+
+import copy
+import io
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+import uuid
+from unittest import mock
+
+import agent_labels
+import agent_spawn
+import ledger_display
+from agent_directory import ssh_program_command
+from ledger_remote import RemoteLedger
+from ledger_display import (LEGACY_SOURCE, RECAP_SOURCE, SOURCE, LedgerDisplay,
+                            border_owned, build_display, refresh_pane, report_metadata)
+from ledger_settings import RepoSettings
+from ledger_status import AgentRegistry
+from ledger_store import LedgerStore
+
+
+class HerdrDisplay:
+    def __init__(self, pane_ids, *, terminals=None):
+        self.commands = []
+        self.labels = dict.fromkeys(pane_ids, "")
+        self.terminals = {} if terminals is None else dict(terminals)
+        self.metadata = {pane: {
+            "device": {"tokens": {"phone": "serial", "emu": "5554"}},
+            RECAP_SOURCE: {"tokens": {"recap": "legacy phase", "other": "keep"}},
+        } for pane in pane_ids}
+        self.rename_fails = False
+        self.metadata_fails = False
+        self.pane_get_fails = False
+
+    def __call__(self, command):
+        command = list(command)
+        self.commands.append(command)
+        pane_id = command[2]
+        result = {}
+        code = 0
+        if command[:2] == ["pane", "get"]:
+            if self.pane_get_fails:
+                code = 1
+            else:
+                pane = {"pane_id": pane_id, "terminal_id": self.terminals.get(pane_id, "unbound-fixture")}
+                if self.labels[pane_id]:
+                    pane["label"] = self.labels[pane_id]
+                result = {"pane": pane}
+        elif command[:2] == ["pane", "rename"]:
+            if self.rename_fails:
+                code = 1
+            else:
+                self.labels[pane_id] = "" if command[3] == "--clear" else command[3]
+        elif command[:2] == ["pane", "report-metadata"]:
+            if self.metadata_fails:
+                code = 1
+            else:
+                source = command[command.index("--source") + 1]
+                fields = self.metadata[pane_id].setdefault(source, {"tokens": {}})
+                index = 5
+                while index < len(command):
+                    option = command[index]
+                    if option == "--clear-display-agent":
+                        fields.pop("display_agent", None)
+                        index += 1
+                        continue
+                    value = command[index + 1]
+                    if option == "--token":
+                        key, _, text = value.partition("=")
+                        fields["tokens"][key] = text
+                    elif option == "--clear-token":
+                        fields["tokens"].pop(value, None)
+                    else:
+                        fields[option.removeprefix("--").replace("-", "_")] = value
+                    index += 2
+        else:
+            raise AssertionError(f"Unexpected command: {command}")
+        return subprocess.CompletedProcess(command, code, json.dumps({"result": result}), "failure" if code else "")
+
+
+class LedgerDisplayTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.worktree = self.root / "worker"
+        self.git("init", "-q", str(self.repo))
+        self.git("-C", str(self.repo), "-c", "user.name=Display Test", "-c", "user.email=display@example.invalid",
+                 "commit", "-q", "--allow-empty", "-m", "initial")
+        self.git("-C", str(self.repo), "config", "remote.origin.url", "https://example.invalid/ham/display.git")
+        self.git("-C", str(self.repo), "worktree", "add", "-q", "-b", "worker", str(self.worktree))
+        self.store = LedgerStore(self.root / "ledger", canonical_name="display-test")
+        self.herdr = HerdrDisplay(["p-main", "p-worker"],
+                                 terminals={"p-main": "main", "p-worker": "worker"})
+        self.registry = AgentRegistry(self.store, display_runner=self.herdr)
+        self.settings = RepoSettings(self.store, display_runner=self.herdr)
+        panes = [{"terminal_id": "main", "pane_id": "p-main", "workspace_id": "w-main"},
+                 {"terminal_id": "worker", "pane_id": "p-worker", "workspace_id": "w-worker"}]
+        snapshot = {"panes": panes, "agents": [
+            {**panes[0], "agent": "omp", "name": "orange-rabbit", "agent_status": "idle",
+             "agent_session": {"value": "main-session"}, "cwd": str(self.repo)},
+            {**panes[1], "agent": "codex", "name": "review-worker", "agent_status": "working",
+             "agent_session": {"value": "worker-session"}, "cwd": str(self.worktree)},
+        ]}
+        self.registry.reconcile(snapshot, refresh_display=False)
+        self.repo_id = self.agent("main")["repo_id"]
+        self.display = LedgerDisplay(self.store, runner=self.herdr)
+
+    @staticmethod
+    def git(*arguments):
+        subprocess.run(["git", *arguments], check=True, capture_output=True, text=True)
+
+    def agent(self, terminal="main"):
+        return next(row for row in self.registry.list() if row["terminal_id"] == terminal)
+
+    def status(self, *, phase="구현 중", summary="Implement mailbox"):
+        # These cases explicitly exercise the projector below. Keep the real
+        # status commit, but defer its already-covered notification boundary.
+        with mock.patch.object(LedgerDisplay, "refresh", return_value={"updated": [], "failed": []}):
+            return self.registry.set_status(self.agent(), phase=phase, summary=summary)
+
+    def test_status_service_projects_with_injected_selected_host_runner(self):
+        result = self.registry.set_status(self.agent(), phase="구현 중", summary="Status service route",
+                                          feature_invoked=True)
+        self.assertEqual(result["display"]["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], "Status service route")
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+
+    def test_pure_builder_keeps_role_before_address_suffix(self):
+        for role, prefix in ((None, ""), ("main", "[메인] "), ("worker", "[워커] ")):
+            projected = build_display("omp", "orange-rabbit", "🟧", "orange", role=role,
+                                      phase="검토 중", summary="Mailbox implementation")
+            self.assertEqual(projected.display_agent, f"🟧 {prefix}orange-rabbit")
+            self.assertTrue(projected.display_agent.endswith(" orange-rabbit"))
+            self.assertEqual((projected.recap, projected.label), ("검토 중", f"{prefix}Mailbox implementation"))
+            command = projected.metadata_command("p")
+            self.assertEqual(command[3:5], ["--source", SOURCE])
+            self.assertEqual(command[5:9], ["--agent", "omp", "--display-agent", projected.display_agent])
+            self.assertEqual(command[9:], ["--token", "alias=orange-rabbit", "--token", "color=orange",
+                                          "--token", "recap=검토 중"])
+
+    def test_auto_roles_use_actual_main_and_linked_worktree(self):
+        self.settings.mutate(self.repo_id, "mode", "auto")
+        self.status()
+        result = self.display.refresh()
+        self.assertCountEqual(result["updated"], ["p-main", "p-worker"])
+        self.assertEqual(result["failed"], [])
+        main = self.herdr.metadata["p-main"][SOURCE]
+        worker = self.herdr.metadata["p-worker"][SOURCE]
+        self.assertEqual(main["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(worker["display_agent"], "[워커] review-worker")
+        self.assertEqual(main["tokens"], {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중"})
+        self.assertEqual(worker["tokens"], {"alias": "review-worker", "color": "", "recap": ""})
+        self.assertEqual(self.herdr.labels["p-main"], "[메인] Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "[메인] Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-worker"], "[워커]")
+        for metadata in self.herdr.metadata.values():
+            self.assertEqual(metadata["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+            self.assertEqual(metadata[RECAP_SOURCE]["tokens"], {"other": "keep"})
+
+    def test_manual_roles_and_off_keep_status_without_role(self):
+        self.settings.mutate(self.repo_id, "mode", "manual")
+        target = {"host": self.store.host, "terminal_id": "main"}
+        self.settings.mutate(self.repo_id, "main", target)
+        self.settings.mutate(self.repo_id, "members", [{"host": self.store.host, "terminal_id": "worker"}])
+        self.status()
+        self.display.refresh()
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        self.settings.mutate(self.repo_id, "mode", "off")
+        self.display.refresh()
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+
+    def test_manual_border_is_not_captured_even_when_equal_to_summary(self):
+        self.status()
+        self.herdr.labels["p-main"] = "Implement mailbox"
+        self.display.refresh("p-main")
+        self.assertIsNone(self.agent()["last_ham_label"])
+        self.status(summary="Next task")
+        self.display.refresh("p-main")
+        self.assertEqual(self.herdr.labels["p-main"], "Implement mailbox")
+        self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_owned_border_updates_clears_and_preserves_later_manual_rename(self):
+        self.status()
+        self.display.refresh("p-main")
+        self.status(summary="Second task")
+        self.display.refresh("p-main")
+        self.assertEqual(self.herdr.labels["p-main"], "Second task")
+        self.status(phase="", summary="")
+        self.display.refresh("p-main")
+        self.assertEqual(self.agent()["last_ham_label"], "")
+        self.assertEqual(self.herdr.labels["p-main"], "")
+        self.status(summary="Third task")
+        self.display.refresh("p-main")
+        self.herdr.labels["p-main"] = "My manual title"
+        self.status(summary="Fourth task")
+        self.display.refresh("p-main")
+        self.assertEqual(self.herdr.labels["p-main"], "My manual title")
+        self.assertEqual(self.agent()["last_ham_label"], "Third task")
+
+    def test_legacy_token_is_not_border_ownership_confirmation(self):
+        self.status()
+        self.herdr.labels["p-main"] = "Old recap border"
+        self.display.refresh("p-main")
+        self.assertEqual(self.herdr.labels["p-main"], "Old recap border")
+        self.assertIsNone(self.agent()["last_ham_label"])
+        result = refresh_pane("p-main", self.store, runner=self.herdr, legacy_label="Old recap border")
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], "Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "Implement mailbox")
+
+    def test_border_ownership_distinguishes_null_and_empty(self):
+        self.assertFalse(border_owned("manual", None))
+        self.assertFalse(border_owned("manual", ""))
+        self.assertTrue(border_owned("", None))
+        self.assertTrue(border_owned("owned", "owned"))
+        self.assertTrue(border_owned("legacy", None, legacy_label="legacy"))
+        self.assertFalse(border_owned("manual", None, legacy_label="legacy"))
+
+    def test_failed_border_rename_does_not_persist_ownership(self):
+        self.status()
+        self.herdr.rename_fails = True
+        self.assertEqual(self.display.refresh("p-main")["failed"], ["p-main"])
+        self.assertIsNone(self.agent()["last_ham_label"])
+        self.assertEqual(self.herdr.labels["p-main"], "")
+
+    def test_unreadable_binding_does_not_change_metadata_or_border(self):
+        self.status()
+        before = copy.deepcopy(self.herdr.metadata)
+        self.herdr.pane_get_fails = True
+        self.assertEqual(self.display.refresh("p-main")["failed"], ["p-main"])
+        self.assertEqual(self.herdr.metadata, before)
+        self.assertEqual(self.herdr.labels["p-main"], "")
+        self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_actual_omitted_blank_label_is_owned_after_verified_binding(self):
+        before = json.loads(self.herdr(["pane", "get", "p-main"]).stdout)["result"]["pane"]
+        self.assertEqual(before, {"pane_id": "p-main", "terminal_id": "main"})
+        self.status()
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], "Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "Implement mailbox")
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+
+    def test_invalid_or_wrong_binding_fails_closed_before_any_metadata_or_rename(self):
+        valid = {"pane_id": "p-main", "terminal_id": "main"}
+        cases = [
+            "", "not-json", {}, {"result": {}}, {"result": {"pane": {}}},
+            {"result": {"pane": {"pane_id": "another-pane", "terminal_id": "main"}}},
+            {"result": {"pane": {"pane_id": "p-main", "terminal_id": "replacement-terminal"}}},
+            {"result": {"pane": {"pane_id": "p-main"}}},
+            {"result": {"pane": {**valid, "label": None}}},
+            {"error": {"code": "not_found"}, "result": {"pane": valid}},
+            {"ok": False, "result": {"pane": valid}},
+        ]
+        self.status()
+        before = copy.deepcopy(self.herdr.metadata)
+        for payload in cases:
+            with self.subTest(payload=payload):
+                def runner(command):
+                    if command[:2] == ["pane", "get"]:
+                        body = payload if isinstance(payload, str) else json.dumps(payload)
+                        return subprocess.CompletedProcess(command, 0, body, "")
+                    return self.herdr(command)
+                self.display.runner = runner
+                self.assertEqual(self.display.refresh("p-main")["failed"], ["p-main"])
+                self.assertEqual(self.herdr.metadata, before)
+                self.assertEqual(self.herdr.labels["p-main"], "")
+                self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_plain_label_report_does_not_clear_user_recap(self):
+        self.assertTrue(report_metadata(self.herdr, "p-main", build_display("omp", "orange-rabbit", "🟧", "orange")))
+        self.assertEqual(self.herdr.metadata["p-main"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "")
+
+    def test_named_assignment_refreshes_arbitrary_alias_without_renaming(self):
+        self.herdr.labels["p-worker"] = "User review border"
+        with (mock.patch.object(agent_labels, "fetch_agent_info", return_value={"agent": "codex", "name": "review-worker"}),
+              mock.patch("ledger_display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: self.herdr(args)),
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(agent_labels.assign_label("p-worker"), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["tokens"]["alias"], "review-worker")
+        self.assertEqual(self.herdr.labels["p-worker"], "User review border")
+        self.assertFalse(any(command[:2] == ["agent", "rename"] for command in self.herdr.commands))
+
+    def test_name_taken_race_refreshes_the_winning_alias_metadata(self):
+        info = {"agent": "codex", "terminal_id": "worker",
+                "agent_session": {"value": "worker-session"}}
+        self.herdr.labels["p-worker"] = "User review border"
+
+        def run(*arguments):
+            if arguments[:2] == ("agent", "get"):
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": {"agent": info}}), "")
+            if arguments[:2] == ("agent", "rename"):
+                self.assertFalse(info.get("name"), "A concurrent owner's alias must not be replaced")
+                info["name"] = "review-worker"
+                return subprocess.CompletedProcess(arguments, 1, "", "agent_name_taken")
+            return self.herdr(arguments)
+
+        with (mock.patch("ledger_display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=run),
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(agent_labels.assign_label("p-worker"), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["tokens"]["alias"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        self.assertEqual(self.herdr.labels["p-worker"], "User review border")
+
+    def test_initial_named_agent_without_registry_row_uses_plain_builder_only(self):
+        initial = HerdrDisplay(["p-unregistered"])
+        initial.labels["p-unregistered"] = "User's existing border"
+        with (mock.patch.object(agent_labels, "fetch_agent_info",
+                                return_value={"agent": "codex", "name": "initial-reviewer"}),
+              mock.patch("ledger_display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: initial(args)),
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(agent_labels.assign_label("p-unregistered"), 0)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(initial.metadata["p-unregistered"][SOURCE], {
+            "agent": "codex", "display_agent": "initial-reviewer",
+            "tokens": {"alias": "initial-reviewer", "color": "", "recap": ""},
+        })
+        self.assertEqual([command[4] for command in initial.commands], [LEGACY_SOURCE, SOURCE])
+        self.assertTrue(all(command[:2] == ["pane", "report-metadata"] for command in initial.commands))
+        self.assertEqual(initial.labels["p-unregistered"], "User's existing border")
+        self.assertEqual(initial.metadata["p-unregistered"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+        self.assertEqual(initial.metadata["p-unregistered"]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+        self.assertEqual(len(self.registry.list()), 2)
+
+    def test_reconcile_refreshes_alias_metadata_without_replacing_existing_names(self):
+        infos = {
+            "p-main": {"agent": "omp", "pane_id": "p-main", "name": "orange-rabbit"},
+            "p-worker": {"agent": "codex", "pane_id": "p-worker", "name": "review-worker"},
+            "p-new": {"agent": "codex", "pane_id": "p-new", "terminal_id": "new",
+                      "agent_session": {"value": "new-session"}},
+        }
+        listed = [*infos.values(), infos["p-new"], {"pane_id": "p-ignored"}]
+        surface = HerdrDisplay(infos, terminals={"p-main": "main", "p-worker": "worker"})
+        surface.labels["p-worker"] = "User review border"
+
+        def run(*arguments):
+            if arguments[:2] == ("agent", "list"):
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": {"agents": listed}}), "")
+            if arguments[:2] == ("agent", "get"):
+                return subprocess.CompletedProcess(
+                    arguments, 0, json.dumps({"result": {"agent": infos[arguments[2]]}}), "")
+            if arguments[:2] == ("agent", "rename"):
+                info = infos[arguments[2]]
+                self.assertFalse(info.get("name"), "Existing palette and custom aliases must remain addressable")
+                if arguments[3] in {item.get("name") for item in infos.values()}:
+                    return subprocess.CompletedProcess(arguments, 1, "", "agent_name_taken")
+                info["name"] = arguments[3]
+                return subprocess.CompletedProcess(arguments, 0, "{}", "")
+            return surface(arguments)
+
+        with (mock.patch("ledger_display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=run),
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(agent_labels.reconcile_labels(), 0)
+        self.assertEqual(infos["p-main"]["name"], "orange-rabbit")
+        self.assertEqual(infos["p-worker"]["name"], "review-worker")
+        self.assertTrue(infos["p-new"].get("name"))
+        self.assertEqual(output.getvalue(), infos["p-new"]["name"] + "\n")
+        for pane_id, info in infos.items():
+            self.assertEqual(surface.metadata[pane_id][SOURCE]["tokens"]["alias"], info["name"])
+            self.assertIn(info["name"], surface.metadata[pane_id][SOURCE]["display_agent"])
+            self.assertEqual(surface.metadata[pane_id]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+        self.assertEqual(surface.labels["p-worker"], "User review border")
+
+    def test_spawn_local_refresh_preserves_authoritative_role_and_status(self):
+        self.settings.mutate(self.repo_id, "mode", "auto")
+        self.status()
+        with (mock.patch.object(agent_spawn, "LedgerStore", return_value=self.store),
+              mock.patch.object(AgentRegistry, "refresh", return_value=({}, {}))):
+            self.assertTrue(agent_spawn._report_metadata(
+                self.herdr, "p-main", "omp", agent_labels.Alias("orange-rabbit", "🟧", "orange")))
+        metadata = self.herdr.metadata["p-main"][SOURCE]
+        self.assertEqual(metadata["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(metadata["tokens"]["recap"], "구현 중")
+        self.assertEqual(self.herdr.labels["p-main"], "[메인] Implement mailbox")
+
+    def test_metadata_failures_are_returned_without_dropping_other_reports(self):
+        self.herdr.metadata_fails = True
+        self.assertFalse(report_metadata(self.herdr, "p-main", build_display("omp", "named"), clear_legacy_recap=True))
+        self.assertEqual([command[4] for command in self.herdr.commands], [LEGACY_SOURCE, RECAP_SOURCE, SOURCE])
+
+
+    def test_global_refresh_off_without_status_keeps_legacy_recap(self):
+        self.assertEqual(self.display.refresh()["failed"], [])
+        self.assertFalse(border_owned("", "previous HAM title"))
+        for metadata in self.herdr.metadata.values():
+            self.assertEqual(metadata[RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+
+    def test_failed_label_cas_is_reported_after_rename_without_fake_persistence(self):
+        self.status()
+        with mock.patch.object(self.display.registry, "set_display_label",
+                               return_value={"updated": False, "last_ham_label": None}) as save:
+            self.assertEqual(self.display.refresh("p-main")["failed"], ["p-main"])
+        save.assert_called_once_with(self.agent()["agent_id"], None, "Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "Implement mailbox")
+        self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_released_agent_clears_only_owned_display_tokens(self):
+        with mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: self.herdr(args)):
+            self.assertTrue(agent_labels.clear_agent_label_metadata("p-main"))
+        self.assertEqual([command[4] for command in self.herdr.commands], [SOURCE, LEGACY_SOURCE])
+        self.assertEqual(self.herdr.metadata["p-main"]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+        self.assertEqual(self.herdr.metadata["p-main"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+
+
+    def test_manual_border_clear_after_ham_ownership_is_preserved(self):
+        self.status()
+        self.display.refresh("p-main")
+        self.herdr.labels["p-main"] = ""
+        self.status(summary="Do not recapture manually cleared border")
+        self.display.refresh("p-main")
+        self.assertEqual(self.herdr.labels["p-main"], "")
+        self.assertEqual(self.agent()["last_ham_label"], "Implement mailbox")
+
+
+    def test_metadata_side_effect_manual_rename_is_preserved_by_fresh_read(self):
+        self.status()
+
+        def rename_during_report(command):
+            result = self.herdr(command)
+            if command[:2] == ["pane", "report-metadata"] and command[4] == SOURCE:
+                self.herdr.labels["p-main"] = "User renamed during report"
+            return result
+
+        self.display.runner = rename_during_report
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], "User renamed during report")
+        self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_spawn_remote_uses_registered_endpoint_and_overrides_not_local_roles(self):
+        environment = {
+            "HERDR_AGENT_LEDGER_DIR": str(self.store.directory),
+            "HERDR_AGENT_MESSENGER_SSH_CONFIG": str(self.root / "ssh-config"),
+            "HERDR_AGENT_LEDGER_AUTOSTART": "0",
+        }
+        with mock.patch("ledger_remote.ssh_hosts", return_value=["remote-alias"]):
+            RemoteLedger(self.store, environment).add_peer(
+                canonical_name="remote-canonical", uuid=str(uuid.uuid4()), ssh_alias="remote-alias",
+                remote_ham_root="/work/HAM checkout", remote_ledger_dir="/state/isolated",
+                remote_socket="/run/selected.sock")
+        completed = subprocess.CompletedProcess([], 0, json.dumps({
+            "result": {"updated": ["remote-pane"], "failed": []}}), "")
+        run_program = mock.Mock(return_value=completed)
+        run_herdr = mock.Mock(side_effect=AssertionError("plain remote metadata overwrite"))
+        with (mock.patch.object(AgentRegistry, "refresh", side_effect=AssertionError("local roles read")),
+              mock.patch.object(agent_spawn, "LedgerStore", return_value=self.store)):
+            self.assertTrue(agent_spawn._report_metadata(
+                run_herdr, "remote-pane", "codex", agent_labels.Alias("review-worker", "", ""),
+                host="remote-alias", environment=environment, command_runner=run_program))
+        expected = ssh_program_command("remote-alias", [
+            "env", "HERDR_AGENT_LEDGER_DIR=/state/isolated", "HERDR_SOCKET_PATH=/run/selected.sock",
+            "HERDR_AGENT_LEDGER_AUTOSTART=0", "python3", "/work/HAM checkout/ledger_display.py",
+            "--pane", "remote-pane",
+        ], config_path=self.root / "ssh-config")
+        run_program.assert_called_once_with(
+            expected, timeout=agent_spawn.REMOTE_DISCOVERY_TIMEOUT_SECONDS, environment=environment)
+        run_herdr.assert_not_called()
+
+    def test_spawn_unregistered_remote_refuses_without_any_metadata_write(self):
+        run_program = mock.Mock(side_effect=AssertionError("unregistered endpoint invoked"))
+        run_herdr = mock.Mock(side_effect=AssertionError("unknown source overwritten"))
+        with mock.patch.object(agent_spawn, "LedgerStore", return_value=self.store):
+            self.assertFalse(agent_spawn._report_metadata(
+                run_herdr, "remote-pane", "codex", agent_labels.Alias("review-worker", "", ""),
+                host="unregistered", environment={}, command_runner=run_program))
+        run_program.assert_not_called()
+        run_herdr.assert_not_called()
+
+    def test_selected_host_cli_refreshes_registry_then_projects_real_roles(self):
+        self.settings.mutate(self.repo_id, "mode", "auto")
+        self.status()
+        with (mock.patch.object(ledger_display, "LedgerStore", return_value=self.store),
+              mock.patch.object(AgentRegistry, "refresh", return_value=({}, {})) as refresh_registry,
+              mock.patch.object(ledger_display, "run_bounded_command",
+                                side_effect=lambda command, **kwargs: self.herdr(command[1:])),
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(ledger_display.main(["--pane", "p-main"]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"result": {"updated": ["p-main"], "failed": []}})
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(self.herdr.labels["p-main"], "[메인] Implement mailbox")
+
+
+    def test_refresh_entrypoints_forward_exact_environment_to_runner(self):
+        environment = {"HERDR_SOCKET_PATH": "/run/isolated.sock", "HOME": str(self.root)}
+        for entrypoint in (ledger_display.refresh, ledger_display.refresh_pane):
+            with self.subTest(entrypoint=entrypoint.__name__):
+                with (mock.patch.object(ledger_display, "herdr_executable", return_value="/selected/herdr"),
+                      mock.patch.object(ledger_display, "run_bounded_command",
+                                        side_effect=lambda command, **kwargs: self.herdr(command[1:])) as run):
+                    if entrypoint is ledger_display.refresh:
+                        result = entrypoint(self.store, environment)
+                    else:
+                        result = entrypoint("p-main", self.store, environment)
+                self.assertEqual(result["failed"], [])
+                self.assertTrue(run.called)
+                for call in run.call_args_list:
+                    self.assertEqual(call.args[0][0], "/selected/herdr")
+                    self.assertIs(call.kwargs["environment"], environment)
+                    self.assertEqual(call.kwargs["timeout"], 10)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

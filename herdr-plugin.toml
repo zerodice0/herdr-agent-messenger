@@ -6,6 +6,20 @@ description = "Label Herdr agents and coordinate prompts with HAM, the Herdr Age
 platforms = ["macos", "linux"]
 
 [[actions]]
+id = "mailbox-split"
+title = "HAM: Mailbox (Right Split)"
+description = "Inspect status, mailbox threads, user compose and repository settings."
+contexts = ["workspace", "pane"]
+command = ["python3", "mailbox_tui.py", "split"]
+
+[[actions]]
+id = "mailbox-tab"
+title = "HAM: Mailbox (Tab)"
+description = "Open the workspace's HAM mailbox in a plugin-owned tab."
+contexts = ["workspace", "pane"]
+command = ["python3", "mailbox_tui.py", "tab"]
+
+[[actions]]
 id = "label-current"
 title = "Assign Agent Label"
 description = "Assign a color-animal name to the agent in the focused pane."
@@ -39,6 +53,9 @@ command = ["python3", "agent_labels.py", "reconcile"]
 [[startup]]
 command = ["python3", "agent_delivery.py", "reconcile"]
 
+[[startup]]
+command = ["python3", "ledger_cli.py", "ledger", "reconcile"]
+
 [[events]]
 on = "pane.agent_detected"
 command = ["python3", "agent_labels.py", "event"]
@@ -46,6 +63,14 @@ command = ["python3", "agent_labels.py", "event"]
 [[events]]
 on = "pane.agent_status_changed"
 command = ["python3", "agent_labels.py", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "ledger_cli.py", "ledger", "event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "ledger_cli.py", "ledger", "event"]
 
 [[panes]]
 id = "messenger"
@@ -64,3 +89,9 @@ id = "held"
 title = "HAM: Held Messages"
 placement = "popup"
 command = ["python3", "agent_messenger.py", "popup-held"]
+
+[[panes]]
+id = "mailbox"
+title = "HAM Mailbox"
+placement = "split"
+command = ["python3", "mailbox_tui.py", "pane"]
