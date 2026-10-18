@@ -485,9 +485,16 @@ class MailboxApp:
         self.confirm: dict[str, Any] | None = None
         self.edit: dict[str, Any] | None = None
         self.settings_selection = 0
+        self.settings_pending: dict[str, Any] = {}
+        self.settings_picker: dict[str, Any] | None = None
+        self.settings_numeric: dict[str, Any] | None = None
+        self.settings_results: dict[str, str] = {}
+        self.settings_saving: str | None = None
         self.help_return = "nav"
         self.overlay_scroll = 0
         self.cursor_position: tuple[int, int] | None = None
+        self.hit_map: list[tuple[tuple[int, int, int, int], str, Any]] = []
+        self.input_scroll: int | None = None
         self.colors_enabled = False
         self.popup, self.running = popup, True
 
@@ -599,6 +606,10 @@ class MailboxApp:
                         if pending.startswith("remote:") and pending.split(":", 1)[1] not in peers:
                             self.jobs.pop(pending).close()
             else:
+                if job.operation == "setting" and self.settings_saving:
+                    self.settings_results[self.settings_saving] = (
+                        f"✕ {error.get('code')}: {error.get('message')}" if error else "Saved.")
+                    self.settings_saving = None
                 if job.operation in {"send", "direct"}:
                     self.finish_send(value, error)
                 elif error:
@@ -655,6 +666,7 @@ class MailboxApp:
         self.body, self.body_cursor = draft.get("text", ""), draft.get("cursor", 0)
         self.draft_version, self.delivery = draft.get("version", 0), draft.get("delivery", "mailbox")
         self.mode, self.input_error = "input", ""
+        self.input_scroll = None
         self.save_draft()
 
     def choose_agent(self) -> None:
@@ -775,6 +787,8 @@ class MailboxApp:
                 self.running = False
             elif operation in {"send", "direct"}:
                 self.send_request(operation, confirm["values"])
+            elif operation == "setting":
+                self.save_setting(**confirm["values"])
             else:
                 self.start_job("mutation", operation, **confirm["values"])
 
@@ -828,11 +842,144 @@ class MailboxApp:
         if field == "mode":
             return settings.get("mode", "off")
         if field in DEFAULT_THRESHOLDS:
-            return fields.get("thresholds", {}).get("value", DEFAULT_THRESHOLDS).get(field)
+            return fields.get("thresholds", {}).get("value", {}).get(field, DEFAULT_THRESHOLDS[field])
         return fields.get(field, {}).get("value")
 
-    def settings_key(self, key: Any) -> None:
+    def settings_ready(self, field: str) -> bool:
+        if not self.repo_id:
+            message = "Select an agent to choose a repository first."
+        elif (self.local.get("settings") or {}).get("repo_id") != self.repo_id:
+            message = "Loading settings…"
+            self.start_job("snapshot", "snapshot")
+        else:
+            return True
+        self.settings_results[field] = message
+        self.set_status(message, "error" if not self.repo_id else "info")
+        return False
+
+    def save_setting(self, field: str, value: Any) -> bool:
+        if not self.settings_ready(field):
+            return False
+        if "mutation" in self.jobs:
+            message = "An operation is pending; this setting has not been submitted."
+            self.settings_results[field] = message
+            self.set_status(message, "error")
+            return False
+        save_field, save_value = field, value
+        if field in DEFAULT_THRESHOLDS:
+            save_field = "thresholds"
+            save_value = {name: self.setting_value(name) for name in DEFAULT_THRESHOLDS}
+            save_value[field] = value
+        if not self.start_job("mutation", "setting", field=save_field, value=save_value):
+            return False
+        self.settings_saving = field
+        self.settings_results[field] = "Saving settings…"
+        self.settings_pending.pop(field, None)
+        return True
+
+    def open_settings_picker(self, field: str) -> None:
+        current = self.setting_value(field)
+        if field == "mode":
+            entries = [
+                ("off · No main or worker roles.", "off"),
+                ("manual · Explicit main and checked members only.", "manual"),
+                ("auto · Other agents are workers; infer the sole home main-checkout agent unless set.", "auto"),
+            ]
+        else:
+            agents = self.agents()
+            entries = [("(none)", None)] if field == "main" else []
+            for agent in agents:
+                if not agent.get("stale"):
+                    entries.append((f"{self.address(agent)} · {agent.get('turn_state', 'unknown')}",
+                                    {name: agent[name] for name in ("host", "terminal_id")}))
+            if field == "members":
+                live = [value for _label, value in entries]
+                for target in current or []:
+                    if target not in live:
+                        agent = next((agent for agent in agents
+                                      if self.identity(agent) == (target["host"], target["terminal_id"])), target)
+                        entries.append((f"{self.address(agent)} · stale", target))
+        selection = next((index for index, (_label, value) in enumerate(entries)
+                          if value == current), 0)
+        self.settings_picker = {"field": field, "entries": entries, "selection": selection,
+                                "checked": list(current or []) if field == "members" else []}
+        self.overlay_scroll = 0
+
+    def settings_picker_key(self, key: Any) -> None:
+        picker = self.settings_picker
+        assert picker is not None
+        entries = picker["entries"]
         if key == key_input.ESCAPE:
+            self.settings_picker = None
+            self.overlay_scroll = 0
+        elif key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j",
+                     curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            selection = picker["selection"]
+            if key == curses.KEY_HOME:
+                selection = 0
+            elif key == curses.KEY_END:
+                selection = len(entries) - 1
+            else:
+                amount = max(1, self.screen.getmaxyx()[0] - 8) if key in (
+                    curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+                selection += (-amount if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else amount)
+            picker["selection"] = min(max(0, len(entries) - 1), max(0, selection))
+            self.overlay_scroll = 0
+        elif key == " " and picker["field"] == "members" and entries:
+            target = entries[picker["selection"]][1]
+            checked = picker["checked"]
+            checked.remove(target) if target in checked else checked.append(target)
+        elif key == "\r":
+            value = picker["checked"] if picker["field"] == "members" else entries[picker["selection"]][1]
+            if self.save_setting(picker["field"], value):
+                self.settings_picker = None
+                self.overlay_scroll = 0
+
+    def step_setting(self, direction: int) -> None:
+        field = self.SETTINGS[self.settings_selection]
+        if not self.settings_ready(field):
+            return
+        value = self.settings_pending.get(field, self.setting_value(field))
+        if field == "mode":
+            modes = ("off", "manual", "auto")
+            value = modes[(modes.index(value) + direction) % len(modes)]
+        elif field in DEFAULT_THRESHOLDS:
+            # ledger_settings.validate_setting accepts 0..10000 for every threshold.
+            value = min(10000, max(0, value + direction * (5 if field == "coalesce_seconds" else 1)))
+        else:
+            return
+        if field == "mode" and value == self.setting_value(field):
+            self.settings_pending.pop(field, None)
+        else:
+            self.settings_pending[field] = value
+        if self.settings_saving != field:
+            self.settings_results.pop(field, None)
+
+    def settings_key(self, key: Any) -> None:
+        if self.settings_picker is not None:
+            self.settings_picker_key(key)
+            return
+        numeric = self.settings_numeric
+        if numeric is not None:
+            field = numeric["field"]
+            if key == key_input.ESCAPE:
+                self.settings_numeric = None
+            elif key == "\r":
+                text = numeric["text"]
+                if not text or len(text) > 5 or not 0 <= int(text) <= 10000:
+                    self.settings_results[field] = "Enter a number from 0 to 10000."
+                elif self.save_setting(field, int(text)):
+                    self.settings_numeric = None
+            elif isinstance(key, str) and len(key) == 1 and "0" <= key <= "9":
+                numeric["text"], numeric["cursor"], _ = edit_buffer(
+                    numeric["text"], numeric["cursor"], key, multiline=False)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_HOME, curses.KEY_END,
+                         curses.KEY_BACKSPACE, curses.KEY_DC, "\x7f", "\b"):
+                numeric["text"], numeric["cursor"], _ = edit_buffer(
+                    numeric["text"], numeric["cursor"], key, multiline=False)
+            return
+        if key == key_input.ESCAPE:
+            self.settings_pending.clear()
             self.mode = "nav"
             return
         if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
@@ -843,34 +990,64 @@ class MailboxApp:
                                           (-1 if key in (curses.KEY_UP, "k") else 1)))
             self.overlay_scroll = 0
             return
-        if not self.repo_id:
-            self.set_status("Select an agent to choose a repository first.", "error")
+        field = self.SETTINGS[self.settings_selection]
+        if key in (curses.KEY_LEFT, "h", "-", curses.KEY_RIGHT, "l", "+"):
+            self.step_setting(-1 if key in (curses.KEY_LEFT, "h", "-") else 1)
             return
-        if key in ("m", " ", "\r") and (self.local.get("settings") or {}).get("repo_id") != self.repo_id:
-            self.set_status("Loading settings…")
-            self.start_job("snapshot", "snapshot")
+        if key not in ("m", " ", "\r") or not self.settings_ready(field):
             return
         if key in ("m", " "):
             agent = self.selected("agents")
             if not agent or agent["repo_id"] != self.repo_id or agent.get("stale"):
                 self.set_status("Choose a live, non-stale agent in this repository first.", "error")
                 return
-            target = {field: agent[field] for field in ("host", "terminal_id")}
+            target = {name: agent[name] for name in ("host", "terminal_id")}
             field, value = "main", target
             if key == " ":
                 field, value = "members", list(self.setting_value("members") or [])
                 value.remove(target) if target in value else value.append(target)
+            if "mutation" in self.jobs:
+                self.settings_results[field] = "An operation is pending; this setting has not been submitted."
+                self.set_status(self.settings_results[field], "error")
+                return
             self.open_confirm(f"Change {field}?", [f"Target: {self.address(agent)}",
                               json.dumps(value, ensure_ascii=False)], "setting",
                               {"field": field, "value": value}, return_mode="settings")
-        elif key == "\r":
-            field = self.SETTINGS[self.settings_selection]
-            value = self.setting_value(field)
-            text = json.dumps(value, ensure_ascii=False) if field in {"main", "members"} else str(value)
-            self.edit = {"title": f"Edit {field}", "text": text, "cursor": len(text),
-                         "action": "setting", "field": field, "return_mode": "settings"}
-            self.overlay_scroll = 0
-            self.mode = "evidence"
+        elif field in self.settings_pending:
+            self.save_setting(field, self.settings_pending[field])
+        elif field in {"mode", "main", "members"}:
+            self.open_settings_picker(field)
+        elif not self.settings_pending:
+            text = str(self.setting_value(field))
+            self.settings_numeric = {"field": field, "text": text, "cursor": len(text)}
+
+    def settings_mouse(self, event: key_input.MouseEvent, hits: list[Any]) -> None:
+        if event.action in {"wheel_up", "wheel_down"}:
+            if any(target == "overlay" for _, target, _ in hits):
+                direction = -1 if event.action == "wheel_up" else 1
+                if self.settings_picker is not None:
+                    for _ in range(3):
+                        self.settings_picker_key(curses.KEY_UP if direction < 0 else curses.KEY_DOWN)
+                else:
+                    self.overlay_scroll = max(0, self.overlay_scroll + direction * 3)
+            return
+        if self.settings_numeric is not None:
+            return
+        for _, target, value in hits:
+            if target == "picker-entry" and self.settings_picker is not None:
+                self.settings_picker["selection"] = value
+                self.settings_picker_key(" " if self.settings_picker["field"] == "members" else "\r")
+                return
+            if target == "setting-step" and self.settings_picker is None:
+                self.settings_selection, direction = value
+                self.step_setting(direction)
+                return
+            if target == "setting" and self.settings_picker is None:
+                activate = self.settings_selection == value
+                self.settings_selection = value
+                if activate:
+                    self.settings_key("\r")
+                return
 
     def edit_key(self, key: Any) -> None:
         edit = self.edit
@@ -883,24 +1060,13 @@ class MailboxApp:
             return
         if key == "\r":
             try:
-                if edit["action"] == "resolve":
-                    if not edit["text"].strip():
-                        raise ValueError("Non-empty operator evidence is required.")
-                    claim = {**edit["claim"], "evidence": edit["text"].strip()}
-                    self.open_confirm("USER CONFIRM " + claim["disposition"],
-                                      [*edit["target"], "Evidence: " + claim["evidence"],
-                                       "Operator confirmation, NOT native ACK."],
-                                      "resolve", {"claim": claim})
-                else:
-                    field = edit["field"]
-                    value = json.loads(edit["text"]) if field in {"main", "members"} else edit["text"].strip()
-                    if field in DEFAULT_THRESHOLDS:
-                        thresholds = dict((self.local.get("settings") or {}).get("settings", {}).get(
-                            "thresholds", {}).get("value", DEFAULT_THRESHOLDS))
-                        thresholds[field] = int(value)
-                        field, value = "thresholds", thresholds
-                    self.open_confirm("Save settings?", [f"Field: {field}", json.dumps(value, ensure_ascii=False)],
-                                      "setting", {"field": field, "value": value}, return_mode="settings")
+                if not edit["text"].strip():
+                    raise ValueError("Non-empty operator evidence is required.")
+                claim = {**edit["claim"], "evidence": edit["text"].strip()}
+                self.open_confirm("USER CONFIRM " + claim["disposition"],
+                                  [*edit["target"], "Evidence: " + claim["evidence"],
+                                   "Operator confirmation, NOT native ACK."],
+                                  "resolve", {"claim": claim})
                 self.edit = None
             except (ValueError, TypeError) as error:
                 self.set_status(str(error), "error")
@@ -939,6 +1105,7 @@ class MailboxApp:
             text, cursor, handled = edit_buffer(self.body, self.body_cursor,
                                                 "\r" if key == key_input.NEWLINE else key, multiline=True)
             if handled:
+                self.input_scroll = None
                 if text != self.body:
                     self.draft_version += 1
                     self.input_error = ""
@@ -947,6 +1114,9 @@ class MailboxApp:
 
     def key(self, key: Any) -> None:
         if key is None or key == curses.KEY_RESIZE:
+            return
+        if isinstance(key, key_input.MouseEvent):
+            self.mouse_key(key)
             return
         self.set_status("")
         if self.focus == "agents" and self.mode == "nav":
@@ -1023,6 +1193,91 @@ class MailboxApp:
         elif self.focus == "threads" and key in ("w", "t", "a", "n"):
             self.thread_action(key)
 
+    def add_hit(self, rect: tuple[int, int, int, int], target: str, value: Any = None) -> None:
+        if rect[2] > 0 and rect[3] > 0:
+            self.hit_map.append((rect, target, value))
+
+    def mouse_key(self, event: key_input.MouseEvent) -> None:
+        height, width = self.screen.getmaxyx()
+        if (self.environment.get("HAM_MAILBOX_NO_MOUSE") or width < 32 or height < 10
+                or not 0 < event.row < height - 1 or not 0 <= event.column < width):
+            return
+        if self.mode == "help" and event.action == "press":
+            self.mode = self.help_return
+            return
+        hits = [(rect, target, value) for rect, target, value in reversed(self.hit_map)
+                if rect[0] <= event.row < rect[0] + rect[2]
+                and rect[1] <= event.column < rect[1] + rect[3]]
+        if self.mode == "settings":
+            self.settings_mouse(event, hits)
+            return
+        wheel = event.action in {"wheel_up", "wheel_down"}
+        amount = -3 if event.action == "wheel_up" else 3
+        if wheel:
+            if self.mode in {"confirm", "evidence", "help"}:
+                if any(target == "overlay" for _, target, _ in hits):
+                    self.overlay_scroll = max(0, self.overlay_scroll + amount)
+                return
+            input_hit = next((value for _, target, value in hits if target == "input"), None)
+            if input_hit is not None:
+                first, maximum = input_hit
+                self.input_scroll = min(maximum, max(0, first + amount))
+                return
+            region = next((value for _, target, value in hits if target == "region"), None)
+            if region == "detail":
+                self.scrolls["detail"] = max(0, self.scrolls["detail"] + amount)
+            elif region is not None:
+                self.selections[region] += amount
+                self.selected(region)
+                if self.preview == region:
+                    self.diagnostics = False
+                    self.scrolls["detail"] = 0
+                    self.refresh_detail()
+            return
+        if event.action != "press":
+            return
+        if self.mode == "input":
+            for rect, target, value in hits:
+                if target == "input-line":
+                    text, offset = value
+                    self.body_cursor = offset + character_index_at_display_column(
+                        text, event.column - rect[1])
+                    self.save_draft()
+                    break
+            return
+        if self.mode in {"confirm", "evidence"}:
+            for rect, target, value in hits:
+                if target == "button":
+                    if self.mode == "confirm":
+                        self.confirm["choice"] = value
+                        self.confirm_key("\r")
+                    else:
+                        self.edit_key("\r" if value else key_input.ESCAPE)
+                    break
+                if target == "edit-text" and self.mode == "evidence":
+                    text, offset = value
+                    self.edit["cursor"] = offset + character_index_at_display_column(
+                        text, event.column - rect[1])
+                    break
+            return
+        region = next((value for _, target, value in hits if target == "region"), None)
+        if region is None:
+            return
+        self.set_status("")
+        self.focus = region
+        if region != "detail":
+            self.preview, self.diagnostics = region, False
+            self.scrolls["detail"] = 0
+            row = next((value for _, target, value in hits if target == "list-row"), None)
+            activate = row is not None and row == self.selections[region]
+            if row is not None:
+                self.selections[region] = row
+            self.refresh_detail()
+            if region == "agents":
+                self.result_tags.pop(self.identity(self.selected("agents")), None)
+            if activate:
+                self.choose_agent() if region == "agents" else self.reply()
+
     def initialize_colors(self) -> None:
         if self.environment.get("NO_COLOR"):
             return
@@ -1078,6 +1333,8 @@ class MailboxApp:
             return "NAV · " + self.focus.title()
         if self.mode == "input":
             return "INPUT → " + self.address(self.recipient)
+        if self.mode == "settings" and self.settings_picker is not None:
+            return "CHECK" if self.settings_picker["field"] == "members" else "PICK"
         return self.mode.upper()
 
     def footer_hints(self) -> list[str]:
@@ -1089,7 +1346,12 @@ class MailboxApp:
         if self.mode == "evidence":
             return ["Enter review", "Esc cancel", "←→ edit"]
         if self.mode == "settings":
-            return ["↑↓ select", "Enter edit", "m main", "Space member", "Esc close", "PgUp/PgDn info"]
+            if self.settings_picker is not None:
+                return ["↑↓ select", "Space toggle", "Enter save", "Esc cancel"] if (
+                    self.settings_picker["field"] == "members") else ["↑↓ select", "Enter save", "Esc cancel"]
+            if self.settings_numeric is not None:
+                return ["Digits only", "Enter save", "Esc cancel", "←→ cursor"]
+            return ["↑↓ select", "Enter pick/save", "←→ adjust", "m main", "Space member", "Esc discard/close"]
         if self.mode == "help":
             return ["Esc close", "↑↓ scroll", "PgUp/PgDn", "F1 close"]
         context = (["Enter send"] if self.focus == "agents" else
@@ -1121,6 +1383,7 @@ class MailboxApp:
     def render(self) -> None:
         self.screen.erase()
         self.cursor_position = None
+        self.hit_map.clear()
         height, width = self.screen.getmaxyx()
         self.layout = ("tiny" if width < 32 or height < 10 else
                        "single" if width < 80 or height < 18 else "two" if width < 140 else "three")
@@ -1161,6 +1424,7 @@ class MailboxApp:
                 bottom -= input_height
                 input_rect = (bottom, 0, input_height, width)
             for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
+                self.add_hit(rect, "region", region)
                 inner = self.box(rect, region.title(), self.focus == region)
                 if region == "agents":
                     self.render_agents(inner)
@@ -1266,6 +1530,8 @@ class MailboxApp:
             lines = [("No agents. r refresh", -1, curses.A_DIM, False)]
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 1), y + 1):
             self.put(row, x, truncate_display_text(text, width), attr)
+            if _index >= 0:
+                self.add_hit((row, x, 1, width), "list-row", _index)
 
     def render_threads(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
@@ -1298,6 +1564,8 @@ class MailboxApp:
             lines = [("No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height), y):
             self.put(row, x, truncate_display_text(text, width), attr)
+            if _index >= 0:
+                self.add_hit((row, x, 1, width), "list-row", _index)
 
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
@@ -1367,22 +1635,61 @@ class MailboxApp:
             self.put(y + height - 1, x, truncate_display_text(self.input_error, width), self.style(4))
             height -= 1
         before = self.body[:self.body_cursor]
-        lines, row, column = wrap_message_lines(self.body.split("\n"), width=max(1, width - 1),
+        logical = self.body.split("\n")
+        logical_offsets = [0]
+        for part in logical[:-1]:
+            logical_offsets.append(logical_offsets[-1] + len(part) + 1)
+        lines, row, column = wrap_message_lines(logical, width=max(1, width - 1),
                                                cursor_row=before.count("\n"),
                                                cursor_column=len(before.rsplit("\n", 1)[-1]))
-        first = max(0, row - max(1, height) + 1)
-        for offset, line in enumerate(lines[first:first + max(0, height)]):
+        maximum = max(0, len(lines) - max(1, height))
+        first = (max(0, row - max(1, height) + 1) if self.input_scroll is None else
+                 min(maximum, self.input_scroll))
+        self.add_hit(rect, "input", (first, maximum))
+        visible = lines[first:first + max(0, height)]
+        for offset, line in enumerate(visible):
             self.put(y + offset, x, truncate_display_text(line.text, width))
-        if height > 0 and self.mode == "input":
-            self.cursor_position = y + min(height - 1, row - first), x + min(width - 1, column)
+            offset_in_body = logical_offsets[line.logical_row] + line.start
+            self.add_hit((y + offset, x, 1, width), "input-line", (line.text, offset_in_body))
+        for offset in range(len(visible), max(0, height)):
+            self.add_hit((y + offset, x, 1, width), "input-line", ("", len(self.body)))
+        if height > 0 and self.mode == "input" and first <= row < first + height:
+            self.cursor_position = y + row - first, x + min(width - 1, column)
 
     def settings_lines(self) -> list[str]:
         settings = self.local.get("settings") or {}
         fields = settings.get("settings", {})
+        picker = self.settings_picker
+        if picker is not None:
+            field = picker["field"]
+            result = [field + " · " + ("Space/click toggles; Enter saves" if field == "members" else
+                                      "Enter/click saves") +
+                      (" · " + self.settings_results[field] if field in self.settings_results else "")]
+            for index, (label, value) in enumerate(picker["entries"]):
+                marker = ("☑" if value in picker["checked"] else "☐") if field == "members" else (
+                    "●" if value == self.setting_value(field) else "○")
+                result.append(("▌ " if index == picker["selection"] else "  ") + marker + " " + label)
+            return result
         result = [f"Target: {self.address(self.selected('agents'))}"]
-        result.extend(("▌ " if index == self.settings_selection else "  ") +
-                      f"{field}: {json.dumps(self.setting_value(field), ensure_ascii=False)}"
-                      for index, field in enumerate(self.SETTINGS))
+        for index, field in enumerate(self.SETTINGS):
+            value = self.settings_pending.get(field, self.setting_value(field))
+            if field in DEFAULT_THRESHOLDS:
+                shown = f"◀ {value} ▶"
+            elif field == "main":
+                shown = self.address(value) if value else "(none)"
+            elif field == "members":
+                shown = ", ".join(self.address(target) for target in value or []) or "(none)"
+            else:
+                shown = str(value)
+            numeric = self.settings_numeric
+            if numeric is not None and numeric["field"] == field:
+                shown = "> " + numeric["text"] + "  (digits only)"
+            feedback = self.settings_results.get(field, "")
+            if self.settings_saving == field and not feedback.startswith("Saving settings"):
+                feedback = "Saving settings… · " + feedback
+            result.append(("▌ " if index == self.settings_selection else "  ") + f"{field}: {shown}" +
+                          (" · unsaved" if field in self.settings_pending else "") +
+                          (" · " + feedback if feedback else ""))
         result.extend([f"home: {settings.get('home_host') or 'unset'}",
                        f"computed main: {json.dumps(fields.get('computed_main', {}).get('value'), ensure_ascii=False)}",
                        f"propagation pending: {settings.get('propagation_pending', 0)}"])
@@ -1407,6 +1714,8 @@ class MailboxApp:
                     "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",
                     "FYI mailbox sends immediately; direct input always asks for confirmation.",
                     "Inspection never acknowledges messages. Direct acceptance ≠ native delivery.",
+                    "Mouse: click focus/select; click selected row to send/reply. Wheel scrolls.",
+                    "Shift+drag selects terminal text. HAM_MAILBOX_NO_MOUSE=1 disables mouse.",
                     "Esc closes overlays. Top-level Esc closes popups only."]
         elif self.mode == "settings":
             lines = self.settings_lines()
@@ -1426,19 +1735,29 @@ class MailboxApp:
         else:
             overlay_width = min(width, 100)
             columns = max(1, overlay_width - 2)
-        wrapped = [part for line in lines for part in wrap_display_text(line, columns)]
-        overlay_height = min(height, len(wrapped) + 4) if compact else min(height, 28)
+        wrapped = []
+        setting_rows = {}
+        for index, line in enumerate(lines):
+            parts = wrap_display_text(line, columns)
+            count = len(self.settings_picker["entries"]) if self.settings_picker else len(self.SETTINGS)
+            if self.mode == "settings" and 1 <= index <= count:
+                for row in range(len(wrapped), len(wrapped) + len(parts)):
+                    setting_rows[row] = index - 1
+            wrapped.extend(parts)
+        reserved = 3 if self.mode == "evidence" else 2 if compact else 0
+        overlay_height = min(height, len(wrapped) + reserved + 2) if compact else min(height, 28)
         top = body_y + (height - overlay_height) // 2
         left = body_x + (width - overlay_width) // 2
+        self.add_hit((top, left, overlay_height, overlay_width), "overlay")
         for row in range(top, top + overlay_height):
             self.put(row, left, " " * overlay_width)
-        y, x, rows, columns = self.box((top, left, overlay_height, overlay_width), self.mode.upper(), True)
+        title = self.mode_word() if self.mode == "settings" else self.mode.upper()
+        y, x, rows, columns = self.box((top, left, overlay_height, overlay_width), title, True)
         self.cursor_position = None
         if compact:
             x, columns = x + 1, columns - 2
         if rows <= 0 or columns <= 0:
             return
-        reserved = 2 if compact else 0
         available = max(0, rows - reserved)
         start = self.overlay_scroll
         if self.mode == "settings" and not start:
@@ -1449,17 +1768,38 @@ class MailboxApp:
         for offset, text in enumerate(wrapped[start:start + max(0, rows - reserved)]):
             self.put(y + offset, x, truncate_display_text(text, columns),
                      curses.A_BOLD if text.startswith("▌") else 0)
-        if self.mode == "confirm":
-            assert self.confirm is not None
-            buttons = ("[ Cancel ]   Confirm" if self.confirm["choice"] == 0 else "Cancel   [ Confirm ]")
-            self.put(y + rows - 1, x, truncate_display_text(buttons, columns), self.style(1, curses.A_BOLD))
-        elif self.mode == "evidence":
+            if start + offset in setting_rows:
+                index = setting_rows[start + offset]
+                target = "picker-entry" if self.settings_picker is not None else "setting"
+                self.add_hit((y + offset, x, 1, columns), target, index)
+                if target == "setting":
+                    for arrow, direction in (("◀", -1), ("▶", 1)):
+                        if arrow in text and self.SETTINGS[index] in DEFAULT_THRESHOLDS:
+                            column = x + display_width(text[:text.index(arrow)])
+                            self.add_hit((y + offset, column, 1, 1), "setting-step", (index, direction))
+                    numeric = self.settings_numeric
+                    if numeric and numeric["field"] == self.SETTINGS[index] and "> " in text:
+                        column = display_width(text[:text.index("> ") + 2]) + numeric["cursor"]
+                        self.cursor_position = y + offset, x + min(columns - 1, column)
+        if self.mode in {"confirm", "evidence"}:
+            choice = self.confirm["choice"] if self.mode == "confirm" else 0
+            cancel, accept = ("[ Cancel ]", "Confirm") if not choice else ("Cancel", "[ Confirm ]")
+            button_row = y + rows - (2 if self.mode == "evidence" else 1)
+            if button_row >= y:
+                self.put(button_row, x, truncate_display_text(cancel + "   " + accept, columns),
+                         self.style(1, curses.A_BOLD))
+                self.add_hit((button_row, x, 1, min(columns, display_width(cancel))), "button", 0)
+                button_x = x + display_width(cancel) + 3
+                self.add_hit((button_row, button_x, 1,
+                              min(display_width(accept), max(0, x + columns - button_x))), "button", 1)
+        if self.mode == "evidence":
             assert self.edit is not None
             text, cursor = self.edit["text"], self.edit["cursor"]
             start = 0
             while display_width(text[start:cursor]) > max(0, columns - 3):
                 start += 1
             self.put(y + rows - 1, x, truncate_display_text("> " + text[start:], columns))
+            self.add_hit((y + rows - 1, x + 2, 1, columns - 2), "edit-text", (text[start:], start))
             self.cursor_position = y + rows - 1, x + min(columns - 1, 2 + display_width(text[start:cursor]))
 
     def overlay_key(self, key: Any) -> None:
@@ -1493,8 +1833,14 @@ class MailboxApp:
             except curses.error:
                 return None
 
-        decoder = key_input.KeyDecoder(read_key)
+        decoder = key_input.KeyDecoder(read_key, curses.getmouse)
         try:
+            if not self.environment.get("HAM_MAILBOX_NO_MOUSE"):
+                try:
+                    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+                    curses.mouseinterval(0)
+                except curses.error:
+                    pass
             with key_input.kitty_keyboard(enabled=not self.environment.get("HAM_MAILBOX_NO_KITTY")):
                 while self.running:
                     self.tick()
@@ -1505,6 +1851,10 @@ class MailboxApp:
                     if key is not None:
                         self.key(key)
         finally:
+            try:
+                curses.mousemask(0)
+            except curses.error:
+                pass
             for job in self.jobs.values():
                 job.close()
             self.jobs.clear()

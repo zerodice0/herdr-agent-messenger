@@ -1,4 +1,4 @@
-"""Per-field repository settings. Mutations are for the user TUI, not agent CLI."""
+"""Per-field repository settings and registration defaults, not an agent mutation CLI."""
 
 from __future__ import annotations
 
@@ -169,6 +169,20 @@ class RepoSettings:
                                    [(repo_id, item["host"], item["terminal_id"]) for item in incoming["value"]])
         self._publish(connection, incoming, exclude=source)
         return True
+
+    def _seed_new_repo(self, connection: Any, repo_id: str, at: float) -> None:
+        """Called only after registry insertion, never for already-known repositories."""
+        if self.fields(connection, repo_id):
+            return
+        # Protocol 1 (including 0.9.1) accepts "home" attribution and positive
+        # versions only. The reserved mode origin sorts below every canonical
+        # hostname, so any explicit host-origin setting at version >= 1 wins,
+        # even on an unchanged peer. Home keeps its existing proposal shape.
+        for field, value, origin in (("home", self.store.host, self.store.host),
+                                     ("mode", "auto", "!default")):
+            self._apply(connection, {"repo_id": repo_id, "field": field, "value": value,
+                                     "version": 1, "origin_host": origin,
+                                     "changed_by": "home", "changed_at": at})
 
     def mutate(self, repo_id: str, field: str, value: Any) -> dict[str, Any]:
         """Local user-TUI service. Intentionally not exposed by a mutation CLI."""

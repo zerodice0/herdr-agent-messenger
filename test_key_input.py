@@ -8,7 +8,8 @@ import io
 import unittest
 from unittest import mock
 
-from key_input import ESCAPE, F1, KITTY_POP, KITTY_PUSH, NEWLINE, SHIFT_TAB, KeyDecoder, kitty_keyboard
+from key_input import (ESCAPE, F1, KITTY_POP, KITTY_PUSH, NEWLINE, SHIFT_TAB,
+                       KeyDecoder, MouseEvent, kitty_keyboard)
 
 
 class FakeRead:
@@ -151,6 +152,98 @@ class KeyDecoderTests(unittest.TestCase):
         decoder = KeyDecoder(FakeRead("\x1b[" + "1" * 32))
         self.assertEqual(decoder.next(), ESCAPE)
         self.assertIsNone(decoder.next())
+
+    def test_curses_mouse_press_wheel_and_ignored_states(self) -> None:
+        states = (
+            (curses.BUTTON1_PRESSED, "press"),
+            (curses.BUTTON1_CLICKED, "press"),
+            (curses.BUTTON4_PRESSED, "wheel_up"),
+            (curses.BUTTON1_RELEASED, None),
+            (curses.BUTTON3_PRESSED, None),
+        )
+        if hasattr(curses, "BUTTON5_PRESSED"):
+            states += ((curses.BUTTON5_PRESSED, "wheel_down"),)
+        for state, action in states:
+            with self.subTest(state=state):
+                mouse = mock.Mock(side_effect=[(0, 9, 4, 0, state), curses.error()])
+                decoder = KeyDecoder(FakeRead([curses.KEY_MOUSE, "x"]), mouse)
+                self.assertEqual(decoder.next(), MouseEvent(4, 9, action) if action else "x")
+                self.assertEqual(mouse.call_count, 2)
+                if action:
+                    self.assertEqual(decoder.next(), "x")
+                self.assertIsNone(decoder.next())
+
+    def test_curses_mouse_errors_and_missing_callback_are_skipped(self) -> None:
+        for mouse in (None, mock.Mock(side_effect=curses.error("no mouse event"))):
+            decoder = KeyDecoder(FakeRead([curses.KEY_MOUSE, "한"]), mouse)
+            self.assertEqual(decoder.next(), "한")
+            self.assertIsNone(decoder.next())
+        with mock.patch("key_input.curses.BUTTON5_PRESSED", 0):
+            decoder = KeyDecoder(FakeRead([curses.KEY_MOUSE]), mock.Mock(side_effect=[
+                (0, 1, 1, 0, curses.BUTTON1_RELEASED), curses.error()]))
+            self.assertIsNone(decoder.next())
+
+    def test_coalesced_press_release_drains_before_next_mouse_notification(self) -> None:
+        # Live ncurses can queue both tuples behind a single KEY_MOUSE. Reading
+        # only one leaves the old release/coordinates for the next input.
+        mouse = mock.Mock(side_effect=[
+            (0, 6, 5, 0, curses.BUTTON1_PRESSED),
+            (0, 6, 5, 0, curses.BUTTON1_RELEASED), curses.error(),
+            (0, 44, 2, 0, curses.BUTTON1_PRESSED),
+            (0, 44, 2, 0, curses.BUTTON1_RELEASED), curses.error(),
+            (0, 99, 11, 0, curses.BUTTON4_PRESSED), curses.error(),
+        ])
+        decoder = KeyDecoder(FakeRead([curses.KEY_MOUSE] * 3 + ["x"]), mouse)
+        self.assertEqual(decoder.next(), MouseEvent(5, 6, "press"))
+        self.assertEqual(decoder.next(), MouseEvent(2, 44, "press"))
+        self.assertEqual(decoder.next(), MouseEvent(11, 99, "wheel_up"))
+        self.assertEqual(decoder.next(), "x")
+        self.assertIsNone(decoder.next())
+        self.assertEqual(mouse.call_count, 8)
+
+    def test_one_mouse_notification_preserves_all_actionable_reports_in_order(self) -> None:
+        mouse = mock.Mock(side_effect=[
+            (0, 4, 3, 0, curses.BUTTON1_PRESSED),
+            (0, 4, 3, 0, curses.BUTTON1_RELEASED),
+            (0, 8, 7, 0, curses.BUTTON1_PRESSED),
+            (0, 8, 7, 0, curses.BUTTON1_RELEASED), curses.error(),
+        ])
+        decoder = KeyDecoder(FakeRead([curses.KEY_MOUSE, "한"]), mouse)
+        self.assertEqual(decoder.next(), MouseEvent(3, 4, "press"))
+        self.assertEqual(decoder.next(), MouseEvent(7, 8, "press"))
+        self.assertEqual(decoder.next(), "한")
+        self.assertIsNone(decoder.next())
+
+    def test_raw_coalesced_press_release_emits_one_action(self) -> None:
+        decoder = KeyDecoder(FakeRead("\x1b[<0;10;5M\x1b[<0;10;5mz"))
+        self.assertEqual(decoder.next(), MouseEvent(4, 9, "press"))
+        self.assertEqual(decoder.next(), "z")
+        self.assertIsNone(decoder.next())
+
+    def test_raw_sgr_mouse_coordinates_and_modifiers(self) -> None:
+        for sequence, expected in (
+            ("\x1b[<0;10;5M", MouseEvent(4, 9, "press")),
+            ("\x1b[<64;10;5M", MouseEvent(4, 9, "wheel_up")),
+            ("\x1b[<65;10;5M", MouseEvent(4, 9, "wheel_down")),
+            ("\x1b[<28;1;1M", MouseEvent(0, 0, "press")),
+            ("\x1b[<80;15;7M", MouseEvent(6, 14, "wheel_up")),
+        ):
+            with self.subTest(sequence=repr(sequence)):
+                decoder = KeyDecoder(FakeRead(sequence + "z"))
+                self.assertEqual(decoder.next(), expected)
+                self.assertEqual(decoder.next(), "z")
+                self.assertIsNone(decoder.next())
+
+    def test_raw_sgr_release_motion_and_other_buttons_never_leak_text(self) -> None:
+        for sequence in (
+            "\x1b[<0;10;5m", "\x1b[<3;10;5M", "\x1b[<1;10;5M",
+            "\x1b[<32;10;5M", "\x1b[<0;0;5M", "\x1b[<0;10;0M",
+            "\x1b[<0;10M", "\x1b[<0;10;5u",
+        ):
+            with self.subTest(sequence=repr(sequence)):
+                decoder = KeyDecoder(FakeRead(sequence + "한"))
+                self.assertEqual(decoder.next(), "한")
+                self.assertIsNone(decoder.next())
 
 
 class KittyKeyboardTests(unittest.TestCase):

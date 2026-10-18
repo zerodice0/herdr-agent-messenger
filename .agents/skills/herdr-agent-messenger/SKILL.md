@@ -41,6 +41,11 @@ python3 scripts/herdr_agent_messenger.py status clear
 `--kind` defaults to `fyi`; use exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Only eligible OMP `action` can start a later turn; FYI alone cannot. Sending stores/routes mail, never starts a turn itself. Local mail normally waits queued; remote pending, withdrawal and terminal-closed final results are also possible. Handling is explicit/atomic; reads never ACK. Pull handling needs no delivered timestamp; replies handle their addressed queued/delivered parent. Repeated successful withdrawal stays `withdrawn:true`; a winning claim/other final result returns false.
 
 `status set` takes a **positional phase**, not `--phase`. Summary/phase reporting works even in off mode. Herdr owns turn state; do not invent it from phase text.
+HAM-owned pane borders show `[메인] alias · summary` / `[워커] alias · summary`,
+omitting missing parts. Alias comes before summary for Herdr's width truncation.
+`status clear` clears phase/summary but retains alias and any active role;
+manual user borders stay untouched. Agents keeps the addressable alias last in
+`display_agent`, while phase is projected separately to HAM's `$recap` token.
 
 ### Read-only history and board
 
@@ -72,7 +77,7 @@ No message flag means session creation only. Otherwise immutable target/body and
 
 ## Modes, receiving, and truth boundaries
 
-Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only. Default `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt. `manual` uses designated main/workers; nonmembers cannot wake. `auto` prefers explicit main; otherwise exactly one active home main-checkout agent becomes main. Zero/multiple means none; other same-repo agents across registered hosts are workers. Home is fixed by activation/concurrent proposal convergence, not agent-editable.
+Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only. Repos first seen by HAM from this version default to `auto` (including host-local `local:` repos): all same-repo agents participate, eligible queued action mail may auto-start an OMP turn, and same-repo legacy `send`/`request`/`batch` must use mail. Already-known repos preserve settings; missing mode stays `off` until changed. Reads never seed defaults. `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt. `manual` uses designated main/workers; nonmembers cannot wake. `auto` prefers explicit main; otherwise exactly one active home main-checkout agent becomes main. Zero/multiple means none; other same-repo agents across registered hosts are workers. Home is fixed by registration/activation and concurrent proposal convergence, not agent-editable.
 
 - **OMP:** opt-in root receiver. Action wake needs supported TUI empty editor, quiet/idle input, no pending work, eligible membership and coalescing/hour/hop guards. Uses agent-attributed `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves exact same-session active-branch journal acceptance, not provider success.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. Native ACK needs exact SDK context + fresh request correlation (`claude:api-request:`), or typed hook bytes/hash + causal native witness (`claude:accepted-journal:`). The latter proves host-context application, not exact provider-wire bytes, attestation or understanding. Stdout alone is not delivery. Bounded live SessionStart/no-wake observations exclude provider success and cold-unreported binding CAS (unit-only); see reference for limits and safe-launcher notes.

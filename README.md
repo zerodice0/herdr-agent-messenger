@@ -225,14 +225,29 @@ for inbox, Threads, transport outbox, message states and unread counts.
 Choose participation in the TUI Settings view, not through an agent mutation
 command:
 
+Repositories first seen by HAM from this version default to `auto`: all same-repo
+agents participate, eligible queued action mail may auto-start an OMP turn, and
+same-repo legacy `send`/`request`/`batch` must use mail instead. Already-known
+repositories keep their settings; without a stored mode they remain `off` until
+changed. Host-local (`local:`) repositories follow the same default without
+propagating settings. Read-only commands never initialize participation.
+
 | Mode | Roles and automatic behavior |
 | --- | --- |
-| `off` (default) | No roles, automatic wakes, or participating legacy rejection. Explicit inbox reads and receiving at natural user-turn boundaries remain possible. |
+| `off` | No roles, automatic wakes, or participating legacy rejection. Explicit inbox reads and receiving at natural user-turn boundaries remain possible. |
 | `manual` | An explicitly selected main coordinates selected worker members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
 | `auto` | An explicit main wins. Otherwise, exactly one active main-checkout agent at the repository's home becomes main; zero or multiple candidates means no computed main. All other same-repository agents across hosts are workers. |
 
-The home is the canonical host established when participation is first enabled;
-it is read-only in Settings. A canonical host name plus UUID is distinct from an
+HAM-owned pane borders show `[메인] alias · summary` or `[워커] alias · summary`.
+Missing roles or summaries are omitted; the alias stays before the summary so
+Herdr can truncate long summaries without discarding the identity first.
+`status clear` removes phase/summary but keeps the alias and any active role.
+Manual user borders are preserved. Agents keeps the addressable alias last in
+`display_agent`; phase appears separately in HAM's `$recap` token.
+
+The home is the canonical host proposed at first registration (or when an
+already-known repository first enables participation); it is read-only in Settings.
+Concurrent proposals converge by canonical host name. A canonical host name plus UUID is distinct from an
 SSH alias or hostname. Agents use stable terminal slots with session generations;
 pane moves do not change the slot. Uncertain claims from an old generation are
 never automatically replayed. The TUI's evidence-based operator resolution is

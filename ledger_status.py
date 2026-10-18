@@ -297,6 +297,9 @@ class AgentRegistry:
                                   "turn_state": str(raw.get("agent_status") or 'unknown'),
                                   "native_session_pid": native_session_pid}
         with self.store.transaction(tuple(locations)) as connection:
+            from ledger_settings import RepoSettings
+            settings = RepoSettings(self.store)
+            seeded_repos: set[str] = set()
             old_terminals = {row[0] for row in connection.execute(
                 "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (self.store.host,))}
             for terminal, location in locations.items():
@@ -335,7 +338,11 @@ class AgentRegistry:
                         "SELECT coalesce(max(generation),0)+1 FROM agents WHERE host=? AND terminal_id=?",
                         (self.store.host, terminal)).fetchone()[0]
                     agent_id = str(uuid.uuid4())
-                    connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)", (value["repo_id"], at))
+                    inserted = connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)",
+                                                  (value["repo_id"], at)).rowcount
+                    if inserted:
+                        settings._seed_new_repo(connection, value["repo_id"], at)
+                        seeded_repos.add(value["repo_id"])
                     connection.execute(
                         "INSERT INTO agents (agent_id,host,terminal_id,workspace_id,pane_id,session_ref,generation,"
                         "client,repo_id,is_main_checkout,alias,first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -345,6 +352,10 @@ class AgentRegistry:
                                        (agent_id, "unknown", at))
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
                     changed_panes.add(value["pane_id"])
+            # Compute only after all observed agents exist, in the registration
+            # transaction, so multiple main-checkout candidates stay ambiguous.
+            for repo_id in seeded_repos:
+                settings._compute(connection, repo_id)
             changed_ids: list[str] = []
             for row in connection.execute(
                     "SELECT d.message_id,d.recipient_terminal_id,m.repo_id,d.state FROM deliveries d "

@@ -46,6 +46,11 @@ class CollaborationPolicyTest(unittest.TestCase):
         self.remote = LedgerStore(self.root / "remote-ledger", canonical_name="beta")
         self.local_snapshot = self.snapshot(self.project, "a")
         self.remote_snapshot = self.snapshot(self.remote_project, "b")
+        # These policy scenarios model a repository known before auto-default
+        # rollout; participation changes below remain explicit test actions.
+        for store in (self.local, self.remote):
+            with store.transaction() as connection:
+                connection.execute("INSERT INTO repos VALUES (?,NULL,?)", ("git:policy/shared", 1.0))
         AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
         AgentRegistry(self.remote).reconcile(self.remote_snapshot, refresh_display=False)
         self.sender = AgentRegistry(self.local).list()[0]

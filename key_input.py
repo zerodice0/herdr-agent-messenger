@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 import contextlib
 import curses
+from dataclasses import dataclass
 import sys
 from typing import Callable, Iterator, TextIO
 
@@ -15,6 +16,13 @@ NEWLINE = "newline"
 ESCAPE = "escape"
 SHIFT_TAB = "shift-tab"
 F1 = "f1"
+
+
+@dataclass(frozen=True)
+class MouseEvent:
+    row: int
+    column: int
+    action: str
 
 
 def _write_keyboard_mode(stream: TextIO, sequence: str) -> None:
@@ -45,18 +53,25 @@ def kitty_keyboard(stream: TextIO | None = None, *, enabled: bool = True) -> Ite
 
 
 class KeyDecoder:
-    def __init__(self, read: Callable[[], str | int | None]) -> None:
+    def __init__(self, read: Callable[[], str | int | None],
+                 get_mouse: Callable[[], tuple[int, int, int, int, int]] | None = None) -> None:
         self._read = read
-        self._pending: deque[str | int] = deque()
+        self._get_mouse = get_mouse
+        self._pending: deque[str | int | MouseEvent] = deque()
 
-    def _unit(self) -> str | int | None:
+    def _unit(self) -> str | int | MouseEvent | None:
         return self._pending.popleft() if self._pending else self._read()
 
-    def next(self) -> str | int | None:
+    def next(self) -> str | int | MouseEvent | None:
         """Return one logical key, ignoring unknown complete escape sequences."""
         while True:
             unit = self._unit()
             if isinstance(unit, int):
+                if unit == curses.KEY_MOUSE:
+                    event = self._mouse()
+                    if event is not None:
+                        return event
+                    continue
                 return {
                     curses.KEY_BTAB: SHIFT_TAB,
                     curses.KEY_F0 + 1: F1,
@@ -78,6 +93,29 @@ class KeyDecoder:
             decoded = self._decode(following, sequence)
             if decoded is not None:
                 return decoded
+
+    def _mouse(self) -> MouseEvent | None:
+        if self._get_mouse is None:
+            return None
+        # One KEY_MOUSE can represent several reports read together by ncurses
+        # (notably press + release with mouseinterval(0)). Leaving the release
+        # queued makes the next notification dispatch the previous click's
+        # coordinates. Drain the mouse queue, retaining actionable reports in
+        # arrival order rather than assuming one report per notification.
+        while True:
+            try:
+                _device, column, row, _z, state = self._get_mouse()
+            except curses.error:
+                break
+            for mask, action in (
+                (curses.BUTTON4_PRESSED, "wheel_up"),
+                (getattr(curses, "BUTTON5_PRESSED", 0), "wheel_down"),
+                (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED, "press"),
+            ):
+                if state & mask:
+                    self._pending.append(MouseEvent(row, column, action))
+                    break
+        return self._pending.popleft() if self._pending else None
 
     def _sequence(self) -> str | None:
         parts: list[str] = []
@@ -102,7 +140,7 @@ class KeyDecoder:
         return None
 
     @staticmethod
-    def _decode(prefix: str, sequence: str) -> str | int | None:
+    def _decode(prefix: str, sequence: str) -> str | int | MouseEvent | None:
         arrows = {
             "A": curses.KEY_UP,
             "B": curses.KEY_DOWN,
@@ -119,6 +157,18 @@ class KeyDecoder:
         if sequence == "Z":
             return SHIFT_TAB
         final = sequence[-1]
+        if sequence.startswith("<"):
+            try:
+                button, column, row = map(int, sequence[1:-1].split(";"))
+            except ValueError:
+                return None
+            if final != "M" or column < 1 or row < 1:
+                return None
+            # Modifiers do not change the button, but motion/release reports
+            # must not turn a drag into repeated presses.
+            button &= ~(4 | 8 | 16)
+            action = {0: "press", 64: "wheel_up", 65: "wheel_down"}.get(button)
+            return MouseEvent(row - 1, column - 1, action) if action else None
         try:
             params = [int(part.split(":", 1)[0]) for part in sequence[:-1].split(";")]
         except ValueError:

@@ -298,8 +298,14 @@ mode/main/members/thresholds 변경은 사용자 UI 서비스 전용입니다. a
 
 ### 모드, 역할, 공개 상태
 
-기본 모드는 **off**입니다. main/worker 역할, 자동 깨우기, 참여 트래픽의 기존 전송
-제한이 없습니다. 명시적 조회와 자연스러운 사용자 입력 경계의 수신은 허용합니다.
+이 버전부터 HAM이 처음 발견한 저장소는 **auto**로 시작합니다. 같은 저장소의 모든
+에이전트가 참여하며, 조건에 맞는 대기 중 action 메일은 OMP의 새 턴을 자동으로
+시작할 수 있습니다. 같은 저장소의 기존 `send`·`request`·`batch` 대신 메일을
+사용해야 합니다. 이미 알려진 저장소는 기존 설정을 유지하며, 저장된 모드가 없으면
+변경할 때까지 **off**로 남습니다. 호스트 로컬(`local:`) 저장소에도 같은 기본값을
+적용하지만 설정을 전파하지 않습니다. 읽기 전용 명령은 기본값을 저장하지 않습니다.
+off에서는 main/worker 역할, 자동 깨우기, 참여 트래픽의 기존 전송 제한이 없습니다.
+명시적 조회와 자연스러운 사용자 입력 경계의 수신은 허용합니다.
 
 - **manual:** 명시적으로 지정한 에이전트가 main이며, 선택한 members 중 main을
   제외한 에이전트가 worker입니다. 비회원도 자연스러운 경계에서 수신할 수 있지만
@@ -320,9 +326,12 @@ python3 "$HAM_CLI" repo show
 ```
 
 `status set PHASE --summary TEXT`는 호출자의 phase와 summary를 갱신하며 Herdr의
-`turn_state`는 바꾸지 않습니다. phase는 `$recap`에, summary는 HAM 소유 pane
-테두리에 표시합니다. 사용자가 지정한 기존 테두리는 보존합니다. 역할은 Agents의
-별칭과 HAM 소유 테두리 내용 앞에 표시하며, off에서도 상태 기능은 동작합니다.
+`turn_state`는 바꾸지 않습니다. phase는 `$recap`에 표시합니다. HAM 소유 pane
+테두리는 `[메인] alias · summary` 또는 `[워커] alias · summary`로 표시하며,
+없는 부분은 생략합니다. 별칭을 요약 앞에 두므로 Herdr가 폭에 맞춰 내용을 자를 때
+요약이 먼저 잘립니다. `status clear`는 phase와 summary만 지우고 별칭과 현재
+역할은 유지합니다. 사용자가 지정한 기존 테두리는 보존합니다. Agents에서는 역할을
+주소로 쓸 별칭 앞에 표시하며, off에서도 역할 접두사 없이 상태 기능이 동작합니다.
 `status list`는 저장된 로컬 상태를 나열합니다. 값 없는 `--repo`는 호출자의 저장소를,
 `--repo ID`는 해당 저장소를 선택합니다. 상세한 로컬·등록 peer 조회에는
 `status board`를 사용하며, `status list`에 기존 상위 명령의 `--host`를 붙여
@@ -361,7 +370,7 @@ Settings에서 **수정할 수 있는 행은 일곱 개**입니다.
 
 | 행 | 값과 기본값 |
 | --- | --- |
-| `mode` | `off`, `manual`, `auto`이며 기본값은 `off`입니다. |
+| `mode` | `off`, `manual`, `auto`이며 새 저장소는 `auto`, 모드가 없는 기존 저장소는 `off`로 시작합니다. |
 | `main` | `{"host":"canonical","terminal_id":"term_…"}` 또는 `null`입니다. |
 | `members` | 위 target의 중복 없는 배열이며 기본값은 빈 배열입니다. |
 | `idle_minutes` | 기본값은 3분입니다. |

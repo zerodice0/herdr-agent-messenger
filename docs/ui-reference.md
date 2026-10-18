@@ -47,6 +47,21 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 | `q` | Quit, confirming before discarding nonempty drafts. |
 | `Esc` | Close help/diagnostics/overlays; at top level, quit only in popup mode. |
 
+### Mouse
+
+- Click a region to focus it, or click an Agents or Threads row to select it.
+  Clicking the already selected row acts like `Enter`: Agents opens input;
+  Threads opens a reply.
+  Press and release act once even when the terminal delivers both together;
+  queued mouse reports are drained before processing the next click or wheel.
+- The wheel scrolls the region under the pointer without moving focus.
+- Click inside input text to move the cursor.
+- Dialog buttons are clickable; clicks outside a dialog are ignored.
+  In Settings, click a row to select it; clicking the selected row acts like `Enter`.
+  Clicking anywhere in help closes it.
+- Mouse handling is enabled by default. While it is on, `Shift`+drag usually
+  selects terminal text. Set `HAM_MAILBOX_NO_MOUSE=1` to disable mouse handling.
+
 Digits never navigate. Agents are grouped by host with stale/error headings.
 Each row shows alias, turn state, unread count and native receiver readiness,
 followed by one dim `role · phase · summary` line. A disconnected host keeps its
@@ -87,21 +102,36 @@ made while a send is pending are retained. Failure leaves the text open with an 
 
 ### Settings overlay
 
-Press `s` in NAV. `↑`/`↓` selects a row, `Enter` edits its value, and `Esc` closes
-the overlay. The seven editable rows are `mode` (`off`/`manual`/`auto`), `main`,
-`members`, `idle_minutes`, `coalesce_seconds`, `wakes_per_hour`, and `max_hop`.
-Main is a canonical-host/terminal JSON target or `null`; members are an array
-of those targets. The overlay shows `Target: host/alias` for the selected
-Agents row: `m` sets it as main and `Space` toggles its manual membership.
-Every mutation requires confirmation, with Cancel selected by default.
+Press `s` in NAV. `↑`/`↓` or `j`/`k` selects a row. Click a row to select it;
+clicking the selected row acts like `Enter`. `Esc` closes the overlay and
+discards unsaved inline changes.
+
+- **Mode:** `Enter` opens a **PICK** list with a short explanation of each option.
+  `↑`/`↓` selects; `Enter` or clicking an option saves immediately.
+  On the mode row, `←`/`→` or `h`/`l` cycles an unsaved choice; `Enter` saves it.
+- **Main:** `Enter` opens a **PICK** list of live, non-stale repository agents plus
+  `(none)`. The current choice has a `●` marker. `Enter` or clicking a choice saves.
+- **Members:** `Enter` opens a **CHECK** list. `Space` or clicking an entry toggles
+  its checkbox; `Enter` saves the checked set. Existing unavailable members carry
+  a `stale` tag and remain checked unless explicitly unticked.
+- **Thresholds:** `←`/`→`, `-`/`+`, or clicking `◀`/`▶` adjusts the inline value.
+  Steps are 1 for `idle_minutes`, 5 for `coalesce_seconds`, and 1 each for
+  `wakes_per_hour` and `max_hop`; values stay within 0–10000. An `unsaved` marker
+  remains until `Enter` saves. With no pending changes, `Enter` opens an optional
+  digits-only input instead. `Esc` cancels an open picker, checklist, or numeric input.
+
+The mouse wheel scrolls picker/checklist entries or overlay metadata.
+The overlay shows `Target: host/alias` for the selected Agents row:
+`m` sets that agent as main; `Space` toggles its manual membership.
+These two shortcuts still require confirmation, with Cancel selected by default.
 Home, `computed_main`, version/origin stamps, propagation pending and conflicts
 are read-only. Settings uses the internal service; agent `repo show` remains read-only.
 
-Only one settings save can be in flight. **Saving settings** marks it; further
-saves/toggles are rejected, not queued. Rejected edits are retained; navigation
-remains responsive. The authoritative result appears immediately and stale
-snapshots cannot overwrite it. `PgUp`/`PgDn` scroll long metadata and complete
-wrapped conflict records; `e` in NAV shows full diagnostics.
+Only one settings save can be in flight. The affected row shows **Saving settings**,
+then its save result or error. Further saves are rejected, not queued, and rejected
+edits remain available. Navigation stays responsive. The authoritative result
+appears immediately and stale snapshots cannot overwrite it. `PgUp`/`PgDn` scroll
+long metadata and complete wrapped conflict records; `e` in NAV shows full diagnostics.
 
 ### Honest acceptance and uncertainty
 

@@ -275,8 +275,13 @@ installed by these commands.
 
 ### Modes, roles, and public status
 
-The default mode is **off**. It creates no main/worker roles, no automatic wake,
-and no participating-traffic legacy restriction. Explicit reads and natural
+Repositories first seen by HAM from this version default to **auto**: all same-repo
+agents participate, eligible queued action mail may auto-start an OMP turn, and
+same-repo legacy `send`/`request`/`batch` must use mail instead. Already-known
+repositories retain stored settings; without a stored mode they remain **off**
+until changed. Host-local (`local:`) repos follow the same default without
+propagation. Reads never seed defaults. Off creates no main/worker roles, automatic
+wake, or participating-traffic legacy restriction; explicit reads and natural
 user-boundary receiving remain available.
 
 - **manual:** the explicitly designated main is main; chosen members are workers,
@@ -297,9 +302,12 @@ python3 "$HAM_CLI" repo show
 ```
 
 `status set PHASE --summary TEXT` updates the caller's phase/summary; it does not
-change Herdr's `turn_state`. Phase is projected to `$recap`, summary to a
-HAM-owned pane border. An existing user border is preserved. Roles precede the
-alias in Agents and HAM-owned border content; status still works in off mode.
+change Herdr's `turn_state`. Phase is projected to `$recap`. HAM-owned pane
+borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting
+missing parts. The alias precedes the summary so Herdr's width truncation clips
+the summary first. `status clear` removes phase/summary, not alias or active role.
+An existing user border is preserved. Agents keeps the role before the
+addressable alias; status still works in off mode without a role prefix.
 `status list` without a filter lists stored local status; bare `--repo` selects
 the caller's repository and `--repo ID` selects that identity. For the rich
 local/registered-peer read use `status board`, not a legacy parent `--host` flag
@@ -337,7 +345,7 @@ The Settings overlay has exactly **seven mutable rows**:
 
 | Row | Value / default |
 | --- | --- |
-| `mode` | `off`, `manual`, or `auto`; default `off` |
+| `mode` | `off`, `manual`, or `auto`; new repos default to `auto`; known repos without mode keep `off` |
 | `main` | `{"host":"canonical","terminal_id":"term_…"}` or `null` |
 | `members` | Unique array of those targets; default empty |
 | `idle_minutes` | `3` minutes |

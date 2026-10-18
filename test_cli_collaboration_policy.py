@@ -63,6 +63,10 @@ class CliCollaborationPolicyTest(unittest.TestCase):
             alias: self.snapshot(self.project, prefix)
             for alias, prefix in zip(aliases, ("b", "c", "d"))
         }
+        # Existing policy scenarios start with repositories known before rollout.
+        for store in (self.local, *self.remotes.values()):
+            with store.transaction() as connection:
+                connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (self.repo_id, 1.0))
         AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
         for alias, store in self.remotes.items():
             AgentRegistry(store).reconcile(self.remote_snapshots[alias], refresh_display=False)
@@ -203,6 +207,22 @@ class CliCollaborationPolicyTest(unittest.TestCase):
         self.assertIn(f"mail send --to {address} --body", payload["error"]["message"])
         self.assertIn("No prompt was submitted", payload["error"]["message"])
         self.assert_no_legacy_effects()
+
+    def test_seeded_auto_rejects_legacy_send_request_and_batch_without_user_mutation(self):
+        for raw in self.local_snapshot["agents"]:
+            raw["cwd"] = str(self.other_project)
+        AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
+        repo_id = "git:cli-policy/other"
+        mode = self.settings(self.local).show(repo_id)["settings"]["mode"]
+        self.assertEqual((mode["value"], mode["changed_by"]), ("auto", "home"))
+        address = "local/bird-a-1"
+        for command in ("send", "request"):
+            with self.subTest(command=command):
+                self.assert_mailbox_refusal(self.single_arguments(command, address), address)
+        # Exercise the SQL stored-mode batch gate, not only role() fallbacks.
+        for wait in (False, True):
+            with self.subTest(batch_wait=wait):
+                self.assert_mailbox_refusal(self.batch_arguments([address], wait), address)
 
     def test_send_and_request_same_repo_remote_manual_auto_members_use_mailbox(self):
         self.peers()

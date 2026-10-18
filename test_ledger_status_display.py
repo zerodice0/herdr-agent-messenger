@@ -9,7 +9,7 @@ from unittest import mock
 
 from ledger_display import LEGACY_SOURCE, RECAP_SOURCE, SOURCE
 from ledger_settings import RepoSettings
-from ledger_status import AgentRegistry
+from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerStore
 from test_ledger_display import HerdrDisplay
 
@@ -23,6 +23,10 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.store = LedgerStore(self.root / "ledger", canonical_name="status-display-test")
+        # Most projection scenarios retain the already-known repository policy.
+        repo_id = repository_identity(str(self.repo), self.store.host)["repo_id"]
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (repo_id, 1.0))
         self.herdr = HerdrDisplay(["p-current", "p-moved"])
         self.observations = []
         self.registry = AgentRegistry(self.store, display_runner=self.capture)
@@ -57,6 +61,26 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         return [command for command in self.herdr.commands
                 if command[:2] == ["pane", "report-metadata"] and command[4] == SOURCE]
 
+    def test_new_repo_auto_and_computed_main_are_committed_before_first_redraw(self):
+        repo = self.root / "new-repo"
+        repo.mkdir()
+        observed = copy.deepcopy(self.snapshot)
+        observed["agents"][0]["cwd"] = str(repo)
+        repo_id = repository_identity(str(repo), self.store.host)["repo_id"]
+        settings_seen = []
+
+        def capture(command):
+            settings_seen.append(RepoSettings(self.store).show(repo_id))
+            return self.capture(command)
+
+        AgentRegistry(self.store, display_runner=capture).reconcile(observed)
+        self.assertTrue(settings_seen)
+        for current in settings_seen:
+            self.assertEqual(current["mode"], "auto")
+            self.assertEqual(current["settings"]["computed_main"]["value"]["target"],
+                             {"host": self.store.host, "terminal_id": "terminal"})
+        self.assertIn("[메인]", self.herdr.metadata["p-current"][SOURCE]["display_agent"])
+
     def test_new_snapshot_rows_are_committed_before_shared_redraw(self):
         result = self.registry.reconcile(self.snapshot)
         self.assertEqual(result["terminals"], 1)
@@ -81,7 +105,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
                              ("review", "Inspect committed status"), command)
         metadata = self.herdr.metadata["p-current"][SOURCE]
         self.assertEqual(metadata["tokens"]["recap"], "review")
-        self.assertEqual(self.herdr.labels["p-current"], "Inspect committed status")
+        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Inspect committed status")
         with self.store.read() as connection:
             status = [tuple(row) for row in connection.execute(
                 "SELECT field,value FROM status_log WHERE field IN ('phase','summary') ORDER BY seq"
@@ -157,7 +181,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         result = self.registry.set_status(agent, phase="review", summary="Moved task")
         self.assertEqual(result["display"], {"updated": ["p-moved"], "failed": []})
         self.assertTrue(all(command[2] == "p-moved" for command in self.herdr.commands))
-        self.assertEqual(self.herdr.labels["p-moved"], "Moved task")
+        self.assertEqual(self.herdr.labels["p-moved"], "orange-rabbit · Moved task")
 
     def test_session_replacement_redraw_sees_only_new_committed_generation(self):
         old = self.seed()
@@ -298,21 +322,22 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.herdr.labels["p-current"] = "Human title"
         self.registry.set_status(agent, phase="review", summary="New HAM title")
         self.assertEqual(self.herdr.labels["p-current"], "Human title")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "HAM title")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit · HAM title")
         self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["recap"], "review")
 
-    def test_successful_blank_border_ownership_preserves_exact_cas_value(self):
+    def test_cleared_status_retains_identity_and_exact_cas_value(self):
         agent = self.seed()
         self.registry.set_status(agent, phase="review", summary="HAM title")
         self.registry.set_status(agent, phase="", summary="")
-        self.assertEqual(self.herdr.labels["p-current"], "")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "")
+        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["recap"], "")
         self.registry.set_status(agent, phase="review", summary="Owned after clear")
-        self.assertEqual(self.herdr.labels["p-current"], "Owned after clear")
+        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Owned after clear")
         self.herdr.labels["p-current"] = "Later human rename"
         self.registry.set_status(agent, phase="review", summary="Do not replace human title")
         self.assertEqual(self.herdr.labels["p-current"], "Later human rename")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "Owned after clear")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit · Owned after clear")
 
 
 if __name__ == "__main__":

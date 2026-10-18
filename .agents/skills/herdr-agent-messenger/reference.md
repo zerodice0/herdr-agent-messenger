@@ -272,20 +272,39 @@ visible `main_unavailable` (failed item, explicit retry after configuration).
 
 ### Modes, roles, settings and status
 
-`repo show` is read-only. Only the user Settings UI mutates repository
-participation; there is no `repo set`, main/home mutation command, or public
-policy-bypass flag.
+`repo show` is read-only. After first-registration defaults, only the user Settings
+UI changes repository participation; there is no `repo set`, main/home mutation
+command, or public policy-bypass flag.
+
+Repos first seen by HAM from this version default to `auto`, including host-local
+`local:` repos (whose settings do not propagate). All same-repo agents participate;
+eligible queued action mail may auto-start an OMP turn, and same-repo legacy
+`send`/`request`/`batch` must use mail. Already-known repos retain all stored
+settings; missing mode remains `off` until changed. Reads, including board, inbox,
+`repo show`, and status export with `refresh:false`, never seed defaults.
+
+First registration atomically stores home plus auto through the settings protocol.
+The mode seed has version 1, origin `!default`, and `changed_by:home`: protocol-1
+peers (including 0.9.1) accept it, and every explicit canonical-host mode at version
+1 or higher outranks it. Old peers may still log a differing version-1 value as a
+conflict, with the explicit value winning. Home retains the existing version-1
+canonical-host proposal; concurrent/offline proposals converge lexicographically,
+not by wall-clock age, so an existing remote home can lose that tie. Offline
+hosts may temporarily disagree until settings propagate; there is no home failover.
 
 | Mode | Main | Workers / receiving |
 | --- | --- | --- |
-| `off` (default) | None | No roles or automatic wakes, and no participation-based legacy rejection. Explicit inbox reads and natural user-turn receiving remain allowed. |
+| `off` | None | No roles or automatic wakes, and no participation-based legacy rejection. Explicit inbox reads and natural user-turn receiving remain allowed. |
 | `manual` | Explicit user-designated terminal, otherwise none | Explicit members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
 | `auto` | Explicit designation first; otherwise exactly one active main-checkout agent at home | All other agents with the same repo ID across registered hosts. Zero/multiple home candidates means no default main. A remote main-checkout agent is not an additional default main. |
 
 The stable terminal slot survives a pane move; a new native session/client/repo
-changes generation. Role projection appears before the alias and on HAM-owned
-borders, preserving manual user renames. Summary supplies the owned border;
-phase supplies the HAM `recap` token. Herdr's turn state is stored unchanged.
+changes generation. Agents keeps role before the addressable alias. HAM-owned
+borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting
+missing parts and preserving manual user renames. Alias precedes summary so
+Herdr's width truncation clips the summary first. `status clear` removes
+phase/summary but retains alias and any active role. Phase supplies the HAM
+`recap` token. Herdr's turn state is stored unchanged.
 `status set`/`clear` also work off, without a role prefix; invoking this feature
 removes the obsolete `user:pane-recap` token without overwriting other sources.
 
@@ -347,7 +366,7 @@ Settings (`s`) has exactly seven editable rows:
 
 | Row | Value / default |
 | --- | --- |
-| `mode` | `off`, `manual`, `auto`; default `off`. |
+| `mode` | `off`, `manual`, `auto`; newly seen repos default to `auto`; already-known repos without mode keep `off`. |
 | `main` | JSON `{"host":"CANONICAL","terminal_id":"term_…"}` or `null`; null removes the explicit designation. |
 | `members` | Unique JSON array of canonical-host/terminal targets; default empty. |
 | `idle_minutes` | Integer 0–10000, default 3 minutes after input. |
@@ -361,8 +380,8 @@ main and Space toggles manual membership. Esc closes Settings.
 The four threshold rows edit one
 versioned `thresholds` field, preserving its other values. Home,
 `computed_main`, version/origin stamps, pending propagation and conflict
-records are **intentionally read-only**. Home is the first activation proposal,
-subject to deterministic concurrent proposal convergence, not an omitted
+records are **intentionally read-only**. Home is the first registration/activation
+proposal, subject to deterministic concurrent proposal convergence, not an omitted
 eighth setting. Offline peers do not block initial local use.
 
 Only one settings mutation is in flight. **Saving settings** is visible; a

@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from ledger_mail import Mailbox
-from ledger_status import AgentRegistry
+from ledger_settings import RepoSettings
+from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerStore
 import ledger_worker
 from test_ledger_core import snapshot
@@ -21,12 +22,32 @@ class WorkerHandoffTest(unittest.TestCase):
         self.repo = self.root/'repo'
         self.repo.mkdir()
         self.store = LedgerStore(self.root/'ledger',canonical_name='handoff')
+        # Exit-handoff scenarios retain the pre-rollout, known-repo off policy.
+        repo_id = repository_identity(str(self.repo), self.store.host)["repo_id"]
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (repo_id, 1.0))
         registry = AgentRegistry(self.store)
         registry.reconcile(snapshot(self.repo), refresh_display=False)
         self.sender,self.recipient = registry.list()
         self.mail = Mailbox(self.store)
         self.environment = {**os.environ, 'HERDR_AGENT_LEDGER_AUTOSTART':'0',
                             'HERDR_SOCKET_PATH': str(self.root/'herdr-isolated.sock')}
+
+    def test_seeded_auto_keeps_maintenance_like_explicit_auto(self):
+        repo = self.root / 'new-repo'
+        repo.mkdir()
+        registry = AgentRegistry(self.store)
+        registry.reconcile(snapshot(repo), refresh_display=False)
+        repo_id = registry.list()[0]['repo_id']
+        settings = RepoSettings(self.store)
+        seeded = settings.show(repo_id)['settings']['mode']
+        self.assertEqual((seeded['value'], seeded['changed_by']), ('auto', 'home'))
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        with patch.object(RepoSettings, '_display_result', return_value={}):
+            settings.mutate(repo_id, 'mode', 'off')
+            self.assertFalse(ledger_worker.maintenance_pending(self.store))
+            settings.mutate(repo_id, 'mode', 'auto')
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
 
     def send(self):
         return self.mail.send(self.sender,self.recipient,body='Real local handoff consumer mail')

@@ -40,10 +40,11 @@ class DisplayProjection:
 
 def build_display(agent: str, alias: str, marker: str = "", color: str = "", *,
                   role: str | None = None, phase: str = "", summary: str = "") -> DisplayProjection:
-    """Keep the addressable alias as the suffix; status never changes identity."""
+    """Keep Agents addressable by suffix and put border identity before status."""
     role_label = {"main": "[메인]", "worker": "[워커]"}.get(role, "")
     display = " ".join(part for part in (marker, role_label, alias) if part)
-    label = " ".join(part for part in (role_label, summary) if part)
+    content = " · ".join(part for part in (alias, summary) if part)
+    label = " ".join(part for part in (role_label, content) if part)
     return DisplayProjection(agent, display, alias, color, phase, label)
 
 
@@ -137,7 +138,7 @@ class LedgerDisplay:
         )
         pane_id = str(agent["pane_id"])
         invoked = feature_invoked or role is not None or bool(
-            display.recap or display.label or agent.get("last_ham_label") is not None)
+            display.recap or agent.get("summary") or agent.get("last_ham_label") not in (None, name))
         if self._border_label(agent) is None:
             return False
         succeeded = report_metadata(self.runner, pane_id, display, clear_legacy_recap=invoked, on_failure=on_failure)

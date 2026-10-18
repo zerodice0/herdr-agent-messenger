@@ -16,7 +16,7 @@ import uuid
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings, stamp
-from ledger_status import AgentRegistry
+from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerError, LedgerStore, public_receipt, receipt
 from ledger_worker import maintenance_pending, worker_lock
 
@@ -74,6 +74,10 @@ class RemoteLedgerTest(unittest.TestCase):
         self.agents = {}
         self.snapshots = {}
         for index, (host, store) in enumerate(self.stores.items()):
+            # Existing scenarios model a repo known before auto-default rollout.
+            repo_id = repository_identity(str(self.repo), host)["repo_id"]
+            with store.transaction() as connection:
+                connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (repo_id, 1.0))
             pane = {'terminal_id': 'term-'+host, 'pane_id': f'w{index+1}:p1', 'workspace_id': f'w{index+1}'}
             raw = {**pane, 'agent': 'codex', 'name': host+'-owl', 'agent_status': 'idle',
                    'agent_session': {'value': 'session-'+host}, 'cwd': str(self.repo)}
@@ -333,6 +337,67 @@ class RemoteLedgerTest(unittest.TestCase):
         self.drain()
         self.assertEqual(self.current('alpha', first['message_id'])['state'], 'queued')
         self.assertEqual(self.services['alpha'].outbox()[0]['item_id'], failed['item_id'])
+
+    def test_seeded_auto_publishes_once_and_concurrent_homes_converge(self):
+        repo = self.root / 'new-repo'
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        subprocess.run(['git', '-C', str(repo), 'config', 'ham.repo-id', 'git:defaults/new'], check=True)
+        repo_id = 'git:defaults/new'
+        for host, store in self.stores.items():
+            original = self.snapshots[host]
+            observed = {**original, 'agents': [{**original['agents'][0], 'cwd': str(repo)}]}
+            registry = AgentRegistry(store)
+            registry.reconcile(observed, refresh_display=False)
+            before = self.settings_for(host).show(repo_id)['settings']
+            self.assertEqual(before['mode']['value'], 'auto')
+            self.assertEqual(before['computed_main']['value']['target']['host'], host)
+            with store.read() as connection:
+                queued = connection.execute(
+                    "SELECT count(*) FROM outbox WHERE json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0]
+            self.assertEqual(queued, 6)  # home, mode and computed main, to two peers.
+            registry.reconcile(observed, refresh_display=False)
+            self.settings_for(host).reconcile_local(refresh_display=False)
+            self.assertEqual(self.settings_for(host).show(repo_id)['settings'], before)
+            with store.read() as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT count(*) FROM outbox WHERE json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0], queued)
+        self.drain()
+        for host, store in self.stores.items():
+            current = self.settings_for(host).show(repo_id)
+            self.assertEqual((current['mode'], current['home_host']), ('auto', 'gamma'))
+            with store.read() as connection:
+                self.assertEqual(self.settings_for(host).main(connection, repo_id)['host'], 'gamma')
+
+    def test_explicit_peer_version_one_mode_beats_seed_in_both_arrival_orders(self):
+        for mode in ('off', 'manual', 'auto'):
+            with self.subTest(mode=mode):
+                repo = self.root / ('explicit-' + mode)
+                subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+                repo_id = 'git:defaults/' + mode
+                subprocess.run(['git', '-C', str(repo), 'config', 'ham.repo-id', repo_id], check=True)
+                explicit = {'repo_id': repo_id, 'field': 'mode', 'value': mode, 'version': 1,
+                            'origin_host': 'alpha', 'changed_by': 'user', 'changed_at': 1.0}
+                with self.stores['alpha'].transaction() as connection:
+                    self.settings_for('alpha')._apply(connection, explicit)
+                original = self.snapshots['gamma']
+                observed = {**original, 'agents': [{**original['agents'][0], 'cwd': str(repo)}]}
+                AgentRegistry(self.stores['gamma']).reconcile(observed, refresh_display=False)
+                seed = self.settings_for('gamma').show(repo_id)['settings']['mode']
+                # The seeding host sorts AFTER the explicit writer: using its
+                # real origin would wrongly beat the existing version-1 choice.
+                result = self.wire('alpha', 'setting', self.services['gamma'].envelope(seed))
+                self.assertFalse(result['applied'])
+                result = self.wire('gamma', 'setting', self.services['alpha'].envelope(explicit))
+                self.assertTrue(result['applied'])
+                self.drain()
+                for host in self.stores:
+                    current = self.settings_for(host).show(repo_id)
+                    self.assertEqual(current['settings']['mode'], explicit)
+                    self.assertEqual(current['mode'], mode)
+                if mode != 'auto':
+                    conflicts = self.settings_for('alpha').show(repo_id)['conflicts']
+                    self.assertTrue(any(item['field'] == 'mode' and item['winner_host'] == 'alpha'
+                                        and item['loser_host'] == '!default' for item in conflicts))
 
     def test_disjoint_settings_and_equal_version_ties_converge(self):
         alpha, beta = self.settings_for('alpha'), self.settings_for('beta')

@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from agent_directory import AgentRecord, SendResult
 from curses_snapshot_harness import DrawCall, FakeCursesWindow
-from key_input import ESCAPE, F1, NEWLINE, SHIFT_TAB
+from key_input import ESCAPE, F1, NEWLINE, SHIFT_TAB, MouseEvent
 from ledger_mail import Mailbox
 from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry
@@ -131,6 +131,280 @@ class MailboxUiTest(unittest.TestCase):
         self.assertTrue(all(call.column + display_width(call.requested_text) <= width
                             for call in app.screen.draw_calls))
         return app.screen.snapshot()
+
+    def mouse_at_text(self, app, needle, action='press', offset=0):
+        call = next(call for call in reversed(app.screen.draw_calls) if needle in call.requested_text)
+        column = call.column + display_width(call.requested_text[:call.requested_text.index(needle)]) + offset
+        app.key(MouseEvent(call.row, column, action))
+        return call.row, column
+
+    def test_mouse_region_focus_and_agent_primary_and_secondary_rows(self):
+        for width in (100, 160):
+            for secondary in (False, True):
+                with self.subTest(width=width, secondary=secondary):
+                    app = self.app()
+                    app.local['agents'] = [
+                        {**agent, 'alias': f'agent-{index}', 'summary': f'summary-{index}',
+                         'role': '', 'phase': ''}
+                        for index, agent in enumerate(app.agents())]
+                    self.capture(app, 32, width)
+                    self.mouse_at_text(app, ' Threads ')
+                    self.assertEqual(app.focus, 'threads')
+                    self.assertEqual(app.mode, 'nav')
+                    self.capture(app, 32, width)
+                    point = self.mouse_at_text(app, 'summary-1' if secondary else 'agent-1')
+                    self.assertEqual(app.focus, 'agents')
+                    self.assertEqual(app.selections['agents'], 1)
+                    self.assertEqual(app.mode, 'nav')
+                    expected = app.agents()[1]
+                    self.capture(app, 32, width)
+                    app.key(MouseEvent(*point, 'press'))
+                    self.assertEqual(app.mode, 'input')
+                    self.assertEqual(app.identity(app.recipient), app.identity(expected))
+
+    def test_mouse_headers_and_empty_region_space_only_focus(self):
+        app = self.app()
+        self.capture(app, 32, 160)
+        app.focus = 'threads'
+        self.mouse_at_text(app, 'ALIAS')
+        self.assertEqual((app.focus, app.mode, app.selections['agents']), ('agents', 'nav', 0))
+        app.focus = 'threads'
+        self.mouse_at_text(app, ' · 2 agents')
+        self.assertEqual((app.focus, app.mode), ('agents', 'nav'))
+        app.focus = 'agents'
+        app.key(MouseEvent(28, 45, 'press'))
+        self.assertEqual((app.focus, app.mode), ('threads', 'nav'))
+        app.key(MouseEvent(0, 2, 'press'))
+        app.key(MouseEvent(31, 2, 'press'))
+        self.assertEqual((app.focus, app.mode), ('threads', 'nav'))
+
+    def test_mouse_thread_rows_select_then_open_reply_without_ack(self):
+        for width in (100, 160):
+            for secondary in (False, True):
+                with self.subTest(width=width, secondary=secondary):
+                    app = self.app()
+                    sent = [self.mail.send_user(self.repo_id, agent, body='thread-' + str(index))
+                            for index, agent in enumerate(app.agents())]
+                    app.local = local_snapshot(self.store, self.repo_id)
+                    app.selections['threads'] = 0
+                    snapshot = self.capture(app, 36, width)
+                    rows = [call for call in snapshot.draw_calls
+                            if 'queued · thread-' in call.requested_text]
+                    self.assertGreaterEqual(len(rows), 2)
+                    row = rows[1].row + int(secondary)
+                    column = rows[1].column
+                    app.key(MouseEvent(row, column, 'press'))
+                    self.assertEqual((app.focus, app.selections['threads'], app.mode), ('threads', 1, 'nav'))
+                    target = app.selected('threads')
+                    self.capture(app, 36, width)
+                    app.key(MouseEvent(row, column, 'press'))
+                    self.assertEqual(app.mode, 'input')
+                    self.assertEqual(app.reply_to, target['messages'][-1]['message_id'])
+                    for result in sent:
+                        message = self.mail.show_thread(result['thread_id'])['messages'][0]
+                        self.assertEqual(message['state'], 'queued')
+                        self.assertIsNone(message['delivered_at'])
+
+    def test_mouse_wheels_scroll_target_region_without_changing_focus(self):
+        for width in (100, 160):
+            with self.subTest(width=width):
+                app = self.app()
+                base = app.agents()[0]
+                app.local['agents'] = [
+                    {**base, 'alias': f'agent-{index:02}', 'terminal_id': f'term-{index}',
+                     'summary': 'long detail ' * 100} for index in range(10)]
+                app.local['submissions'] = [
+                    {'submission_id': str(index), 'acceptance': 'accepted', 'body': 'direct',
+                     'target': base} for index in range(10)]
+                self.capture(app, 24, width)
+                self.mouse_at_text(app, ' Detail ', 'wheel_down')
+                self.assertEqual(app.scrolls['detail'], 3)
+                self.assertEqual(app.focus, 'agents')
+                self.capture(app, 24, width)
+                self.mouse_at_text(app, ' Detail ', 'wheel_up')
+                self.assertEqual(app.scrolls['detail'], 0)
+                self.mouse_at_text(app, ' Threads ')
+                self.capture(app, 24, width)
+                self.mouse_at_text(app, ' Agents ', 'wheel_down')
+                self.assertEqual((app.selections['agents'], app.focus), (3, 'threads'))
+                self.capture(app, 24, width)
+                self.mouse_at_text(app, ' Agents ', 'wheel_up')
+                self.assertEqual((app.selections['agents'], app.focus), (0, 'threads'))
+                self.mouse_at_text(app, ' Detail ')
+                self.capture(app, 24, width)
+                self.mouse_at_text(app, ' Threads ', 'wheel_down')
+                self.assertEqual((app.selections['threads'], app.focus), (3, 'detail'))
+                for _ in range(6):
+                    self.mouse_at_text(app, ' Agents ', 'wheel_down')
+                self.assertEqual((app.selections['agents'], app.focus), (9, 'detail'))
+                for _ in range(6):
+                    self.mouse_at_text(app, ' Agents ', 'wheel_up')
+                self.assertEqual(app.selections['agents'], 0)
+
+    def test_mouse_input_cursor_uses_display_cells_and_ignores_outside_clicks(self):
+        app = self.app()
+        app.key('\r')
+        self.type_text(app, '가나다 abc\n둘째 줄')
+        self.capture(app, 32, 100)
+        self.mouse_at_text(app, '가나다 abc', offset=3)
+        self.assertEqual(app.body_cursor, 1)
+        self.assertEqual(app.drafts[app.draft_key]['cursor'], 1)
+        self.mouse_at_text(app, '둘째 줄', offset=5)
+        self.assertEqual(app.body_cursor, len('가나다 abc\n둘째 '))
+        before = app.body, app.body_cursor, app.focus, app.recipient
+        self.mouse_at_text(app, ' Agents ')
+        self.assertEqual((app.body, app.body_cursor, app.focus, app.recipient), before)
+        self.assertEqual(app.mode, 'input')
+
+    def test_mouse_input_wheel_scrolls_text_and_click_tracks_wrapped_offset(self):
+        app = self.app()
+        app.key('\r')
+        text = '\n'.join(f'행{index:02} 가나다' for index in range(20))
+        self.type_text(app, text)
+        self.capture(app, 32, 100)
+        self.mouse_at_text(app, 'To ', 'wheel_up')
+        snapshot = self.capture(app, 32, 100)
+        visible = [call for call in snapshot.draw_calls if call.requested_text.startswith('행')]
+        line = visible[0]
+        logical_row = int(line.requested_text[1:3])
+        self.assertLess(logical_row, 17)
+        app.key(MouseEvent(line.row, line.column + 3, 'press'))
+        self.assertEqual(app.body_cursor, len('\n'.join(text.split('\n')[:logical_row])) +
+                         int(logical_row > 0) + 2)
+        self.assertEqual(app.mode, 'input')
+        app.body = '가' * 60 + '\nlast'
+        app.body_cursor = len(app.body)
+        self.capture(app, 32, 40)
+        call = next(call for call in app.screen.draw_calls if call.requested_text.startswith('가'))
+        app.key(MouseEvent(call.row + 1, call.column + 4, 'press'))
+        self.assertEqual(app.body_cursor, 20)
+
+    def test_mouse_confirm_buttons_execute_only_chosen_action(self):
+        for choice in ('Confirm', 'Cancel'):
+            with self.subTest(choice=choice):
+                app = self.app()
+                app.open_confirm('Withdraw message?', ['Message: exact-message'], 'withdraw',
+                                 {'message_id': 'exact-message'})
+                self.capture(app, 24, 100)
+                app.key(MouseEvent(2, 2, 'press'))
+                self.assertEqual(app.mode, 'confirm')
+                self.mouse_at_text(app, choice)
+                self.assertEqual(app.mode, 'nav')
+                if choice == 'Confirm':
+                    self.assertEqual(app.jobs['mutation'].request['message_id'], 'exact-message')
+                    self.assertEqual(app.jobs['mutation'].operation, 'withdraw')
+                else:
+                    self.assertNotIn('mutation', app.jobs)
+
+    def test_mouse_evidence_buttons_review_cancel_and_cursor(self):
+        for choice in ('Confirm', 'Cancel'):
+            with self.subTest(choice=choice):
+                app = self.app()
+                app.edit = {'title': 'Evidence', 'text': 'observed', 'cursor': 8, 'action': 'resolve',
+                            'return_mode': 'nav', 'claim': {'disposition': 'applied'}, 'target': []}
+                app.mode = 'evidence'
+                self.capture(app, 24, 100)
+                app.key(MouseEvent(2, 2, 'press'))
+                self.assertEqual(app.mode, 'evidence')
+                self.mouse_at_text(app, 'observed', offset=2)
+                self.assertEqual(app.edit['cursor'], 2)
+                self.mouse_at_text(app, choice)
+                self.assertEqual(app.mode, 'confirm' if choice == 'Confirm' else 'nav')
+                self.assertNotIn('mutation', app.jobs)
+                if choice == 'Confirm':
+                    self.assertEqual(app.confirm['values']['claim']['evidence'], 'observed')
+        app = self.app()
+        app.edit = {'title': 'Evidence', 'text': '', 'cursor': 0, 'action': 'resolve', 'return_mode': 'nav'}
+        app.mode = 'evidence'
+        self.capture(app)
+        self.mouse_at_text(app, 'Confirm')
+        self.assertEqual(app.mode, 'evidence')
+        self.assertIn('Non-empty operator evidence', app.status)
+
+    def test_mouse_settings_rows_select_then_edit_and_wheel_overlay(self):
+        app = self.app()
+        app.key('s')
+        self.capture(app, 24, 100)
+        point = self.mouse_at_text(app, 'members:')
+        self.assertEqual(app.settings_selection, app.SETTINGS.index('members'))
+        self.assertEqual(app.mode, 'settings')
+        self.capture(app, 24, 100)
+        app.key(MouseEvent(*point, 'press'))
+        self.assertEqual(app.mode_word(), 'CHECK')
+        self.assertEqual(app.settings_picker['field'], 'members')
+        app.key(ESCAPE)
+        app.local['settings']['conflicts'] = [{'detail': 'conflict'} for _ in range(40)]
+        self.capture(app, 24, 100)
+        before = app.focus, app.settings_selection
+        self.mouse_at_text(app, ' SETTINGS ', 'wheel_down')
+        self.capture(app, 24, 100)
+        self.assertEqual(app.overlay_scroll, 3)
+        self.assertEqual((app.focus, app.settings_selection), before)
+        self.mouse_at_text(app, ' SETTINGS ', 'wheel_up')
+        self.capture(app, 24, 100)
+        self.assertEqual(app.overlay_scroll, 0)
+
+    def test_mouse_help_click_closes_to_original_mode_and_tiny_ignores(self):
+        for mode in ('nav', 'input'):
+            app = self.app()
+            if mode == 'input':
+                app.key('\r')
+            app.key(F1)
+            self.capture(app, 24, 100)
+            app.key(MouseEvent(2, 2, 'press'))
+            self.assertEqual(app.mode, mode)
+        app = self.app()
+        app.key(F1)
+        self.capture(app, 9, 31)
+        before = app.focus, app.mode, dict(app.selections), dict(app.scrolls)
+        for action in ('press', 'wheel_up', 'wheel_down'):
+            app.key(MouseEvent(2, 2, action))
+            self.assertEqual((app.focus, app.mode, app.selections, app.scrolls), before)
+        self.assertEqual(app.hit_map, [])
+
+    def test_mouse_hit_map_rebuilt_on_resize(self):
+        app = self.app()
+        self.capture(app, 24, 160)
+        self.capture(app, 24, 60)
+        app.key(MouseEvent(3, 50, 'press'))
+        self.assertEqual(app.focus, 'agents')
+        self.assertEqual(app.mode, 'nav')
+        self.assertTrue(all(rect[1] + rect[3] <= 60 for rect, _, _ in app.hit_map))
+
+    def test_run_enables_mouse_unless_disabled_and_always_releases_mask(self):
+        for disabled in (False, True):
+            for fail in (False, True):
+                with self.subTest(disabled=disabled, fail=fail):
+                    app = self.app()
+                    app.environment.pop('HAM_MAILBOX_NO_MOUSE', None)
+                    if disabled:
+                        app.environment['HAM_MAILBOX_NO_MOUSE'] = '1'
+                    app.start_job('pending', 'snapshot')
+                    job = app.jobs['pending']
+                    def tick():
+                        if fail:
+                            raise RuntimeError('loop failed')
+                        app.running = False
+                    with patch.object(app, 'tick', side_effect=tick), \
+                         patch.object(app, 'initialize_colors'), \
+                         patch.object(app.screen, 'keypad', create=True), \
+                         patch.object(app.screen, 'timeout', create=True), \
+                         patch('mailbox_tui.curses.nonl'), \
+                         patch('mailbox_tui.curses.set_escdelay'), \
+                         patch('mailbox_tui.curses.mousemask') as mask, \
+                         patch('mailbox_tui.curses.mouseinterval') as interval:
+                        if fail:
+                            with self.assertRaisesRegex(RuntimeError, 'loop failed'):
+                                app.run()
+                        else:
+                            self.assertEqual(app.run(), 0)
+                    self.assertEqual([call.args for call in mask.call_args_list],
+                                     [(0,)] if disabled else [(curses.ALL_MOUSE_EVENTS,), (0,)])
+                    self.assertEqual(interval.call_count, 0 if disabled else 1)
+                    if not disabled:
+                        interval.assert_called_once_with(0)
+                    self.assertTrue(job.closed)
+                    self.assertEqual(app.jobs, {})
 
     def test_execute_send_is_user_origin_without_opener_agent(self):
         result = execute_job({'operation': 'send', 'repo_id': self.repo_id,
@@ -697,8 +971,16 @@ class MailboxUiTest(unittest.TestCase):
                 elif context == 'confirm':
                     app.key('q')
                 elif context == 'evidence':
-                    app.key('s')
-                    app.key('\r')
+                    sent = self.mail.send_user(self.repo_id, self.recipient, body='Claim to inspect')
+                    self.mail.claim(terminal_id='term-b', agent_id=self.recipient['agent_id'],
+                                    generation=self.recipient['generation'])
+                    app.local = local_snapshot(self.store, self.repo_id)
+                    app.key('\t')
+                    app.selections['threads'] = next(
+                        index for index, item in enumerate(app.items('threads'))
+                        if item['thread_id'] == sent['thread_id'])
+                    app.key('a')
+                    self.assertEqual(app.mode, 'evidence')
                 app.jobs['mutation'].result = {'error': {'message': 'Send failed'}}
                 app.tick()
                 self.assertEqual(app.mode, context)
@@ -762,6 +1044,223 @@ class MailboxUiTest(unittest.TestCase):
                     snapshot = app.jobs['snapshot']
                     app.key(key)
                     self.assertIs(app.jobs['snapshot'], snapshot)
+
+    def test_settings_mode_picker_saves_auto_once_with_keys_or_mouse(self):
+        for mouse in (False, True):
+            with self.subTest(mouse=mouse):
+                app = self.app()
+                app.local['settings']['mode'] = 'off'
+                app.key('s')
+                if mouse:
+                    self.capture(app)
+                    self.mouse_at_text(app, 'mode:')
+                else:
+                    app.key('\r')
+                self.assertEqual(app.mode_word(), 'PICK')
+                self.assertIsNone(app.edit)
+                if mouse:
+                    self.capture(app)
+                    self.mouse_at_text(app, 'auto ·')
+                else:
+                    app.key(curses.KEY_DOWN)
+                    app.key(curses.KEY_DOWN)
+                    app.key('\r')
+                job = app.jobs['mutation']
+                self.assertEqual(job.request, {'operation': 'setting', 'repo_id': self.repo_id,
+                                               'field': 'mode', 'value': 'auto'})
+                self.assertIsNone(app.confirm)
+                app.key('\r')
+                app.key(curses.KEY_END)
+                app.key('\r')
+                self.assertIs(app.jobs['mutation'], job)
+                self.assertIn('pending', app.settings_results['mode'])
+
+    def test_settings_main_picker_live_repo_targets_and_none(self):
+        for choose_none in (False, True):
+            with self.subTest(choose_none=choose_none):
+                app = self.app()
+                target = {name: app.agents()[0][name] for name in ('host', 'terminal_id')}
+                app.local['agents'] += [
+                    {**app.agents()[0], 'terminal_id': 'stale', 'stale': True},
+                    {**app.agents()[0], 'terminal_id': 'elsewhere', 'repo_id': 'elsewhere'}]
+                if choose_none:
+                    app.local['settings']['settings']['main'] = {'value': target}
+                app.key('s')
+                app.key(curses.KEY_DOWN)
+                app.key('\r')
+                entries = app.settings_picker['entries']
+                self.assertEqual(len(entries), 3)
+                self.assertEqual(entries[0], ('(none)', None))
+                app.key(curses.KEY_HOME)
+                if not choose_none:
+                    app.key(curses.KEY_DOWN)
+                app.key('\r')
+                self.assertEqual(app.jobs['mutation'].request['field'], 'main')
+                self.assertEqual(app.jobs['mutation'].request['value'], None if choose_none else target)
+
+    def test_settings_members_checklist_retains_stale_until_unticked(self):
+        stale = {'host': 'missing-host', 'terminal_id': 'missing-terminal'}
+        for untick in (False, True):
+            with self.subTest(untick=untick):
+                app = self.app()
+                app.local['settings']['settings']['members'] = {'value': [stale]}
+                app.key('s')
+                app.key(curses.KEY_DOWN)
+                app.key(curses.KEY_DOWN)
+                app.key('\r')
+                self.assertEqual(app.mode_word(), 'CHECK')
+                self.assertIn('stale', app.settings_picker['entries'][-1][0])
+                selected = app.settings_picker['entries'][0][1]
+                app.key(' ')
+                if untick:
+                    app.key(curses.KEY_END)
+                    app.key(' ')
+                app.key('\r')
+                self.assertEqual(app.jobs['mutation'].request['field'], 'members')
+                self.assertCountEqual(app.jobs['mutation'].request['value'],
+                                      [selected] if untick else [stale, selected])
+
+    def test_settings_threshold_steps_clamp_and_escape_discards(self):
+        for field, step in (('idle_minutes', 1), ('coalesce_seconds', 5),
+                            ('wakes_per_hour', 1), ('max_hop', 1)):
+            for initial, direction in ((12, 1), (9999, 1), (10000, 1), (1, -1), (0, -1)):
+                with self.subTest(field=field, initial=initial, direction=direction):
+                    app = self.app()
+                    thresholds = {name: app.setting_value(name) for name in app.SETTINGS[3:]}
+                    thresholds[field] = initial
+                    app.local['settings']['settings']['thresholds'] = {'value': thresholds}
+                    app.key('s')
+                    app.settings_selection = app.SETTINGS.index(field)
+                    for _ in range(2):
+                        app.key(curses.KEY_RIGHT if direction > 0 else curses.KEY_LEFT)
+                    expected = min(10000, max(0, initial + 2 * direction * step))
+                    self.assertEqual(app.settings_pending[field], expected)
+                    self.assertIn('unsaved', '\n'.join(app.settings_lines()))
+                    app.key('\r')
+                    self.assertEqual(app.jobs['mutation'].request['value'],
+                                     {**thresholds, field: expected})
+        app = self.app()
+        app.key('s')
+        app.key(curses.KEY_RIGHT)
+        app.settings_selection = app.SETTINGS.index('idle_minutes')
+        app.key(curses.KEY_RIGHT)
+        app.key(ESCAPE)
+        self.assertEqual(app.mode, 'nav')
+        self.assertEqual(app.settings_pending, {})
+        self.assertNotIn('mutation', app.jobs)
+        app.key('s')
+        self.assertNotIn('unsaved', '\n'.join(app.settings_lines()))
+
+    def test_settings_picker_checklist_and_numeric_escape_cancel_without_save(self):
+        for field in ('mode', 'main', 'members', 'idle_minutes'):
+            with self.subTest(field=field):
+                app = self.app()
+                original = app.setting_value(field)
+                app.key('s')
+                app.settings_selection = app.SETTINGS.index(field)
+                app.key('\r')
+                if field == 'members':
+                    app.key(' ')
+                elif field == 'idle_minutes':
+                    app.key(curses.KEY_BACKSPACE)
+                    app.key('7')
+                else:
+                    app.key(curses.KEY_DOWN)
+                app.key(ESCAPE)
+                self.assertEqual(app.mode, 'settings')
+                self.assertIsNone(app.settings_picker)
+                self.assertIsNone(app.settings_numeric)
+                self.assertNotIn('mutation', app.jobs)
+                self.assertEqual(app.setting_value(field), original)
+
+    def test_settings_mode_row_pending_cycles_then_saves(self):
+        app = self.app()
+        app.local['settings']['mode'] = 'off'
+        app.key('s')
+        app.key('l')
+        app.key('l')
+        self.assertEqual(app.settings_pending, {'mode': 'auto'})
+        app.key('\r')
+        self.assertEqual(app.jobs['mutation'].request['value'], 'auto')
+        self.assertIsNone(app.settings_picker)
+
+    def test_settings_numeric_escape_hatch_rejects_text_and_json(self):
+        app = self.app()
+        app.key('s')
+        app.settings_selection = app.SETTINGS.index('idle_minutes')
+        app.key('\r')
+        self.assertEqual(app.mode, 'settings')
+        self.assertIsNone(app.edit)
+        original = app.settings_numeric['text']
+        self.type_text(app, '{"mode":"auto"}')
+        self.assertEqual(app.settings_numeric['text'], original)
+        app.key(curses.KEY_BACKSPACE)
+        self.type_text(app, '42')
+        app.key('\r')
+        self.assertEqual(app.jobs['mutation'].request['value']['idle_minutes'], 42)
+        app = self.app()
+        app.key('s')
+        app.key('\r')
+        before = app.settings_picker.copy()
+        self.type_text(app, '{"mode":"auto"}')
+        self.assertEqual(app.settings_picker, before)
+        self.assertNotIn('mutation', app.jobs)
+        app.key(ESCAPE)
+        app.settings_selection = app.SETTINGS.index('idle_minutes')
+        app.key('+')
+        app.settings_selection = app.SETTINGS.index('max_hop')
+        app.key('\r')
+        self.assertIsNone(app.settings_numeric)
+
+    def test_settings_mouse_threshold_arrows_and_checklist_entries(self):
+        app = self.app()
+        app.key('s')
+        self.capture(app)
+        line = next(call for call in app.screen.draw_calls if 'idle_minutes:' in call.requested_text)
+        right = line.column + display_width(line.requested_text[:line.requested_text.index('▶')])
+        initial = app.setting_value('idle_minutes')
+        app.key(MouseEvent(line.row, right, 'press'))
+        self.capture(app)
+        app.key(MouseEvent(line.row, right, 'press'))
+        self.assertEqual(app.settings_pending['idle_minutes'], initial + 2)
+        app.key('\r')
+        self.assertEqual(app.jobs['mutation'].request['value']['idle_minutes'], initial + 2)
+        app = self.app()
+        app.key('s')
+        app.settings_selection = app.SETTINGS.index('members')
+        app.key('\r')
+        self.capture(app)
+        selected = app.settings_picker['entries'][0][1]
+        self.mouse_at_text(app, app.settings_picker['entries'][0][0])
+        self.assertIn(selected, app.settings_picker['checked'])
+        app.key('\r')
+        self.assertEqual(app.jobs['mutation'].request['value'], [selected])
+
+    def test_settings_field_local_save_result_and_error(self):
+        for error in (False, True):
+            with self.subTest(error=error):
+                app = self.app()
+                app.key('s')
+                app.key(curses.KEY_RIGHT)
+                app.key('\r')
+                self.assertIn('Saving settings', '\n'.join(app.settings_lines()))
+                result = RepoSettings(self.store).show(self.repo_id)
+                if error:
+                    result = {'error': {'code': 'denied', 'message': 'Not saved'}}
+                app.jobs['mutation'].result = result
+                app.tick()
+                self.assertIn('Not saved' if error else 'Saved.', '\n'.join(app.settings_lines()))
+
+    def test_settings_shortcuts_still_require_confirmation(self):
+        for key, field in (('m', 'main'), (' ', 'members')):
+            with self.subTest(key=key):
+                app = self.app()
+                app.key('s')
+                app.key(key)
+                self.assertEqual(app.mode, 'confirm')
+                self.assertEqual(app.confirm['values']['field'], field)
+                self.accept(app)
+                self.assertEqual(app.jobs['mutation'].operation, 'setting')
 
     def test_short_failed_input_retains_text_cursor_without_duplicate_error(self):
         app = self.app()
@@ -915,11 +1414,11 @@ class MailboxUiTest(unittest.TestCase):
                     if mode == 'confirm':
                         app.open_confirm('Discard 1 unsent draft?', [], 'quit', {})
                     else:
-                        app.edit = {'title': 'Edit mode', 'text': 'manual', 'cursor': 6,
-                                    'action': 'setting', 'field': 'mode', 'return_mode': 'settings'}
+                        app.edit = {'title': 'Evidence', 'text': 'observed', 'cursor': 8,
+                                    'action': 'resolve', 'return_mode': 'nav'}
                         app.mode = 'evidence'
                     snapshot = self.capture(app, height, width)
-                    dialog_height, dialog_width = 5, 40
+                    dialog_height, dialog_width = (6 if mode == 'evidence' else 5), 40
                     top = 1 + (height - 2 - dialog_height) // 2
                     left = (width - dialog_width) // 2
                     right, bottom = left + dialog_width - 1, top + dialog_height - 1
@@ -1201,14 +1700,15 @@ class MailboxUiTest(unittest.TestCase):
                     execute_job(request, self.environment)
                 self.assertEqual(RepoSettings(self.store).show(self.repo_id)['settings'][field]['value'], request['value'])
 
-    def test_settings_edit_mutates_real_internal_service_after_confirm(self):
+    def test_settings_picker_mutates_real_internal_service_without_confirm(self):
         app = self.app()
         app.key('s')
         app.key('\r')
-        self.assertEqual(app.mode, 'evidence')
-        app.edit['text'], app.edit['cursor'] = 'manual', 6
+        self.assertEqual(app.mode_word(), 'PICK')
+        app.key(curses.KEY_HOME)
+        app.key(curses.KEY_DOWN)
         app.key('\r')
-        self.accept(app)
+        self.assertIsNone(app.confirm)
         with patch('ledger_display.LedgerDisplay.refresh'), patch('ledger_worker.ensure_worker'):
             execute_job(app.jobs['mutation'].request, self.environment)
         self.assertEqual(RepoSettings(self.store).show(self.repo_id)['mode'], 'manual')

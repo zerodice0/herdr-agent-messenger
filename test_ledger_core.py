@@ -11,11 +11,15 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import uuid
 
 from ledger_mail import Mailbox
+from ledger_remote import RemoteLedger
+from ledger_settings import RepoSettings, validate_setting
 from ledger_status import AgentRegistry, normalize_origin, repository_identity
 from ledger_store import LedgerError, LedgerStore
+from ledger_views import status_board
 
 ROOT = Path(__file__).resolve().parent
 
@@ -33,6 +37,112 @@ def snapshot(directory, *, recipient_session="session-b", recipient_repo=None,
             agents.append({**pane, "agent": "omp", "agent_status": "idle", "name": "blue-owl",
                            "agent_session": {"value": recipient_session}, "cwd": str(recipient_repo or directory)})
     return {"panes": panes, "agents": agents}
+
+
+class NewRepoDefaultsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.store = LedgerStore(self.root / "ledger", canonical_name="alpha")
+        self.registry = AgentRegistry(self.store)
+        self.settings = RepoSettings(self.store)
+        self.repo_id = repository_identity(str(self.repo), self.store.host)["repo_id"]
+
+    def register(self, **options):
+        return self.registry.reconcile(snapshot(self.repo, **options), refresh_display=False)
+
+    def test_new_repo_seeds_home_auto_once_and_reconciliation_keeps_versions(self):
+        self.register(recipient_present=False)
+        seeded = self.settings.show(self.repo_id)
+        self.assertEqual(seeded["mode"], "auto")
+        fields = seeded["settings"]
+        self.assertEqual(set(fields), {"home", "mode", "computed_main"})
+        self.assertEqual((fields["home"]["version"], fields["home"]["origin_host"], fields["home"]["value"]),
+                         (1, "alpha", "alpha"))
+        self.assertEqual((fields["mode"]["version"], fields["mode"]["origin_host"], fields["mode"]["changed_by"]),
+                         (1, "!default", "home"))
+        self.assertEqual(fields["computed_main"]["value"]["target"],
+                         {"host": "alpha", "terminal_id": "term-a"})
+        self.register(recipient_present=False)
+        self.settings.reconcile_local(refresh_display=False)
+        self.assertEqual(self.settings.show(self.repo_id)["settings"], fields)
+
+    def test_local_repo_auto_stays_local_and_ambiguous_main_is_none(self):
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO peers VALUES (?,?,?,?)", ("beta", str(uuid.uuid4()), "b", "/peer"))
+        self.register()
+        self.assertTrue(self.repo_id.startswith("local:"))
+        current = self.settings.show(self.repo_id)
+        self.assertEqual(current["mode"], "auto")
+        self.assertIsNone(current["settings"]["computed_main"]["value"]["target"])
+        self.assertEqual([self.settings.role(agent) for agent in self.registry.list()], ["worker", "worker"])
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
+
+    def test_known_repo_without_settings_stays_off_through_registration_and_reads(self):
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (self.repo_id, 1.0))
+        self.register()
+        self.settings.reconcile_local(refresh_display=False)
+        with self.store.read() as connection:
+            before = list(connection.iterdump())
+        self.assertEqual(self.registry.repo_show(self.repo_id)["mode"], "off")
+        self.assertEqual(self.settings.show("git:not-yet-observed/repo")["mode"], "off")
+        self.assertTrue(all(agent["role"] is None for agent in
+                            status_board(self.store, host="local")["agents"]))
+        self.assertTrue(all(agent["role"] is None for agent in RemoteLedger(self.store).status_export()["agents"]))
+        self.assertEqual(Mailbox(self.store).read(self.registry.list()[0])["messages"], [])
+        with self.store.read() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+        self.assertEqual(self.settings.show(self.repo_id)["settings"], {})
+
+    def test_any_existing_settings_preserve_off_manual_main_members_and_home(self):
+        cases = (("mode", "off"), ("mode", "manual"), ("mode", "auto"),
+                 ("home", "beta"), ("main", {"host": "beta", "terminal_id": "selected"}),
+                 ("members", [{"host": "beta", "terminal_id": "selected"}]))
+        for index, (field, value) in enumerate(cases):
+            with self.subTest(field=field, value=value):
+                store = LedgerStore(self.root / f"existing-{index}", canonical_name="alpha")
+                settings = RepoSettings(store)
+                with store.transaction() as connection:
+                    settings._apply(connection, {"repo_id": self.repo_id, "field": field, "value": value,
+                                                 "version": 1, "origin_host": "beta",
+                                                 "changed_by": "user", "changed_at": 1.0})
+                before = settings.show(self.repo_id)["settings"]
+                AgentRegistry(store).reconcile(snapshot(self.repo), refresh_display=False)
+                settings.reconcile_local(refresh_display=False)
+                current = settings.show(self.repo_id)
+                self.assertEqual(current["settings"], before)
+                self.assertEqual(current["mode"], value if field == "mode" else "off")
+
+    def test_seed_uses_existing_protocol_validation_and_lowest_origin_order(self):
+        self.register()
+        seed = self.settings.show(self.repo_id)["settings"]["mode"]
+        self.assertEqual(validate_setting(seed), seed)
+        with self.assertRaises(LedgerError):
+            validate_setting({**seed, "version": 0})
+        # Explicit names begin with ASCII alnum; normalized default hostnames
+        # additionally permit "-", "." and "_", which also sort after "!".
+        for host in ("0", "A", "a", "z-host", "-host", ".host", "_host"):
+            self.assertLess((seed["version"], seed["origin_host"]), (1, host))
+
+    def test_seed_failure_rolls_back_repository_agents_and_publication(self):
+        apply = RepoSettings._apply
+
+        def fail_mode(settings, connection, value, **options):
+            if value["field"] == "mode":
+                raise LedgerError("invalid_setting", "Injected atomic seed failure")
+            return apply(settings, connection, value, **options)
+
+        with patch.object(RepoSettings, "_apply", fail_mode):
+            with self.assertRaises(LedgerError):
+                self.register()
+        with self.store.read() as connection:
+            for table in ("repos", "repo_settings", "agents", "terminal_slots", "outbox"):
+                self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
 
 
 class LedgerCoreTest(unittest.TestCase):
