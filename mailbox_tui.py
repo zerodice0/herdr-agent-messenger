@@ -1559,35 +1559,62 @@ class MailboxApp:
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 
+    def thread_state(self, state: str, *, direct: bool = False) -> tuple[str, str]:
+        """Use one-cell ASCII cues; direct acceptance is never a native receipt."""
+        glyph, palette = {
+            "pending": (".", "working"), "queued": (".", "working"),
+            "submitting": (">", "working"),
+            "delivering": ("?", "working"), "unknown": ("?", "working"),
+            "accepted": ("+", "idle"), "delivered": ("+", "idle"),
+            "handled": ("=", "done"),
+            "failed": ("!", "blocked"), "undeliverable": ("!", "blocked"),
+            "withdrawn": ("-", "unknown"),
+        }.get(state, ("?", "unknown"))
+        label = "UNCERTAIN delivering" if state == "delivering" else state
+        return f"{glyph} {'DIRECT ' if direct else ''}{label}", palette
+
+    def thread_kind(self, kind: str) -> tuple[str, str]:
+        return {"fyi": ("i fyi", "done"), "action": ("! action", "working")}.get(
+            kind, (f"? {kind}", "unknown"))
+
+    def outbox_operation(self, kind: str) -> tuple[str, str]:
+        """Outbox kinds describe transport operations, not FYI/action mail kinds."""
+        glyph = {"message": ">", "receipt": "<", "setting": "#", "withdraw": "-"}.get(kind, "?")
+        return f"{glyph} {kind}", "done" if kind in {"message", "receipt", "setting", "withdraw"} else "unknown"
+
     def render_threads(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
         if height <= 0 or width <= 0:
             return
         self.render_table_header(y, x, "  STATE / TITLE · PARTICIPANTS", width)
         lines: list[tuple[str, int, int, bool]] = []
+        accents: dict[int, tuple[str, str, str, str]] = {}
         for index, item in enumerate(self.items("threads")):
             chosen = index == self.selections["threads"]
             marker = "▌" if chosen and self.focus == "threads" else "▸" if chosen else " "
-            warning = False
             if item["type"] == "thread":
                 messages = item.get("messages", [])
                 latest = messages[-1] if messages else {}
-                warning = any(message.get("state") == "delivering" for message in messages)
-                state = "⚠ UNCERTAIN" if warning else latest.get("state", "unknown")
+                uncertain = any(message.get("state") == "delivering" for message in messages)
+                state, palette = self.thread_state("delivering" if uncertain else latest.get("state", "unknown"))
+                kind, kind_palette = self.thread_kind(latest.get("kind", "unknown"))
                 body = (latest.get("body") or "").splitlines()
                 title = item.get("subject") or (body[0] if body else "(empty message)")
                 participants = f"{latest.get('sender_label', '—')} → {latest.get('recipient_address', '—')}"
-                metadata = f"{participants} · {latest.get('kind', 'fyi')} · {state}"
+                metadata = f"{kind} · {participants} · {state}"
             elif item["type"] == "direct":
-                state = "DIRECT " + item["acceptance"]
+                state, palette = self.thread_state(item["acceptance"], direct=True)
+                kind, kind_palette = "> direct", "done"
                 title = item.get("subject") or (item.get("body") or "Terminal input").splitlines()[0]
-                metadata = f"user → {self.address(item.get('target'))} · direct · acceptance ≠ native delivery"
+                metadata = f"{kind} · user → {self.address(item.get('target'))} · acceptance ≠ native delivery"
             else:
-                state = "OUTBOX " + item["state"]
+                status, palette = self.thread_state(item["state"])
+                state = "OUTBOX " + status
+                kind, kind_palette = self.outbox_operation(item["kind"])
                 title = item.get("last_error") or item["item_id"]
-                metadata = f"→ {item['target_host']} · {item['kind']} · {item['state']}"
-            attr = (self.state_style("working", selected=True) if warning and chosen else
-                    self.selection_style() if chosen else self.style(3 if warning else 0))
+                metadata = f"{kind} · → {item['target_host']} · {item['state']}"
+            accents[index] = state, palette, kind, kind_palette
+            attr = self.selection_style() if chosen else 0
             lines.append((f"{marker} {state} · {title}", index, attr, True))
             lines.append(("  " + metadata, index, attr | curses.A_DIM, False))
         if not lines:
@@ -1595,7 +1622,44 @@ class MailboxApp:
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height - 1), y + 1):
             self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
+                state, palette, kind, kind_palette = accents[_index]
+                label, tone = (state, palette) if _primary else (kind, kind_palette)
+                self.put(row, x + 2, clip(label, width - 2),
+                         self.state_style(tone, selected=_index == self.selections["threads"]))
+            if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
+
+    def thread_detail(self) -> list[tuple[str, int]]:
+        item = self.detail or {}
+        if item.get("type") == "thread":
+            result = [(f"Thread {item['thread_id']}  {item.get('subject') or ''}", 0)]
+            for message in item["messages"]:
+                state, palette = self.thread_state(message["state"])
+                kind, kind_palette = self.thread_kind(message["kind"])
+                result.extend([
+                    ("", 0), (f"{message['sender_label']} → {message['recipient_address']}", 0),
+                    (f"Kind: {kind}", self.state_style(kind_palette)),
+                    (state + " · " + describe_message(message), self.state_style(palette)),
+                    *((line, 0) for line in self.message_target(message)),
+                    (f"via: {message.get('via') or '—'}", 0),
+                    (f"confirmation source: {message.get('confirmation_source') or '—'}", 0),
+                    (f"evidence: {message.get('evidence') or '—'}", 0), (message["body"], 0)])
+            return result
+        if item.get("type") == "direct":
+            state, palette = self.thread_state(item["acceptance"], direct=True)
+            return [
+                (state, self.state_style(palette)),
+                ("> direct · user terminal input; acceptance ≠ native delivery/handled",
+                 self.state_style("done")),
+                (f"user → {self.address(item.get('target'))}", 0),
+                (json.dumps(item, ensure_ascii=False, indent=2), 0)]
+        if item.get("type") == "outbox":
+            state, palette = self.thread_state(item["state"])
+            kind, kind_palette = self.outbox_operation(item["kind"])
+            return [("OUTBOX " + state, self.state_style(palette)),
+                    ("Transport operation: " + kind, self.state_style(kind_palette)),
+                    (json.dumps(item, ensure_ascii=False, indent=2), 0)]
+        return []
 
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
@@ -1603,15 +1667,8 @@ class MailboxApp:
                     "pending_operations": list(self.jobs), "status": self.status, "last_error": self.last_error,
                     "repo_id": self.repo_id}, ensure_ascii=False, indent=2)]
         item = self.detail or {}
-        if item.get("type") == "thread":
-            result = [f"Thread {item['thread_id']}  {item.get('subject') or ''}"]
-            for message in item["messages"]:
-                result.extend(["", f"{message['sender_label']} → {message['recipient_address']}",
-                               describe_message(message), *self.message_target(message),
-                               f"via: {message.get('via') or '—'}",
-                               f"confirmation source: {message.get('confirmation_source') or '—'}",
-                               f"evidence: {message.get('evidence') or '—'}", message["body"]])
-            return result
+        if item.get("type") in {"thread", "direct", "outbox"}:
+            return [text for text, _attribute in self.thread_detail()]
         if item.get("host") and item.get("terminal_id") and not item.get("type"):
             now = self.wall_clock()
             return [
@@ -1642,12 +1699,15 @@ class MailboxApp:
         self.put(y, x, truncate_display_text("Read-only · viewing does not ACK", width), curses.A_DIM)
         agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
         wrap = wrap_summary if agent and not self.diagnostics else wrap_display_text
-        lines = [part for line in self.detail_lines() for logical in line.split("\n")
+        entries = (self.thread_detail() if not self.diagnostics and (self.detail or {}).get("type")
+                   else [(line, 0) for line in self.detail_lines()])
+        lines = [(part, attribute) for line, attribute in entries for logical in line.split("\n")
                  for part in wrap(logical, max(1, width))]
         available = max(0, height - 1)
         self.scrolls["detail"] = min(self.scrolls["detail"], max(0, len(lines) - available))
-        for row, text in enumerate(lines[self.scrolls["detail"]:self.scrolls["detail"] + available], y + 1):
-            attr = self.style(3, curses.A_BOLD) if "UNCERTAIN" in text or "NOT native ACK" in text else 0
+        for row, (text, attr) in enumerate(lines[self.scrolls["detail"]:self.scrolls["detail"] + available], y + 1):
+            if "UNCERTAIN" in text or "NOT native ACK" in text:
+                attr = self.style(3, curses.A_BOLD)
             self.put(row, x, truncate_display_text(text, width), attr)
             if agent and not self.diagnostics and text.startswith("Turn state: "):
                 self.put(row, x + len("Turn state: "), clip(text[len("Turn state: "):], width - len("Turn state: ")),
@@ -1745,6 +1805,11 @@ class MailboxApp:
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
+                    "Thread states: . queued/pending · > submitting · + accepted/delivered · = handled",
+                    "! failed/undeliverable · - withdrawn · ? UNCERTAIN delivering / unknown",
+                    "Kinds: i fyi (cyan) · ! action (yellow) · > direct (user input, NOT native mail)",
+                    "OUTBOX transport ops (cyan): > message · < receipt · # setting · - withdraw",
+                    "States: yellow waiting/uncertain · green accepted/delivered · cyan handled · red failed",
                     "INPUT: printable characters are text (including q, ?, digits, :, /)",
                     "←→ Home/End Backspace/Delete edit · ↑↓ move between lines",
                     "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",

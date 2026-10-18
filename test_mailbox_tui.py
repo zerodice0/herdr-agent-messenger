@@ -1954,11 +1954,183 @@ class MailboxUiTest(unittest.TestCase):
             snapshot = app.screen.snapshot()
             row = snapshot.rows_containing('first message')[0]
             for selected_row in (row, row + 1):
-                self.assertTrue(all(cell.attribute & 0xff00 == 5 << 8
+                self.assertTrue(all(cell.attribute & 0xff00 in {5 << 8, 6 << 8, 7 << 8}
                                     for cell in snapshot.cells[selected_row]))
                 self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[selected_row]))
             row = snapshot.rows_containing('second message')[0]
-            self.assertFalse(any(cell.attribute & 0xff00 for cell in snapshot.cells[row]))
+            self.assertEqual(snapshot.cells[row][2].attribute & 0xff00, 2 << 8)
+            title_column = snapshot.line(row).index('second message')
+            self.assertFalse(any(cell.attribute & 0xff00 for cell in snapshot.cells[row][title_column:]))
+
+    def test_thread_status_and_kind_accents_preserve_plain_title_and_participants(self):
+        cases = (
+            ('pending', '.', 3), ('queued', '.', 3), ('delivering', '?', 3),
+            ('delivered', '+', 2), ('handled', '=', 1), ('failed', '!', 4),
+            ('undeliverable', '!', 4), ('withdrawn', '-', 0),
+        )
+        for state, glyph, pair in cases:
+            for kind, kind_label, kind_pair in (('fyi', 'i fyi', 1), ('action', '! action', 3)):
+                with self.subTest(state=state, kind=kind), \
+                     patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                    app = self.app()
+                    app.colors_enabled = True
+                    app.local['threads'] = [{
+                        'thread_id': 'styled-thread', 'subject': 'Visible title',
+                        'messages': [{'state': state, 'kind': kind, 'body': 'body',
+                                      'sender_label': 'sender', 'recipient_address': 'host/recipient'}]}]
+                    app.selections['threads'] = 1  # Leave the representative row unselected.
+                    app.screen = Screen(8, 90)
+                    app.render_threads((0, 0, 8, 90))
+                    snapshot = app.screen.snapshot()
+                    label = '? UNCERTAIN delivering' if state == 'delivering' else f'{glyph} {state}'
+                    self.assertIn(label + ' · Visible title', snapshot.line(1))
+                    self.assertIn(kind_label + ' · sender → host/recipient', snapshot.line(2))
+                    self.assertEqual(display_width(glyph), 1)
+                    self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, pair << 8)
+                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, kind_pair << 8)
+                    for row, text in ((1, 'Visible title'), (2, 'sender → host/recipient')):
+                        column = snapshot.line(row).index(text)
+                        self.assertTrue(all(not cell.attribute & curses.A_COLOR
+                                            for cell in snapshot.cells[row][column:column + len(text)]))
+                    self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_thread_uncertainty_is_not_hidden_by_a_later_delivered_message(self):
+        app = self.app()
+        app.local['threads'] = [{
+            'thread_id': 'held', 'messages': [
+                {'state': 'delivering', 'kind': 'action'},
+                {'state': 'delivered', 'kind': 'fyi', 'body': 'Newer message'}]}]
+        app.screen = Screen(8, 90)
+        app.render_threads((0, 0, 8, 90))
+        self.assertIn('? UNCERTAIN delivering · Newer message', app.screen.snapshot().line(1))
+        self.assertIn('i fyi', app.screen.snapshot().line(2))
+        self.assertEqual(app.jobs, {})
+
+    def test_direct_acceptance_and_outbox_are_distinct_from_native_receipts(self):
+        for acceptance, glyph, pair in (('submitting', '>', 3), ('accepted', '+', 2),
+                                        ('unknown', '?', 3), ('failed', '!', 4)):
+            with self.subTest(acceptance=acceptance), \
+                 patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                app = self.app()
+                app.colors_enabled = True
+                app.local['submissions'] = [{
+                    'submission_id': 'direct-evidence', 'acceptance': acceptance,
+                    'body': 'Explicit user input', 'target': self.recipient}]
+                app.local['outbox'] = [
+                    {'item_id': 'pending', 'state': 'pending', 'kind': 'message', 'target_host': 'remote'},
+                    {'item_id': 'failed', 'state': 'failed', 'kind': 'receipt', 'target_host': 'remote',
+                     'last_error': 'Transport rejected'}]
+                app.selections['threads'] = 9
+                app.screen = Screen(10, 100)
+                app.render_threads((0, 0, 10, 100))
+                snapshot = app.screen.snapshot()
+                self.assertIn(f'{glyph} DIRECT {acceptance}', snapshot.line(1))
+                self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, pair << 8)
+                self.assertIn('> direct · user →', snapshot.line(2))
+                self.assertIn('acceptance ≠ native delivery', snapshot.line(2))
+                self.assertIn('OUTBOX . pending', snapshot.line(3))
+                self.assertIn('OUTBOX ! failed · Transport rejected', snapshot.line(5))
+                app.detail = app.items('threads')[0]
+                app.screen = Screen(20, 100)
+                app.render_detail((0, 0, 20, 100))
+                detail = app.screen.snapshot()
+                self.assertIn(f'{glyph} DIRECT {acceptance}', detail.line(1))
+                self.assertIn('user terminal input; acceptance ≠ native delivery/handled', detail.line(2))
+                self.assertEqual(detail.cells[1][1].attribute & curses.A_COLOR, pair << 8)
+                self.assertEqual(app.jobs, {})
+
+    def test_outbox_transport_operations_cover_pending_and_failed_without_inventing_mail_kind(self):
+        for operation, glyph in (('message', '>'), ('receipt', '<'), ('setting', '#'), ('withdraw', '-')):
+            for state, state_glyph, state_pair in (('pending', '.', 3), ('failed', '!', 4)):
+                with self.subTest(operation=operation, state=state), \
+                     patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                    app = self.app()
+                    app.colors_enabled = True
+                    app.local['outbox'] = [{
+                        'item_id': 'transport-operation', 'state': state, 'kind': operation,
+                        'target_host': 'remote', 'last_error': 'Transport rejected' if state == 'failed' else None,
+                        # A message transport payload may carry an action, but its operation
+                        # label must still say message rather than guessing its mail kind.
+                        'payload': {'kind': 'action'} if operation == 'message' else {}}]
+                    app.selections['threads'] = 1
+                    app.screen = Screen(8, 100)
+                    app.render_threads((0, 0, 8, 100))
+                    snapshot = app.screen.snapshot()
+                    self.assertIn(f'OUTBOX {state_glyph} {state}', snapshot.line(1))
+                    self.assertIn(f'{glyph} {operation} · → remote · {state}', snapshot.line(2))
+                    self.assertNotIn('! action', snapshot.line(2))
+                    self.assertNotIn('i fyi', snapshot.line(2))
+                    self.assertNotIn('? ' + operation, snapshot.line(2))
+                    self.assertEqual(display_width(glyph), 1)
+                    self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, state_pair << 8)
+                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, 1 << 8)
+                    if state == 'failed':
+                        self.assertIn('Transport rejected', snapshot.line(1))
+                    app.detail = app.items('threads')[0]
+                    app.screen = Screen(20, 100)
+                    app.render_detail((0, 0, 20, 100))
+                    detail = app.screen.snapshot()
+                    self.assertIn(f'OUTBOX {state_glyph} {state}', detail.line(1))
+                    self.assertIn(f'Transport operation: {glyph} {operation}', detail.line(2))
+                    self.assertEqual(detail.cells[1][1].attribute & curses.A_COLOR, state_pair << 8)
+                    self.assertEqual(detail.cells[2][1].attribute & curses.A_COLOR, 1 << 8)
+                    self.assertEqual(app.jobs, {})
+
+    def test_selected_narrow_thread_rows_keep_suffix_geometry_and_no_color_cues(self):
+        for no_color in (False, True):
+            with self.subTest(no_color=no_color), \
+                 patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8) as pair:
+                app = self.app()
+                app.environment.pop('NO_COLOR', None)
+                if no_color:
+                    app.environment['NO_COLOR'] = '1'
+                    app.initialize_colors()
+                else:
+                    app.colors_enabled = True
+                app.focus = 'threads'
+                app.local['threads'] = [{
+                    'thread_id': 'narrow', 'subject': '한글 title [failed: rejected]',
+                    'messages': [{'state': 'failed', 'kind': 'action', 'body': 'body',
+                                  'sender_label': 'user', 'recipient_address': 'host/recipient'}]}]
+                app.screen = Screen(8, 46)
+                app.render_threads((1, 1, 6, 44))
+                snapshot = app.screen.snapshot()
+                row = snapshot.rows_containing('[failed: rejected]')[0]
+                self.assertIn('! failed · 한글 title [failed: rejected]', snapshot.line(row))
+                self.assertIn('! action · user → host/recipient', snapshot.line(row + 1))
+                self.assertEqual(app.hit_map, [
+                    ((row, 1, 1, 44), 'list-row', 0), ((row + 1, 1, 1, 44), 'list-row', 0)])
+                for selected_row in (row, row + 1):
+                    for cell in snapshot.cells[selected_row][1:45]:
+                        if no_color:
+                            self.assertTrue(cell.attribute & curses.A_REVERSE)
+                            self.assertFalse(cell.attribute & curses.A_COLOR)
+                        else:
+                            self.assertIn(cell.attribute & curses.A_COLOR, {5 << 8, 8 << 8, 9 << 8})
+                            self.assertFalse(cell.attribute & curses.A_REVERSE)
+                if no_color:
+                    pair.assert_not_called()
+                self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_thread_detail_state_kind_and_operator_evidence_keep_their_meaning(self):
+        app = self.app()
+        message = {'state': 'delivered', 'kind': 'action', 'body': 'Body remains plain',
+                   'message_id': 'evidence', 'sender_label': 'user', 'recipient_address': 'host/recipient',
+                   'confirmation_source': 'operator', 'evidence': 'Checked old claim'}
+        app.detail = {'type': 'thread', 'thread_id': 'evidence', 'messages': [message]}
+        app.colors_enabled = True
+        with patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+            app.screen = Screen(30, 110)
+            app.render_detail((0, 0, 30, 110))
+        snapshot = app.screen.snapshot()
+        kind_row = snapshot.rows_containing('Kind: ! action')[0]
+        self.assertEqual(snapshot.cells[kind_row][1].attribute & curses.A_COLOR, 3 << 8)
+        status_row = snapshot.rows_containing('+ delivered · action delivered')[0]
+        self.assertEqual(snapshot.cells[status_row][1].attribute & curses.A_COLOR, 3 << 8)
+        self.assertIn('NOT native ACK', '\n'.join(snapshot.lines()))
+        body_row = snapshot.rows_containing('Body remains plain')[0]
+        self.assertFalse(snapshot.cells[body_row][1].attribute & curses.A_COLOR)
+        self.assertEqual(app.jobs, {})
 
     def test_detail_and_empty_list_content_have_one_column_left_padding(self):
         app = self.app()

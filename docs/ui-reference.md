@@ -104,12 +104,38 @@ snapshot marked stale; it is not treated as closed.
 
 Threads uses the same **full-width bold column header with underlined words**
 and **full-width selected-row background** (reverse video without color).
+Only the state and kind labels use foreground colors; titles and participants
+retain their normal foreground, including on the selected row. Each entry keeps
+two lines and the same full-width mouse targets.
+
+| Threads cue | Meaning / color |
+| --- | --- |
+| `. pending`, `. queued` | Waiting, yellow |
+| `> submitting` | Direct submission in progress, yellow |
+| `? UNCERTAIN delivering` | Unresolved native claim, yellow; not a delivered receipt |
+| `+ delivered`, `+ DIRECT accepted` | Recorded native delivery / separate direct acceptance, green |
+| `= handled` | Recorded handled state, cyan |
+| `! failed`, `! undeliverable` | Failure, red |
+| `- withdrawn` | Withdrawn, dim |
+| `? DIRECT unknown` | Uncertain direct acceptance, yellow |
+| `i fyi`, `! action` | Mail kind, cyan / yellow |
+| `> direct` | User terminal-input evidence, cyan; **not native mail** |
+| `> message`, `< receipt`, `# setting`, `- withdraw` | OUTBOX transport operation, cyan; not an FYI/action mail kind |
+
+These compact cue glyphs are single-cell ASCII and always retain a text label.
+States appear only from recorded row data, never from viewing or selecting a row.
+If any message in a thread has an unresolved `delivering` claim, the thread keeps
+its uncertainty warning even when a later message has another state. OUTBOX
+retains its prefix, target and error. Its operation label does not infer the
+payload's mail kind. Detail repeats state/kind/transport cues and preserves
+operator-vs-native evidence; direct acceptance never means native delivered or
+handled. The `?` help overlay includes this legend.
 
 State colors are redundant cues: **working is yellow**, **idle green**,
 **done cyan**, and **blocked red**; **unknown/stale states are dim**.
 Glyphs and words remain visible (`● working`, `○ idle`, `✓ done`, `! blocked`,
-`? unknown`, `~ stale`). A nonempty `NO_COLOR` disables color but preserves
-glyphs, words, bold, underline, dim and reverse-video selection.
+`? unknown`, `~ stale`). The presence of `NO_COLOR` (even an empty value) disables
+color but preserves glyphs, words, bold, underline, dim and reverse-video selection.
 
 Detail and other plain-text panels leave one column of inner padding on the left.
 
@@ -206,7 +232,7 @@ releases exactly that claim and does not itself resend anything.
 The TUI checks the local board bell once per second and queries peers every
 30 seconds in bounded child processes outside the keyboard loop. Closing stops
 only its own workers; these checks do not create model turns. Display-cell-aware
-text helpers support Korean input, clipping and resizing. Nonempty `NO_COLOR`
+text helpers support Korean input, clipping and resizing. The presence of `NO_COLOR`
 disables colors without removing labels or other non-color state cues.
 
 ### Role, phase and border ownership
