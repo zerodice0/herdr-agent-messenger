@@ -104,9 +104,11 @@ snapshot marked stale; it is not treated as closed.
 
 Threads uses the same **full-width bold column header with underlined words**
 and **full-width selected-row background** (reverse video without color).
-Only the state and kind labels use foreground colors; titles and participants
-retain their normal foreground, including on the selected row. Each entry keeps
-two lines and the same full-width mouse targets.
+Unselected state, kind and transport-operation labels use semantic foreground
+colors; titles and participants retain their normal foreground. On the pale
+selected-row background, labels instead use the high-contrast selection
+foreground and bold, preserving every glyph and word. Each entry keeps two
+lines and the same full-width mouse targets.
 
 | Threads cue | Meaning / color |
 | --- | --- |

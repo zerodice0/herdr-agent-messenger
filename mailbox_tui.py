@@ -1624,8 +1624,10 @@ class MailboxApp:
             if _index >= 0:
                 state, palette, kind, kind_palette = accents[_index]
                 label, tone = (state, palette) if _primary else (kind, kind_palette)
-                self.put(row, x + 2, clip(label, width - 2),
-                         self.state_style(tone, selected=_index == self.selections["threads"]))
+                chosen = _index == self.selections["threads"]
+                label_style = (self.selection_style() | curses.A_BOLD if chosen and self.colors_enabled
+                               else self.state_style(tone, selected=chosen))
+                self.put(row, x + 2, clip(label, width - 2), label_style)
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 

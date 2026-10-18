@@ -1954,13 +1954,57 @@ class MailboxUiTest(unittest.TestCase):
             snapshot = app.screen.snapshot()
             row = snapshot.rows_containing('first message')[0]
             for selected_row in (row, row + 1):
-                self.assertTrue(all(cell.attribute & 0xff00 in {5 << 8, 6 << 8, 7 << 8}
+                self.assertTrue(all(cell.attribute & 0xff00 == 5 << 8
                                     for cell in snapshot.cells[selected_row]))
                 self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[selected_row]))
             row = snapshot.rows_containing('second message')[0]
             self.assertEqual(snapshot.cells[row][2].attribute & 0xff00, 2 << 8)
             title_column = snapshot.line(row).index('second message')
             self.assertFalse(any(cell.attribute & 0xff00 for cell in snapshot.cells[row][title_column:]))
+
+    def test_selected_thread_state_kind_and_operation_labels_use_contrasting_bold_foreground(self):
+        cases = [
+            ({'thread_id': state, 'subject': 'Legible title',
+              'messages': [{'state': state, 'kind': kind, 'body': 'Body',
+                            'sender_label': 'user', 'recipient_address': 'host/worker'}]},
+             f'{glyph} {state}', kind_label)
+            for state, glyph, kind, kind_label in (
+                ('queued', '.', 'action', '! action'),
+                ('delivered', '+', 'fyi', 'i fyi'),
+                ('handled', '=', 'action', '! action'),
+                ('failed', '!', 'fyi', 'i fyi'))]
+        cases.extend([
+            ({'submission_id': 'direct', 'acceptance': 'accepted', 'body': 'Legible title',
+              'target': self.recipient}, '+ DIRECT accepted', '> direct'),
+            ({'item_id': 'outbox', 'state': 'pending', 'kind': 'setting', 'target_host': 'remote'},
+             'OUTBOX . pending', '# setting'),
+            ({'item_id': 'outbox', 'state': 'failed', 'kind': 'receipt', 'target_host': 'remote',
+              'last_error': 'Legible title'}, 'OUTBOX ! failed', '< receipt'),
+        ])
+        for item, state_label, kind_label in cases:
+            with self.subTest(state=state_label, kind=kind_label), \
+                 patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                app = self.app()
+                app.colors_enabled = True
+                collection = ('threads' if 'thread_id' in item else
+                              'submissions' if 'submission_id' in item else 'outbox')
+                app.local[collection] = [item]
+                app.focus = 'threads'
+                app.screen = Screen(8, 100)
+                app.render_threads((0, 0, 8, 100))
+                snapshot = app.screen.snapshot()
+                for row, label in ((1, state_label), (2, kind_label)):
+                    self.assertIn(label, snapshot.line(row))
+                    start = snapshot.line(row).index(label)
+                    label_cells = snapshot.cells[row][start:start + len(label)]
+                    self.assertTrue(all(cell.attribute & curses.A_BOLD for cell in label_cells))
+                    self.assertTrue(all(not cell.attribute & curses.A_DIM for cell in label_cells))
+                    self.assertTrue(all(cell.attribute & curses.A_COLOR == 5 << 8
+                                        for cell in snapshot.cells[row]))
+                    self.assertFalse(any(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[row]))
+                self.assertEqual(app.hit_map, [
+                    ((1, 0, 1, 100), 'list-row', 0), ((2, 0, 1, 100), 'list-row', 0)])
+                self.assertEqual(app.screen.out_of_bounds, [])
 
     def test_thread_status_and_kind_accents_preserve_plain_title_and_participants(self):
         cases = (
@@ -2106,7 +2150,7 @@ class MailboxUiTest(unittest.TestCase):
                             self.assertTrue(cell.attribute & curses.A_REVERSE)
                             self.assertFalse(cell.attribute & curses.A_COLOR)
                         else:
-                            self.assertIn(cell.attribute & curses.A_COLOR, {5 << 8, 8 << 8, 9 << 8})
+                            self.assertEqual(cell.attribute & curses.A_COLOR, 5 << 8)
                             self.assertFalse(cell.attribute & curses.A_REVERSE)
                 if no_color:
                     pair.assert_not_called()
