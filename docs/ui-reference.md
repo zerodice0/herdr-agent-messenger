@@ -27,8 +27,9 @@ on the right.** Wider terminals no longer put all three regions side by side.
 
 - **Stacked:** at least 80 columns and 18 available body rows. Agents and Threads
   share the top row in left/right halves; Detail spans the full width below.
-  The top takes about 55% of the body, with at least 10 rows for the top panels
-  and at least 8 rows for Detail.
+  Detail's outer height is roughly one quarter of the usable body, clamped
+  to 8–12 rows; the top panels receive the remaining rows
+  (at least 10). Detail content remains fully scrollable.
 - Available body height excludes the global header, footer, any status line,
   and the INPUT panel. INPUT stays full width below Detail and above the
   status/footer area; opening or growing it can force single-region mode.
@@ -41,9 +42,9 @@ on the right.** Wider terminals no longer put all three regions side by side.
 ```text
 Stacked (width >= 80; available body height >= 18)
 +-------------------------+-------------------------+
-| Agents                  | Threads                 | top ~55%, min 10 rows
+| Agents                  | Threads                 | remaining rows, min 10
 +-------------------------+-------------------------+
-| Detail                                            | min 8 rows
+| Detail                                            | body / 4, clamped 8–12
 +---------------------------------------------------+
 | INPUT (when open; full width, outside body height)  |
 +---------------------------------------------------+
@@ -55,6 +56,11 @@ Single (width < 80 or available body height < 18)
 | INPUT (when open; full width, outside body height)  |
 +---------------------------------------------------+
 ```
+
+For example, without INPUT or a status line, a 200×50 terminal has 48 usable
+body rows: Agents/Threads occupy rows 1–36 and Detail rows 37–48 (12 outer rows).
+At 110×35, Agents/Threads occupy rows 1–25 and Detail rows 26–33 (8 outer rows).
+Coordinates are zero-based; panel borders count toward these heights.
 
 The header names the current mode (`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`,
 or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
@@ -109,6 +115,26 @@ colors; titles and participants retain their normal foreground. On the pale
 selected-row background, labels instead use the high-contrast selection
 foreground and bold, preserving every glyph and word. Each entry keeps two
 lines and the same full-width mouse targets.
+
+Threads is **one list and one scrollport**, with counted `Active (N)` and
+`Handled (N)` group rules. Active/needs-attention entries come first; a blank
+visual row separates the lower Handled section. Empty groups add neither a
+heading nor padding. Each group preserves its existing updated/recent order.
+Handled rows are dimmer unless selected; selection always restores full contrast.
+Headers and blank rows cannot be selected or activated. Arrows, paging and
+the wheel move between entries across the divider, and clicks target the exact
+entry even if a refresh has reordered the list.
+
+Only a nonempty native thread whose **every retained message is `handled`**
+belongs in Handled, with no unresolved claim/audit remaining. A newer handled
+message cannot hide earlier queued, delivered-but-unhandled, uncertain,
+failed or undeliverable mail. A new reply returns the thread to Active without
+changing its identity or losing selection. Withdrawn mail remains Active
+conservatively: withdrawal is final transport cancellation, not human handling.
+Direct submissions and displayed pending/failed OUTBOX operations always remain
+Active; acceptance, transport success and operator evidence are not handling.
+Unresolved claims follow the recorded `delivering` state, not the mere presence
+of claim IDs or evidence: those audit fields remain after explicit handling.
 
 | Threads cue | Meaning / color |
 | --- | --- |

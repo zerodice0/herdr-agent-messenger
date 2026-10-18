@@ -1365,9 +1365,10 @@ class MailboxUiTest(unittest.TestCase):
             'agents': (3, 0, 10, 40),
             'threads': (3, 40, 10, 41),
             'detail': (13, 0, 8, 81)})
+        self.assertEqual(app.region_rects(1, 80, 200)['detail'], (69, 0, 12, 200))
 
     def test_stacked_top_bottom_geometry_at_large_terminal_sizes(self):
-        for height, width, top_height in ((40, 120, 21), (50, 200, 26)):
+        for height, width, top_height in ((35, 110, 25), (40, 120, 28), (50, 200, 36)):
             with self.subTest(height=height, width=width):
                 app = self.app()
                 self.capture(app, height, width)
@@ -1993,7 +1994,7 @@ class MailboxUiTest(unittest.TestCase):
                 app.screen = Screen(8, 100)
                 app.render_threads((0, 0, 8, 100))
                 snapshot = app.screen.snapshot()
-                for row, label in ((1, state_label), (2, kind_label)):
+                for row, label in ((2, state_label), (3, kind_label)):
                     self.assertIn(label, snapshot.line(row))
                     start = snapshot.line(row).index(label)
                     label_cells = snapshot.cells[row][start:start + len(label)]
@@ -2002,8 +2003,10 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertTrue(all(cell.attribute & curses.A_COLOR == 5 << 8
                                         for cell in snapshot.cells[row]))
                     self.assertFalse(any(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[row]))
+                identity = app.identity(app.items('threads')[0])
                 self.assertEqual(app.hit_map, [
-                    ((1, 0, 1, 100), 'list-row', 0), ((2, 0, 1, 100), 'list-row', 0)])
+                    ((2, 0, 1, 100), 'list-row', identity),
+                    ((3, 0, 1, 100), 'list-row', identity)])
                 self.assertEqual(app.screen.out_of_bounds, [])
 
     def test_thread_status_and_kind_accents_preserve_plain_title_and_participants(self):
@@ -2027,16 +2030,266 @@ class MailboxUiTest(unittest.TestCase):
                     app.render_threads((0, 0, 8, 90))
                     snapshot = app.screen.snapshot()
                     label = '? UNCERTAIN delivering' if state == 'delivering' else f'{glyph} {state}'
-                    self.assertIn(label + ' · Visible title', snapshot.line(1))
-                    self.assertIn(kind_label + ' · sender → host/recipient', snapshot.line(2))
+                    self.assertIn(label + ' · Visible title', snapshot.line(2))
+                    self.assertIn(kind_label + ' · sender → host/recipient', snapshot.line(3))
                     self.assertEqual(display_width(glyph), 1)
-                    self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, pair << 8)
-                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, kind_pair << 8)
-                    for row, text in ((1, 'Visible title'), (2, 'sender → host/recipient')):
+                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, pair << 8)
+                    self.assertEqual(snapshot.cells[3][2].attribute & curses.A_COLOR, kind_pair << 8)
+                    for row, text in ((2, 'Visible title'), (3, 'sender → host/recipient')):
                         column = snapshot.line(row).index(text)
                         self.assertTrue(all(not cell.attribute & curses.A_COLOR
                                             for cell in snapshot.cells[row][column:column + len(text)]))
                     self.assertEqual(app.screen.out_of_bounds, [])
+
+    def thread_fixture(self, identity, *states):
+        return {'thread_id': identity, 'subject': identity, 'messages': [
+            {'message_id': f'{identity}-{index}', 'state': state, 'kind': 'fyi',
+             'body': f'{identity} body {index}', 'sender_label': 'user',
+             'recipient_address': self.recipient['host'] + '/blue-owl',
+             'recipient_host': self.recipient['host'],
+             'recipient_terminal_id': self.recipient['terminal_id']}
+            for index, state in enumerate(states)]}
+
+    def test_thread_groups_stably_partition_all_handled_below_active_and_transport(self):
+        app = self.app()
+        app.local['threads'] = [
+            self.thread_fixture('handled-recent', 'handled', 'handled'),
+            self.thread_fixture('active-recent', 'queued'),
+            self.thread_fixture('handled-older', 'handled'),
+            self.thread_fixture('active-older', 'delivered')]
+        app.local['submissions'] = [
+            {'submission_id': 'direct', 'acceptance': 'accepted', 'body': 'Direct input',
+             'target': self.recipient}]
+        app.local['outbox'] = [
+            {'item_id': 'transport', 'state': 'pending', 'kind': 'receipt', 'target_host': 'remote'}]
+        self.assertEqual([app.identity(item) for item in app.items('threads')], [
+            ('thread', 'active-recent'), ('thread', 'active-older'), ('direct', 'direct'),
+            ('outbox', 'transport'), ('thread', 'handled-recent'), ('thread', 'handled-older')])
+        app.screen = Screen(22, 100)
+        app.render_threads((0, 0, 22, 100))
+        snapshot = app.screen.snapshot()
+        self.assertIn('─ Active (4) ', snapshot.line(1))
+        handled_header = snapshot.rows_containing('─ Handled (2) ')[0]
+        self.assertEqual(snapshot.line(handled_header - 1).strip(), '')
+        self.assertLess(snapshot.rows_containing('active-older')[0], handled_header)
+        self.assertGreater(snapshot.rows_containing('handled-recent')[0], handled_header)
+        for row in (handled_header - 1, handled_header):
+            self.assertFalse(any(rect[0] == row for rect, target, _ in app.hit_map
+                                 if target == 'list-row'))
+
+    def test_latest_handled_cannot_hide_any_earlier_unfinished_state(self):
+        for state in ('pending', 'queued', 'delivering', 'delivered',
+                      'undeliverable', 'withdrawn'):
+            with self.subTest(state=state):
+                app = self.app()
+                app.local['threads'] = [
+                    self.thread_fixture('complete', 'handled'),
+                    self.thread_fixture('unfinished', state, 'handled')]
+                first, last = app.items('threads')
+                self.assertEqual(first['thread_id'], 'unfinished')
+                self.assertFalse(app.thread_handled(first))
+                self.assertTrue(app.thread_handled(last))
+                app.screen = Screen(12, 100)
+                app.render_threads((0, 0, 12, 100))
+                row = app.screen.snapshot().rows_containing(' · unfinished')[0]
+                expected, _ = app.thread_state(state)
+                self.assertIn(expected, app.screen.snapshot().line(row))
+        app.local['threads'] = [self.thread_fixture('empty')]
+        self.assertFalse(app.thread_handled(app.items('threads')[0]))
+        app.local['threads'] = [{'thread_id': 'missing-state', 'messages': [{}]}]
+        self.assertFalse(app.thread_handled(app.items('threads')[0]))
+
+    def test_claim_audit_evidence_does_not_invent_or_prevent_explicit_handling(self):
+        sent = self.mail.send_user(self.repo_id, self.recipient, body='Audited message')
+        claim = self.mail.claim(terminal_id='term-b', agent_id=self.recipient['agent_id'],
+                                generation=self.recipient['generation'])
+        target = {key: claim[key] for key in ('claim_id', 'agent_id', 'generation')}
+        self.mail.release(**target, disposition='unknown', evidence='Delivery outcome unknown')
+        newer = self.mail.send_user(self.repo_id, self.recipient, body='Later handled reply',
+                                    reply_to=sent['message_id'])
+        self.mail.handle(self.recipient, [newer['message_id']])
+        app = self.app()
+        unresolved = app.items('threads')[0]
+        self.assertEqual(unresolved['messages'][0]['state'], 'delivering')
+        self.assertTrue(unresolved['messages'][0]['evidence'])
+        self.assertFalse(app.thread_handled(unresolved))
+        self.assertEqual(unresolved['messages'][-1]['state'], 'handled')
+        app.screen = Screen(12, 100)
+        app.render_threads((0, 0, 12, 100))
+        self.assertIn('? UNCERTAIN delivering', app.screen.snapshot().line(2))
+        self.mail.resolve_claim(**target, disposition='applied', evidence='Inspected old context')
+        app.local = local_snapshot(self.store, self.repo_id)
+        delivered = app.items('threads')[0]
+        self.assertEqual(delivered['messages'][0]['confirmation_source'], 'operator')
+        self.assertEqual(delivered['messages'][0]['state'], 'delivered')
+        self.assertFalse(app.thread_handled(delivered))
+        self.mail.handle(self.recipient, [sent['message_id']])
+        app.local = local_snapshot(self.store, self.repo_id)
+        handled = app.items('threads')[0]
+        self.assertEqual(handled['messages'][0]['claim_id'], claim['claim_id'])
+        self.assertEqual(handled['messages'][0]['confirmation_source'], 'operator')
+        self.assertTrue(handled['messages'][0]['evidence'])
+        self.assertTrue(app.thread_handled(handled))
+        self.capture(app, 35, 110)
+        self.assertIn('Handled (1)', '\n'.join(app.screen.snapshot().lines()))
+
+    def test_thread_empty_groups_have_no_padding_and_completed_selection_is_not_dim(self):
+        for states, heading, absent in (([], None, None),
+                                       (['queued'], 'Active (1)', 'Handled ('),
+                                       (['handled'], 'Handled (1)', 'Active (')):
+            for selected in (False, True):
+                for colors in (False, True):
+                    with self.subTest(states=states, selected=selected, colors=colors), \
+                         patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                        app = self.app()
+                        app.colors_enabled = colors
+                        app.local['threads'] = [self.thread_fixture('entry', *states)] if states else []
+                        app.selections['threads'] = 0 if selected else 9
+                        app.screen = Screen(8, 100)
+                        app.render_threads((0, 0, 8, 100))
+                        snapshot = app.screen.snapshot()
+                        text = '\n'.join(snapshot.lines())
+                        if heading is None:
+                            self.assertIn('No threads.', text)
+                            self.assertNotIn('Active (', text)
+                            self.assertNotIn('Handled (', text)
+                            continue
+                        self.assertIn(heading, snapshot.line(1))
+                        self.assertNotIn(absent, text)
+                        self.assertIn(' · entry', snapshot.line(2))
+                        if states == ['handled']:
+                            for row in (2, 3):
+                                self.assertTrue(all(bool(cell.attribute & curses.A_DIM) == (not selected)
+                                                    for cell in snapshot.cells[row]))
+                                if selected:
+                                    self.assertTrue(snapshot.cells[row][2].attribute & curses.A_BOLD)
+                                    if colors:
+                                        self.assertTrue(all(cell.attribute & curses.A_COLOR == 5 << 8
+                                                            for cell in snapshot.cells[row]))
+
+    def test_new_reply_returns_selected_handled_thread_to_active_and_actions_keep_identity(self):
+        handled = self.mail.send_user(self.repo_id, self.recipient, body='Handled original')
+        self.mail.handle(self.recipient, [handled['message_id']])
+        other = self.mail.send_user(self.repo_id, self.recipient, body='Other active')
+        app = self.app()
+        app.focus = app.preview = 'threads'
+        app.selections['threads'] = 1
+        self.capture(app, 35, 110)
+        self.assertEqual(app.identity(app.selected()), ('thread', handled['thread_id']))
+        reply = self.mail.send_user(self.repo_id, self.recipient, body='New reply',
+                                    reply_to=handled['message_id'])
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = local_snapshot(self.store, self.repo_id)
+        app.tick()
+        self.assertEqual(app.selections['threads'], 0)
+        self.assertEqual(app.identity(app.selected()), ('thread', handled['thread_id']))
+        self.assertEqual(app.detail['thread_id'], handled['thread_id'])
+        self.assertEqual(app.items('threads')[1]['thread_id'], other['thread_id'])
+        self.assertFalse(app.thread_handled(app.selected()))
+        app.key('\r')
+        self.assertEqual(app.reply_to, reply['message_id'])
+        app.key(ESCAPE)
+        app.key('w')
+        self.assertEqual(app.confirm['values']['message_id'], reply['message_id'])
+
+    def test_group_headers_and_blank_rows_are_not_actions_and_navigation_reaches_lower_group(self):
+        app = self.app()
+        app.local['threads'] = ([self.thread_fixture(f'active-{index}', 'queued') for index in range(2)] +
+                                [self.thread_fixture(f'handled-{index}', 'handled') for index in range(12)])
+        app.focus = app.preview = 'threads'
+        snapshot = self.capture(app, 35, 110)
+        header_row = snapshot.rows_containing('─ Handled (12) ')[0]
+        thread_rect = next(rect for rect, target, value in app.hit_map
+                           if target == 'region' and value == 'threads')
+        for row in (header_row - 1, header_row, snapshot.rows_containing('─ Active (2) ')[0]):
+            app.key(MouseEvent(row, thread_rect[1] + 3, 'press'))
+            self.assertEqual((app.selections['threads'], app.mode), (0, 'nav'))
+        app.key(curses.KEY_DOWN)
+        self.assertEqual(app.selected()['thread_id'], 'active-1')
+        app.key(curses.KEY_DOWN)
+        self.assertEqual(app.selected()['thread_id'], 'handled-0')
+        app.key(curses.KEY_UP)
+        self.assertEqual(app.selected()['thread_id'], 'active-1')
+        self.capture(app, 35, 110)
+        app.key(MouseEvent(header_row, thread_rect[1] + 3, 'wheel_down'))
+        self.assertEqual(app.selected()['thread_id'], 'handled-2')
+        self.capture(app, 35, 110)
+        app.key(MouseEvent(header_row, thread_rect[1] + 3, 'wheel_up'))
+        self.assertEqual(app.selected()['thread_id'], 'active-1')
+        self.capture(app, 35, 110)
+        visible = {value for _, target, value in app.hit_map
+                   if target == 'list-row' and isinstance(value, tuple)}
+        app.key(curses.KEY_NPAGE)
+        self.assertEqual(app.selections['threads'], len(visible))
+        self.capture(app, 35, 110)
+        app.key(curses.KEY_END)
+        snapshot = self.capture(app, 35, 110)
+        self.assertEqual(app.selected()['thread_id'], 'handled-11')
+        self.assertGreater(app.scrolls['threads'], 0)
+        self.assertIn(' · handled-11', '\n'.join(snapshot.lines()))
+        self.assertEqual(sum(target == 'region' and value == 'threads'
+                             for _, target, value in app.hit_map), 1)
+        app.key(curses.KEY_PPAGE)
+        self.assertLess(app.selections['threads'], 13)
+        app.key(curses.KEY_HOME)
+        snapshot = self.capture(app, 35, 110)
+        self.assertEqual(app.selected()['thread_id'], 'active-0')
+        self.assertIn('Active (2)', '\n'.join(snapshot.lines()))
+
+    def test_clicks_use_rendered_thread_identity_after_snapshot_regroups_or_removes_item(self):
+        app = self.app()
+        app.local['threads'] = [self.thread_fixture('active', 'queued'),
+                                self.thread_fixture('completed', 'handled')]
+        app.focus = app.preview = 'threads'
+        self.capture(app, 35, 110)
+        rect = next(rect for rect, target, value in app.hit_map
+                    if target == 'list-row' and value == ('thread', 'completed'))
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {
+            **app.local, 'threads': [self.thread_fixture('completed', 'handled', 'queued'),
+                                     self.thread_fixture('active', 'queued')]}
+        app.tick()
+        self.assertEqual(app.selected()['thread_id'], 'active')
+        app.key(MouseEvent(rect[0], rect[1], 'press'))
+        self.assertEqual((app.selected()['thread_id'], app.mode), ('completed', 'nav'))
+        app.key(MouseEvent(rect[0], rect[1], 'press'))
+        self.assertEqual((app.mode, app.reply_to), ('input', 'completed-1'))
+        app.key(ESCAPE)
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {**app.local, 'threads': [self.thread_fixture('active', 'queued')]}
+        app.tick()
+        app.key(MouseEvent(rect[0], rect[1], 'press'))
+        self.assertEqual((app.selected()['thread_id'], app.mode), ('active', 'nav'))
+
+    def test_compact_detail_scrolls_full_history_and_long_input_keeps_cursor_in_bounds(self):
+        for height, width in ((50, 200), (35, 110)):
+            with self.subTest(height=height, width=width):
+                sent = self.mail.send_user(self.repo_id, self.recipient,
+                                           body='\n'.join(f'History line {index}' for index in range(50)) +
+                                                '\nHISTORY-END')
+                app = self.app()
+                app.focus = app.preview = 'threads'
+                app.selections['threads'] = next(index for index, item in enumerate(app.items('threads'))
+                                                  if item['thread_id'] == sent['thread_id'])
+                app.key('\t')
+                self.capture(app, height, width)
+                app.key(curses.KEY_END)
+                snapshot = self.capture(app, height, width)
+                self.assertIn('HISTORY-END', '\n'.join(snapshot.lines()))
+                self.assertGreater(app.scrolls['detail'], 0)
+                app.open_input({**self.recipient, 'extension_present': True})
+                self.type_text(app, '\n'.join(f'Input line {index}' for index in range(40)) + '\nINPUT-END')
+                snapshot = self.capture(app, height, width)
+                self.assertIn('INPUT-END', '\n'.join(snapshot.lines()))
+                row, column = app.cursor_position
+                self.assertTrue(0 < row < height - 1)
+                self.assertTrue(0 < column < width - 1)
+                self.assertEqual(app.body_cursor, len(app.body))
+                input_hit = next(rect for rect, target, _ in app.hit_map if target == 'input')
+                self.assertTrue(input_hit[0] < row < input_hit[0] + input_hit[2] - 1)
+                detail = next(rect for rect, target, value in app.hit_map
+                              if target == 'region' and value == 'detail')
+                self.assertTrue(8 <= detail[2] <= 12)
 
     def test_thread_uncertainty_is_not_hidden_by_a_later_delivered_message(self):
         app = self.app()
@@ -2046,8 +2299,8 @@ class MailboxUiTest(unittest.TestCase):
                 {'state': 'delivered', 'kind': 'fyi', 'body': 'Newer message'}]}]
         app.screen = Screen(8, 90)
         app.render_threads((0, 0, 8, 90))
-        self.assertIn('? UNCERTAIN delivering · Newer message', app.screen.snapshot().line(1))
-        self.assertIn('i fyi', app.screen.snapshot().line(2))
+        self.assertIn('? UNCERTAIN delivering · Newer message', app.screen.snapshot().line(2))
+        self.assertIn('i fyi', app.screen.snapshot().line(3))
         self.assertEqual(app.jobs, {})
 
     def test_direct_acceptance_and_outbox_are_distinct_from_native_receipts(self):
@@ -2068,12 +2321,12 @@ class MailboxUiTest(unittest.TestCase):
                 app.screen = Screen(10, 100)
                 app.render_threads((0, 0, 10, 100))
                 snapshot = app.screen.snapshot()
-                self.assertIn(f'{glyph} DIRECT {acceptance}', snapshot.line(1))
-                self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, pair << 8)
-                self.assertIn('> direct · user →', snapshot.line(2))
-                self.assertIn('acceptance ≠ native delivery', snapshot.line(2))
-                self.assertIn('OUTBOX . pending', snapshot.line(3))
-                self.assertIn('OUTBOX ! failed · Transport rejected', snapshot.line(5))
+                self.assertIn(f'{glyph} DIRECT {acceptance}', snapshot.line(2))
+                self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, pair << 8)
+                self.assertIn('> direct · user →', snapshot.line(3))
+                self.assertIn('acceptance ≠ native delivery', snapshot.line(3))
+                self.assertIn('OUTBOX . pending', snapshot.line(4))
+                self.assertIn('OUTBOX ! failed · Transport rejected', snapshot.line(6))
                 app.detail = app.items('threads')[0]
                 app.screen = Screen(20, 100)
                 app.render_detail((0, 0, 20, 100))
@@ -2100,16 +2353,16 @@ class MailboxUiTest(unittest.TestCase):
                     app.screen = Screen(8, 100)
                     app.render_threads((0, 0, 8, 100))
                     snapshot = app.screen.snapshot()
-                    self.assertIn(f'OUTBOX {state_glyph} {state}', snapshot.line(1))
-                    self.assertIn(f'{glyph} {operation} · → remote · {state}', snapshot.line(2))
-                    self.assertNotIn('! action', snapshot.line(2))
-                    self.assertNotIn('i fyi', snapshot.line(2))
-                    self.assertNotIn('? ' + operation, snapshot.line(2))
+                    self.assertIn(f'OUTBOX {state_glyph} {state}', snapshot.line(2))
+                    self.assertIn(f'{glyph} {operation} · → remote · {state}', snapshot.line(3))
+                    self.assertNotIn('! action', snapshot.line(3))
+                    self.assertNotIn('i fyi', snapshot.line(3))
+                    self.assertNotIn('? ' + operation, snapshot.line(3))
                     self.assertEqual(display_width(glyph), 1)
-                    self.assertEqual(snapshot.cells[1][2].attribute & curses.A_COLOR, state_pair << 8)
-                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, 1 << 8)
+                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, state_pair << 8)
+                    self.assertEqual(snapshot.cells[3][2].attribute & curses.A_COLOR, 1 << 8)
                     if state == 'failed':
-                        self.assertIn('Transport rejected', snapshot.line(1))
+                        self.assertIn('Transport rejected', snapshot.line(2))
                     app.detail = app.items('threads')[0]
                     app.screen = Screen(20, 100)
                     app.render_detail((0, 0, 20, 100))
@@ -2143,7 +2396,8 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertIn('! failed · 한글 title [failed: rejected]', snapshot.line(row))
                 self.assertIn('! action · user → host/recipient', snapshot.line(row + 1))
                 self.assertEqual(app.hit_map, [
-                    ((row, 1, 1, 44), 'list-row', 0), ((row + 1, 1, 1, 44), 'list-row', 0)])
+                    ((row, 1, 1, 44), 'list-row', ('thread', 'narrow')),
+                    ((row + 1, 1, 1, 44), 'list-row', ('thread', 'narrow'))])
                 for selected_row in (row, row + 1):
                     for cell in snapshot.cells[selected_row][1:45]:
                         if no_color:

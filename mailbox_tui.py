@@ -542,14 +542,32 @@ class MailboxApp:
         return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
                       key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
 
+    @staticmethod
+    def thread_handled(item: Mapping[str, Any]) -> bool:
+        """Only explicit native handling completes every retained message.
+
+        Delivering is the unresolved-claim truth used by resolve/_claim_rows;
+        claim IDs and operator/native evidence survive successful handling.
+        Withdrawn is terminal cancellation, not handled. Direct/outbox transport
+        records cannot establish human handling either.
+        """
+        messages = item.get("messages", [])
+        return (item.get("type") == "thread" and bool(messages) and
+                all(message.get("state") == "handled" for message in messages))
+
     def items(self, region: str | None = None) -> list[Any]:
         region = region or (self.preview if self.focus == "detail" else self.focus)
         if region == "agents":
             return self.agents()
-        return ([{"type": "thread", **item} for item in self.local.get("threads", [])] +
-                [{"type": "direct", **item} for item in self.local.get("submissions", [])] +
-                [{"type": "outbox", **item} for item in self.local.get("outbox", [])
-                 if item["state"] in {"pending", "failed"}])
+        values = ([{"type": "thread", **item} for item in self.local.get("threads", [])] +
+                  [{"type": "direct", **item} for item in self.local.get("submissions", [])] +
+                  [{"type": "outbox", **item} for item in self.local.get("outbox", [])
+                   if item["state"] in {"pending", "failed"}])
+        # Stable partition: retain the ledger's updated/recent order in each group.
+        active, handled = [], []
+        for item in values:
+            (handled if self.thread_handled(item) else active).append(item)
+        return active + handled
 
     def selected(self, region: str | None = None) -> Any:
         region = region or (self.preview if self.focus == "detail" else self.focus)
@@ -1162,6 +1180,11 @@ class MailboxApp:
                 self.scrolls["detail"] = (0 if key == curses.KEY_HOME else 10**9 if key == curses.KEY_END
                                          else max(0, self.scrolls["detail"] + direction * amount))
             else:
+                if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                    visible = {value for _, target, value in self.hit_map if target == "list-row"
+                               and (isinstance(value, tuple) if self.focus == "threads"
+                                    else isinstance(value, int))}
+                    amount = max(1, len(visible) - 1)
                 items = self.items(self.focus)
                 self.selections[self.focus] = (0 if key == curses.KEY_HOME else len(items) - 1
                                                if key == curses.KEY_END else
@@ -1269,6 +1292,11 @@ class MailboxApp:
             self.preview, self.diagnostics = region, False
             self.scrolls["detail"] = 0
             row = next((value for _, target, value in hits if target == "list-row"), None)
+            if row is not None and region == "threads":
+                row = next((index for index, item in enumerate(self.items(region))
+                            if self.identity(item) == row), None)
+                if row is None:  # The clicked snapshot's item has since disappeared.
+                    return
             activate = row is not None and row == self.selections[region]
             if row is not None:
                 self.selections[region] = row
@@ -1379,7 +1407,8 @@ class MailboxApp:
     def region_rects(self, top: int, height: int, width: int) -> dict[str, tuple[int, int, int, int]]:
         if self.layout == "single" or width < 80 or height < 18:
             return {self.focus: (top, 0, height, width)}
-        top_height = max(10, min(height - 8, round(height * .55)))
+        detail_height = max(8, min(12, round(height * .25)))
+        top_height = height - detail_height
         left = width // 2
         return {"agents": (top, 0, top_height, left),
                 "threads": (top, left, top_height, width - left),
@@ -1495,6 +1524,12 @@ class MailboxApp:
             visible_end = chosen + min(selected_rows, max(1, height))
             if chosen < scroll:
                 scroll = chosen
+                if region == "threads":
+                    # Keep a returning group's rule visible when it fits with
+                    # the selected entry; presentation rows are not selections.
+                    while (scroll > 0 and lines[scroll - 1][1] < 0 and
+                           visible_end - (scroll - 1) <= height):
+                        scroll -= 1
             elif visible_end > scroll + height:
                 scroll = max(0, visible_end - height)
         scroll = min(max(0, scroll), max(0, len(lines) - height))
@@ -1589,14 +1624,27 @@ class MailboxApp:
         self.render_table_header(y, x, "  STATE / TITLE · PARTICIPANTS", width)
         lines: list[tuple[str, int, int, bool]] = []
         accents: dict[int, tuple[str, str, str, str]] = {}
-        for index, item in enumerate(self.items("threads")):
+        items = self.items("threads")
+        active_count = sum(not self.thread_handled(item) for item in items)
+        for index, item in enumerate(items):
+            handled = self.thread_handled(item)
+            if index == 0 or index == active_count:
+                if index:
+                    lines.append(("", -1, 0, False))
+                label = (f"─ Handled ({len(items) - active_count}) " if handled else
+                         f"─ Active ({active_count}) ")
+                label = truncate_display_text(label, width)
+                lines.append((label + "─" * max(0, width - display_width(label)),
+                              -1, curses.A_BOLD | (curses.A_DIM if handled else 0), False))
             chosen = index == self.selections["threads"]
             marker = "▌" if chosen and self.focus == "threads" else "▸" if chosen else " "
             if item["type"] == "thread":
                 messages = item.get("messages", [])
                 latest = messages[-1] if messages else {}
                 uncertain = any(message.get("state") == "delivering" for message in messages)
-                state, palette = self.thread_state("delivering" if uncertain else latest.get("state", "unknown"))
+                unfinished = next((message for message in reversed(messages)
+                                   if message.get("state") != "handled"), latest)
+                state, palette = self.thread_state("delivering" if uncertain else unfinished.get("state", "unknown"))
                 kind, kind_palette = self.thread_kind(latest.get("kind", "unknown"))
                 body = (latest.get("body") or "").splitlines()
                 title = item.get("subject") or (body[0] if body else "(empty message)")
@@ -1614,9 +1662,9 @@ class MailboxApp:
                 title = item.get("last_error") or item["item_id"]
                 metadata = f"{kind} · → {item['target_host']} · {item['state']}"
             accents[index] = state, palette, kind, kind_palette
-            attr = self.selection_style() if chosen else 0
+            attr = self.selection_style() if chosen else curses.A_DIM if handled else 0
             lines.append((f"{marker} {state} · {title}", index, attr, True))
-            lines.append(("  " + metadata, index, attr | curses.A_DIM, False))
+            lines.append(("  " + metadata, index, attr if chosen else attr | curses.A_DIM, False))
         if not lines:
             lines = [(" No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height - 1), y + 1):
@@ -1627,9 +1675,12 @@ class MailboxApp:
                 chosen = _index == self.selections["threads"]
                 label_style = (self.selection_style() | curses.A_BOLD if chosen and self.colors_enabled
                                else self.state_style(tone, selected=chosen))
+                if self.thread_handled(items[_index]):
+                    label_style = ((self.selection_style() | curses.A_BOLD) if chosen else
+                                   (self.state_style(tone) & ~curses.A_BOLD) | curses.A_DIM)
                 self.put(row, x + 2, clip(label, width - 2), label_style)
             if _index >= 0:
-                self.add_hit((row, x, 1, width), "list-row", _index)
+                self.add_hit((row, x, 1, width), "list-row", self.identity(items[_index]))
 
     def thread_detail(self) -> list[tuple[str, int]]:
         item = self.detail or {}
