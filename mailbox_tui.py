@@ -1279,7 +1279,8 @@ class MailboxApp:
                 self.choose_agent() if region == "agents" else self.reply()
 
     def initialize_colors(self) -> None:
-        if self.environment.get("NO_COLOR"):
+        self.colors_enabled = False
+        if "NO_COLOR" in self.environment:
             return
         try:
             if not curses.has_colors():
@@ -1293,12 +1294,28 @@ class MailboxApp:
             for pair, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN,
                                                 curses.COLOR_YELLOW, curses.COLOR_RED), 1):
                 curses.init_pair(pair, foreground, background)
+            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            for pair, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN,
+                                                curses.COLOR_YELLOW, curses.COLOR_RED), 6):
+                curses.init_pair(pair, foreground, curses.COLOR_WHITE)
             self.colors_enabled = True
         except curses.error:
             pass
 
     def style(self, pair: int = 0, attribute: int = 0) -> int:
         return attribute | (curses.color_pair(pair) if pair and self.colors_enabled else 0)
+
+    def selection_style(self) -> int:
+        return self.style(5) if self.colors_enabled else curses.A_REVERSE
+
+    def state_style(self, state: str, *, stale: bool = False, selected: bool = False) -> int:
+        pair = {"working": 3, "idle": 2, "done": 1, "blocked": 4}.get(state, 0)
+        attribute = curses.A_BOLD if pair and not stale else curses.A_DIM
+        if selected and self.colors_enabled:
+            return self.style(5 + pair if pair and not stale else 5, attribute)
+        if selected:
+            attribute |= curses.A_REVERSE
+        return self.style(0 if stale else pair, attribute)
 
     def put(self, row: int, column: int, text: str, attribute: int = 0) -> None:
         height, width = self.screen.getmaxyx()
@@ -1360,33 +1377,20 @@ class MailboxApp:
         return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
 
     def region_rects(self, top: int, height: int, width: int) -> dict[str, tuple[int, int, int, int]]:
-        if self.layout == "single":
+        if self.layout == "single" or width < 80 or height < 18:
             return {self.focus: (top, 0, height, width)}
-        if self.layout == "three":
-            agents = max(30, round(width * .23))
-            threads = max(30, round(width * .29))
-            if width - agents - threads < 60:
-                threads = width - agents - 60
-            return {"agents": (top, 0, height, agents),
-                    "threads": (top, agents, height, threads),
-                    "detail": (top, agents + threads, height, width - agents - threads)}
-        left = min(44, max(28, round(width * .36)))
-        result = {"detail": (top, left, height, width - left)}
-        if height // 2 - 2 < 6:
-            region = self.focus if self.focus != "detail" else "agents"
-            result[region] = (top, 0, height, left)
-        else:
-            result["agents"] = (top, 0, height // 2, left)
-            result["threads"] = (top + height // 2, 0, height - height // 2, left)
-        return result
+        top_height = max(10, min(height - 8, round(height * .55)))
+        left = width // 2
+        return {"agents": (top, 0, top_height, left),
+                "threads": (top, left, top_height, width - left),
+                "detail": (top + top_height, 0, height - top_height, width)}
 
     def render(self) -> None:
         self.screen.erase()
         self.cursor_position = None
         self.hit_map.clear()
         height, width = self.screen.getmaxyx()
-        self.layout = ("tiny" if width < 32 or height < 10 else
-                       "single" if width < 80 or height < 18 else "two" if width < 140 else "three")
+        self.layout = "tiny" if width < 32 or height < 10 else "single"
         word = self.mode_word()
         word = truncate_display_text(word, width)
         right = max(0, width - display_width(word))
@@ -1415,7 +1419,7 @@ class MailboxApp:
             input_rect = None
             if input_visible:
                 body_height = max(0, bottom - 1)
-                lines = wrap_message_lines(self.body.split("\n"), width=max(1, width - 3),
+                lines = wrap_message_lines(self.body.split("\n"), width=max(1, width - 4),
                                            cursor_row=0, cursor_column=0)[0]
                 rows = min(max(3, body_height // 3), max(3, len(lines)))
                 warning = bool(self.recipient and not self.recipient.get("extension_present"))
@@ -1423,6 +1427,8 @@ class MailboxApp:
                 input_height = min(input_height, max(3 + int(bool(self.input_error)), body_height - 3))
                 bottom -= input_height
                 input_rect = (bottom, 0, input_height, width)
+            if width >= 80 and bottom - 1 >= 18:
+                self.layout = "stacked"
             for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
                 self.add_hit(rect, "region", region)
                 inner = self.box(rect, region.title(), self.focus == region)
@@ -1454,11 +1460,12 @@ class MailboxApp:
     @staticmethod
     def agent_columns(width: int) -> list[tuple[str, int, bool]]:
         # The same cell widths drive the header and each row, including CJK aliases.
-        columns = [("marker", 1, False), ("alias", max(1, width - 23), False),
-                   ("turn", 10, False), ("mail", 4, True), ("rx", 2, False)]
-        if width >= 65:
-            columns[1] = ("alias", max(1, width - 42), False)
-            columns.extend([("role", 8, False), ("receiver", 9, False)])
+        columns = [("marker", 1, False), ("turn", 10, False),
+                   ("alias", max(1, width - 21), False),
+                   ("mail", 4, True), ("rx", 2, False)]
+        if width >= 55:
+            columns[2] = ("alias", 14, False)
+            columns.extend([("role", 7, False), ("summary", width - 44, False)])
         return columns
 
     def column_text(self, values: Mapping[str, str], columns: list[tuple[str, int, bool]]) -> str:
@@ -1468,6 +1475,15 @@ class MailboxApp:
             parts.append((" " * max(0, width - display_width(value)) + value) if right else
                          pad_display_text(value, width))
         return " ".join(parts)
+
+    def render_table_header(self, y: int, x: int, text: str, width: int) -> None:
+        text = truncate_display_text(text, width)
+        self.put(y, x, pad_display_text(text, width), curses.A_BOLD)
+        column = 0
+        for part in text.split(" "):
+            if part.isalnum():
+                self.put(y, x + column, part, curses.A_BOLD | curses.A_UNDERLINE)
+            column += display_width(part) + 1
 
     def list_window(self, region: str, lines: list[tuple[str, int, int, bool]], height: int
                     ) -> list[tuple[str, int, int, bool]]:
@@ -1490,51 +1506,64 @@ class MailboxApp:
         if height <= 0 or width <= 0:
             return
         columns = self.agent_columns(width)
-        self.put(y, x, truncate_display_text(self.column_text(
+        self.render_table_header(y, x, self.column_text(
             {"alias": "ALIAS", "turn": "TURN", "mail": "MAIL", "rx": "RX",
-             "role": "ROLE", "receiver": "RECEIVER"}, columns), width), curses.A_DIM)
+             "role": "ROLE", "summary": "PHASE · SUMMARY"}, columns), width)
         agents = self.agents()
         lines: list[tuple[str, int, int, bool]] = []
         for host in dict.fromkeys([agent["host"] for agent in agents] + sorted(self.remote_errors)):
             group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
             stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
-            lines.append((f"{host} · {len(group)} agents" + (" · ⚠ stale" if stale else ""),
-                          -1, curses.A_DIM, False))
+            label = f"─ {host} · {len(group)} agents" + (" · ⚠ stale" if stale else "") + " "
+            label = truncate_display_text(label, width)
+            lines.append((label + "─" * max(0, width - display_width(label)),
+                          -1, curses.A_BOLD, False))
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
             for index, agent in group:
                 chosen = index == self.selections["agents"]
                 marker = "▌" if chosen and self.focus == "agents" else "▸" if chosen else " "
                 turn = agent.get("turn_state") or "unknown"
-                glyph = {"working": "●", "done": "✓", "idle": "○"}.get(turn, "?")
+                glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
                 receiver = agent.get("extension_present")
                 rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
                 values = {"marker": marker, "alias": agent.get("alias") or agent["terminal_id"],
                           "turn": glyph + " " + turn, "mail": str("?" if agent.get("stale") else agent.get("unread", "?")),
                           "rx": rx, "role": agent.get("role") or "—",
-                          "receiver": "ready" if receiver else "absent" if receiver is False else "unknown"}
+                          "summary": " · ".join(str(agent[field]) for field in ("phase", "summary")
+                                                if agent.get(field))}
                 tag = self.result_tags.get(self.identity(agent))
                 text = self.column_text(values, columns)
                 if tag:
                     suffix = " [" + tag[0] + "]"
                     text = truncate_display_text(text, max(0, width - display_width(suffix))) + suffix
-                attr = self.style(1 if chosen and self.focus == "agents" else 0, curses.A_BOLD)
+                attr = self.selection_style() if chosen else 0
                 if tag and tag[0].startswith("failed"):
-                    attr = self.style(4, curses.A_BOLD)
+                    attr = self.state_style("blocked", selected=chosen)
                 lines.append((text, index, attr, True))
-                secondary = " · ".join(str(agent[field]) for field in ("role", "phase", "summary")
-                                       if agent.get(field))
-                if secondary:
-                    lines.append(("  " + secondary, index, curses.A_DIM, False))
         if not lines:
-            lines = [("No agents. r refresh", -1, curses.A_DIM, False)]
+            lines = [(" No agents. r refresh", -1, curses.A_DIM, False)]
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 1), y + 1):
-            self.put(row, x, truncate_display_text(text, width), attr)
+            self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
+            if _index >= 0:
+                agent = agents[_index]
+                turn = agent.get("turn_state") or "unknown"
+                glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
+                tag = self.result_tags.get(self.identity(agent))
+                prefix_width = max(0, width - display_width(" [" + tag[0] + "]")) if tag else width
+                state_width = max(0, min(10, prefix_width - 2))
+                self.put(row, x + 2,
+                         pad_display_text(truncate_display_text(glyph + " " + turn, state_width), state_width),
+                         self.state_style(turn, stale=bool(agent.get("stale")),
+                                          selected=_index == self.selections["agents"]))
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 
     def render_threads(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
+        if height <= 0 or width <= 0:
+            return
+        self.render_table_header(y, x, "  STATE / TITLE · PARTICIPANTS", width)
         lines: list[tuple[str, int, int, bool]] = []
         for index, item in enumerate(self.items("threads")):
             chosen = index == self.selections["threads"]
@@ -1557,13 +1586,14 @@ class MailboxApp:
                 state = "OUTBOX " + item["state"]
                 title = item.get("last_error") or item["item_id"]
                 metadata = f"→ {item['target_host']} · {item['kind']} · {item['state']}"
-            attr = self.style(3 if warning else 1 if chosen and self.focus == "threads" else 0, curses.A_BOLD)
+            attr = (self.state_style("working", selected=True) if warning and chosen else
+                    self.selection_style() if chosen else self.style(3 if warning else 0))
             lines.append((f"{marker} {state} · {title}", index, attr, True))
-            lines.append(("  " + metadata, index, curses.A_DIM, False))
+            lines.append(("  " + metadata, index, attr | curses.A_DIM, False))
         if not lines:
-            lines = [("No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
-        for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height), y):
-            self.put(row, x, truncate_display_text(text, width), attr)
+            lines = [(" No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
+        for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height - 1), y + 1):
+            self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 
@@ -1606,6 +1636,7 @@ class MailboxApp:
 
     def render_detail(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
+        x, width = x + 1, width - 1
         if height <= 0 or width <= 0:
             return
         self.put(y, x, truncate_display_text("Read-only · viewing does not ACK", width), curses.A_DIM)
@@ -1618,6 +1649,10 @@ class MailboxApp:
         for row, text in enumerate(lines[self.scrolls["detail"]:self.scrolls["detail"] + available], y + 1):
             attr = self.style(3, curses.A_BOLD) if "UNCERTAIN" in text or "NOT native ACK" in text else 0
             self.put(row, x, truncate_display_text(text, width), attr)
+            if agent and not self.diagnostics and text.startswith("Turn state: "):
+                self.put(row, x + len("Turn state: "), clip(text[len("Turn state: "):], width - len("Turn state: ")),
+                         self.state_style(self.detail.get("turn_state") or "unknown",
+                                          stale=bool(self.detail.get("stale"))))
 
     def render_input(self, rect: tuple[int, int, int, int]) -> None:
         direct = self.delivery == "direct"
@@ -1625,6 +1660,7 @@ class MailboxApp:
         if direct:
             title = "DIRECT · " + title + " · may interrupt; acceptance ≠ native delivery"
         y, x, height, width = self.box(rect, title, True, direct)
+        x, width = x + 1, width - 1
         if height <= 0 or width <= 0:
             return
         if self.recipient and not self.recipient.get("extension_present") and height - int(bool(self.input_error)) > 1:
@@ -1734,7 +1770,7 @@ class MailboxApp:
             columns = max(1, overlay_width - 4)
         else:
             overlay_width = min(width, 100)
-            columns = max(1, overlay_width - 2)
+            columns = max(1, overlay_width - 3)
         wrapped = []
         setting_rows = {}
         for index, line in enumerate(lines):
@@ -1756,6 +1792,8 @@ class MailboxApp:
         self.cursor_position = None
         if compact:
             x, columns = x + 1, columns - 2
+        else:
+            x, columns = x + 1, columns - 1
         if rows <= 0 or columns <= 0:
             return
         available = max(0, rows - reserved)

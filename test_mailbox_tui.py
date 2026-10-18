@@ -138,10 +138,10 @@ class MailboxUiTest(unittest.TestCase):
         app.key(MouseEvent(call.row, column, action))
         return call.row, column
 
-    def test_mouse_region_focus_and_agent_primary_and_secondary_rows(self):
-        for width in (100, 160):
-            for secondary in (False, True):
-                with self.subTest(width=width, secondary=secondary):
+    def test_mouse_region_focus_and_agent_alias_and_summary_cells(self):
+        for width in (120, 160):
+            for summary in (False, True):
+                with self.subTest(width=width, summary=summary):
                     app = self.app()
                     app.local['agents'] = [
                         {**agent, 'alias': f'agent-{index}', 'summary': f'summary-{index}',
@@ -152,7 +152,7 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(app.focus, 'threads')
                     self.assertEqual(app.mode, 'nav')
                     self.capture(app, 32, width)
-                    point = self.mouse_at_text(app, 'summary-1' if secondary else 'agent-1')
+                    point = self.mouse_at_text(app, 'summary-1' if summary else 'agent-1')
                     self.assertEqual(app.focus, 'agents')
                     self.assertEqual(app.selections['agents'], 1)
                     self.assertEqual(app.mode, 'nav')
@@ -172,7 +172,10 @@ class MailboxUiTest(unittest.TestCase):
         self.mouse_at_text(app, ' · 2 agents')
         self.assertEqual((app.focus, app.mode), ('agents', 'nav'))
         app.focus = 'agents'
-        app.key(MouseEvent(28, 45, 'press'))
+        rect = next(rect for rect, kind, value in app.hit_map
+                    if kind == 'region' and value == 'threads')
+        y, x, height, width = rect
+        app.key(MouseEvent(y + height - 2, x + width - 2, 'press'))
         self.assertEqual((app.focus, app.mode), ('threads', 'nav'))
         app.key(MouseEvent(0, 2, 'press'))
         app.key(MouseEvent(31, 2, 'press'))
@@ -365,8 +368,14 @@ class MailboxUiTest(unittest.TestCase):
     def test_mouse_hit_map_rebuilt_on_resize(self):
         app = self.app()
         self.capture(app, 24, 160)
-        self.capture(app, 24, 60)
-        app.key(MouseEvent(3, 50, 'press'))
+        old_threads = next(rect for rect, kind, value in app.hit_map
+                           if kind == 'region' and value == 'threads')
+        snapshot = self.capture(app, 24, 60)
+        rect = next(rect for rect, kind, value in app.hit_map if kind == 'region')
+        self.assertEqual(rect, (1, 0, 22, 60))
+        self.assertNotIn(old_threads, [rect for rect, _, _ in app.hit_map])
+        header = next(call for call in snapshot.draw_calls if 'ALIAS' in call.requested_text)
+        app.key(MouseEvent(header.row, header.column, 'press'))
         self.assertEqual(app.focus, 'agents')
         self.assertEqual(app.mode, 'nav')
         self.assertTrue(all(rect[1] + rect[3] <= 60 for rect, _, _ in app.hit_map))
@@ -1302,6 +1311,32 @@ class MailboxUiTest(unittest.TestCase):
         widths = [call.kwargs['width'] for call in wrap.call_args_list]
         self.assertEqual(len(widths), 2)
         self.assertEqual(widths[0], widths[1])
+        self.assertEqual(widths[0], 28)
+
+    def test_input_content_and_cursor_keep_one_column_inside_box_padding(self):
+        app = self.app()
+        app.open_input({**self.recipient, 'extension_present': True})
+        self.type_text(app, '가나다')
+        app.screen = Screen(16, 40)
+        app.render_input((3, 2, 8, 34))
+        snapshot = app.screen.snapshot()
+        row = snapshot.rows_containing('가나다')[0]
+        self.assertEqual(snapshot.cells[row][2].text, '│')
+        self.assertEqual(snapshot.cells[row][3].text, ' ')
+        self.assertEqual(snapshot.cells[row][4].text, '가')
+        self.assertEqual(app.cursor_position, (row, 10))
+        self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_noncompact_settings_and_help_content_keep_inner_left_padding(self):
+        for mode, text in (('settings', 'Target:'), ('help', 'NAV: Tab')):
+            with self.subTest(mode=mode):
+                app = self.app()
+                app.key('s' if mode == 'settings' else '?')
+                snapshot = self.capture(app, height=24, width=80)
+                call = next(call for call in snapshot.draw_calls if text in call.requested_text)
+                self.assertEqual(call.column, 2)
+                self.assertEqual(snapshot.cells[call.row][0].text, '│')
+                self.assertEqual(snapshot.cells[call.row][1].text, ' ')
 
     def test_popup_success_does_not_spawn_refresh_jobs_after_exit(self):
         app = self.app(popup=True)
@@ -1316,11 +1351,73 @@ class MailboxUiTest(unittest.TestCase):
         app.tick()
         self.assertEqual(app.jobs, {})
 
-    def test_two_layout_counts_rows_inside_list_borders(self):
+    def test_stacked_region_rects_fall_back_for_short_or_narrow_body(self):
         app = self.app()
-        app.layout = 'two'
-        self.assertEqual(set(app.region_rects(1, 14, 100)), {'agents', 'detail'})
-        self.assertEqual(set(app.region_rects(1, 16, 100)), {'agents', 'threads', 'detail'})
+        app.layout = 'stacked'
+        for focus in ('agents', 'threads', 'detail'):
+            app.focus = focus
+            for height, width in ((0, 120), (14, 100), (17, 200), (18, 79)):
+                with self.subTest(focus=focus, height=height, width=width):
+                    self.assertEqual(app.region_rects(3, height, width),
+                                     {focus: (3, 0, height, width)})
+        app.focus = 'agents'
+        self.assertEqual(app.region_rects(3, 18, 81), {
+            'agents': (3, 0, 10, 40),
+            'threads': (3, 40, 10, 41),
+            'detail': (13, 0, 8, 81)})
+
+    def test_stacked_top_bottom_geometry_at_large_terminal_sizes(self):
+        for height, width, top_height in ((40, 120, 21), (50, 200, 26)):
+            with self.subTest(height=height, width=width):
+                app = self.app()
+                self.capture(app, height, width)
+                self.assertEqual(app.layout, 'stacked')
+                regions = {value: rect for rect, kind, value in app.hit_map if kind == 'region'}
+                self.assertEqual(regions, {
+                    'agents': (1, 0, top_height, width // 2),
+                    'threads': (1, width // 2, top_height, width - width // 2),
+                    'detail': (1 + top_height, 0, height - 2 - top_height, width)})
+                for _ in range(2):
+                    for focus in ('threads', 'detail', 'agents'):
+                        app.key('\t')
+                        self.assertEqual(app.focus, focus)
+                        self.capture(app, height, width)
+                        self.assertEqual({value: rect for rect, kind, value in app.hit_map
+                                          if kind == 'region'}, regions)
+
+    def test_layout_uses_body_height_after_header_footer_and_status(self):
+        for height, status, layout in ((19, '', 'single'), (20, '', 'stacked'),
+                                       (20, 'Notice', 'single'), (21, 'Notice', 'stacked')):
+            with self.subTest(height=height, status=status):
+                app = self.app()
+                app.status = status
+                self.capture(app, height, 120)
+                self.assertEqual(app.layout, layout)
+                regions = [rect for rect, kind, _ in app.hit_map if kind == 'region']
+                bottom = height - 1 - bool(status)
+                self.assertEqual(max(y + rows for y, _, rows, _ in regions), bottom)
+
+    def test_input_stays_full_width_below_detail_and_can_force_single(self):
+        for popup in (False, True):
+            with self.subTest(popup=popup):
+                app = self.app(popup=popup)
+                app.open_input({**self.recipient, 'extension_present': True})
+                self.type_text(app, 'draft')
+                with patch.object(app, 'render_input', wraps=app.render_input) as render_input:
+                    self.capture(app, 40, 120)
+                input_rect = render_input.call_args.args[0]
+                self.assertEqual(app.layout, 'stacked')
+                detail = next(rect for rect, kind, value in app.hit_map
+                              if kind == 'region' and value == 'detail')
+                self.assertEqual((input_rect[1], input_rect[3]), (0, 120))
+                self.assertEqual(input_rect[0], detail[0] + detail[2])
+                self.assertEqual(input_rect[0] + input_rect[2], 39)
+                before = app.body, app.body_cursor, app.focus, dict(app.drafts)
+                self.capture(app, 24, 120)
+                self.assertEqual(app.layout, 'single')
+                self.assertEqual(len([1 for _, kind, _ in app.hit_map if kind == 'region']), 1)
+                self.assertEqual((app.body, app.body_cursor, app.focus, app.drafts), before)
+                self.assertTrue(app.running)
 
     def test_diagnostics_preserves_last_error_after_key_dismisses_status(self):
         app = self.app()
@@ -1369,6 +1466,42 @@ class MailboxUiTest(unittest.TestCase):
         self.now = 11
         app.tick()
         self.assertFalse(app.result_tags)
+
+    def test_narrow_failed_send_suffix_survives_colored_state_repaint(self):
+        for color in (False, True):
+            for error in ('Transport rejected', 'Transport rejected by peer'):
+                with self.subTest(color=color, error=error):
+                    app = self.app()
+                    app.environment.pop('NO_COLOR', None)
+                    app.local['agents'][0]['turn_state'] = 'working'
+                    app.key('\r')
+                    self.type_text(app, 'retain this draft')
+                    app.key('\r')
+                    app.jobs['mutation'].result = {'acceptance': 'failed', 'evidence': error}
+                    app.tick()
+                    app.key(ESCAPE)
+                    app.colors_enabled = color
+                    with patch('mailbox_tui.curses.color_pair', side_effect=lambda pair: pair << 8):
+                        snapshot = self.capture(app, height=35, width=80)
+                    label = '[failed: ' + error + ']'
+                    rows = snapshot.rows_containing(label)
+                    self.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    self.assertEqual(app.layout, 'stacked')
+                    self.assertIn(label + '│', snapshot.line(row))
+                    label_column = display_width(snapshot.line(row).split(label)[0])
+                    for cell in snapshot.cells[row][label_column:label_column + len(label)]:
+                        if color:
+                            self.assertEqual(cell.attribute & curses.A_COLOR, 9 << 8)
+                            self.assertFalse(cell.attribute & curses.A_REVERSE)
+                        else:
+                            self.assertTrue(cell.attribute & curses.A_REVERSE)
+                    if color and error == 'Transport rejected':
+                        self.assertEqual(snapshot.cells[row][3].attribute & curses.A_COLOR, 8 << 8)
+                    self.assertIn(((row, 1, 1, 38), 'list-row', 0), app.hit_map)
+                    app.key(MouseEvent(row, 38, 'press'))
+                    self.assertEqual(app.mode, 'input')
+                    self.assertEqual(app.body, 'retain this draft')
 
     def test_top_level_escape_only_quits_popup(self):
         for popup in (False, True):
@@ -1556,10 +1689,12 @@ class MailboxUiTest(unittest.TestCase):
 
     def test_layout_breakpoints_preserve_input_focus_selection_and_draft(self):
         cases = [(24, 31, 'tiny'), (24, 32, 'single'), (24, 79, 'single'),
-                 (24, 80, 'two'), (24, 139, 'two'), (24, 140, 'three'),
+                 (24, 80, 'single'), (24, 139, 'single'), (24, 140, 'single'),
+                 (32, 79, 'single'), (32, 80, 'stacked'), (32, 140, 'stacked'),
+                 (40, 120, 'stacked'), (50, 200, 'stacked'),
                  (9, 160, 'tiny'), (10, 160, 'single'),
-                 (17, 160, 'single'), (18, 160, 'three'),
-                 (17, 100, 'single'), (18, 100, 'two')]
+                 (17, 160, 'single'), (18, 160, 'single'),
+                 (17, 100, 'single'), (18, 100, 'single')]
         app = self.app()
         self.select_agent(app)
         app.key('\t')
@@ -1578,7 +1713,8 @@ class MailboxUiTest(unittest.TestCase):
 
     def test_layouts_keep_all_overlay_modes_in_bounds_without_state_loss(self):
         for mode in ('nav', 'settings', 'help', 'evidence', 'confirm'):
-            for height, width in ((9, 31), (10, 32), (17, 79), (18, 80), (24, 139), (24, 140)):
+            for height, width in ((9, 31), (10, 32), (17, 79), (18, 80),
+                                  (24, 139), (24, 140), (40, 120), (50, 200)):
                 with self.subTest(mode=mode, height=height, width=width):
                     app = self.app()
                     app.key('\r')
@@ -1602,6 +1738,8 @@ class MailboxUiTest(unittest.TestCase):
         app.local['agents'] = [
             {**agent, 'alias': alias, 'turn_state': 'working', 'unread': 12, 'extension_present': True}
             for agent, alias in zip(app.local['agents'], ('한글별칭', 'latin-alias'))]
+        app.selections['agents'] = next(index for index, agent in enumerate(app.agents())
+                                        if agent['alias'] == '한글별칭')
         snapshot = self.capture(app, width=79)
         lines = snapshot.lines()
         header = next(line for line in lines if 'ALIAS' in line and 'MAIL' in line)
@@ -1614,66 +1752,289 @@ class MailboxUiTest(unittest.TestCase):
             self.assertEqual(cell_column(row, '12') + 2, cell_column(header, 'MAIL') + 4)
             self.assertEqual(cell_column(row, '✓'), cell_column(header, 'RX'))
         self.assertEqual(cell_column(rows[0], '한글별칭'), cell_column(header, 'ALIAS'))
-        self.assertFalse(any(call.attribute & curses.A_REVERSE for call in snapshot.draw_calls))
+        chosen_row = snapshot.rows_containing('한글별칭')[0]
+        self.assertTrue(all(cell.attribute & curses.A_REVERSE
+                            for cell in snapshot.cells[chosen_row][1:78]))
 
-    def test_agent_metadata_uses_only_present_parts_and_variable_row_heights(self):
+    def test_agent_metadata_stays_in_single_rows_and_scrolls_by_rows(self):
         app = self.app()
         base = app.local['agents'][0]
         metadata = ({}, {'role': 'builder'}, {'phase': 'review', 'summary': 'checking'},
                     {}, {'summary': 'ready'})
+        aliases = ('alpha', 'bravo', 'charlie', 'delta', 'echo')
         app.local['agents'] = [
             {**base, 'terminal_id': f'term-{index}', 'alias': alias,
              'role': '', 'phase': '', 'summary': '', **fields}
-            for index, (alias, fields) in enumerate(zip(
-                ('alpha', 'bravo', 'charlie', 'delta', 'echo'), metadata))]
+            for index, (alias, fields) in enumerate(zip(aliases, metadata))]
         app.screen = Screen(20, 79)
         app.render_agents((0, 0, 20, 79))
         snapshot = app.screen.snapshot()
-        self.assertEqual(snapshot.rows_containing('bravo')[0],
-                         snapshot.rows_containing('alpha')[0] + 1)
-        self.assertEqual(snapshot.rows_containing('charlie')[0],
-                         snapshot.rows_containing('bravo')[0] + 2)
-        self.assertEqual(snapshot.rows_containing('echo')[0],
-                         snapshot.rows_containing('delta')[0] + 1)
-        self.assertEqual(snapshot.line(snapshot.rows_containing('bravo')[0] + 1).strip(), 'builder')
-        self.assertEqual(snapshot.line(snapshot.rows_containing('charlie')[0] + 1).strip(),
-                         'review · checking')
+        rows = [snapshot.rows_containing(alias)[0] for alias in aliases]
+        self.assertEqual(rows, list(range(rows[0], rows[0] + len(aliases))))
+        self.assertIn('builder', snapshot.line(rows[1]))
+        self.assertIn('review · checking', snapshot.line(rows[2]))
+        self.assertIn('ready', snapshot.line(rows[4]))
         self.assertNotIn('— ·', '\n'.join(snapshot.lines()))
         app.selections['agents'] = 3
         app.screen = Screen(6, 79)
         app.render_agents((0, 0, 6, 79))
         snapshot = app.screen.snapshot()
-        self.assertEqual(app.scrolls['agents'], 2)
         self.assertEqual(snapshot.rows_containing('delta'), [5])
-        self.assertIn('▌', snapshot.line(5))
         self.assertNotIn('echo', '\n'.join(snapshot.lines()))
         app.key(curses.KEY_DOWN)
         app.screen.erase()
         app.render_agents((0, 0, 6, 79))
         snapshot = app.screen.snapshot()
         self.assertEqual(app.selected('agents')['alias'], 'echo')
-        self.assertEqual(app.scrolls['agents'], 4)
-        self.assertEqual(snapshot.rows_containing('echo'), [4])
-        self.assertIn('▌', snapshot.line(4))
-        self.assertEqual(snapshot.line(5).strip(), 'ready')
+        self.assertEqual(snapshot.rows_containing('echo'), [5])
+        self.assertIn('ready', snapshot.line(5))
         self.assertEqual(app.screen.out_of_bounds, [])
 
-    def test_no_color_never_initializes_or_uses_pairs_but_renders_layout(self):
-        self.environment['NO_COLOR'] = '1'
+    def test_agent_column_order_width_threshold_and_cell_alignment(self):
+        for width in (54, 55, 79):
+            with self.subTest(width=width):
+                app = self.app()
+                app.local['agents'] = [{**app.local['agents'][0], 'alias': '한글별칭',
+                                        'turn_state': 'working', 'unread': 12,
+                                        'extension_present': True, 'role': 'builder',
+                                        'phase': 'review', 'summary': 'checking'}]
+                app.screen = Screen(6, width)
+                app.render_agents((0, 0, 6, width))
+                snapshot = app.screen.snapshot()
+                header = snapshot.line(0)
+                row = snapshot.line(snapshot.rows_containing('한글별칭')[0])
+                def column(line, text):
+                    return display_width(line[:line.index(text)])
+                self.assertEqual(column(header, 'TURN'), 2)
+                self.assertEqual(column(header, 'ALIAS'), 13)
+                self.assertEqual(column(row, '● working'), 2)
+                self.assertEqual(column(row, '한글별칭'), 13)
+                self.assertEqual(column(row, '12') + 2, column(header, 'MAIL') + 4)
+                self.assertEqual(column(row, '✓'), column(header, 'RX'))
+                if width >= 55:
+                    self.assertEqual(column(header, 'MAIL'), 28)
+                    self.assertEqual(column(header, 'RX'), 33)
+                    self.assertEqual(column(header, 'ROLE'), 36)
+                    self.assertEqual(column(header, 'PHASE'), 44)
+                    self.assertEqual(column(row, 'builder'), 36)
+                    self.assertEqual(column(row, 'review'), 44)
+                else:
+                    self.assertEqual(column(header, 'MAIL'), width - 7)
+                    self.assertEqual(column(header, 'RX'), width - 2)
+                    self.assertNotIn('ROLE', header)
+                    self.assertNotIn('builder', row)
+                    self.assertNotIn('review', row)
+                if width == 79:
+                    self.assertIn('PHASE · SUMMARY', header)
+                    self.assertIn('review · checking', row)
+
+    def test_table_headers_host_rules_and_unfocused_selection_have_distinct_styles(self):
+        with patch.multiple('mailbox_tui.curses', A_BOLD=1, A_UNDERLINE=2,
+                            A_REVERSE=4, A_DIM=8):
+            app = self.app()
+            app.focus = 'detail'
+            app.screen = Screen(16, 100)
+            app.render_agents((0, 0, 8, 100))
+            app.local['submissions'] = [
+                {'submission_id': 'first', 'acceptance': 'accepted', 'body': 'first message',
+                 'target': self.recipient},
+                {'submission_id': 'second', 'acceptance': 'accepted', 'body': 'second message',
+                 'target': self.recipient}]
+            app.render_threads((8, 0, 8, 100))
+            snapshot = app.screen.snapshot()
+            for row in (0, 8):
+                for cell in snapshot.cells[row]:
+                    self.assertEqual(cell.attribute, 3 if cell.text.isalpha() else 1)
+            self.assertIn('STATE / TITLE', snapshot.line(8))
+            self.assertIn('PHASE · SUMMARY', snapshot.line(0))
+            for row, separator in ((0, '·'), (8, '/')):
+                column = snapshot.line(row).index(separator)
+                self.assertEqual(snapshot.cells[row][column].attribute, 1)
+            host_row = next(row for row, line in enumerate(snapshot.lines()) if ' · 2 agents' in line)
+            host = snapshot.line(host_row)
+            self.assertTrue(host.startswith('─ ui-test · 2 agents ─'))
+            self.assertTrue(host.endswith('─'))
+            self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[host_row]))
+            agent_row = snapshot.rows_containing(app.agents()[0]['alias'])[0]
+            thread_row = snapshot.rows_containing('DIRECT accepted')[0]
+            for row in (agent_row, thread_row, thread_row + 1):
+                self.assertTrue(all(cell.attribute & 4 for cell in snapshot.cells[row]))
+                self.assertFalse(any(cell.attribute & 2 for cell in snapshot.cells[row]))
+            self.assertIn('user →', snapshot.line(thread_row + 1))
+            second_thread = snapshot.rows_containing('DIRECT accepted')[1]
+            self.assertEqual(second_thread, thread_row + 2)
+            self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[second_thread]))
+
+    def test_turn_state_colors_only_state_cells_and_detail_word(self):
+        states = (('working', False, 3), ('idle', False, 2), ('done', False, 1),
+                  ('blocked', False, 4), ('unknown', False, 0), ('working', True, 0))
+        for state, stale, pair in states:
+            for selected in (False, True):
+                with self.subTest(state=state, stale=stale, selected=selected), \
+                     patch.multiple('mailbox_tui.curses', A_BOLD=1, A_UNDERLINE=2,
+                                    A_REVERSE=4, A_DIM=8), \
+                     patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+                    app = self.app()
+                    app.environment.pop('NO_COLOR', None)
+                    app.colors_enabled = True
+                    base = app.local['agents'][0]
+                    agent = {**base, 'alias': 'target-agent', 'turn_state': state, 'stale': stale}
+                    app.local['agents'] = [
+                        agent, {**base, 'alias': 'other-agent', 'terminal_id': 'other',
+                                'turn_state': 'unknown', 'stale': False}]
+                    app.selections['agents'] = next(
+                        index for index, item in enumerate(app.agents())
+                        if item['alias'] == ('target-agent' if selected else 'other-agent'))
+                    app.focus = 'detail'
+                    app.screen = Screen(8, 100)
+                    app.render_agents((0, 0, 8, 100))
+                    snapshot = app.screen.snapshot()
+                    row = snapshot.rows_containing('target-agent')[0]
+                    base_pair = 5 if selected else 0
+                    state_pair = 5 + pair if selected else pair
+                    for column, cell in enumerate(snapshot.cells[row]):
+                        self.assertFalse(cell.attribute & 4)
+                        if not 2 <= column < 12:
+                            self.assertEqual(cell.attribute & 0xff00, base_pair << 8)
+                    state_cell = snapshot.cells[row][2]
+                    self.assertEqual(state_cell.attribute & 0xff00, state_pair << 8)
+                    if pair:
+                        self.assertTrue(state_cell.attribute & 1)
+                    else:
+                        self.assertTrue(state_cell.attribute & 8)
+                    other_row = snapshot.rows_containing('other-agent')[0]
+                    other_pair = 0 if selected else 5
+                    self.assertTrue(all(cell.attribute & 0xff00 == other_pair << 8
+                                        for cell in snapshot.cells[other_row]))
+                    self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[other_row]))
+                    colored = [call for call in snapshot.draw_calls
+                               if call.row == row and call.attribute & 0xff00
+                               and call.attribute & 0xff00 != 5 << 8]
+                    if pair:
+                        self.assertTrue(colored)
+                        self.assertTrue(all(call.column >= 2
+                                            and call.column + display_width(call.requested_text) <= 12
+                                            for call in colored))
+                    else:
+                        self.assertEqual(colored, [])
+                    app.detail = agent
+                    app.screen = Screen(30, 100)
+                    app.render_detail((0, 0, 30, 100))
+                    snapshot = app.screen.snapshot()
+                    row = snapshot.rows_containing('Turn state:')[0]
+                    self.assertTrue(snapshot.line(row).startswith(' Turn state: '))
+                    self.assertEqual(snapshot.cells[row][0].attribute, 0)
+                    start = 1 + len('Turn state: ')
+                    for column, cell in enumerate(snapshot.cells[row]):
+                        expected = pair << 8 if start <= column < start + len(state) else 0
+                        self.assertEqual(cell.attribute & 0xff00, expected)
+                    self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[row]))
+                    if pair:
+                        self.assertTrue(all(cell.attribute & 1
+                                            for cell in snapshot.cells[row][start:start + len(state)]))
+                    else:
+                        self.assertTrue(all(cell.attribute & 8
+                                            for cell in snapshot.cells[row][start:start + len(state)]))
+
+    def test_colored_thread_selection_uses_white_background_without_reverse(self):
+        with patch.multiple('mailbox_tui.curses', A_BOLD=1, A_UNDERLINE=2,
+                            A_REVERSE=4, A_DIM=8), \
+             patch('mailbox_tui.curses.color_pair', side_effect=lambda value: value << 8):
+            app = self.app()
+            app.environment.pop('NO_COLOR', None)
+            app.colors_enabled = True
+            app.focus = 'agents'
+            app.local['submissions'] = [
+                {'submission_id': 'first', 'acceptance': 'accepted', 'body': 'first message',
+                 'target': self.recipient},
+                {'submission_id': 'second', 'acceptance': 'accepted', 'body': 'second message',
+                 'target': self.recipient}]
+            app.screen = Screen(8, 100)
+            app.render_threads((0, 0, 8, 100))
+            snapshot = app.screen.snapshot()
+            row = snapshot.rows_containing('first message')[0]
+            for selected_row in (row, row + 1):
+                self.assertTrue(all(cell.attribute & 0xff00 == 5 << 8
+                                    for cell in snapshot.cells[selected_row]))
+                self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[selected_row]))
+            row = snapshot.rows_containing('second message')[0]
+            self.assertFalse(any(cell.attribute & 0xff00 for cell in snapshot.cells[row]))
+
+    def test_detail_and_empty_list_content_have_one_column_left_padding(self):
         app = self.app()
+        app.screen = Screen(12, 50)
+        app.detail = None
+        app.render_detail((1, 3, 5, 40))
+        snapshot = app.screen.snapshot()
+        for text in ('Read-only', 'Select an agent'):
+            row = snapshot.rows_containing(text)[0]
+            self.assertEqual(snapshot.cells[row][3].text, ' ')
+            self.assertTrue(snapshot.line(row).startswith('    ' + text))
+        app.screen = Screen(12, 50)
+        app.local['threads'] = []
+        app.local['submissions'] = []
+        app.local['outbox'] = []
+        app.render_threads((1, 3, 5, 40))
+        snapshot = app.screen.snapshot()
+        row = snapshot.rows_containing('No threads.')[0]
+        self.assertTrue(snapshot.line(row).startswith('    No threads.'))
+        self.assertEqual(snapshot.cells[row][3].text, ' ')
+        self.assertEqual(app.screen.out_of_bounds, [])
+        app.screen = Screen(12, 50)
+        app.local['agents'] = []
+        app.remote = {}
+        app.remote_errors = {}
+        app.render_agents((1, 3, 5, 40))
+        snapshot = app.screen.snapshot()
+        row = snapshot.rows_containing('No agents.')[0]
+        self.assertTrue(snapshot.line(row).startswith('    No agents.'))
+        self.assertEqual(snapshot.cells[row][3].text, ' ')
+        self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_color_initialization_assigns_turn_state_palette(self):
+        app = self.app()
+        app.environment.pop('NO_COLOR', None)
         with patch('mailbox_tui.curses.has_colors', return_value=True), \
              patch('mailbox_tui.curses.start_color') as start, \
-             patch('mailbox_tui.curses.init_pair') as initialize, \
-             patch('mailbox_tui.curses.color_pair') as pair:
+             patch('mailbox_tui.curses.use_default_colors'), \
+             patch('mailbox_tui.curses.init_pair') as initialize:
             app.initialize_colors()
-            snapshot = self.capture(app, width=140)
-        start.assert_not_called()
-        initialize.assert_not_called()
-        pair.assert_not_called()
-        self.assertEqual(app.layout, 'three')
-        self.assertIn('Agents', '\n'.join(snapshot.lines()))
-        self.assertIn('Threads', '\n'.join(snapshot.lines()))
-        self.assertFalse(any(call.attribute & curses.A_COLOR for call in snapshot.draw_calls))
+        start.assert_called_once_with()
+        self.assertEqual(initialize.call_args_list, [
+            unittest.mock.call(1, curses.COLOR_CYAN, -1),
+            unittest.mock.call(2, curses.COLOR_GREEN, -1),
+            unittest.mock.call(3, curses.COLOR_YELLOW, -1),
+            unittest.mock.call(4, curses.COLOR_RED, -1),
+            unittest.mock.call(5, curses.COLOR_BLACK, curses.COLOR_WHITE),
+            unittest.mock.call(6, curses.COLOR_CYAN, curses.COLOR_WHITE),
+            unittest.mock.call(7, curses.COLOR_GREEN, curses.COLOR_WHITE),
+            unittest.mock.call(8, curses.COLOR_YELLOW, curses.COLOR_WHITE),
+            unittest.mock.call(9, curses.COLOR_RED, curses.COLOR_WHITE)])
+        self.assertTrue(app.colors_enabled)
+
+    def test_no_color_never_initializes_or_uses_pairs_including_empty_value(self):
+        for value in ('1', ''):
+            with self.subTest(value=value):
+                app = self.app()
+                app.environment['NO_COLOR'] = value
+                for agent in app.local['agents']:
+                    agent['turn_state'] = 'working'
+                with patch('mailbox_tui.curses.has_colors', return_value=True) as has_colors, \
+                     patch('mailbox_tui.curses.start_color') as start, \
+                     patch('mailbox_tui.curses.init_pair') as initialize, \
+                     patch('mailbox_tui.curses.color_pair') as pair:
+                    app.initialize_colors()
+                    snapshot = self.capture(app, height=40, width=140)
+                has_colors.assert_not_called()
+                start.assert_not_called()
+                initialize.assert_not_called()
+                pair.assert_not_called()
+                self.assertFalse(app.colors_enabled)
+                self.assertEqual(app.layout, 'stacked')
+                text = '\n'.join(snapshot.lines())
+                for label in ('Agents', 'Threads', 'Detail', 'Turn state: working'):
+                    self.assertIn(label, text)
+                self.assertFalse(any(call.attribute & curses.A_COLOR for call in snapshot.draw_calls))
 
     def test_settings_main_and_members_use_agents_selection_through_confirmation(self):
         for key, field in [('m', 'main'), (' ', 'members')]:

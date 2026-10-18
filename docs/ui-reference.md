@@ -21,22 +21,47 @@ closes a popup but does nothing in split/tab mode; in input or overlays it backs
 
 ### Responsive regions and navigation
 
-The body contains **Agents**, **Threads**, and **Detail** regions, not tabs:
+The body contains **Agents**, **Threads**, and **Detail** regions, not tabs.
+**Layout v2 replaces the old width-based two-/three-column layout with Detail
+on the right.** Wider terminals no longer put all three regions side by side.
 
-- Below 80 columns or 18 rows, only the focused region is visible.
-- At 80–139 columns, Agents and Threads stack on the left and Detail appears on
-  the right. If the lists would each have fewer than six rows, only the focused
-  list appears on the left (Agents when Detail is focused).
-- At 140 columns or more, all three regions appear side by side.
-- Below 32 columns or 10 rows, a resize notice replaces the body. Drafts,
-  selections, cursor and mode survive resizing; `Esc`/`q` retain their mode-specific behavior.
+- **Stacked:** at least 80 columns and 18 available body rows. Agents and Threads
+  share the top row in left/right halves; Detail spans the full width below.
+  The top takes about 55% of the body, with at least 10 rows for the top panels
+  and at least 8 rows for Detail.
+- Available body height excludes the global header, footer, any status line,
+  and the INPUT panel. INPUT stays full width below Detail and above the
+  status/footer area; opening or growing it can force single-region mode.
+- **Single:** below 80 columns or 18 available body rows, only the focused region
+  fills the body. INPUT, when open, remains a separate full-width panel below it.
+- **Tiny:** below 32 columns or 10 terminal rows, a resize notice replaces the
+  body. Resizing preserves drafts, selections, cursor and mode;
+  `Esc`/`q` retain their mode-specific behavior.
+
+```text
+Stacked (width >= 80; available body height >= 18)
++-------------------------+-------------------------+
+| Agents                  | Threads                 | top ~55%, min 10 rows
++-------------------------+-------------------------+
+| Detail                                            | min 8 rows
++---------------------------------------------------+
+| INPUT (when open; full width, outside body height)  |
++---------------------------------------------------+
+
+Single (width < 80 or available body height < 18)
++---------------------------------------------------+
+| Focused region: Agents / Threads / Detail          |
++---------------------------------------------------+
+| INPUT (when open; full width, outside body height)  |
++---------------------------------------------------+
+```
 
 The header names the current mode (`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`,
 or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab`, `←` / `→`, `h` / `l` | Move focus between regions. |
+| `Tab` / `Shift+Tab`, `←` / `→`, `h` / `l` | Move focus between regions: `Tab` follows Agents → Threads → Detail → Agents; `Shift+Tab` reverses it. In single mode, this reveals the focused region. |
 | `↑` / `↓`, `j` / `k` | Move the list selection; arrows scroll when Detail is focused. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
@@ -62,10 +87,32 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 - Mouse handling is enabled by default. While it is on, `Shift`+drag usually
   selects terminal text. Set `HAM_MAILBOX_NO_MOUSE=1` to disable mouse handling.
 
-Digits never navigate. Agents are grouped by host with stale/error headings.
-Each row shows alias, turn state, unread count and native receiver readiness,
-followed by one dim `role · phase · summary` line. A disconnected host keeps its
-last snapshot marked stale and unread `?`; it is not treated as closed.
+Digits never navigate. Agents uses a **one-line, aligned table**, not a second
+metadata line per agent. The full-width column header is **bold**, with
+**underline on header words only**, not separators or spaces. Each host group
+starts with a **bold rule and agent count**, with stale/error information when
+applicable. The selected row has a **common light background across the full
+table width**, including padding, while retaining state foreground colors;
+it does not turn into a yellow reverse-video block. Without color, the selected
+row uses full-width reverse video instead.
+
+Columns show **state glyph + word**, **alias**, **MAIL** (unread count), and
+**RX** (native receiver flag: `✓` ready, `⚠` absent, `?` unknown). Wider panels
+also show **role** and **phase · summary** on the same row; full summaries remain
+in Detail. MAIL is `?` for a stale host. A disconnected host keeps its last
+snapshot marked stale; it is not treated as closed.
+
+Threads uses the same **full-width bold column header with underlined words**
+and **full-width selected-row background** (reverse video without color).
+
+State colors are redundant cues: **working is yellow**, **idle green**,
+**done cyan**, and **blocked red**; **unknown/stale states are dim**.
+Glyphs and words remain visible (`● working`, `○ idle`, `✓ done`, `! blocked`,
+`? unknown`, `~ stale`). A nonempty `NO_COLOR` disables color but preserves
+glyphs, words, bold, underline, dim and reverse-video selection.
+
+Detail and other plain-text panels leave one column of inner padding on the left.
+
 Detail automatically previews the most recently focused list's selection,
 including full agent summaries and separate status-update/observation timestamps
 in local time with relative age. **Detail is read-only: viewing never ACKs,
@@ -74,10 +121,12 @@ submissions and pending/failed OUTBOX entries; `delivering` is **UNCERTAIN**.
 
 ### Inline input and replies
 
-Select an Agents row and press `Enter`. The full-width input box shows
-`To host/alias · FYI`; UI mail is always `sender=user`, kind `fyi`, without a
-subject. A missing native receiver produces a warning but still permits sending
-to the mailbox. A stale recipient cannot be selected for input.
+Select an Agents row and press `Enter`. The full-width input box below Detail
+(or below the focused region in single mode) shows `To host/alias · FYI`;
+UI mail is always `sender=user`, kind `fyi`, without a subject. Input space is
+reserved before choosing the body layout, so opening or growing input can switch
+from stacked to single mode. A missing native receiver produces a warning but
+still permits sending to the mailbox. A stale recipient cannot be selected for input.
 Threads `Enter` opens the same input as a reply to the thread's latest message.
 The recipient must resolve to a live, non-stale agent; otherwise an error is shown.
 
