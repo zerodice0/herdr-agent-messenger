@@ -13,6 +13,7 @@ from unittest import mock
 
 import agent_directory
 import agent_skill_cli
+from ledger_store import LedgerStore
 
 SKILL_WRAPPER_PATH = Path(
     ".agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
@@ -60,7 +61,36 @@ def batch_route_resolution(route, environment=None):
     )
 
 
-class AgentSkillCliTest(unittest.TestCase):
+class IsolatedLegacyCliTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="ham-legacy-cli-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        home = root / "home"
+        self.environment = {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_STATE_HOME": str(home / ".local/state"),
+            "HERDR_AGENT_LEDGER_DIR": str(home / ".local/state/herdr-agent-messenger/ledger"),
+            "HERDR_AGENT_REQUEST_STATE_DIR": str(root / "requests"),
+            "HERDR_AGENT_LEDGER_AUTOSTART": "0",
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_TERMINAL_ID": "terminal-w1:p1",
+        }
+        # Even environment={} falls back to Path.home(). Never read the user's
+        # live coordination settings or request records from transport fixtures.
+        environment_patch = mock.patch.dict(os.environ, self.environment)
+        environment_patch.start()
+        self.addCleanup(environment_patch.stop)
+        store = LedgerStore(environment=self.environment, canonical_name="legacy-cli-test")
+        repo_id = agent_skill_cli.repository_identity(agent().cwd, store.host)["repo_id"]
+        with store.transaction() as connection:
+            # This is a pre-existing, nonparticipating repo, not a newly observed
+            # repo whose first registry reconciliation must default to auto.
+            connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (repo_id, 1.0))
+
+
+class AgentSkillCliTest(IsolatedLegacyCliTest):
     def test_local_discovery_reports_snapshot_permission_failure(self):
         failed = agent_directory.ProbeResult(
             "local",
@@ -649,7 +679,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 max_workers=1,
-                environment={"HERDR_PANE_ID": "w1:p1"},
+                environment=self.environment,
             )
 
         self.assertEqual(request.call_count, 3)
@@ -676,7 +706,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=False,
                 timeout_ms=90_000,
                 max_workers=1,
-                environment={},
+                environment=self.environment,
             )
 
         self.assertEqual(payload["status"], "succeeded")
@@ -688,13 +718,14 @@ class AgentSkillCliTest(unittest.TestCase):
     def test_no_wait_batch_does_not_turn_uncertain_submission_into_failure(self):
         with mock.patch.object(agent_skill_cli, "send_command", side_effect=agent_skill_cli.SkillCommandError(
             "prompt_acceptance_unknown", "Connection lost after possible delivery.",
-        )):
+        )) as send:
             result = agent_skill_cli.batch_command(
                 requests_json='[{"route":"worker","message":"work"}]',
-                wait=False, timeout_ms=1000, max_workers=1, environment={},
+                wait=False, timeout_ms=1000, max_workers=1, environment=self.environment,
             )
         self.assertEqual(result["results"][0]["status"], "timeout")
         self.assertEqual(result["results"][0]["error_code"], "prompt_acceptance_unknown")
+        self.assertEqual(send.call_count, 1, "Uncertain delivery must never be retried.")
 
     def test_batch_normalizes_future_request_lifecycle_payloads(self):
         cases = (
@@ -742,7 +773,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 max_workers=1,
-                environment={},
+                environment=self.environment,
                 cancel_event=cancel_event,
             )
 
@@ -766,7 +797,7 @@ class AgentSkillCliTest(unittest.TestCase):
                 wait=True,
                 timeout_ms=90_000,
                 max_workers=1,
-                environment={},
+                environment=self.environment,
                 verbose=True,
             )
 
@@ -1109,7 +1140,7 @@ class AgentSkillCliTest(unittest.TestCase):
         )
 
 
-class AgentSkillContractTest(unittest.TestCase):
+class AgentSkillContractTest(IsolatedLegacyCliTest):
     def test_request_and_status_exit_codes_follow_lifecycle_state(self):
         states = {
             "submitted_settled": 0,
@@ -1264,7 +1295,7 @@ class AgentSkillContractTest(unittest.TestCase):
         ):
             result = agent_skill_cli.batch_command(
                 requests_json='[{"address":"local/white-bison","message":"work"}]',
-                wait=False, timeout_ms=1000, max_workers=1, environment={},
+                wait=False, timeout_ms=1000, max_workers=1, environment=self.environment,
             )
         self.assertEqual(result["results"][0]["status"], "submitted")
         self.assertEqual(len(commands), 1)
@@ -1286,7 +1317,7 @@ class AgentSkillContractTest(unittest.TestCase):
                     {"address": "local/white-bison", "message": "two"},
                     {"route": route, "message": "three"},
                 ]),
-                wait=False, timeout_ms=1000, max_workers=1, environment={},
+                wait=False, timeout_ms=1000, max_workers=1, environment=self.environment,
             )
         self.assertEqual(
             [item["error_code"] for item in result["results"]], ["duplicate_route"] * 3
@@ -1396,12 +1427,12 @@ class AgentSkillContractTest(unittest.TestCase):
                 self.assertEqual(result["initial_prompt"]["acceptance"], acceptance)
 
 
-class FocusDeferredCliTest(unittest.TestCase):
+class FocusDeferredCliTest(IsolatedLegacyCliTest):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.environment = {"HERDR_AGENT_REQUEST_STATE_DIR": directory.name}
-        self.store = agent_skill_cli.JsonRequestStateStore(Path(directory.name))
+        super().setUp()
+        self.store = agent_skill_cli.JsonRequestStateStore(
+            Path(self.environment["HERDR_AGENT_REQUEST_STATE_DIR"])
+        )
         self.sender = agent(name="blue-raven", pane_id="w1:p1")
         self.recipient = agent(name="white-bison", pane_id="w1:p2")
         self.clock = 0.0
