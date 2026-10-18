@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Plugin-owned, code-only mailbox board and explicit operator controls.
+"""Responsive mailbox inspection and explicit user-origin quick send.
 
-All durable mailbox mutations belong to the ledger services. UI state contains
-only live plugin-pane identities; snapshots and subprocess results are ephemeral.
+Durable mutations belong to ledger services; drafts and previews stay local.
 """
 from __future__ import annotations
 
@@ -24,7 +23,9 @@ from typing import Any, Mapping, Sequence
 
 from agent_directory import (dispatch_user_prompts, herdr_executable, query_local_agents,
                              query_remote_agents, ssh_config_path, user_prompt_text)
+import agent_messenger
 from agent_messenger import focused_pane_id, terminal_flow_control_disabled
+import key_input
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
@@ -32,6 +33,7 @@ from ledger_status import repository_identity
 from ledger_store import LedgerError, LedgerStore, ledger_directory
 from ledger_views import status_board
 from terminal_text import (character_index_at_display_column, display_width,
+                           pad_display_text, truncate_display_text,
                            wrap_display_text, wrap_message_lines)
 
 PLUGIN = "herdr.agent-messenger"
@@ -269,10 +271,10 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
                             previous=request.get("previous"))
     if operation == "send":
         return mail.send_user(repo_id, request["recipient"], body=request["body"], kind=request["kind"],
-                              subject=request.get("subject", ""), reply_to=request.get("reply_to"))
+                              subject=request.get("subject") or "", reply_to=request.get("reply_to"))
     if operation == "direct":
         return dispatch_direct(store, request["recipient"], request["body"], environment,
-                               subject=request.get("subject", ""))
+                               subject=request.get("subject") or "")
     if operation == "setting":
         result = RepoSettings(store).mutate(repo_id, request["field"], request["value"])
         from ledger_display import LedgerDisplay
@@ -375,9 +377,9 @@ def edit_buffer(text: str, cursor: int, key: Any, *, multiline: bool) -> tuple[s
         return (text[:cursor - 1] + text[cursor:], cursor - 1, True) if cursor else (text, cursor, True)
     if key == curses.KEY_DC:
         return text[:cursor] + text[cursor + 1:], cursor, True
-    if key in ("\n", "\r", curses.KEY_ENTER):
+    if key in ("\n", "\r"):
         return (text[:cursor] + "\n" + text[cursor:], cursor + 1, True) if multiline else (text, cursor, True)
-    if isinstance(key, str) and key.isprintable():
+    if isinstance(key, str) and len(key) == 1 and key.isprintable():
         return text[:cursor] + key + text[cursor:], cursor + len(key), True
     return text, cursor, False
 
@@ -435,15 +437,6 @@ def wrap_summary(value: str, width: int) -> list[str]:
     return result
 
 
-def elide(value: str, width: int) -> str:
-    if display_width(value) <= width:
-        return value
-    prefix = clip(value, max(0, width - 1))
-    if " " in prefix and not value[len(prefix)].isspace():
-        prefix = prefix.rsplit(" ", 1)[0]
-    return prefix.rstrip() + "…"
-
-
 def status_time(value: float | None, now: float) -> str:
     if value is None:
         return "—"
@@ -458,50 +451,118 @@ def yes_no(value: Any) -> str:
 
 
 class MailboxApp:
-    """Four keyboard-first screens; every potentially blocking action is a Job."""
+    """Responsive regions, ephemeral drafts, and bounded asynchronous mutations."""
+    REGIONS = ("agents", "threads", "detail")
+    SETTINGS = ("mode", "main", "members", *DEFAULT_THRESHOLDS)
+
     def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job,
-                 clock=time.monotonic, wall_clock=time.time):
-        self.screen = screen
-        self.environment = dict(environment)
+                 clock=time.monotonic, wall_clock=time.time, popup: bool = False):
+        self.screen, self.environment = screen, dict(environment)
         self.repo_id = self.environment.get(REPO_ENV) or None
         self.store = LedgerStore(environment=environment)
-        self.job_factory, self.clock = job_factory, clock
-        self.wall_clock = wall_clock
+        self.job_factory, self.clock, self.wall_clock = job_factory, clock, wall_clock
         self.jobs: dict[str, Any] = {}
         self.local: dict[str, Any] = {"agents": [], "threads": [], "submissions": [], "peers": [], "outbox": []}
         self.remote: dict[str, Any] = {}
         self.remote_errors: dict[str, str] = {}
         self.remote_due: dict[str, float] = {}
-        self.next_bell = 0.0
-        self.bell_stamp: int | None = None
-        self.tab, self.selection, self.scroll = 0, 0, 0
-        self.status = "Loading local ledger…"
-        self.body, self.subject = "", ""
-        self.body_cursor = self.subject_cursor = 0
-        self.cursor_position: tuple[int, int] | None = None
-        self.kind, self.delivery = "fyi", "mailbox"
-        self.compose_field = 0
-        self.recipient: dict[str, Any] | None = None
-        self.reply_to: str | None = None
-        self.edit: dict[str, Any] | None = None
+        self.next_bell, self.bell_stamp = 0.0, None
+        self.focus, self.mode, self.layout = "agents", "nav", "single"
+        self.preview = "agents"
+        self.selections = {"agents": 0, "threads": 0}
+        self.scrolls = {"agents": 0, "threads": 0, "detail": 0}
         self.detail: dict[str, Any] | None = None
-        self.confirm: str | None = None
-        self.running = True
-        self.draft_version = 0
-        self.submitted_draft_version: int | None = None
-        self.follow_selection = True
+        self.diagnostics = False
+        self.status, self.input_error = "", ""
+        self.status_level, self.last_error = "info", ""
+        self.drafts: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+        self.draft_key: tuple[str, str, str | None] | None = None
+        self.body, self.body_cursor, self.draft_version = "", 0, 0
+        self.delivery, self.reply_to = "mailbox", None
+        self.recipient: dict[str, Any] | None = None
+        self.submitted: dict[str, Any] | None = None
+        self.result_tags: dict[tuple[str, str], tuple[str, float]] = {}
+        self.confirm: dict[str, Any] | None = None
+        self.edit: dict[str, Any] | None = None
+        self.settings_selection = 0
+        self.help_return = "nav"
+        self.overlay_scroll = 0
+        self.cursor_position: tuple[int, int] | None = None
+        self.colors_enabled = False
+        self.popup, self.running = popup, True
+
+    def set_status(self, message: str, level: str = "info") -> None:
+        self.status, self.status_level = message, level
+        if level == "error":
+            self.last_error = message
+
+    def input_active(self) -> bool:
+        return self.draft_key is not None and (
+            self.mode == "input" or self.mode == "help" and self.help_return == "input" or
+            self.mode == "confirm" and self.confirm is not None and
+            self.confirm["return_mode"] == "input")
 
     def start_job(self, key: str, operation: str, **values: Any) -> bool:
+        if not self.running:
+            return False
         if key in self.jobs:
             if key == "mutation":
-                self.status = "An operation is pending; this input has not been submitted."
+                self.set_status("An operation is pending; this input has not been submitted.", "error")
             return False
-        self.jobs[key] = self.job_factory({"operation": operation, "repo_id": self.repo_id, **values}, self.environment)
-        if key == "mutation" and operation == "setting":
-            self.status = "Saving settings… navigation and q remain available."
+        self.jobs[key] = self.job_factory({"operation": operation, "repo_id": self.repo_id, **values},
+                                         self.environment)
         return True
 
+    @staticmethod
+    def identity(item: Mapping[str, Any] | None) -> Any:
+        if not item:
+            return None
+        if item.get("type"):
+            field = {"thread": "thread_id", "direct": "submission_id", "outbox": "item_id"}[item["type"]]
+            return item["type"], item[field]
+        return item["host"], item["terminal_id"]
+
+    def agents(self) -> list[dict[str, Any]]:
+        values = list(self.local.get("agents", []))
+        peers = {peer["canonical_name"]: peer["uuid"] for peer in self.local.get("peers", [])}
+        for host, snapshot in self.remote.items():
+            if not any(item["host"] == host and item["uuid"] == peers.get(host)
+                       for item in snapshot.get("hosts", [])):
+                continue
+            for agent in snapshot.get("agents", []):
+                stale = host in self.remote_errors or agent.get("stale", False)
+                values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
+        return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
+                      key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+
+    def items(self, region: str | None = None) -> list[Any]:
+        region = region or (self.preview if self.focus == "detail" else self.focus)
+        if region == "agents":
+            return self.agents()
+        return ([{"type": "thread", **item} for item in self.local.get("threads", [])] +
+                [{"type": "direct", **item} for item in self.local.get("submissions", [])] +
+                [{"type": "outbox", **item} for item in self.local.get("outbox", [])
+                 if item["state"] in {"pending", "failed"}])
+
+    def selected(self, region: str | None = None) -> Any:
+        region = region or (self.preview if self.focus == "detail" else self.focus)
+        items = self.items(region)
+        index = min(max(0, self.selections[region]), max(0, len(items) - 1))
+        self.selections[region] = index
+        return items[index] if items else None
+
+    def refresh_detail(self, identities: Mapping[str, Any] | None = None) -> None:
+        if identities:
+            for region, identity in identities.items():
+                self.selections[region] = next((index for index, item in enumerate(self.items(region))
+                                               if self.identity(item) == identity), self.selections[region])
+                self.selected(region)
+        if not self.diagnostics:
+            self.detail = self.selected(self.preview)
+
     def tick(self) -> None:
+        if not self.running:
+            return
         now = self.clock()
         for key, job in list(self.jobs.items()):
             if self.jobs.get(key) is not job:
@@ -511,54 +572,52 @@ class MailboxApp:
                 continue
             job.close()
             del self.jobs[key]
+            identities = {region: self.identity(self.selected(region)) for region in ("agents", "threads")}
             error = value.get("error") if isinstance(value, dict) else None
-            selected_agent = self.selected() if self.tab == 0 else None
             if key.startswith("remote:"):
                 host = key.split(":", 1)[1]
                 if error:
                     self.remote_errors[host] = str(error.get("message", error))
                 else:
                     self.remote[host] = value
-                    host_state = next((item for item in value["hosts"] if item["host"] == host), {})
-                    peer_error = host_state.get("error")
-                    if peer_error:
-                        self.remote_errors[host] = str(peer_error["message"])
+                    state = next((item for item in value.get("hosts", []) if item["host"] == host), {})
+                    if state.get("error"):
+                        self.remote_errors[host] = str(state["error"].get("message", state["error"]))
                     else:
                         self.remote_errors.pop(host, None)
-                self.refresh_detail(selected_agent)
             elif key == "snapshot":
                 if error:
-                    self.status = f"Local ledger: {error.get('code')}: {error.get('message')}"
+                    self.set_status(f"Local ledger: {error.get('code')}: {error.get('message')}", "error")
                 else:
                     self.local = value
-                    peers = {peer["canonical_name"] for peer in self.local.get("peers", [])}
-                    for cached in (self.remote, self.remote_errors, self.remote_due):
-                        for host in list(cached):
+                    peers = {peer["canonical_name"] for peer in value.get("peers", [])}
+                    for cache in (self.remote, self.remote_errors, self.remote_due):
+                        for host in list(cache):
                             if host not in peers:
-                                del cached[host]
+                                del cache[host]
                     for pending in list(self.jobs):
                         if pending.startswith("remote:") and pending.split(":", 1)[1] not in peers:
                             self.jobs.pop(pending).close()
-                    self.refresh_detail(selected_agent)
-                    mutation = self.jobs.get("mutation")
-                    if mutation is None or mutation.operation != "setting":
-                        self.status = "Local ledger updated. Read-only inspection does not acknowledge messages."
             else:
-                self.status = (f"{error.get('code')}: {error.get('message')}" if error else
-                               json.dumps(value, ensure_ascii=False))
-                if not error and job.operation == "setting":
-                    # A snapshot started before this commit cannot replace the
-                    # authoritative result used by the next settings key.
-                    snapshot = self.jobs.pop("snapshot", None)
-                    if snapshot is not None:
-                        snapshot.close()
-                    self.local["settings"] = value
-                if (not error and job.operation in {"send", "direct"}
-                        and self.submitted_draft_version == self.draft_version
-                        and value.get("acceptance") != "failed"):
-                    self.body, self.body_cursor = "", 0
-                    self.draft_version += 1
-                self.start_job("snapshot", "snapshot")
+                if job.operation in {"send", "direct"}:
+                    self.finish_send(value, error)
+                elif error:
+                    self.set_status(f"{error.get('code')}: {error.get('message')}", "error")
+                else:
+                    self.set_status("Settings saved." if job.operation == "setting" else "Operation completed.")
+                    if job.operation == "setting":
+                        snapshot = self.jobs.pop("snapshot", None)
+                        if snapshot is not None:
+                            snapshot.close()
+                        self.local["settings"] = value
+                if self.running:
+                    self.start_job("snapshot", "snapshot")
+            self.refresh_detail(identities)
+            if not self.running:
+                return
+        for identity, (_tag, until) in list(self.result_tags.items()):
+            if now >= until:
+                del self.result_tags[identity]
         if now >= self.next_bell:
             self.next_bell = now + LOCAL_INTERVAL
             try:
@@ -568,103 +627,559 @@ class MailboxApp:
             if stamp != self.bell_stamp and "snapshot" not in self.jobs:
                 self.bell_stamp = stamp
                 self.start_job("snapshot", "snapshot")
-        # This schedule is deliberately independent from local bell activity.
         for peer in self.local.get("peers", []):
             host = peer["canonical_name"]
             if now >= self.remote_due.get(host, 0):
                 self.remote_due[host] = now + REMOTE_INTERVAL
                 self.start_job(f"remote:{host}", "remote", host=host, previous=self.remote.get(host))
 
-    def refresh_detail(self, selected_agent: Mapping[str, Any] | None = None) -> None:
-        if selected_agent is not None:
-            identity = (selected_agent["host"], selected_agent["terminal_id"])
-            self.selection = next((index for index, agent in enumerate(self.agents())
-                                   if (agent["host"], agent["terminal_id"]) == identity), self.selection)
-            self.selected()
-        if not self.detail:
+    def save_draft(self) -> None:
+        if self.draft_key is not None:
+            self.drafts[self.draft_key] = {"text": self.body, "cursor": self.body_cursor,
+                                          "version": self.draft_version, "delivery": self.delivery}
+
+    def open_input(self, recipient: Mapping[str, Any], reply_to: str | None = None) -> None:
+        if recipient.get("stale"):
+            self.set_status("Remote snapshot is stale; refresh before selecting a recipient.", "error")
             return
-        item = self.detail
-        kind = item.get("type")
-        if kind in {"thread", "direct", "outbox"}:
-            collection, identity = {"thread": ("threads", "thread_id"),
-                                    "direct": ("submissions", "submission_id"),
-                                    "outbox": ("outbox", "item_id")}[kind]
-            replacement = next((entry for entry in self.local.get(collection, [])
-                                if entry[identity] == item[identity]), None)
-            self.detail = {**replacement, "type": kind} if replacement else None
-        elif "agent_id" in item:
-            self.detail = next((agent for agent in self.agents() if agent["agent_id"] == item["agent_id"]), None)
+        self.recipient = dict(recipient)
+        changed_repo = self.repo_id != recipient["repo_id"]
+        self.repo_id, self.reply_to = recipient["repo_id"], reply_to
+        if changed_repo:
+            snapshot = self.jobs.pop("snapshot", None)
+            if snapshot is not None:
+                snapshot.close()
+            self.start_job("snapshot", "snapshot")
+        self.draft_key = (recipient["host"], recipient["terminal_id"], reply_to)
+        draft = self.drafts.get(self.draft_key, {})
+        self.body, self.body_cursor = draft.get("text", ""), draft.get("cursor", 0)
+        self.draft_version, self.delivery = draft.get("version", 0), draft.get("delivery", "mailbox")
+        self.mode, self.input_error = "input", ""
+        self.save_draft()
 
-    def agents(self) -> list[dict[str, Any]]:
-        values = list(self.local["agents"])
-        peers = {peer["canonical_name"]: peer["uuid"] for peer in self.local.get("peers", [])}
-        for host, snapshot in self.remote.items():
-            if not any(item["host"] == host and item["uuid"] == peers.get(host)
-                       for item in snapshot.get("hosts", [])):
-                continue
-            for agent in snapshot.get("agents", []):
-                values.append({**agent, "stale": host in self.remote_errors or agent.get("stale", False),
-                               "unread": "?" if host in self.remote_errors else agent.get("unread", "?")})
-        return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
-                      key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+    def choose_agent(self) -> None:
+        agent = self.selected("agents")
+        if agent:
+            self.open_input(agent)
+        else:
+            self.set_status("No agent selected. Refresh to discover recipients.", "error")
 
-    def items(self) -> list[Any]:
-        if self.tab == 0:
-            return self.agents()
-        if self.tab == 1:
-            return ([{"type": "thread", **thread} for thread in self.local["threads"]] +
-                    [{"type": "direct", **record} for record in self.local["submissions"]] +
-                    [{"type": "outbox", **record} for record in self.local.get("outbox", []) if record["state"] in {"pending", "failed"}])
-        if self.tab == 3:
-            return ["mode", "main", "members", *DEFAULT_THRESHOLDS]
-        return []
+    def reply(self) -> None:
+        item = self.selected("threads")
+        if not item or item.get("type") != "thread" or not item.get("messages"):
+            self.set_status("Select a mailbox thread to reply.", "error")
+            return
+        latest = max(item["messages"], key=lambda message: (message.get("created_at", 0), message["message_id"]))
+        agents = self.agents()
+        # Agent replies identify their sender by immutable agent ID; user-origin
+        # messages identify the other participant by the concrete recipient slot.
+        participant = next((agent for agent in agents
+                            if latest.get("sender") not in (None, "user") and
+                            agent.get("agent_id") == latest["sender"]), None)
+        if participant is not None:
+            identity = self.identity(participant)
+        else:
+            user_messages = [message for message in item["messages"] if message.get("sender") in (None, "user")]
+            other = max(user_messages, key=lambda message: (message.get("created_at", 0), message["message_id"])) if user_messages else None
+            identity = ((other.get("recipient_host"), other.get("recipient_terminal_id")) if other else None)
+        recipient = next((agent for agent in agents if self.identity(agent) == identity and not agent.get("stale")), None)
+        if recipient is None:
+            self.set_status("Thread participant is unavailable or stale; refresh before replying.", "error")
+            return
+        self.open_input(recipient, latest["message_id"])
 
-    def selected(self) -> Any:
-        items = self.items()
-        self.selection = min(max(0, self.selection), max(0, len(items) - 1))
-        return items[self.selection] if items else None
+    def submit(self) -> None:
+        if not self.body.strip():
+            self.input_error = "Enter a non-empty message body."
+            return
+        if not self.recipient:
+            self.input_error = "No recipient selected."
+            return
+        recipient = next((agent for agent in self.agents()
+                          if self.identity(agent) == self.identity(self.recipient)), None)
+        if recipient is None or recipient.get("stale"):
+            self.input_error = "Recipient is unavailable or stale; refresh before sending."
+            return
+        request = {"recipient": dict(self.recipient), "body": self.body, "kind": "fyi",
+                   "subject": None, "reply_to": self.reply_to}
+        if self.delivery == "direct":
+            self.open_confirm("DIRECT · may interrupt; acceptance ≠ native delivery",
+                              [f"To {self.address(recipient)}", self.body],
+                              "direct", request, return_mode="input")
+        else:
+            self.send_request("send", request)
 
-    def put(self, row: int, text: str, attribute: int = 0) -> None:
-        height, width = self.screen.getmaxyx()
-        if 0 <= row < height and width > 1:
+    def send_request(self, operation: str, request: Mapping[str, Any]) -> None:
+        self.save_draft()
+        if self.start_job("mutation", operation, **request):
+            self.submitted = {"key": self.draft_key, "version": self.draft_version,
+                              "identity": self.identity(request["recipient"]), "operation": operation}
+            self.input_error = ""
+
+    def finish_send(self, value: Mapping[str, Any], error: Any) -> None:
+        submitted, self.submitted = self.submitted, None
+        if submitted is None:
+            return
+        failed = bool(error) or value.get("acceptance") == "failed"
+        if failed:
+            message = str(error.get("message", error) if error else
+                          value.get("evidence") or value.get("error") or "Delivery failed.")
+            tag = "failed: " + message
+            self.set_status(message, "error")
+            if self.draft_key == submitted["key"] and self.input_active():
+                self.input_error, self.mode, self.confirm = message, "input", None
+        else:
+            draft = self.drafts.get(submitted["key"])
+            cleared = draft is not None and draft["version"] == submitted["version"]
+            if cleared:
+                del self.drafts[submitted["key"]]
+                if self.draft_key == submitted["key"]:
+                    self.body, self.body_cursor = "", 0
+                    if self.input_active():
+                        self.mode, self.confirm = "nav", None
+                    self.draft_key = None
+            tag = ("direct accepted" if value.get("acceptance") == "accepted" else "direct uncertain"
+                   if submitted["operation"] == "direct" else value.get("state") or "queued")
+            self.set_status("Direct acceptance ≠ native delivery." if submitted["operation"] == "direct"
+                            else "Message queued in the mailbox.")
+            if self.popup and cleared and not any(draft["text"].strip() for draft in self.drafts.values()):
+                self.running = False
+        self.result_tags[submitted["identity"]] = (tag, self.clock() + 10)
+
+    @staticmethod
+    def address(agent: Mapping[str, Any] | None) -> str:
+        return f"{agent['host']}/{agent.get('alias') or agent['terminal_id']}" if agent else "—"
+
+    def open_confirm(self, title: str, lines: list[str], operation: str, values: Mapping[str, Any],
+                     *, return_mode: str = "nav") -> None:
+        self.confirm = {"title": title, "lines": lines, "operation": operation,
+                        "values": dict(values), "choice": 0, "return_mode": return_mode}
+        self.overlay_scroll = 0
+        self.mode = "confirm"
+
+    def confirm_key(self, key: Any) -> None:
+        confirm = self.confirm
+        assert confirm is not None
+        if key == key_input.ESCAPE:
+            self.mode, self.confirm = confirm["return_mode"], None
+        elif key in ("\t", key_input.SHIFT_TAB, curses.KEY_LEFT, curses.KEY_RIGHT):
+            confirm["choice"] = 1 - confirm["choice"]
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.overlay_key(key)
+        elif key == "\r":
+            self.mode, self.confirm = confirm["return_mode"], None
+            if not confirm["choice"]:
+                return
+            operation = confirm["operation"]
+            if operation == "quit":
+                self.running = False
+            elif operation in {"send", "direct"}:
+                self.send_request(operation, confirm["values"])
+            else:
+                self.start_job("mutation", operation, **confirm["values"])
+
+    def resolve(self, disposition: str) -> None:
+        item = self.selected("threads")
+        message = next((message for message in (item or {}).get("messages", [])
+                        if message["state"] == "delivering"), None)
+        if message is None:
+            self.set_status("Select a thread containing an uncertain native claim.", "error")
+            return
+        self.edit = {"title": "Operator evidence (required; NOT native ACK)", "text": "", "cursor": 0,
+                     "action": "resolve", "return_mode": "nav",
+                     "claim": {"claim_id": message["claim_id"], "agent_id": message["claimed_agent_id"],
+                               "generation": message["claimed_generation"], "disposition": disposition},
+                     "target": self.message_target(message)}
+        self.overlay_scroll = 0
+        self.mode = "evidence"
+
+    @staticmethod
+    def message_target(message: Mapping[str, Any]) -> list[str]:
+        return [f"Message: {message.get('message_id', '—')}",
+                f"Claim: {message.get('claim_id') or '—'}",
+                f"Old agent: {message.get('claimed_agent_id') or '—'}",
+                f"Generation: {message.get('claimed_generation', '—')}",
+                f"Current state: {message.get('state', '—')}"]
+
+    def thread_action(self, key: str) -> None:
+        item = self.selected("threads")
+        if key in ("a", "n"):
+            self.resolve("applied" if key == "a" else "not_applied")
+        elif key == "w":
+            message = next((message for message in (item or {}).get("messages", [])
+                            if message.get("origin_host") == self.store.host and
+                            message["state"] in {"pending", "queued"}), None)
+            if message:
+                self.open_confirm("Withdraw message?", self.message_target(message),
+                                  "withdraw", {"message_id": message["message_id"]})
+            else:
+                self.set_status("No locally originated pending or queued message is selected.", "error")
+        elif key == "t":
+            if item and item.get("type") == "outbox":
+                self.open_confirm("Retry outbox item?",
+                                  [f"Item: {item['item_id']}", *self.message_target(item)],
+                                  "retry", {"item_id": item["item_id"]})
+            else:
+                self.set_status("Select a pending or failed outbox item to retry.", "error")
+
+    def setting_value(self, field: str) -> Any:
+        settings = self.local.get("settings") or {}
+        fields = settings.get("settings", {})
+        if field == "mode":
+            return settings.get("mode", "off")
+        if field in DEFAULT_THRESHOLDS:
+            return fields.get("thresholds", {}).get("value", DEFAULT_THRESHOLDS).get(field)
+        return fields.get(field, {}).get("value")
+
+    def settings_key(self, key: Any) -> None:
+        if key == key_input.ESCAPE:
+            self.mode = "nav"
+            return
+        if key in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            self.overlay_key(key)
+            return
+        if key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j"):
+            self.settings_selection = min(len(self.SETTINGS) - 1, max(0, self.settings_selection +
+                                          (-1 if key in (curses.KEY_UP, "k") else 1)))
+            self.overlay_scroll = 0
+            return
+        if not self.repo_id:
+            self.set_status("Select an agent to choose a repository first.", "error")
+            return
+        if key in ("m", " ", "\r") and (self.local.get("settings") or {}).get("repo_id") != self.repo_id:
+            self.set_status("Loading settings…")
+            self.start_job("snapshot", "snapshot")
+            return
+        if key in ("m", " "):
+            agent = self.selected("agents")
+            if not agent or agent["repo_id"] != self.repo_id or agent.get("stale"):
+                self.set_status("Choose a live, non-stale agent in this repository first.", "error")
+                return
+            target = {field: agent[field] for field in ("host", "terminal_id")}
+            field, value = "main", target
+            if key == " ":
+                field, value = "members", list(self.setting_value("members") or [])
+                value.remove(target) if target in value else value.append(target)
+            self.open_confirm(f"Change {field}?", [f"Target: {self.address(agent)}",
+                              json.dumps(value, ensure_ascii=False)], "setting",
+                              {"field": field, "value": value}, return_mode="settings")
+        elif key == "\r":
+            field = self.SETTINGS[self.settings_selection]
+            value = self.setting_value(field)
+            text = json.dumps(value, ensure_ascii=False) if field in {"main", "members"} else str(value)
+            self.edit = {"title": f"Edit {field}", "text": text, "cursor": len(text),
+                         "action": "setting", "field": field, "return_mode": "settings"}
+            self.overlay_scroll = 0
+            self.mode = "evidence"
+
+    def edit_key(self, key: Any) -> None:
+        edit = self.edit
+        assert edit is not None
+        if key == key_input.ESCAPE:
+            self.mode, self.edit = edit["return_mode"], None
+            return
+        if key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.overlay_key(key)
+            return
+        if key == "\r":
             try:
-                self.screen.addstr(row, 0, clip(text, width - 1), attribute)
+                if edit["action"] == "resolve":
+                    if not edit["text"].strip():
+                        raise ValueError("Non-empty operator evidence is required.")
+                    claim = {**edit["claim"], "evidence": edit["text"].strip()}
+                    self.open_confirm("USER CONFIRM " + claim["disposition"],
+                                      [*edit["target"], "Evidence: " + claim["evidence"],
+                                       "Operator confirmation, NOT native ACK."],
+                                      "resolve", {"claim": claim})
+                else:
+                    field = edit["field"]
+                    value = json.loads(edit["text"]) if field in {"main", "members"} else edit["text"].strip()
+                    if field in DEFAULT_THRESHOLDS:
+                        thresholds = dict((self.local.get("settings") or {}).get("settings", {}).get(
+                            "thresholds", {}).get("value", DEFAULT_THRESHOLDS))
+                        thresholds[field] = int(value)
+                        field, value = "thresholds", thresholds
+                    self.open_confirm("Save settings?", [f"Field: {field}", json.dumps(value, ensure_ascii=False)],
+                                      "setting", {"field": field, "value": value}, return_mode="settings")
+                self.edit = None
+            except (ValueError, TypeError) as error:
+                self.set_status(str(error), "error")
+            return
+        edit["text"], edit["cursor"], _handled = edit_buffer(edit["text"], edit["cursor"], key, multiline=False)
+
+    def refresh(self) -> None:
+        self.start_job("snapshot", "snapshot")
+        self.remote_due.clear()
+
+    def request_quit(self) -> None:
+        count = sum(bool(draft["text"]) for draft in self.drafts.values())
+        if count:
+            noun = "draft" if count == 1 else "drafts"
+            self.open_confirm(f"Discard {count} unsent {noun}?", [], "quit", {})
+        else:
+            self.running = False
+
+    def input_key(self, key: Any) -> None:
+        if key == key_input.ESCAPE:
+            self.save_draft()
+            self.mode = "nav"
+            self.draft_key = None
+        elif key == key_input.F1:
+            self.help_return, self.mode = "input", "help"
+            self.overlay_scroll = 0
+        elif key == "\x12":
+            self.refresh()
+        elif key == "\x04":
+            self.delivery = "direct" if self.delivery == "mailbox" else "mailbox"
+            self.draft_version += 1
+            self.save_draft()
+        elif key == "\r":
+            self.submit()
+        elif key != "\n":
+            text, cursor, handled = edit_buffer(self.body, self.body_cursor,
+                                                "\r" if key == key_input.NEWLINE else key, multiline=True)
+            if handled:
+                if text != self.body:
+                    self.draft_version += 1
+                    self.input_error = ""
+                self.body, self.body_cursor = text, cursor
+                self.save_draft()
+
+    def key(self, key: Any) -> None:
+        if key is None or key == curses.KEY_RESIZE:
+            return
+        self.set_status("")
+        if self.focus == "agents" and self.mode == "nav":
+            self.result_tags.pop(self.identity(self.selected("agents")), None)
+        if self.mode == "input":
+            self.input_key(key)
+            return
+        if self.mode == "confirm":
+            self.confirm_key(key)
+            return
+        if self.mode == "evidence":
+            self.edit_key(key)
+            return
+        if self.mode == "settings":
+            self.settings_key(key)
+            return
+        if self.mode == "help":
+            if key in (key_input.ESCAPE, key_input.F1, "?", "q"):
+                self.mode = self.help_return
+            else:
+                self.overlay_key(key)
+            return
+        if key == key_input.ESCAPE:
+            if self.diagnostics:
+                self.diagnostics = False
+                self.refresh_detail()
+            elif self.popup:
+                self.request_quit()
+        elif key == "q":
+            self.request_quit()
+        elif key in ("\t", key_input.SHIFT_TAB, curses.KEY_LEFT, curses.KEY_RIGHT, "h", "l"):
+            direction = -1 if key in (key_input.SHIFT_TAB, curses.KEY_LEFT, "h") else 1
+            self.focus = self.REGIONS[(self.REGIONS.index(self.focus) + direction) % len(self.REGIONS)]
+            if self.focus != "detail":
+                self.preview, self.diagnostics = self.focus, False
+                self.scrolls["detail"] = 0
+            self.refresh_detail()
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, "j", "k", curses.KEY_PPAGE,
+                     curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
+            amount = max(1, self.screen.getmaxyx()[0] - 6) if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+            if self.focus == "detail":
+                self.scrolls["detail"] = (0 if key == curses.KEY_HOME else 10**9 if key == curses.KEY_END
+                                         else max(0, self.scrolls["detail"] + direction * amount))
+            else:
+                items = self.items(self.focus)
+                self.selections[self.focus] = (0 if key == curses.KEY_HOME else len(items) - 1
+                                               if key == curses.KEY_END else
+                                               self.selections[self.focus] + direction * amount)
+                self.selected()
+                self.preview, self.diagnostics = self.focus, False
+                self.scrolls["detail"] = 0
+                self.refresh_detail()
+        elif key == "\r":
+            if self.focus == "agents":
+                self.choose_agent()
+            elif self.focus == "threads":
+                self.reply()
+        elif key == "s":
+            agent = self.selected("agents")
+            if not self.repo_id and agent:
+                self.repo_id = agent["repo_id"]
+                self.refresh()
+            self.mode = "settings"
+            self.overlay_scroll = 0
+        elif key in ("?", key_input.F1):
+            self.help_return, self.mode = "nav", "help"
+            self.overlay_scroll = 0
+        elif key == "e":
+            self.diagnostics, self.focus = True, "detail"
+            self.scrolls["detail"] = 0
+        elif key == "r":
+            self.refresh()
+        elif self.focus == "threads" and key in ("w", "t", "a", "n"):
+            self.thread_action(key)
+
+    def initialize_colors(self) -> None:
+        if self.environment.get("NO_COLOR"):
+            return
+        try:
+            if not curses.has_colors():
+                return
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                background = -1
+            except curses.error:
+                background = curses.COLOR_BLACK
+            for pair, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN,
+                                                curses.COLOR_YELLOW, curses.COLOR_RED), 1):
+                curses.init_pair(pair, foreground, background)
+            self.colors_enabled = True
+        except curses.error:
+            pass
+
+    def style(self, pair: int = 0, attribute: int = 0) -> int:
+        return attribute | (curses.color_pair(pair) if pair and self.colors_enabled else 0)
+
+    def put(self, row: int, column: int, text: str, attribute: int = 0) -> None:
+        height, width = self.screen.getmaxyx()
+        if not (0 <= row < height and 0 <= column < width):
+            return
+        available = width - column - (1 if row == height - 1 else 0)
+        if available <= 0:
+            return
+        value = clip(str(text), available)
+        if value:
+            try:
+                self.screen.addstr(row, column, value, attribute)
             except curses.error:
                 pass
+
+    def box(self, rect: tuple[int, int, int, int], title: str, focused: bool = False,
+            warning: bool = False) -> tuple[int, int, int, int]:
+        y, x, height, width = rect
+        attr = self.style(3 if warning else 1 if focused else 0, curses.A_BOLD if focused else curses.A_DIM)
+        if height < 2 or width < 2:
+            return y, x, 0, 0
+        self.put(y, x, "┌" + "─" * (width - 2) + "┐", attr)
+        self.put(y, x + 2, truncate_display_text(" " + title + " ", max(0, width - 4)), attr)
+        for row in range(y + 1, y + height - 1):
+            self.put(row, x, "│", attr)
+            self.put(row, x + width - 1, "│", attr)
+        self.put(y + height - 1, x, "└" + "─" * (width - 2) + "┘", attr)
+        return y + 1, x + 1, height - 2, width - 2
+
+    def mode_word(self) -> str:
+        if self.mode == "nav":
+            return "NAV · " + self.focus.title()
+        if self.mode == "input":
+            return "INPUT → " + self.address(self.recipient)
+        return self.mode.upper()
+
+    def footer_hints(self) -> list[str]:
+        if self.mode == "input":
+            return ["Enter send", "Shift+Enter / Alt+Enter newline", "Esc keep draft",
+                    "^D direct", "F1 help", "^R refresh"]
+        if self.mode == "confirm":
+            return ["Enter choose", "Tab/←→ select", "Esc cancel", "↑↓ scroll"]
+        if self.mode == "evidence":
+            return ["Enter review", "Esc cancel", "←→ edit"]
+        if self.mode == "settings":
+            return ["↑↓ select", "Enter edit", "m main", "Space member", "Esc close", "PgUp/PgDn info"]
+        if self.mode == "help":
+            return ["Esc close", "↑↓ scroll", "PgUp/PgDn", "F1 close"]
+        context = (["Enter send"] if self.focus == "agents" else
+                   ["Enter reply", "w withdraw", "t retry", "a/n recover"] if self.focus == "threads" else
+                   ["↑↓ scroll", "PgUp/PgDn"])
+        return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
+
+    def region_rects(self, top: int, height: int, width: int) -> dict[str, tuple[int, int, int, int]]:
+        if self.layout == "single":
+            return {self.focus: (top, 0, height, width)}
+        if self.layout == "three":
+            agents = max(30, round(width * .23))
+            threads = max(30, round(width * .29))
+            if width - agents - threads < 60:
+                threads = width - agents - 60
+            return {"agents": (top, 0, height, agents),
+                    "threads": (top, agents, height, threads),
+                    "detail": (top, agents + threads, height, width - agents - threads)}
+        left = min(44, max(28, round(width * .36)))
+        result = {"detail": (top, left, height, width - left)}
+        if height // 2 - 2 < 6:
+            region = self.focus if self.focus != "detail" else "agents"
+            result[region] = (top, 0, height, left)
+        else:
+            result["agents"] = (top, 0, height // 2, left)
+            result["threads"] = (top + height // 2, 0, height - height // 2, left)
+        return result
 
     def render(self) -> None:
         self.screen.erase()
         self.cursor_position = None
         height, width = self.screen.getmaxyx()
-        self.put(0, "HAM  1 Status  2 Threads  3 Compose  4 Settings", curses.A_BOLD)
-        self.put(1, f"[{('STATUS', 'THREADS', 'COMPOSE', 'SETTINGS')[self.tab]}] repo {self.repo_id or '(all; select an agent)'}", curses.A_REVERSE)
-        if height < 7 or width < 20:
-            self.put(2, "Resize terminal; q closes.")
-        elif self.edit:
-            self.render_edit(height, width)
-        elif self.detail:
-            self.render_detail(height, width)
-        elif self.tab == 2:
-            self.render_compose(height, width)
+        self.layout = ("tiny" if width < 32 or height < 10 else
+                       "single" if width < 80 or height < 18 else "two" if width < 140 else "three")
+        word = self.mode_word()
+        word = truncate_display_text(word, width)
+        right = max(0, width - display_width(word))
+        self.put(0, 0, "HAM", curses.A_BOLD)
+        repo = self.repo_id or "all repositories"
+        short_repo = Path(repo).name
+        self.put(0, 5, truncate_display_text(short_repo, max(0, right - 6)), curses.A_DIM)
+        self.put(0, right, word, self.style(1, curses.A_BOLD))
+        hints = ""
+        for hint in self.footer_hints():
+            candidate = hints + ("  ·  " if hints else "") + hint
+            if display_width(candidate) <= max(0, width - 1):
+                hints = candidate
+        self.put(height - 1, 0, hints, curses.A_DIM)
+        bottom = height - 1
+        input_visible = self.layout != "tiny" and self.input_active()
+        if self.status and not (input_visible and self.status == self.input_error):
+            bottom -= 1
+            error = self.status_level == "error"
+            self.put(bottom, 0, ("✕ " if error else "") + self.status,
+                     self.style(4 if error else 0, curses.A_BOLD if error else 0))
+        if self.layout == "tiny":
+            self.put(min(2, height - 2), 0, "Resize terminal", curses.A_BOLD)
         else:
-            self.render_list(height, width)
-        footer = "Esc back  q close  1–4 screen  ↑↓ select  Enter inspect  c compose  r refresh  ? errors"
-        if self.tab == 1:
-            footer = "Enter inspect  a applied / n not-applied (claim)  w withdraw  t retry outbox"
-        elif self.tab == 2:
-            footer = "Tab field  ^K kind  ^D mailbox/direct  ^S review/send  Esc back"
-        elif self.tab == 3:
-            footer = "Enter edit  m use selected board agent as main  Space toggle manual member"
-        if self.edit:
-            footer = "Enter confirm  Esc cancel  ←→ move  Home/End  Backspace/Delete edit"
-        self.put(height - 2, self.status)
-        self.put(height - 1, footer, curses.A_DIM)
+            self.refresh_detail()
+            input_rect = None
+            if input_visible:
+                body_height = max(0, bottom - 1)
+                lines = wrap_message_lines(self.body.split("\n"), width=max(1, width - 3),
+                                           cursor_row=0, cursor_column=0)[0]
+                rows = min(max(3, body_height // 3), max(3, len(lines)))
+                warning = bool(self.recipient and not self.recipient.get("extension_present"))
+                input_height = rows + 2 + int(warning) + int(bool(self.input_error))
+                input_height = min(input_height, max(3 + int(bool(self.input_error)), body_height - 3))
+                bottom -= input_height
+                input_rect = (bottom, 0, input_height, width)
+            for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
+                inner = self.box(rect, region.title(), self.focus == region)
+                if region == "agents":
+                    self.render_agents(inner)
+                elif region == "threads":
+                    self.render_threads(inner)
+                else:
+                    self.render_detail(inner)
+            if input_rect:
+                self.render_input(input_rect)
+            if self.mode in {"confirm", "settings", "help", "evidence"}:
+                self.render_overlay((1, 0, max(0, bottom - 1), width))
         if self.cursor_position is not None:
-            try:
-                self.screen.move(*self.cursor_position)
-                curses.curs_set(1)
-            except (curses.error, AttributeError):
-                pass
+            row, column = self.cursor_position
+            if 0 <= row < height - 1 and 0 <= column < width:
+                try:
+                    self.screen.move(row, column)
+                    curses.curs_set(1)
+                except (curses.error, AttributeError):
+                    pass
         else:
             try:
                 curses.curs_set(0)
@@ -672,404 +1187,323 @@ class MailboxApp:
                 pass
         self.screen.refresh()
 
-    def render_list(self, height: int, width: int) -> None:
-        items = self.items()
-        self.selected()
-        lines: list[tuple[str, int]] = []
-        if self.tab == 0:
-            hosts = dict.fromkeys([agent["host"] for agent in items] + sorted(self.remote_errors))
-            for host in hosts:
-                group = [(index, agent) for index, agent in enumerate(items) if agent["host"] == host]
-                stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
-                heading = f"── {host}{'  STALE/offline' if stale else ''}"
-                if host in self.remote_errors:
-                    heading += f" — {self.remote_errors[host]}"
-                heading += " ──"
-                lines.extend((line, -1) for line in wrap_summary(heading, width - 3))
-                if group:
-                    lines.append(("ALIAS ROLE TURN/PHASE UNREAD RECEIVER" if width < 80 else
-                                  "ALIAS   ROLE   TURN / PHASE   UNREAD   RECEIVER   SUMMARY", -1))
-                for index, agent in group:
-                    unread = str(agent.get("unread", "?"))
-                    if width >= 80:
-                        unread = "unread:" + unread
-                    essential = (f"{agent.get('role') or '—'} "
-                                 f"{agent.get('turn_state', 'unknown')}/{agent.get('phase') or '—'} "
-                                 f"{unread}")
-                    alias_width = max(1, width - 4 - display_width(essential))
-                    text = f"{elide(agent.get('alias') or agent['terminal_id'], alias_width)} {essential}"
-                    tail = "extension absent" if not agent.get("extension_present") else "receiver ready"
-                    if agent.get("user_border"):
-                        tail += "  user border preserved"
-                    remaining = width - 3 - display_width(text)
-                    if remaining > 5:
-                        text += " " + elide(tail, remaining - 1)
-                    lines.append((elide(text, width - 3), index))
-                    summary = wrap_summary(agent.get("summary") or "—", width - 5)
-                    if len(summary) > 3:
-                        summary = [*summary[:2], elide(summary[2] + "…", width - 5)]
-                    lines.extend(("  " + line, index) for line in summary)
-        elif self.tab == 1:
-            for index, item in enumerate(items):
-                if item["type"] == "thread":
-                    states = "; ".join(describe_message(message) for message in item["messages"])
-                    line = f"{item['subject'] or '(no subject)'}  {states}  [{item['thread_id'][:8]}]"
-                elif item["type"] == "direct":
-                    target = item["target"]
-                    address = target.get("recipient_address") or f"{target['host']}/{target.get('alias') or target['terminal_id']}"
-                    line = f"USER DIRECT {item['acceptance']}  {address}  [{item['submission_id'][:8]}]"
-                else:
-                    line = f"OUTBOX {item['state']} {item['kind']} → {item['target_host']}  {item.get('last_error') or ''}"
-                lines.append((line, index))
-        else:
-            settings = self.local.get("settings") or {}
-            fields = settings.get("settings", {})
-            for index, field in enumerate(items):
-                value = settings.get("mode", "off") if field == "mode" else fields.get(field, {}).get("value")
-                if field in DEFAULT_THRESHOLDS:
-                    value = fields.get("thresholds", {}).get("value", DEFAULT_THRESHOLDS).get(field)
-                lines.append((f"{field}: {json.dumps(value, ensure_ascii=False)}", index))
-            lines.append((f"home: {settings.get('home_host') or 'unset'}; propagation pending: {settings.get('propagation_pending', 0)}", -1))
-            for field, data in fields.items():
-                lines.append((f"{field} v{data['version']} @ {data['origin_host']}", -1))
-            for conflict in settings.get("conflicts", []):
-                for line in wrap_display_text("! CONFLICT " + json.dumps(conflict, ensure_ascii=False), width - 3):
-                    lines.append((line, -1))
-        if not lines:
-            lines = [("No entries. No message has been acknowledged by opening this view.", -1)]
-        available = height - 5
-        chosen_lines = [index for index, (_line, item) in enumerate(lines) if item == self.selection]
-        chosen_line = chosen_lines[0] if chosen_lines else 0
-        last_line = chosen_lines[-1] if chosen_lines else chosen_line
-        if self.follow_selection:
-            self.scroll = max(0, min(self.scroll, chosen_line))
-            if last_line >= self.scroll + available:
-                self.scroll = min(chosen_line, last_line - available + 1)
-            if self.tab == 0 and self.selection == 0 and last_line < available:
-                self.scroll = 0
-        self.scroll = min(max(0, self.scroll), max(0, len(lines) - available))
-        for row, (line, item) in enumerate(lines[self.scroll:self.scroll + available], 3):
-            continuation = self.tab == 0 and line.startswith("  ")
-            self.put(row, ("› " if item == self.selection and not continuation else "  ") + line,
-                     curses.A_REVERSE if item == self.selection else 0)
+    @staticmethod
+    def agent_columns(width: int) -> list[tuple[str, int, bool]]:
+        # The same cell widths drive the header and each row, including CJK aliases.
+        columns = [("marker", 1, False), ("alias", max(1, width - 23), False),
+                   ("turn", 10, False), ("mail", 4, True), ("rx", 2, False)]
+        if width >= 65:
+            columns[1] = ("alias", max(1, width - 42), False)
+            columns.extend([("role", 8, False), ("receiver", 9, False)])
+        return columns
 
-    def render_compose(self, height: int, width: int) -> None:
-        target = self.recipient
-        self.put(3, f"USER → {target['host']}/{target.get('alias') or target['terminal_id']}" if target else "Select a status-board agent, then c to compose.", curses.A_BOLD)
-        self.put(4, f"{self.delivery.upper()} · {self.kind} · sender=user; direct never means native delivered")
-        subject_start = 0
-        while display_width(self.subject[subject_start:self.subject_cursor]) > max(1, width - 11):
-            subject_start += 1
-        self.put(5, "Subject: " + self.subject[subject_start:], curses.A_REVERSE if self.compose_field == 0 else 0)
-        self.put(6, "Body (Enter=new line):", curses.A_REVERSE if self.compose_field == 1 else 0)
-        before = self.body[:self.body_cursor]
-        logical_row, logical_column = before.count("\n"), len(before.rsplit("\n", 1)[-1])
-        lines, cursor_row, cursor_column = wrap_message_lines(
-            self.body.split("\n"), width=max(1, width - 2),
-            cursor_row=logical_row, cursor_column=logical_column)
-        available = max(1, height - 10)
-        first = max(0, cursor_row - available + 1)
-        for row, line in enumerate(lines[first:first + available], 7):
-            self.put(row, " " + line.text)
-        if self.compose_field:
-            self.cursor_position = (min(height - 4, 7 + cursor_row - first), min(width - 2, 1 + cursor_column))
-        else:
-            self.cursor_position = (5, min(width - 2, 9 + display_width(self.subject[subject_start:self.subject_cursor])))
-        if self.confirm:
-            self.put(height - 3, self.confirm, curses.A_BOLD)
+    def column_text(self, values: Mapping[str, str], columns: list[tuple[str, int, bool]]) -> str:
+        parts = []
+        for name, width, right in columns:
+            value = truncate_display_text(values.get(name, ""), width)
+            parts.append((" " * max(0, width - display_width(value)) + value) if right else
+                         pad_display_text(value, width))
+        return " ".join(parts)
+
+    def list_window(self, region: str, lines: list[tuple[str, int, int, bool]], height: int
+                    ) -> list[tuple[str, int, int, bool]]:
+        chosen = next((index for index, line in enumerate(lines)
+                       if line[1] == self.selections[region]), None)
+        scroll = self.scrolls[region]
+        if chosen is not None:
+            selected_rows = sum(line[1] == self.selections[region] for line in lines[chosen:])
+            visible_end = chosen + min(selected_rows, max(1, height))
+            if chosen < scroll:
+                scroll = chosen
+            elif visible_end > scroll + height:
+                scroll = max(0, visible_end - height)
+        scroll = min(max(0, scroll), max(0, len(lines) - height))
+        self.scrolls[region] = scroll
+        return lines[scroll:scroll + max(0, height)]
+
+    def render_agents(self, rect: tuple[int, int, int, int]) -> None:
+        y, x, height, width = rect
+        if height <= 0 or width <= 0:
+            return
+        columns = self.agent_columns(width)
+        self.put(y, x, truncate_display_text(self.column_text(
+            {"alias": "ALIAS", "turn": "TURN", "mail": "MAIL", "rx": "RX",
+             "role": "ROLE", "receiver": "RECEIVER"}, columns), width), curses.A_DIM)
+        agents = self.agents()
+        lines: list[tuple[str, int, int, bool]] = []
+        for host in dict.fromkeys([agent["host"] for agent in agents] + sorted(self.remote_errors)):
+            group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
+            stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
+            lines.append((f"{host} · {len(group)} agents" + (" · ⚠ stale" if stale else ""),
+                          -1, curses.A_DIM, False))
+            if host in self.remote_errors:
+                lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
+            for index, agent in group:
+                chosen = index == self.selections["agents"]
+                marker = "▌" if chosen and self.focus == "agents" else "▸" if chosen else " "
+                turn = agent.get("turn_state") or "unknown"
+                glyph = {"working": "●", "done": "✓", "idle": "○"}.get(turn, "?")
+                receiver = agent.get("extension_present")
+                rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
+                values = {"marker": marker, "alias": agent.get("alias") or agent["terminal_id"],
+                          "turn": glyph + " " + turn, "mail": str("?" if agent.get("stale") else agent.get("unread", "?")),
+                          "rx": rx, "role": agent.get("role") or "—",
+                          "receiver": "ready" if receiver else "absent" if receiver is False else "unknown"}
+                tag = self.result_tags.get(self.identity(agent))
+                text = self.column_text(values, columns)
+                if tag:
+                    suffix = " [" + tag[0] + "]"
+                    text = truncate_display_text(text, max(0, width - display_width(suffix))) + suffix
+                attr = self.style(1 if chosen and self.focus == "agents" else 0, curses.A_BOLD)
+                if tag and tag[0].startswith("failed"):
+                    attr = self.style(4, curses.A_BOLD)
+                lines.append((text, index, attr, True))
+                secondary = " · ".join(str(agent[field]) for field in ("role", "phase", "summary")
+                                       if agent.get(field))
+                if secondary:
+                    lines.append(("  " + secondary, index, curses.A_DIM, False))
+        if not lines:
+            lines = [("No agents. r refresh", -1, curses.A_DIM, False)]
+        for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 1), y + 1):
+            self.put(row, x, truncate_display_text(text, width), attr)
+
+    def render_threads(self, rect: tuple[int, int, int, int]) -> None:
+        y, x, height, width = rect
+        lines: list[tuple[str, int, int, bool]] = []
+        for index, item in enumerate(self.items("threads")):
+            chosen = index == self.selections["threads"]
+            marker = "▌" if chosen and self.focus == "threads" else "▸" if chosen else " "
+            warning = False
+            if item["type"] == "thread":
+                messages = item.get("messages", [])
+                latest = messages[-1] if messages else {}
+                warning = any(message.get("state") == "delivering" for message in messages)
+                state = "⚠ UNCERTAIN" if warning else latest.get("state", "unknown")
+                body = (latest.get("body") or "").splitlines()
+                title = item.get("subject") or (body[0] if body else "(empty message)")
+                participants = f"{latest.get('sender_label', '—')} → {latest.get('recipient_address', '—')}"
+                metadata = f"{participants} · {latest.get('kind', 'fyi')} · {state}"
+            elif item["type"] == "direct":
+                state = "DIRECT " + item["acceptance"]
+                title = item.get("subject") or (item.get("body") or "Terminal input").splitlines()[0]
+                metadata = f"user → {self.address(item.get('target'))} · direct · acceptance ≠ native delivery"
+            else:
+                state = "OUTBOX " + item["state"]
+                title = item.get("last_error") or item["item_id"]
+                metadata = f"→ {item['target_host']} · {item['kind']} · {item['state']}"
+            attr = self.style(3 if warning else 1 if chosen and self.focus == "threads" else 0, curses.A_BOLD)
+            lines.append((f"{marker} {state} · {title}", index, attr, True))
+            lines.append(("  " + metadata, index, curses.A_DIM, False))
+        if not lines:
+            lines = [("No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
+        for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height), y):
+            self.put(row, x, truncate_display_text(text, width), attr)
 
     def detail_lines(self) -> list[str]:
+        if self.diagnostics:
+            return ["Diagnostics", json.dumps({"connection_errors": self.remote_errors,
+                    "pending_operations": list(self.jobs), "status": self.status, "last_error": self.last_error,
+                    "repo_id": self.repo_id}, ensure_ascii=False, indent=2)]
         item = self.detail or {}
         if item.get("type") == "thread":
-            result = [f"Thread {item['thread_id']}  {item['subject']}"]
+            result = [f"Thread {item['thread_id']}  {item.get('subject') or ''}"]
             for message in item["messages"]:
-                result.extend(["", f"{message['sender_label']} → {message['recipient_address']}", describe_message(message),
-                               f"id:{message['message_id']}  via:{message.get('via') or '—'}",
-                               f"claim:{message.get('claim_id') or '—'} agent:{message.get('claimed_agent_id') or '—'} "
-                               f"generation:{message.get('claimed_generation')}",
-                               f"confirmation source:{message.get('confirmation_source') or '—'}",
-                               f"evidence:{message.get('evidence') or '—'}", message["body"]])
-            result.append("a/n resolves the first uncertain claim in this thread; inspect its ID/evidence first.")
+                result.extend(["", f"{message['sender_label']} → {message['recipient_address']}",
+                               describe_message(message), *self.message_target(message),
+                               f"via: {message.get('via') or '—'}",
+                               f"confirmation source: {message.get('confirmation_source') or '—'}",
+                               f"evidence: {message.get('evidence') or '—'}", message["body"]])
             return result
         if item.get("host") and item.get("terminal_id") and not item.get("type"):
             now = self.wall_clock()
             return [
-                f"Address: {item['host']}/{item.get('alias') or item['terminal_id']}",
-                f"Alias: {item.get('alias') or '—'}",
+                f"Address: {self.address(item)}", f"Alias: {item.get('alias') or '—'}",
                 f"Host: {item['host']}{'  STALE/offline' if item.get('stale') else ''}",
-                f"Role: {item.get('role') or '—'}",
-                f"Client: {item.get('client') or '—'}",
-                f"Turn state: {item.get('turn_state') or 'unknown'}",
-                f"Phase: {item.get('phase') or '—'}",
-                f"Summary: {item.get('summary') or '—'}",
-                f"Unread: {item.get('unread', '?')}",
+                f"Role: {item.get('role') or '—'}", f"Client: {item.get('client') or '—'}",
+                f"Turn state: {item.get('turn_state') or 'unknown'}", f"Phase: {item.get('phase') or '—'}",
+                f"Summary: {item.get('summary') or '—'}", f"Unread: {item.get('unread', '?')}",
                 f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
                 f"Extension present: {yes_no(item.get('extension_present'))}",
                 f"Repo ID: {item.get('repo_id') or '—'}",
                 f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
                 f"Workspace / pane: {item.get('workspace_id') or '—'} / {item.get('pane_id') or '—'}",
-                f"Terminal ID: {item['terminal_id']}",
-                f"Generation: {item.get('generation', '—')}",
+                f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",
                 f"Session reference: {item.get('session_ref') or '—'}",
                 f"Last updated: {status_time(item.get('status_updated_at'), now)}",
                 f"Last seen: {status_time(item.get('last_seen'), now)}",
                 f"First seen: {status_time(item.get('first_seen'), now)}",
                 f"User border: {yes_no(item.get('user_border'))}",
             ]
-        return [json.dumps(item, ensure_ascii=False, indent=2)]
+        return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent or thread to preview."]
 
-    def render_detail(self, height: int, width: int) -> None:
-        lines: list[str] = []
-        agent = self.detail and self.detail.get("host") and self.detail.get("terminal_id") and not self.detail.get("type")
-        for line in self.detail_lines():
-            if agent:
-                label, _separator, value = line.partition(": ")
-                prefix = label + ": "
-                parts = wrap_summary(value, width - 1 - display_width(prefix))
-                lines.extend((prefix if index == 0 else " " * len(prefix)) + part
-                             for index, part in enumerate(parts))
-            else:
-                lines.extend(part for logical in line.split("\n")
-                             for part in wrap_display_text(logical, width - 1))
-        self.scroll = min(max(0, self.scroll), max(0, len(lines) - (height - 5)))
-        for row, line in enumerate(lines[self.scroll:self.scroll + height - 5], 3):
-            self.put(row, line)
-
-    def render_edit(self, height: int, width: int) -> None:
-        assert self.edit is not None
-        self.put(3, self.edit["title"], curses.A_BOLD)
-        for row, line in enumerate(wrap_display_text(self.edit.get("warning", ""), width - 1), 4):
-            if row >= height - 4:
-                break
-            self.put(row, line)
-        visible = self.edit["text"]
-        cursor = self.edit["cursor"]
-        prefix = visible[:cursor]
-        while display_width(prefix) > width - 4:
-            visible, prefix = visible[1:], prefix[1:]
-        self.put(height - 3, "> " + visible, curses.A_REVERSE)
-
-    def choose_agent(self) -> None:
-        agent = self.selected()
-        if self.tab == 0 and agent:
-            if agent.get("stale"):
-                self.status = "Remote snapshot is stale; refresh before selecting a recipient."
-                return
-            self.recipient = dict(agent)
-            self.repo_id = agent["repo_id"]
-            self.reply_to = None
-            self.draft_version += 1
-            self.tab, self.selection, self.scroll = 2, 0, 0
-            self.start_job("snapshot", "snapshot")
-
-    def open_edit(self, title: str, value: str, action: str, *, warning: str = "", **extra: Any) -> None:
-        self.edit = {"title": title, "text": value, "cursor": len(value), "action": action,
-                     "warning": warning, **extra}
-
-    def edit_key(self, key: Any) -> None:
-        edit = self.edit
-        assert edit is not None
-        if key == "\x1b":
-            self.edit = None
+    def render_detail(self, rect: tuple[int, int, int, int]) -> None:
+        y, x, height, width = rect
+        if height <= 0 or width <= 0:
             return
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            if "mutation" in self.jobs:
-                self.status = "An operation is pending; keep this evidence/edit until it finishes."
-                return
-            try:
-                if edit["action"] == "resolve":
-                    if not edit["text"].strip():
-                        raise ValueError("Evidence is required; this is a manual confirmation, not runtime-journal proof.")
-                    claim = {**edit["claim"], "evidence": edit["text"].strip()}
-                    self.start_job("mutation", "resolve", claim=claim)
-                else:
-                    field = edit["field"]
-                    value = json.loads(edit["text"]) if field in {"main", "members"} else edit["text"].strip()
-                    if field in DEFAULT_THRESHOLDS:
-                        value = int(value)
-                        thresholds = dict((self.local.get("settings") or {}).get("settings", {}).get("thresholds", {}).get("value", DEFAULT_THRESHOLDS))
-                        thresholds[field] = value
-                        field, value = "thresholds", thresholds
-                    self.start_job("mutation", "setting", field=field, value=value)
-                self.edit = None
-            except (ValueError, TypeError) as error:
-                self.status = str(error)
-            return
-        text, cursor = edit["text"], edit["cursor"]
-        if key == curses.KEY_LEFT:
-            cursor = max(0, cursor - 1)
-        elif key == curses.KEY_RIGHT:
-            cursor = min(len(text), cursor + 1)
-        elif key == curses.KEY_HOME:
-            cursor = 0
-        elif key == curses.KEY_END:
-            cursor = len(text)
-        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b") and cursor:
-            text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
-        elif key == curses.KEY_DC:
-            text = text[:cursor] + text[cursor + 1:]
-        elif isinstance(key, str) and key.isprintable():
-            text, cursor = text[:cursor] + key + text[cursor:], cursor + len(key)
-        edit["text"], edit["cursor"] = text, cursor
+        self.put(y, x, truncate_display_text("Read-only · viewing does not ACK", width), curses.A_DIM)
+        agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
+        wrap = wrap_summary if agent and not self.diagnostics else wrap_display_text
+        lines = [part for line in self.detail_lines() for logical in line.split("\n")
+                 for part in wrap(logical, max(1, width))]
+        available = max(0, height - 1)
+        self.scrolls["detail"] = min(self.scrolls["detail"], max(0, len(lines) - available))
+        for row, text in enumerate(lines[self.scrolls["detail"]:self.scrolls["detail"] + available], y + 1):
+            attr = self.style(3, curses.A_BOLD) if "UNCERTAIN" in text or "NOT native ACK" in text else 0
+            self.put(row, x, truncate_display_text(text, width), attr)
 
-    def resolve(self, disposition: str) -> None:
-        item = self.detail or self.selected()
-        if not item or item.get("type") != "thread":
-            self.status = "Select a thread containing an uncertain native claim."
+    def render_input(self, rect: tuple[int, int, int, int]) -> None:
+        direct = self.delivery == "direct"
+        title = ("Reply to " if self.reply_to else "To ") + self.address(self.recipient) + " · FYI"
+        if direct:
+            title = "DIRECT · " + title + " · may interrupt; acceptance ≠ native delivery"
+        y, x, height, width = self.box(rect, title, True, direct)
+        if height <= 0 or width <= 0:
             return
-        message = next((message for message in item["messages"] if message["state"] == "delivering"), None)
-        if message is None:
-            self.status = "This thread has no uncertain native claim."
-            return
-        self.open_edit(f"USER CONFIRM {disposition}: {message['claim_id']}", "", "resolve",
-                       warning="Manual operator evidence, NOT runtime-journal confirmation or handled/provider understanding. "
-                               f"Claimed agent {message['claimed_agent_id']}, generation {message['claimed_generation']}. "
-                               "Applied records that OLD claim; not-applied releases it without automatic replay. "
-                               "Enter confirms only with evidence; Esc cancels.",
-                       claim={"claim_id": message["claim_id"], "agent_id": message["claimed_agent_id"],
-                              "generation": message["claimed_generation"], "disposition": disposition})
+        if self.recipient and not self.recipient.get("extension_present") and height - int(bool(self.input_error)) > 1:
+            self.put(y, x, truncate_display_text(
+                "⚠ native receiver absent — message will wait in the mailbox", width), self.style(3))
+            y, height = y + 1, height - 1
+        if self.input_error and height > 1:
+            self.put(y + height - 1, x, truncate_display_text(self.input_error, width), self.style(4))
+            height -= 1
+        before = self.body[:self.body_cursor]
+        lines, row, column = wrap_message_lines(self.body.split("\n"), width=max(1, width - 1),
+                                               cursor_row=before.count("\n"),
+                                               cursor_column=len(before.rsplit("\n", 1)[-1]))
+        first = max(0, row - max(1, height) + 1)
+        for offset, line in enumerate(lines[first:first + max(0, height)]):
+            self.put(y + offset, x, truncate_display_text(line.text, width))
+        if height > 0 and self.mode == "input":
+            self.cursor_position = y + min(height - 1, row - first), x + min(width - 1, column)
 
-    def settings_key(self, key: Any) -> None:
+    def settings_lines(self) -> list[str]:
         settings = self.local.get("settings") or {}
-        if not self.repo_id:
-            self.status = "Select an agent on Status to choose a repository first."
-            return
-        field = self.selected()
-        if key in ("\n", "\r", curses.KEY_ENTER) and field:
-            fields = settings.get("settings", {})
-            value = settings.get("mode", "off") if field == "mode" else fields.get(field, {}).get("value")
-            warning = "mode: off | manual | auto. Changes are local settings with durable peer propagation."
-            if field in DEFAULT_THRESHOLDS:
-                value = fields.get("thresholds", {}).get("value", DEFAULT_THRESHOLDS)[field]
-                warning = "Integer 0–10000; thresholds are changed as one versioned field."
-            elif field in {"main", "members"}:
-                value = json.dumps(value if value is not None else ([] if field == "members" else None), ensure_ascii=False)
-                warning = 'JSON target {"host":"canonical","terminal_id":"term_…"}; main null restores automatic/no designation. members is a target array.'
-            self.open_edit(f"Edit {field}", str(value), "setting", field=field, warning=warning)
-        elif key in ("m", " "):
-            if self.recipient is None or self.recipient["repo_id"] != self.repo_id:
-                self.status = "Choose a board agent with c first, then return to Settings."
-                return
-            target = {key: self.recipient[key] for key in ("host", "terminal_id")}
-            if key == "m":
-                self.start_job("mutation", "setting", field="main", value=target)
-            else:
-                members = list(settings.get("settings", {}).get("members", {}).get("value", []))
-                members.remove(target) if target in members else members.append(target)
-                self.start_job("mutation", "setting", field="members", value=members)
+        fields = settings.get("settings", {})
+        result = [f"Target: {self.address(self.selected('agents'))}"]
+        result.extend(("▌ " if index == self.settings_selection else "  ") +
+                      f"{field}: {json.dumps(self.setting_value(field), ensure_ascii=False)}"
+                      for index, field in enumerate(self.SETTINGS))
+        result.extend([f"home: {settings.get('home_host') or 'unset'}",
+                       f"computed main: {json.dumps(fields.get('computed_main', {}).get('value'), ensure_ascii=False)}",
+                       f"propagation pending: {settings.get('propagation_pending', 0)}"])
+        for field, data in fields.items():
+            result.append(f"{field} v{data.get('version', '—')} @ {data.get('origin_host', '—')}")
+        result.extend("⚠ CONFLICT " + json.dumps(conflict, ensure_ascii=False)
+                      for conflict in settings.get("conflicts", []))
+        return result
 
-    def key(self, key: Any) -> None:
-        if self.edit:
-            self.edit_key(key)
+    def render_overlay(self, body: tuple[int, int, int, int]) -> None:
+        body_y, body_x, height, width = body
+        if self.mode == "help":
+            context = ["INPUT: Enter send · Shift+Enter / Alt+Enter newline · Esc keep draft · ^D direct · ^R refresh"
+                       if self.help_return == "input" else " / ".join(self.footer_hints_for_nav())]
+            lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
+                    "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
+                    "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
+                    "s settings · ? / F1 help · e diagnostics · r refresh · q close",
+                    "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
+                    "INPUT: printable characters are text (including q, ?, digits, :, /)",
+                    "←→ Home/End Backspace/Delete edit · ↑↓ move between lines",
+                    "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",
+                    "FYI mailbox sends immediately; direct input always asks for confirmation.",
+                    "Inspection never acknowledges messages. Direct acceptance ≠ native delivery.",
+                    "Esc closes overlays. Top-level Esc closes popups only."]
+        elif self.mode == "settings":
+            lines = self.settings_lines()
+        elif self.mode == "confirm":
+            assert self.confirm is not None
+            lines = [self.confirm["title"], *self.confirm["lines"]]
+        else:
+            assert self.edit is not None
+            lines = [self.edit["title"], *self.edit.get("target", [])]
+        compact = self.mode in {"confirm", "evidence"}
+        if compact:
+            content_width = max((display_width(line) for line in lines), default=0)
+            if self.mode == "evidence":
+                content_width = max(content_width, display_width(self.edit["text"]) + 2)
+            overlay_width = min(width - 4, max(content_width + 4, 40))
+            columns = max(1, overlay_width - 4)
+        else:
+            overlay_width = min(width, 100)
+            columns = max(1, overlay_width - 2)
+        wrapped = [part for line in lines for part in wrap_display_text(line, columns)]
+        overlay_height = min(height, len(wrapped) + 4) if compact else min(height, 28)
+        top = body_y + (height - overlay_height) // 2
+        left = body_x + (width - overlay_width) // 2
+        for row in range(top, top + overlay_height):
+            self.put(row, left, " " * overlay_width)
+        y, x, rows, columns = self.box((top, left, overlay_height, overlay_width), self.mode.upper(), True)
+        self.cursor_position = None
+        if compact:
+            x, columns = x + 1, columns - 2
+        if rows <= 0 or columns <= 0:
             return
-        if key == curses.KEY_RESIZE:
-            return
-        if key == "\x1b":
-            if self.confirm:
-                self.confirm = None
-            elif self.detail:
-                self.detail, self.scroll = None, 0
-            else:
-                self.tab = 0
-            return
-        # Text entry owns ordinary printable keys (including q and digits).
-        if self.tab == 2 and not self.detail:
-            if key == "\x13":
-                if "mutation" in self.jobs:
-                    self.status = "An operation is already pending; inspect its result before sending again."
-                elif not self.recipient or not self.body.strip():
-                    self.status = "Choose a recipient and enter a message body."
-                elif not self.confirm:
-                    self.confirm = f"Ctrl+S again: USER {'DIRECT INPUT (may interrupt)' if self.delivery == 'direct' else self.kind + ' mailbox'} → {self.recipient['host']}/{self.recipient.get('alias')}"
-                else:
-                    self.submitted_draft_version = self.draft_version
-                    self.start_job("mutation", "direct" if self.delivery == "direct" else "send",
-                                   recipient=self.recipient, body=self.body, kind=self.kind,
-                                   subject=self.subject, reply_to=self.reply_to)
-                    self.confirm = None
-                return
-            if key == "\t":
-                self.compose_field = 1 - self.compose_field
-                return
-            if key == "\x0b":
-                self.kind = "action" if self.kind == "fyi" else "fyi"
-                self.draft_version += 1
-                self.confirm = None
-                return
-            if key == "\x04":
-                self.delivery = "direct" if self.delivery == "mailbox" else "mailbox"
-                self.draft_version += 1
-                self.confirm = None
-                return
-            field = "body" if self.compose_field else "subject"
-            text, cursor, handled = edit_buffer(getattr(self, field), getattr(self, field + "_cursor"), key,
-                                                multiline=bool(self.compose_field))
-            if handled:
-                setattr(self, field, text)
-                self.draft_version += 1
-                setattr(self, field + "_cursor", cursor)
-                self.confirm = None
-                return
-        if key == "q":
-            self.running = False
-        elif key in ("1", "2", "3", "4"):
-            self.tab, self.selection, self.scroll, self.detail = int(key) - 1, 0, 0, None
-            self.follow_selection = True
-        elif key in (curses.KEY_UP, curses.KEY_DOWN):
-            amount = -1 if key == curses.KEY_UP else 1
-            if self.detail:
-                self.scroll = max(0, self.scroll + amount)
-            else:
-                self.follow_selection = True
-                self.selection += amount
-                self.selected()
-        elif key in (curses.KEY_NPAGE, curses.KEY_PPAGE):
-            self.follow_selection = False
-            self.scroll = max(0, self.scroll + (1 if key == curses.KEY_NPAGE else -1) * max(1, self.screen.getmaxyx()[0] - 5))
-        elif key == "c" and self.tab == 0:
-            self.choose_agent()
-        elif key == "r":
-            self.start_job("snapshot", "snapshot")
-            self.remote_due.clear()
-        elif key == "?":
-            self.detail = {"status": self.status, "connection_errors": self.remote_errors,
-                           "pending_operations": list(self.jobs), "repo_id": self.repo_id}
-            self.scroll = 0
-        elif self.tab == 3:
-            self.settings_key(key)
-        elif self.tab == 1:
-            if key in ("a", "n"):
-                self.resolve("applied" if key == "a" else "not_applied")
-            elif key in ("\n", "\r", curses.KEY_ENTER):
-                self.detail, self.scroll = self.selected(), 0
-            elif key == "w":
-                item = self.detail or self.selected()
-                if item and item.get("type") == "thread":
-                    message = next((message for message in item["messages"] if message["origin_host"] == self.store.host and message["state"] in {"pending", "queued"}), None)
-                    if message:
-                        self.start_job("mutation", "withdraw", message_id=message["message_id"])
-            elif key == "t":
-                item = self.detail or self.selected()
-                if item and item.get("type") == "outbox":
-                    self.start_job("mutation", "retry", item_id=item["item_id"])
-        elif self.tab == 0 and key in ("\n", "\r", curses.KEY_ENTER):
-            self.detail, self.scroll = self.selected(), 0
+        reserved = 2 if compact else 0
+        available = max(0, rows - reserved)
+        start = self.overlay_scroll
+        if self.mode == "settings" and not start:
+            chosen = next((index for index, text in enumerate(wrapped) if text.startswith("▌")), 0)
+            start = max(0, chosen + 1 - available)
+        start = min(start, max(0, len(wrapped) - available))
+        self.overlay_scroll = start
+        for offset, text in enumerate(wrapped[start:start + max(0, rows - reserved)]):
+            self.put(y + offset, x, truncate_display_text(text, columns),
+                     curses.A_BOLD if text.startswith("▌") else 0)
+        if self.mode == "confirm":
+            assert self.confirm is not None
+            buttons = ("[ Cancel ]   Confirm" if self.confirm["choice"] == 0 else "Cancel   [ Confirm ]")
+            self.put(y + rows - 1, x, truncate_display_text(buttons, columns), self.style(1, curses.A_BOLD))
+        elif self.mode == "evidence":
+            assert self.edit is not None
+            text, cursor = self.edit["text"], self.edit["cursor"]
+            start = 0
+            while display_width(text[start:cursor]) > max(0, columns - 3):
+                start += 1
+            self.put(y + rows - 1, x, truncate_display_text("> " + text[start:], columns))
+            self.cursor_position = y + rows - 1, x + min(columns - 1, 2 + display_width(text[start:cursor]))
+
+    def overlay_key(self, key: Any) -> None:
+        if key == curses.KEY_HOME:
+            self.overlay_scroll = 0
+        elif key == curses.KEY_END:
+            self.overlay_scroll = 10**9
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, "j", "k", curses.KEY_PPAGE, curses.KEY_NPAGE):
+            direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
+            amount = max(1, self.screen.getmaxyx()[0] - 8) if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+            self.overlay_scroll = max(0, self.overlay_scroll + direction * amount)
+
+    def footer_hints_for_nav(self) -> list[str]:
+        if self.focus == "agents":
+            return ["Agents: Enter opens quick send"]
+        if self.focus == "threads":
+            return ["Threads: Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
+        return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"]
 
     def run(self) -> int:
+        curses.nonl()
+        if hasattr(curses, "set_escdelay"):
+            curses.set_escdelay(25)
         self.screen.keypad(True)
         self.screen.timeout(100)
+        self.initialize_colors()
+
+        def read_key() -> Any:
+            try:
+                return self.screen.get_wch()
+            except curses.error:
+                return None
+
+        decoder = key_input.KeyDecoder(read_key)
         try:
-            curses.curs_set(0)
-        except curses.error:
-            pass
-        try:
-            while self.running:
-                self.tick()
-                self.render()
-                try:
-                    self.key(self.screen.get_wch())
-                except curses.error:
-                    pass
+            with key_input.kitty_keyboard(enabled=not self.environment.get("HAM_MAILBOX_NO_KITTY")):
+                while self.running:
+                    self.tick()
+                    if not self.running:
+                        break
+                    self.render()
+                    key = decoder.next()
+                    if key is not None:
+                        self.key(key)
         finally:
             for job in self.jobs.values():
                 job.close()
@@ -1078,14 +1512,25 @@ class MailboxApp:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="HAM mailbox: code-only status, threads, user compose and settings.")
-    parser.add_argument("command", choices=("split", "tab", "pane", "job"))
+    parser = argparse.ArgumentParser(description="HAM mailbox: agents, threads and quick send.")
+    parser.add_argument("command", choices=("split", "tab", "popup", "pane", "popup-pane", "job"))
     arguments = parser.parse_args(argv)
     values = dict(os.environ)
     try:
         if arguments.command in {"split", "tab"}:
             print(json.dumps(launch(arguments.command, values), ensure_ascii=False))
             return 0
+        if arguments.command == "popup":
+            opener_id = focused_pane_id(values)
+            if not opener_id:
+                raise LedgerError("opener_unavailable", "Open HAM from a live workspace pane (an agent is not required).")
+            opener = pane_record(opener_id, values)
+            store = LedgerStore(environment=values)
+            cwd = str(opener.get("cwd") or values.get("PWD") or os.getcwd())
+            repo_id = repository_identity(cwd, store.host)["repo_id"]
+            return 0 if agent_messenger.launch_plugin_popup(
+                "mailbox-popup", width=120, height=36, environment=values,
+                extra_arguments=["--env", f"{REPO_ENV}={repo_id}"]) else 1
         if arguments.command == "job":
             result = execute_job(json.load(sys.stdin), values)
             print(json.dumps(result, ensure_ascii=False))
@@ -1097,8 +1542,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except locale.Error:
             pass
         with terminal_flow_control_disabled(sys.stdin):
-            result = curses.wrapper(lambda screen: MailboxApp(screen, values).run())
-        close_owned(values)
+            result = curses.wrapper(lambda screen: MailboxApp(
+                screen, values, popup=arguments.command == "popup-pane").run())
+        if arguments.command != "popup-pane":
+            close_owned(values)
         return result
     except (LedgerError, OSError, ValueError) as error:
         print(json.dumps({"error": {"code": getattr(error, "code", "mailbox_ui_failed"), "message": str(error)}}, ensure_ascii=False))

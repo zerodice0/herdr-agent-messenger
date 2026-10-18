@@ -328,31 +328,34 @@ python3 "$HAM_CLI" repo show
 `status board`를 사용하며, `status list`에 기존 상위 명령의 `--host`를 붙여
 원격 보드로 대체하지 마세요. `status --address HOST/LABEL`은 수신자 상태 조회로 유지합니다.
 
-### 사용자 TUI: 설정, 작성, 불확실한 claim 복구
+### 사용자 TUI: 빠른 전송, 설정, 불확실한 claim 복구
 
-명령 팔레트에서 **HAM: Mailbox (Right Split)** 또는 **HAM: Mailbox (Tab)**을
-엽니다. 플러그인은 `herdr.agent-messenger`, action은 각각 `mailbox-split`,
-`mailbox-tab`입니다. 사용자의 전역 `prefix+m` 바인딩은 바꾸지 않습니다.
-모든 호스트의 플러그인을 먼저 갱신한 뒤 사용자가 원할 때 action을 연결하세요.
-같은 workspace의 기존 메일함 화면은 표시 이름이 아니라 안정적인 workspace/pane
-ID로 찾아 재사용합니다. `q`로 닫을 때는 이 플러그인이 소유한 메일함 pane만
-닫으며 다른 pane이나 workspace 전체를 닫지 않습니다.
+명령 팔레트에서 **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)** 또는
+**HAM: Mailbox (quick send)**를 엽니다. 플러그인은 `herdr.agent-messenger`이며
+action은 `mailbox-split` / `mailbox-tab` / `mailbox-popup`입니다.
+팝업은 전송 성공 결과가 오면 닫히고 실패하면 입력창을 유지합니다. 전역
+`prefix+m`은 바꾸지 않으므로, 모든 호스트를 갱신한 뒤 원할 때 연결하세요.
+분할·탭 동작은 표시 이름이 아닌 안정적인 ID로 기존 pane을 재사용합니다.
+`q`는 플러그인 소유 화면만 닫으며 내용이 있는 초안은 폐기 여부를 확인합니다.
+최상위의 Esc는 팝업일 때만 닫고, 입력창이나 겹쳐 열린 화면에서는 빠져나옵니다.
 
-`1`은 Status, `2`는 Threads, `3`은 Compose, `4`는 Settings입니다. Enter로
-상세 화면이나 편집기를 열고 Esc로 돌아갑니다. Status에서 `c`로 수신자를 선택한
-뒤 Settings의 `m`으로 main을 지정하거나 Space로 manual 회원 여부를 바꿉니다.
+Agents, Threads, 읽기 전용 Detail 영역은 화면 크기에 맞춰 배치합니다.
+80열 미만이거나 18행 미만이면 포커스가 있는 영역만 표시하며, 80~139열이면
+목록을 위아래로 쌓고 Detail을 옆에 배치합니다. 140열 이상이면 세 열로 표시합니다.
+32열 미만이거나 10행 미만이면 크기 변경 안내를 표시하되 초안, 커서, 모드와
+선택 항목은 보존합니다. NAV에서 Tab·Shift+Tab, ←·→ 또는 h/l로 포커스를 옮기고
+↑·↓ 또는 j/k로 행을 고릅니다. PgUp·PgDn·Home·End로 페이지를 넘기거나
+처음·끝으로 이동합니다. Detail에서는 방향키로 스크롤합니다. 숫자는 탐색 키가
+아닙니다. `s`는 Settings, `?`는 도움말, `e`는 Detail의 진단 정보를 열고
+`r`은 새로고침합니다. Detail에서는 Enter가 동작하지 않습니다.
 
-Status는 호스트별 헤더에 stale·오류 상태를 표시하고 그 아래 에이전트를 묶어
-보여 줍니다. 별칭·역할·턴·unread를 앞세운 메타데이터는 한 줄로 잘라 표시하고,
-요약은 들여쓴 최대 세 줄로 보여 줍니다. 한글·라틴 문자는 단어 경계에서,
-한자·가나·이모지는 표시 셀 경계에서 줄바꿈합니다.
-넘치는 내용에는 말줄임표를, 빈 요약에는 `—`를 표시합니다. Enter로 전체 상세
-정보를 열면 모든 항목을 내어쓰기로 줄바꿈합니다. 전체 요약, 식별자,
-역할·클라이언트, 턴·phase, unread·수신 확장, 저장소·메인 체크아웃 여부,
-위치, generation·세션 정보를 볼 수 있습니다. 상태 갱신 시각(`status_updated_at`)과
-레지스트리 관찰 시각(`last_seen`·`first_seen`)은 현지 날짜·시간과 경과 시간으로
-구분합니다. 플래그는 yes/no/unknown으로 표시합니다. 사용자 테두리 소유권은
-로컬에서만 관찰하므로 원격 증거가 없으면 unknown으로 표시합니다.
+Agents는 호스트별로 묶고 헤더에 stale·오류 상태를 표시합니다. 별칭, 턴 상태,
+unread와 native 수신 준비 상태 아래에 흐린 역할·phase·요약 한 줄을 표시합니다.
+stale 호스트는 마지막 조회 결과를 유지하고 unread를 `?`로 표시하며 종료됐다고
+판단하지 않습니다. Detail은 마지막으로 포커스를 둔 목록의 선택 항목을 자동으로
+보여 줍니다. 전체 필드와 상태 갱신·관찰 시각을 현지 시간과 경과 시간으로
+구분합니다. Threads에는 메시지 이력, 직접 입력 결과와 대기·실패한 OUTBOX가
+포함됩니다. **읽기 전용 조회만으로 ACK·전달·처리·복구가 일어나지 않습니다.**
 
 Settings에서 **수정할 수 있는 행은 일곱 개**입니다.
 
@@ -365,6 +368,10 @@ Settings에서 **수정할 수 있는 행은 일곱 개**입니다.
 | `coalesce_seconds` | 기본값은 30초입니다. |
 | `wakes_per_hour` | 기본값은 시간당 6회입니다. |
 | `max_hop` | 기본값은 10 hop입니다. |
+
+↑·↓로 행을 고르고 Enter로 편집하며 Esc로 닫습니다. `Target: host/alias`는
+선택한 Agents 행을 가리킵니다. `m`으로 main을 지정하고 Space로 manual 구성원에
+넣거나 뺍니다. 모든 변경은 기본 선택이 Cancel인 확인창을 거칩니다.
 
 네 임계값은 각각 0~10000의 정수이며 하나의 version을 가진 `thresholds` 필드로
 저장합니다. home, computed main, version/origin stamp, 충돌과 전파 대기는 모두
@@ -380,21 +387,37 @@ origin은 canonical 이름의 사전식 순서가 큰 쪽이 이깁니다. 새 �
 오프라인이면 원격 전파는 pending으로 남을 수 있으며 로컬 저장은 모든 peer의
 접속을 기다리지 않습니다.
 
-Compose에서 Tab은 제목/본문, Ctrl+K는 `fyi`/`action`, Ctrl+D는 메일함/직접 입력을
-전환합니다. Ctrl+S로 내용을 검토한 뒤 다시 Ctrl+S로 전송합니다. 텍스트 입력
-중에는 `q` 등 인쇄 가능한 키가 입력에 쓰이므로 Esc로 해당 문맥을 벗어나세요.
-사용자 메일의 발신자는 `sender=user`이고 일반 메일함 수신 확인을 따릅니다.
-**직접 입력은 작업을 방해할 수 있으며** 정확한 `Message from user (HAM):` 헤더를
-사용합니다. 직접 입력의 accepted/unknown/failed 기록은 별도 transport 접수
-기록이지 native delivered 수신 확인이 아닙니다.
+Agents에서 Enter를 누르면 인라인 FYI 입력창을 엽니다. Threads의 Enter는 최신
+메시지에 답장하며, 호스트·terminal ID로 현재의 stale이 아닌 에이전트를 찾습니다.
+stale이거나 찾을 수 없는 수신자는 차단합니다. native 수신기가 없으면 경고하지만
+메일은 보낼 수 있습니다. UI 메일은 `sender=user`, 종류 `fyi`이며 제목은 없습니다.
+Enter는 별도 확인 없이 즉시 메일을 보내며 빈 본문은 거절합니다.
+Shift+Enter는 메일함이 요청한 kitty 키보드 프로토콜로 줄을 바꿉니다.
+호환 터미널에서는 herdr를 통해서도 동작합니다. Moshi/mosh는 이 프로토콜을
+협상하지 못하므로 Alt+Enter를 사용하세요. Ctrl+J는 줄바꿈 키가 아닙니다.
+`HAM_MAILBOX_NO_KITTY=1`로 프로토콜 요청을 끌 수 있습니다. q, ?, 숫자 등 인쇄
+가능한 키는 본문에 입력합니다. 방향키·Home·End·Backspace·Delete로 편집하며
+상하 방향키로 줄을 옮깁니다. Esc는 수신자·답장별 본문과 커서를 보존하고,
+Ctrl+R은 입력창을 유지한 채 새로고침합니다. 입력 중 F1은 도움말을 열며 닫으면
+같은 입력창으로 돌아옵니다. 성공하면 제출 후 바뀌지 않은 초안만 지우고 입력창을
+닫습니다. 전송 결과를 기다리며 새로 편집한 초안은 보존합니다.
 
-Threads의 `a` / `n`은 불확실한 claim을 사용자가 applied / not-applied로 판정하는
-기능입니다. 비어 있지 않은 증거를 입력하고 정확한 이전 claim·agent·generation을
-확인하세요. 현재 terminal에 새 세션이 있어도 이전 claim을 지정해야 합니다.
-applied는 그 이전 claim에 적용 사실을 남기고, not-applied는 해당 claim만
-해제하며 다시 제출하지 않습니다. 이는 **운영자** 감사 기록이지 native
-request/journal 증거, 모델의 이해, 작업 처리 완료가 아닙니다. 적용 여부가
-불명확한 동안 자동 재실행하거나 대체 메시지를 보내지 마세요.
+Ctrl+D는 직접 입력으로 전환하거나 되돌립니다. Enter를 누르면 기본 선택이
+Cancel인 확인창을 엽니다. Tab 또는 ←·→로 버튼을 고르고 Enter로 실행합니다.
+**직접 입력은 수신자의 작업을 방해할 수 있습니다.** `Message from user (HAM):`
+헤더와 별도의 accepted/unknown/failed 전송 접수 기록을 사용하며 native 전달
+수신 확인이 아닙니다. 불확실한 결과는 다시 보내기 전에 확인하세요.
+
+Threads의 `w`는 로컬에서 보낸 철회 가능한 메일을 철회하고 `t`는 기존 OUTBOX
+ID로 재시도합니다. 모두 정확한 대상의 확인을 거칩니다. `delivering`은
+**UNCERTAIN**입니다. `a`·`n`은 운영자가 applied·not-applied를 판정하는 기능입니다.
+먼저 비어 있지 않은 증거를 입력한 뒤 정확한 메시지·claim ID, 이전 에이전트,
+generation과 현재 상태를 확인합니다. terminal에 새 세션이 있어도 이전 claim이
+대상입니다. 기본 선택은 Cancel이며 Tab 또는 ←·→로 선택하고 Enter로 실행하며
+Esc로 취소합니다. applied는 이전 claim에 적용 사실을 남기고 not-applied는 해당
+claim만 해제하며 다시 제출하지 않습니다. 이는 **운영자** 감사 기록이지 native
+request/journal 증거, 모델의 이해나 작업 처리 완료가 아닙니다. 적용 여부가
+불확실하면 자동 재실행하거나 대체 메시지를 보내지 마세요.
 
 ### 클라이언트 수신과 증거의 한계
 

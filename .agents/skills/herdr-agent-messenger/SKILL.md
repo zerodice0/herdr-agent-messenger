@@ -79,11 +79,21 @@ Only the **user** changes mode/main/members/thresholds in Settings. `repo show` 
 - **Codex:** skill-guided pull at work boundaries, view-only `inbox read` followed by explicit handling. No automatic wake/receiver and no invented delivered receipt.
 
 Never replay uncertain `delivering` after crashes/session changes. Threads lets the user audit the old claim/agent/generation as applied/not-applied with evidence: **operator**, not native ACK or handled work. User direct input may interrupt (`Message from user (HAM):`); its acceptance is separate from mailbox delivery.
-TUI Status groups agents under host headers showing stale/error state. Each
-agent has one clipped metadata line and up to three indented Unicode-aware
-summary lines. Enter shows full labeled, hanging-wrapped detail fields and
-separate status/registry timestamps as local date/time plus relative age.
-Hangul/Latin preserve words; Han/Kana/emoji allow display-cell breaks.
+The Mailbox opens as a split, tab or quick-send popup (closes after a successful
+send). Responsive Agents/Threads/Detail regions replace exclusive screens.
+NAV: Tab/Shift+Tab, ←/→ or h/l changes focus; ↑/↓ or j/k selects rows.
+Agents Enter opens inline FYI input; Threads Enter replies. Enter sends
+immediately (`sender=user`, no subject); Shift+Enter adds a newline using the
+requested kitty keyboard protocol through herdr in compatible terminals.
+Alt+Enter is the Moshi/mosh fallback; Ctrl+J is not a newline key.
+`HAM_MAILBOX_NO_KITTY=1` disables the protocol request. Esc preserves the draft;
+Ctrl+D toggles direct input with confirmation. `?` opens NAV help; F1 does so
+while typing; `e` shows diagnostics. Settings (`s`) uses the selected Agents row:
+`m` sets main, Space toggles membership, each with confirmation.
+Threads `w`/`t`/`a`/`n` confirms exact targets; `a`/`n` first requires evidence.
+Agents groups by host, marks stale unread `?`, and shows one summary line.
+Detail auto-previews full fields and separate status/observation timestamps.
+Viewing is read-only and never ACKs mail.
 
 ## Legacy requests where policy permits
 

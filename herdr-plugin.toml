@@ -8,7 +8,7 @@ platforms = ["macos", "linux"]
 [[actions]]
 id = "mailbox-split"
 title = "HAM: Mailbox (Right Split)"
-description = "Inspect status, mailbox threads, user compose and repository settings."
+description = "Inspect agents, mailbox threads and repository settings, or send a quick FYI."
 contexts = ["workspace", "pane"]
 command = ["python3", "mailbox_tui.py", "split"]
 
@@ -18,6 +18,13 @@ title = "HAM: Mailbox (Tab)"
 description = "Open the workspace's HAM mailbox in a plugin-owned tab."
 contexts = ["workspace", "pane"]
 command = ["python3", "mailbox_tui.py", "tab"]
+
+[[actions]]
+id = "mailbox-popup"
+title = "HAM Mailbox (quick send)"
+description = "Quick-send a user FYI from a popup that closes after a successful send."
+contexts = ["workspace", "pane"]
+command = ["python3", "mailbox_tui.py", "popup"]
 
 [[actions]]
 id = "label-current"
@@ -95,3 +102,9 @@ id = "mailbox"
 title = "HAM Mailbox"
 placement = "split"
 command = ["python3", "mailbox_tui.py", "pane"]
+
+[[panes]]
+id = "mailbox-popup"
+title = "HAM Mailbox (quick send)"
+placement = "popup"
+command = ["python3", "mailbox_tui.py", "popup-pane"]

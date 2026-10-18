@@ -16,7 +16,7 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 - `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
 - `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
 - 같은 저장소의 대화 이력과 명시적 처리 기록, `off` / `manual` / `auto` 참여 모드를 제공합니다.
-- 키보드 중심 메일함·상태 TUI에서 사용자 메일과 직접 입력을 구분해 작성할 수 있습니다.
+- 키보드 중심 메일함·상태 TUI에서 인라인 FYI 전송, 답장과 확인을 거치는 직접 입력을 제공합니다.
 - Codex, Claude Code, omp용 스킬을 짧은 `SKILL.md`와 필요할 때 읽는 `reference.md`로 제공합니다.
 - `spawn --message`로 라벨이 있는 세션과 첫 프롬프트를 생성하며, 단독 사용과 정책이 허용하는 기존 요청·대기·읽기·배치·원격 배포 도구도 지원합니다.
 - omp와 Claude 수신 런타임은 별도로 선택해 설치합니다. Codex는 작업 경계에서 받은 메일을 명시적으로 읽습니다.
@@ -55,14 +55,22 @@ herdr plugin link "$PWD" --enabled
 ## 사용
 
 같은 저장소의 참여 에이전트끼리는 [영속 메일함](#영속-메일함)으로 협업합니다.
-[HAM TUI](docs/ko/ui-reference.md)는 Status, Threads, Compose, Settings 화면을
-제공합니다. 사용자 작성 화면에서는 일반 메일과 수신자의 작업을 중단할 수 있는
-직접 입력을 구분합니다. 직접 입력은 에이전트 간 협업용 전송 경로가 아닙니다.
-Status는 호스트별 헤더에 stale·오류 상태를 표시하고 그 아래 에이전트를 묶어
-보여 줍니다. 에이전트마다 잘라 표시한 메타데이터 한 줄과 들여쓴 최대 세 줄의
-요약을 볼 수 있습니다. Enter로 전체 상세 정보를 열면 모든 항목을 내어쓰기로
-줄바꿈하며, 상태 갱신·관찰 시각을 각각 현지 날짜·시간과 경과 시간으로 표시합니다.
-한글·라틴 문자는 단어 경계에서, 한자·가나·이모지는 표시 셀 경계에서 줄바꿈합니다.
+[HAM TUI](docs/ko/ui-reference.md)는 화면 크기에 맞춰 Agents, Threads, 읽기 전용
+Detail 영역을 배치하며 `s`로 Settings를 엽니다. **HAM: Mailbox (Right Split)**,
+**HAM: Mailbox (Tab)** 또는 **HAM: Mailbox (quick send)**로 열 수 있고,
+팝업은 전송 성공 후 닫힙니다. NAV에서 Tab·Shift+Tab, 좌우 방향키나 h/l로
+영역을 옮기고 상하 방향키나 j/k로 행을 고릅니다. Agents 행에서 Enter로 인라인
+FYI 입력창을 열고 Enter로 즉시 전송하며, Threads의 Enter는 답장을 엽니다.
+Shift+Enter는 메일함이 요청한 kitty 키보드 프로토콜로 줄을 바꿉니다.
+kitty 호환 터미널에서는 herdr를 통해 동작하며 Moshi/mosh에서는 Alt+Enter를
+사용하세요. Ctrl+J는 줄바꿈 키가 아닙니다. `HAM_MAILBOX_NO_KITTY=1`로 요청을 끕니다.
+Esc는 초안을 보존합니다. Ctrl+D로 전환하는 직접 입력은 확인을 거치며 수신자의
+작업에 끼어들 수 있습니다. 에이전트 간 메일이나 native 전달과는 다릅니다.
+NAV의 `?`와 입력 중 F1은 도움말을, `e`는 진단 정보를 엽니다. Settings의
+`m`·Space로 선택한 에이전트의 main·구성원 지정을 바꿀 때와 Threads의
+`w`·`t`·`a`·`n`을 실행할 때는 확인을 거칩니다. `a`·`n`에는 증거도 필요합니다.
+Agents는 호스트별로 묶으며 stale 호스트의 unread는 `?`입니다. Detail은 전체 요약과
+상태 갱신·관찰 시각을 구분해 보여 주며, 조회만으로 메일에 ACK하지 않습니다.
 
 기존 **Send Prompt to Agents** 팝업의 코디네이터 위임과 다중 수신자 직접 전송은
 참여 정책이 허용하는 경우에 사용할 수 있습니다.
@@ -293,7 +301,7 @@ manual-worker와 auto-main 각각 6.02초의 유휴 구간에 추가 주 턴이�
 
 전체 옵션과 정체성·저장 위치·수신 확인·복구·런타임 설치 규칙은
 [메일함 명령 참고서](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)를,
-설정·작성·불확실한 claim 복구 조작은 [UI 참고서](docs/ko/ui-reference.md)를 참고하세요.
+설정·빠른 전송·답장·불확실한 claim 복구 조작은 [UI 참고서](docs/ko/ui-reference.md)를 참고하세요.
 
 ## 배포 순서
 

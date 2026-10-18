@@ -296,35 +296,54 @@ Open the plugin action without changing a global binding:
 ```bash
 herdr plugin action invoke mailbox-split --plugin herdr.agent-messenger
 herdr plugin action invoke mailbox-tab --plugin herdr.agent-messenger
+herdr plugin action invoke mailbox-popup --plugin herdr.agent-messenger
 ```
 
-The workspace's live plugin pane is deduplicated by pane/terminal IDs, not its
-label. A shell opener is supported. Outside text entry, `q` closes only the
-owned mailbox pane; `Esc` leaves editors/details first. `1` Status groups agents
-under per-host headers showing stale/error state. Each agent keeps alias, role,
-turn and unread first on one clipped metadata line, with an indented, word-aware
-summary capped at three Unicode-width-aware lines. Hangul/Latin preserve word
-boundaries; Han/Kana/emoji allow display-cell breaks. Overflow has an ellipsis;
-empty summary is `—`. Enter opens full labeled details with hanging-indent
-wrapping for every field: identity, role/client, turn/phase, full summary,
-unread/receiver, repository/main-checkout, workspace/pane and generation/session.
-Status-update (`status_updated_at`) and observation (`last_seen`/`first_seen`)
-times use local date/time plus relative age; flags use yes/no/unknown.
-User-border evidence is local-only; unavailable remote evidence is unknown.
-Disconnected remote hosts are stale with
-unread `?`, not treated as closed. `2` Threads inspects messages, direct results
-and OUTBOX; `w` withdraws eligible origin mail and `t` retries the selected
-existing OUTBOX item. Views never acknowledge mail.
+Split/tab opening reuses the workspace's live plugin pane by pane/terminal IDs,
+not its label; a shell opener is supported. The **HAM: Mailbox (quick send)**
+popup closes after a successful send result. `q` closes only the owned pane or
+popup, confirming before discarding nonempty drafts (default Cancel). Top-level
+Esc closes only popup mode; Esc leaves input/overlays without discarding drafts.
 
-`3` Compose always uses sender `user`. Select a board agent with `c`; `Tab`
-selects subject/body, `Ctrl+K` selects `fyi`/`action`, and `Ctrl+D` selects
-mailbox/direct. `Ctrl+S` reviews, then a second `Ctrl+S` confirms. Direct input
-may interrupt: it submits the exact `Message from user (HAM):` header and
-records a distinct `via=direct` submission (`submitting` then
-`accepted|unknown|failed`), never a native mailbox ACK. Retain unknown results
-and inspect before any explicit resend.
+Responsive **Agents**, **Threads**, **Detail** regions replace exclusive screens:
+one focused region below 80 columns or 18 rows, stacked lists plus Detail at
+80–139 columns, three columns from 140. Below 32 columns or 10 rows, resize
+instructions appear without losing mode, focus, selections, text or cursor.
+NAV keys: Tab/Shift+Tab, ←/→ or h/l changes focus; ↑/↓ or j/k selects rows;
+PgUp/PgDn/Home/End pages or jumps. In focused Detail, arrows/PgUp/PgDn scroll.
+Digits never navigate. `s` opens Settings, `?` opens help, `e` shows full
+connection/pending-operation diagnostics in Detail, and `r` refreshes.
 
-`4` Settings has exactly seven editable rows:
+Agents groups rows under host headers, showing stale/errors, alias, turn,
+unread, native receiver readiness and one dim role/phase/summary line.
+Disconnected peers retain stale snapshots with unread `?`, not closed agents.
+Detail automatically previews the last-focused list selection, including full
+agent fields and separate status-update/observation timestamps with local time
+and relative age. Threads includes messages, direct submissions and OUTBOX.
+**Viewing is read-only and never ACKs, delivers, handles or resolves mail.**
+
+Agents Enter opens inline FYI input; Threads Enter opens a reply to its latest
+message, resolving the recipient by host/terminal to a live, non-stale agent.
+Stale/unresolvable recipients are blocked; absent native receivers warn but
+allow mailbox sending. Detail Enter does nothing. UI mail has `sender=user`,
+kind `fyi`, no subject. Enter sends immediately without confirmation; blank
+bodies fail without sending. Shift+Enter inserts a newline using the mailbox's
+kitty keyboard protocol request, including through herdr in compatible terminals.
+Alt+Enter is the fallback for Moshi/mosh, which cannot negotiate that protocol.
+Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the protocol request.
+Printable characters (including q, ?, and digits) are text. Arrows/Home/End/
+Backspace/Delete edit; up/down moves between lines. Esc preserves text/cursor
+per recipient and reply; Ctrl+R refreshes in place; F1 opens help while typing
+and returns to that input. Successful sends close input, clearing only the
+unchanged submitted draft, and show a row result tag; failures preserve input.
+
+Ctrl+D toggles direct terminal input. Enter requires confirmation with Cancel
+selected by default; Tab or ←/→ selects a button and Enter executes it.
+Direct may interrupt: it submits the exact `Message from user (HAM):` header
+and records `via=direct`, `submitting` then `accepted|unknown|failed`, never a
+native mailbox ACK. Retain unknown results and inspect before explicit resend.
+
+Settings (`s`) has exactly seven editable rows:
 
 | Row | Value / default |
 | --- | --- |
@@ -336,8 +355,10 @@ and inspect before any explicit resend.
 | `wakes_per_hour` | Integer 0–10000, default 6 per agent/hour. |
 | `max_hop` | Integer 0–10000, default 10; action above the cap cannot wake. |
 
-`Enter` edits/commits. After selecting a board agent with `c`, `m` designates
-it main and `Space` toggles manual membership. The four threshold rows edit one
+↑/↓ selects a row and Enter edits its value; all mutations require confirmation.
+The overlay's `Target: host/alias` is the selected Agents row: `m` designates it
+main and Space toggles manual membership. Esc closes Settings.
+The four threshold rows edit one
 versioned `thresholds` field, preserving its other values. Home,
 `computed_main`, version/origin stamps, pending propagation and conflict
 records are **intentionally read-only**. Home is the first activation proposal,
@@ -350,12 +371,15 @@ intended submission. An open edit buffer is retained while its submit is gated.
 Navigation and `q` outside text entry remain responsive. The authoritative
 result is shown immediately and obsolete snapshots are discarded. Conflicts
 show complete wrapped winner/loser values and stamps; a user edit publishes a
-newer version to choose the intended value. `Page Up`/`Page Down` expose long
-metadata; `?` shows full errors when the footer clips them.
+newer version to choose the intended value. PgUp/PgDn expose long metadata;
+NAV `e` shows full diagnostics.
 
-An uncertain `delivering` claim is not replayed automatically, including across
-session/generation replacement. Threads `a` (applied) / `n` (not-applied) opens
-a warning requiring nonempty evidence and the old claim/agent/generation.
+Threads `w` withdraws eligible locally originated mail and `t` retries the selected
+OUTBOX identity, each confirming the exact target. An uncertain `delivering`
+claim is **UNCERTAIN** and is never automatically replayed, even across session
+replacement. `a` (applied) / `n` (not-applied) first collects nonempty operator
+evidence, then confirms the exact message/claim ID, old agent, generation and
+current state. Cancel is the default; Tab or ←/→ selects and Enter executes.
 Applied records **operator** confirmation of that old claim, not native journal
 evidence, model understanding or handled work. Not-applied releases exactly the
 old claim for later ordinary receiving; it does not submit a prompt. `Esc`

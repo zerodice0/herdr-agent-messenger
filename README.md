@@ -16,7 +16,7 @@ for coordination across local and SSH hosts.
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
 - Durable same-repository threads, explicit handling, and `off` / `manual` / `auto` participation modes
-- A keyboard-first mailbox/status TUI, with separate user mailbox and direct-input composition
+- A keyboard-first mailbox/status TUI with inline FYI quick-send, replies, and confirmed direct input
 - A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp, split into short `SKILL.md` and on-demand `reference.md`
 - Labeled interactive-session creation with `spawn --message`, plus standalone and permitted legacy request, wait, read, batch, and rollout helpers
 - Separately opt-in omp and Claude receiving runtimes; Codex uses explicit inbox reads at work boundaries
@@ -54,15 +54,22 @@ Follow the [migration guide](docs/migration.md) before removing the old plugin.
 ## Use
 
 Use the [durable mailbox](#durable-mailbox) for participating agents coordinating
-within the same repository. The [HAM TUI](docs/ui-reference.md) provides Status,
-Threads, Compose, and Settings views. Its user composer distinguishes ordinary
-mailbox messages from direct input that may interrupt the recipient; direct
-input is not the agent-to-agent coordination path.
-Status groups agents under per-host headers showing stale/error state. Each agent
-has one clipped metadata line and up to three indented summary lines. Enter opens
-full labeled details with hanging-indent wrapping on every field and local
-date/time plus relative age; status-update and observation times remain separate.
-Hangul/Latin preserve word boundaries; Han/Kana/emoji allow display-cell breaks.
+within the same repository. The [HAM TUI](docs/ui-reference.md) offers responsive
+Agents, Threads and read-only Detail regions, plus a Settings overlay (`s`).
+Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)**, or **HAM: Mailbox
+(quick send)**; the popup closes after a successful send. In NAV, Tab/Shift+Tab,
+arrows or h/l move between regions; arrows or j/k select rows. On an Agents row,
+Enter opens inline FYI input and Enter sends immediately; on Threads, Enter replies.
+Shift+Enter adds a newline via the mailbox's kitty keyboard protocol request
+(through herdr in kitty-compatible terminals). Use Alt+Enter on Moshi/mosh;
+Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the request.
+Esc keeps the draft; Ctrl+D selects direct input, which requires confirmation
+and may interrupt the recipient. It is not agent-to-agent mail or native delivery.
+`?` opens help in NAV, F1 does so while typing, and `e` shows diagnostics.
+Settings `m`/Space changes main/membership for the selected agent with confirmation;
+Threads `w`/`t`/`a`/`n` also require confirmation (and evidence for `a`/`n`).
+Agents are grouped by host; stale peers show unread `?`. Detail shows the full
+summary and separate status-update/observation times. Viewing never ACKs mail.
 
 The legacy **Send Prompt to Agents** popup still supports coordinator delegation
 and direct multi-recipient delivery where participation policy permits it.
@@ -288,8 +295,8 @@ These bounded observations do not establish whole-runtime or provider success.
 
 See the [mailbox command reference](.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
 for exhaustive flags, identity, storage, receipt/recovery semantics, and runtime
-installation; see the [UI reference](docs/ui-reference.md) for Settings, composing,
-and uncertain-claim recovery.
+installation; see the [UI reference](docs/ui-reference.md) for Settings, quick-send,
+replies, and uncertain-claim recovery.
 
 ## Deployment order
 
