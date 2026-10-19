@@ -740,8 +740,9 @@ class MailboxUiTest(unittest.TestCase):
 
 
     def test_launch_dedupe_uses_live_terminal_not_ham_label(self):
-        opener = {'pane_id': 'w1:p1', 'terminal_id': 'open-terminal', 'workspace_id': 'w1', 'cwd': str(self.root), 'label': 'HAM'}
-        owned = {'pane_id': 'w1:p3', 'terminal_id': 'ui-terminal', 'workspace_id': 'w1'}
+        opener = {'pane_id': 'w1:p1', 'terminal_id': 'open-terminal', 'workspace_id': 'w1',
+                  'tab_id': 'w1:t1', 'cwd': str(self.root), 'label': 'HAM'}
+        owned = {'pane_id': 'w1:p3', 'terminal_id': 'ui-terminal', 'workspace_id': 'w1', 'tab_id': 'w1:t1'}
         values = {**self.environment, 'HERDR_PANE_ID': 'w1:p1'}
         calls = []
         def transport(arguments, environment):
@@ -755,8 +756,13 @@ class MailboxUiTest(unittest.TestCase):
             return {}
         with patch('mailbox_tui.herdr', side_effect=transport):
             opened = launch('split', values)
+            split_focused = launch('split', values)
             focused = launch('tab', values)
         self.assertFalse(opened['focused'])
+        self.assertTrue(split_focused['focused'])
+        self.assertEqual(split_focused['pane_id'], owned['pane_id'])
+        self.assertNotIn('kept', opened)
+        self.assertNotIn('retired', opened)
         self.assertTrue(focused['focused'])
         opening = next(call for call in calls if call[:3] == ['plugin', 'pane', 'open'])
         self.assertIn('right', opening)
@@ -764,6 +770,92 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn(f'{OPENER_PANE}=w1:p1', opening)
         self.assertIn(f'{OPENER_TERMINAL}=open-terminal', opening)
         self.assertEqual(sum(call[:3] == ['plugin', 'pane', 'open'] for call in calls), 1)
+        self.assertEqual(sum(call[:3] == ['plugin', 'pane', 'focus'] for call in calls), 2)
+        self.assertFalse(any(call[:2] == ['pane', 'read'] or
+                             call[:3] == ['plugin', 'pane', 'close'] for call in calls))
+
+
+    def test_launch_registered_mailbox_in_other_tab(self):
+        from ledger_store import LedgerError
+        from mailbox_tui import ui_state_directory
+        path = ui_state_directory(self.environment) / 'panes.json'
+        opener = {'pane_id': 'w1:p1', 'terminal_id': 'open-terminal', 'workspace_id': 'w1',
+                  'tab_id': 'w1:t1', 'cwd': str(self.root)}
+        old = {'pane_id': 'w1:p3', 'terminal_id': 'old-terminal', 'workspace_id': 'w1', 'tab_id': 'w1:t2'}
+        new = {'pane_id': 'w1:p4', 'terminal_id': 'new-terminal', 'workspace_id': 'w1', 'tab_id': 'w1:t1'}
+        for placement, screen, failure, retired in (
+                ('split', 'NAV · HAM Mailbox\nAgents', '', True),
+                ('split', 'INPUT · HAM Mailbox\nDraft text', '', False),
+                ('split', 'CONFIRM · HAM Mailbox\nNAV · behind overlay', '', False),
+                ('split', 'PICKER · HAM Mailbox\nAgents', '', False),
+                ('split', '', 'read', False),
+                ('split', 'NAV · HAM Mailbox', 'identity', False),
+                ('split', 'NAV · HAM Mailbox', 'close', False),
+                ('tab', 'NAV · HAM Mailbox', '', False)):
+            with self.subTest(placement=placement, screen=screen, failure=failure):
+                path.write_text(json.dumps({'w1': old}))
+                calls = []
+
+                def transport(arguments, environment):
+                    calls.append(arguments)
+                    if arguments == ['api', 'snapshot']:
+                        return {'snapshot': {'panes': [opener, old]}}
+                    if arguments[:2] == ['pane', 'get']:
+                        pane = next(pane for pane in (opener, old, new) if pane['pane_id'] == arguments[2])
+                        opened = any(call[:3] == ['plugin', 'pane', 'open'] for call in calls)
+                        if pane is old and failure == 'identity' and opened:
+                            return {'pane': {**old, 'terminal_id': 'unrelated-terminal'}}
+                        return {'pane': pane}
+                    if arguments[:3] == ['plugin', 'pane', 'open']:
+                        self.assertEqual(json.loads(path.read_text())['w1']['terminal_id'], old['terminal_id'])
+                        return {'plugin_pane': {'pane': new}}
+                    if arguments[:2] == ['pane', 'read']:
+                        self.fail('Text pane reads must not use the JSON herdr helper')
+                    if arguments[:3] == ['plugin', 'pane', 'close'] and failure == 'close':
+                        raise LedgerError('herdr_failed', 'Pane close failed')
+                    return {}
+
+                values = {**self.environment, 'HERDR_PANE_ID': opener['pane_id']}
+
+                def read_text(command, **options):
+                    arguments = command[1:]
+                    calls.append(arguments)
+                    self.assertEqual(command, ['/sandbox/herdr', 'pane', 'read', old['pane_id'],
+                                               '--source', 'visible', '--format', 'text'])
+                    self.assertEqual(options, {'env': values, 'stdin': subprocess.DEVNULL,
+                                               'capture_output': True, 'text': True, 'timeout': 10})
+                    self.assertEqual(json.loads(path.read_text())['w1']['terminal_id'], new['terminal_id'])
+                    return subprocess.CompletedProcess(command, 1 if failure == 'read' else 0,
+                                                       screen, 'Pane read failed' if failure == 'read' else '')
+
+                with patch('mailbox_tui.herdr', side_effect=transport), \
+                     patch('mailbox_tui.herdr_executable', return_value='/sandbox/herdr'), \
+                     patch('mailbox_tui.subprocess.run', side_effect=read_text), \
+                     patch('mailbox_tui.repository_identity', return_value={'repo_id': self.repo_id}):
+                    result = launch(placement, values)
+                if placement == 'tab':
+                    self.assertTrue(result['focused'])
+                    self.assertEqual(result['pane_id'], old['pane_id'])
+                    self.assertEqual(calls[-1], ['plugin', 'pane', 'focus', old['pane_id']])
+                    self.assertFalse(any(call[:3] == ['plugin', 'pane', 'open'] for call in calls))
+                    self.assertFalse(any(call[:2] == ['pane', 'read'] for call in calls))
+                    self.assertNotIn('kept', result)
+                    self.assertNotIn('retired', result)
+                else:
+                    self.assertFalse(result['focused'])
+                    self.assertEqual(result['pane_id'], new['pane_id'])
+                    self.assertEqual(result['retired' if retired else 'kept'], old['pane_id'])
+                    self.assertNotIn('kept' if retired else 'retired', result)
+                    registered = json.loads(path.read_text())['w1']
+                    self.assertEqual((registered['pane_id'], registered['terminal_id']),
+                                     (new['pane_id'], new['terminal_id']))
+                    opening = next(call for call in calls if call[:3] == ['plugin', 'pane', 'open'])
+                    self.assertEqual(opening[opening.index('--target-pane') + 1], opener['pane_id'])
+                    self.assertEqual(opening[opening.index('--direction') + 1], 'right')
+                    self.assertFalse(any(call[:3] == ['plugin', 'pane', 'focus'] for call in calls))
+                closing = [call for call in calls if call[:3] == ['plugin', 'pane', 'close']]
+                self.assertEqual(closing, [['plugin', 'pane', 'close', old['pane_id']]]
+                                 if retired or failure == 'close' else [])
 
 
     def test_q_close_resolves_moved_owned_terminal_only(self):
@@ -783,8 +875,8 @@ class MailboxUiTest(unittest.TestCase):
         from mailbox_tui import ui_state_directory
         path = ui_state_directory(self.environment) / 'panes.json'
         path.write_text(json.dumps({'w1': {'pane_id': 'w1:p3', 'terminal_id': 'ui-terminal'}}))
-        opener = {'pane_id': 'w2:p1', 'terminal_id': 'open-terminal', 'workspace_id': 'w2'}
-        moved = {'pane_id': 'w2:p9', 'terminal_id': 'ui-terminal', 'workspace_id': 'w2'}
+        opener = {'pane_id': 'w2:p1', 'terminal_id': 'open-terminal', 'workspace_id': 'w2', 'tab_id': 'w2:t1'}
+        moved = {'pane_id': 'w2:p9', 'terminal_id': 'ui-terminal', 'workspace_id': 'w2', 'tab_id': 'w2:t1'}
         calls = []
         def transport(arguments, environment):
             calls.append(arguments)

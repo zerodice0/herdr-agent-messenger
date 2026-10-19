@@ -13,8 +13,13 @@ Three command-palette actions are available:
   popup that closes after a successful send result. A failed send keeps the input open.
 
 A shell pane can open any action; the opener does not need to contain an agent.
-These actions do not change keybindings or install a runtime. Split/tab opening
-reuses the workspace's live mailbox by pane/terminal IDs, not by its display label.
+These actions do not change keybindings or install a runtime. The right-split
+action (when bound to `prefix+m`) focuses the workspace's registered live mailbox
+only if it is in the opener's tab; otherwise it opens a new mailbox to the right
+and registers it instead. The previous mailbox closes only when its visible first
+line contains `NAV ·`; drafts, confirmations, pickers, and unreadable panes stay open.
+The tab action still focuses the workspace's registered live mailbox in any tab.
+Reuse checks pane/terminal IDs, not display labels.
 `q` closes only the owned mailbox pane or popup. Nonempty drafts require a
 discard confirmation, with Cancel selected by default. At top level, `Esc`
 closes a popup but does nothing in split/tab mode; in input or overlays it backs out.

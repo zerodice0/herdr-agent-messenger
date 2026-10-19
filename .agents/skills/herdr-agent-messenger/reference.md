@@ -402,8 +402,12 @@ herdr plugin action invoke mailbox-tab --plugin herdr.agent-messenger
 herdr plugin action invoke mailbox-popup --plugin herdr.agent-messenger
 ```
 
-Split/tab opening reuses the workspace's live plugin pane by pane/terminal IDs,
-not its label; a shell opener is supported. The **HAM: Mailbox (quick send)**
+Opening checks pane/terminal IDs, not labels; a shell opener is supported.
+The split action reuses the registered mailbox only in the opener's tab.
+Otherwise it opens and registers a right split, closing the old mailbox only
+when its visible first line contains `NAV ·`; active drafts and overlays stay open.
+The tab action still reuses the workspace's live mailbox across tabs.
+The **HAM: Mailbox (quick send)**
 popup closes after a successful send result. `q` closes only the owned pane or
 popup, confirming before discarding nonempty drafts (default Cancel). Top-level
 Esc closes only popup mode; Esc leaves input/overlays without discarding drafts.

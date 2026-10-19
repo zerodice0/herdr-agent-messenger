@@ -392,7 +392,10 @@ Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)** or **HAM: Mailbox
 `mailbox-popup`, plugin `herdr.agent-messenger`). The popup closes after a
 successful send result; failed sends keep input open. Actions do not change
 global `prefix+m`; optionally bind one only after upgrading all hosts.
-Split/tab opening reuses the workspace's pane by stable IDs, not display label.
+Reuse checks stable pane/terminal IDs, not display labels. The split action reuses
+the registered mailbox only in the opener's tab; otherwise it opens and registers
+a right split, closing the old mailbox only if its visible first line contains
+`NAV ·`. The tab action still reuses the workspace's mailbox across tabs.
 `q` closes only the owned view, confirming before discarding nonempty drafts.
 At top level, Esc closes only a popup; in input/overlays it backs out.
 

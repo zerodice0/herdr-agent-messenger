@@ -64,6 +64,21 @@ def herdr(arguments: Sequence[str], environment: Mapping[str, str]) -> dict[str,
     return payload
 
 
+def visible_pane_text(pane_id: str, environment: Mapping[str, str]) -> str:
+    """Pane reads in text format return plain stdout, not a JSON envelope."""
+    try:
+        result = subprocess.run(
+            [herdr_executable(environment), "pane", "read", pane_id,
+             "--source", "visible", "--format", "text"],
+            env=dict(environment), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LedgerError("herdr_unavailable", str(error)) from error
+    if result.returncode:
+        raise LedgerError("herdr_failed", result.stderr.strip() or result.stdout.strip() or "Herdr pane read failed.")
+    return result.stdout
+
+
 def pane_record(pane_id: str, environment: Mapping[str, str]) -> dict[str, Any]:
     result = herdr(["pane", "get", pane_id], environment)
     pane = result.get("pane")
@@ -119,12 +134,16 @@ def launch(placement: str, environment: Mapping[str, str] | None = None) -> dict
             state = moved
             save_pane_state(path, state)
         saved = state.get(workspace)
+        previous = None
         if isinstance(saved, dict):
             try:
                 live = pane_record(saved["pane_id"], values)
                 if live["terminal_id"] == saved["terminal_id"]:
-                    herdr(["plugin", "pane", "focus", saved["pane_id"]], values)
-                    return {"focused": True, **saved}
+                    if placement != "split" or (opener.get("tab_id") and
+                                                live.get("tab_id") == opener["tab_id"]):
+                        herdr(["plugin", "pane", "focus", saved["pane_id"]], values)
+                        return {"focused": True, **saved}
+                    previous = saved
             except (LedgerError, KeyError):
                 pass
         store = LedgerStore(environment=values)
@@ -150,7 +169,21 @@ def launch(placement: str, environment: Mapping[str, str] | None = None) -> dict
                  "opener_pane_id": opener_id, "opener_terminal_id": opener["terminal_id"]}
         state[workspace] = saved
         save_pane_state(path, state)
-        return {"focused": False, **saved}
+        result = {"focused": False, **saved}
+        if previous is not None:
+            old_pane = previous["pane_id"]
+            result["kept"] = old_pane
+            try:
+                old_live = pane_record(old_pane, values)
+                if old_live["terminal_id"] == previous["terminal_id"]:
+                    lines = visible_pane_text(old_pane, values).splitlines()
+                    if lines and "NAV ·" in lines[0]:
+                        herdr(["plugin", "pane", "close", old_pane], values)
+                        result.pop("kept")
+                        result["retired"] = old_pane
+            except LedgerError:
+                pass
+        return result
 
 
 def close_owned(environment: Mapping[str, str]) -> bool:
