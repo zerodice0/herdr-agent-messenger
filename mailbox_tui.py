@@ -1425,6 +1425,13 @@ class MailboxApp:
                         text, event.column - rect[1])
                     break
             return
+        tab = next((value for _, target, value in hits if target == "list-tab"), None)
+        if tab is not None:
+            self.set_status("")
+            self.focus = self.preview = tab
+            self.diagnostics = False
+            self.refresh_detail()
+            return
         region = next((value for _, target, value in hits if target == "region"), None)
         if region is None:
             return
@@ -1547,15 +1554,46 @@ class MailboxApp:
                    ["↑↓ scroll", "PgUp/PgDn"] + (["t technical"] if self.technical_supported() else []))
         return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
 
+    def side_by_side_width(self) -> int:
+        # Each half needs its own two border cells. Use the same full-column
+        # model as the table, including the minimum readable summary.
+        columns = self.agent_columns(None, self.agents())
+        return 2 * (sum(size for _, size, _ in columns) + 2 * (len(columns) - 1) + 2)
+
     def region_rects(self, top: int, height: int, width: int) -> dict[str, tuple[int, int, int, int]]:
-        if self.layout == "single" or width < 80 or height < 18:
+        if width < 80 or height < 18:
+            self.layout = "single"
             return {self.focus: (top, 0, height, width)}
-        detail_height = max(8, min(12, round(height * .25)))
+        # Reserve six Detail content rows plus its notice and borders, while
+        # keeping at least eight rows in the list after INPUT is reserved.
+        detail_height = min(height - 8, max(9, round(height * .4)))
         top_height = height - detail_height
+        detail = (top + top_height, 0, detail_height, width)
+        if width < self.side_by_side_width():
+            self.layout = "tabbed"
+            active = self.focus if self.focus != "detail" else self.preview
+            return {active: (top, 0, top_height, width), "detail": detail}
+        self.layout = "stacked"
         left = width // 2
         return {"agents": (top, 0, top_height, left),
                 "threads": (top, left, top_height, width - left),
-                "detail": (top + top_height, 0, height - top_height, width)}
+                "detail": detail}
+
+    def render_list_tabs(self, rect: tuple[int, int, int, int], detail: bool = False) -> None:
+        y, x, _, width = rect
+        active = self.focus if self.focus != "detail" else self.preview
+        column = x + 2
+        for index, region in enumerate(("agents", "threads")):
+            if index:
+                self.put(y, column, " │ ", curses.A_DIM)
+                column += 3
+            label = region.title()
+            attr = self.style(1, curses.A_BOLD) if region == active else curses.A_DIM
+            self.put(y, column, label, attr)
+            self.add_hit((y, column, 1, len(label)), "list-tab", region)
+            column += len(label)
+        if detail:
+            self.put(y, column, " · Detail", self.style(1, curses.A_BOLD))
 
     def render(self) -> None:
         self.screen.erase()
@@ -1601,11 +1639,12 @@ class MailboxApp:
                 input_height = min(input_height, max(3 + int(bool(self.input_error)), body_height - 3))
                 bottom -= input_height
                 input_rect = (bottom, 0, input_height, width)
-            if width >= 80 and bottom - 1 >= 18:
-                self.layout = "stacked"
             for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
                 self.add_hit(rect, "region", region)
-                inner = self.box(rect, region.title(), self.focus == region)
+                tabs = self.layout == "single" or (self.layout == "tabbed" and region != "detail")
+                inner = self.box(rect, "" if tabs else region.title(), self.focus == region)
+                if tabs:
+                    self.render_list_tabs(rect, detail=region == "detail")
                 if region == "agents":
                     self.render_agents(inner)
                 elif region == "threads":
@@ -1634,11 +1673,27 @@ class MailboxApp:
         self.screen.refresh()
 
     @staticmethod
-    def agent_columns(width: int, agents: list[Mapping[str, Any]]) -> list[tuple[str, int, bool]]:
+    def agent_columns(width: int | None, agents: list[Mapping[str, Any]]) -> list[tuple[str, int, bool]]:
         alias_width = min(18, max(8, max((display_width(agent.get("alias") or agent["terminal_id"])
                                        for agent in agents), default=8)))
         role_width = min(8, max(4, max((display_width(agent.get("role") or "—")
                                       for agent in agents), default=4)))
+        columns = [("turn", 11, False), ("alias", alias_width, False), ("mail", 4, True),
+                   ("rx", 2, True), ("role", role_width, False),
+                   *((name, 3, True) for name in ("phone", "emu", "server")),
+                   ("summary", 16, False)]
+        full_width = sum(size for _, size, _ in columns) + 2 * (len(columns) - 1)
+        if width is None:
+            return columns
+        # Full-width tabs should not lose resource columns to a long alias or
+        # role. Fit their existing minimums before dropping any column.
+        if width >= full_width - (alias_width - 8) - (role_width - 4):
+            shortage = max(0, full_width - width)
+            alias_trim = min(shortage, alias_width - 8)
+            columns[1] = ("alias", alias_width - alias_trim, False)
+            columns[4] = ("role", role_width - (shortage - alias_trim), False)
+            columns[-1] = ("summary", 16 + max(0, width - full_width), False)
+            return columns
         # Keep RX at the smallest usable width by collapsing TURN first.
         turn_width = 11 if width >= 11 + 8 + 4 + 2 + 6 else 3
         alias_width = min(alias_width, max(8, width - turn_width - 4 - 4))
@@ -2001,8 +2056,9 @@ class MailboxApp:
         devices, servers = item.get("devices"), item.get("servers")
         lines = ["Devices" + (": ?" if devices is None else ": none" if not devices else "")]
         for device in devices or []:
+            icon = {"phone": "📱", "emu": "🤖"}.get(device.get("kind"), "•")
             lines.extend([
-                f"  {device.get('kind', '?')}: {device.get('label') or device.get('device_id') or '?'}",
+                f"  {device.get('kind', '?')}: {icon} {device.get('label') or device.get('device_id') or '?'}",
                 f"  ID: {device.get('device_id') or '?'}",
                 f"  Claimed: {status_time(device.get('claimed_at'), now)}",
                 f"  Attached: {yes_no(device.get('attached'))}",
@@ -2037,6 +2093,67 @@ class MailboxApp:
         return ["Mail", summary,
                 "Read: Tab → Threads, select a thread, Space opens it"]
 
+    def agent_detail(self, width: int | None = None) -> list[tuple[str, int]]:
+        """Build both previews with section-local, display-cell-aligned fields."""
+        item = self.detail or {}
+        now = self.wall_clock()
+        result: list[tuple[str, int]] = []
+
+        def section(title: str, fields: list[str], *, dim: bool = False) -> None:
+            if result:
+                result.append(("", 0))
+            result.extend((part, curses.A_DIM if dim else curses.A_BOLD)
+                          for part in (wrap_summary(title, width) if width else [title]))
+            labels = [line.strip().partition(": ")[0] for line in fields
+                      if ": " in line and not line.startswith("Read: ")]
+            label_width = max((display_width(label) for label in labels), default=0)
+            for line in fields:
+                attribute = curses.A_DIM if dim or line.startswith("Read: ") else 0
+                label, separator, value = line.strip().partition(": ")
+                if not separator or line.startswith("Read: "):
+                    parts = wrap_summary(line, width) if width else [line]
+                    result.extend((part, attribute if separator else attribute | curses.A_BOLD)
+                                  for part in parts)
+                    continue
+                prefix = label + ":" + " " * (label_width - display_width(label) + 1)
+                if title == "Work" and label == "Summary":
+                    attribute |= curses.A_BOLD
+                # Keep labels usable in tiny viewers rather than spending the
+                # whole row on an indent that leaves no value cells.
+                if width is not None and display_width(prefix) >= width:
+                    result.extend((part, attribute) for part in wrap_summary(prefix.strip(), width))
+                    prefix = ""
+                parts = wrap_summary(value, max(1, width - display_width(prefix))) if width else [value]
+                result.append((prefix + parts[0], attribute))
+                result.extend((" " * display_width(prefix) + part, attribute) for part in parts[1:])
+
+        section("Work", [
+            f"Turn state: {item.get('turn_state') or 'unknown'}",
+            f"Phase: {item.get('phase') or '—'}",
+            f"Summary: {item.get('summary') or '—'}"])
+        section("Identity & role", [
+            f"Alias: {item.get('alias') or '—'}", f"Address: {self.address(item)}",
+            f"Host: {item['host']}{'  STALE/offline' if item.get('stale') else ''}",
+            f"Role: {item.get('role') or '—'}", f"Client: {item.get('client') or '—'}",
+            *([f"Workspace: {item['workspace_id']}"] if item.get("workspace_id") else []),
+            *([f"Pane: {item['pane_id']}"] if item.get("pane_id") else [])])
+        section("Devices & servers", self.agent_resource_lines(item, now))
+        section("Mail", [f"Unread: {item.get('unread', '?')}", *self.agent_mail_lines(item)[1:]])
+        # Agents have always shown receiver evidence directly; only message
+        # technical data is folded by t. Preserve that distinction.
+        section("Receiver/technical", [
+            f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
+            f"Extension present: {yes_no(item.get('extension_present'))}",
+            f"Repo ID: {item.get('repo_id') or '—'}",
+            f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
+            f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",
+            f"Session reference: {item.get('session_ref') or '—'}",
+            f"Last updated: {status_time(item.get('status_updated_at'), now)}",
+            f"Last seen: {status_time(item.get('last_seen'), now)}",
+            f"First seen: {status_time(item.get('first_seen'), now)}",
+            f"User border: {yes_no(item.get('user_border'))}"], dim=True)
+        return result
+
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
             return ["Diagnostics", json.dumps({"connection_errors": self.remote_errors,
@@ -2046,26 +2163,7 @@ class MailboxApp:
         if item.get("type") in {"thread", "direct", "outbox"}:
             return [text for text, _attribute in self.thread_detail()]
         if item.get("host") and item.get("terminal_id") and not item.get("type"):
-            now = self.wall_clock()
-            return [
-                f"Address: {self.address(item)}", f"Alias: {item.get('alias') or '—'}",
-                f"Host: {item['host']}{'  STALE/offline' if item.get('stale') else ''}",
-                f"Role: {item.get('role') or '—'}", f"Client: {item.get('client') or '—'}",
-                f"Turn state: {item.get('turn_state') or 'unknown'}", f"Phase: {item.get('phase') or '—'}",
-                f"Summary: {item.get('summary') or '—'}", f"Unread: {item.get('unread', '?')}",
-            ] + self.agent_mail_lines(item) + [
-                f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
-                f"Extension present: {yes_no(item.get('extension_present'))}",
-                f"Repo ID: {item.get('repo_id') or '—'}",
-                f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
-                f"Workspace / pane: {item.get('workspace_id') or '—'} / {item.get('pane_id') or '—'}",
-                f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",
-                f"Session reference: {item.get('session_ref') or '—'}",
-                f"Last updated: {status_time(item.get('status_updated_at'), now)}",
-                f"Last seen: {status_time(item.get('last_seen'), now)}",
-                f"First seen: {status_time(item.get('first_seen'), now)}",
-                f"User border: {yes_no(item.get('user_border'))}",
-            ] + self.agent_resource_lines(item, now)
+            return [text for text, _attribute in self.agent_detail()]
         return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent or thread to preview."]
 
     def viewer_rect(self) -> tuple[int, int, int, int]:
@@ -2106,19 +2204,19 @@ class MailboxApp:
             self.scrolls["detail"] = 0
             return
         agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
-        wrap = wrap_summary if agent and not self.diagnostics else wrap_display_text
         message_starts: list[int] = []
         entries = (self.thread_detail(width, message_starts=message_starts)
                    if not self.diagnostics and (self.detail or {}).get("type") else
-                   [(line, curses.A_DIM if agent and line.startswith("Read: Tab → Threads,") else 0)
-                    for line in self.detail_lines()])
+                   self.agent_detail(width) if agent and not self.diagnostics else
+                   [(line, 0) for line in self.detail_lines()])
         lines = []
         latest_row = 0
         for index, (line, attribute) in enumerate(entries):
             if message_starts and index == message_starts[-1]:
                 latest_row = len(lines)
             lines.extend((part, attribute) for logical in line.split("\n")
-                         for part in wrap(logical, max(1, width)))
+                         for part in ([logical] if agent and not self.diagnostics else
+                                      wrap_display_text(logical, max(1, width))))
         self.detail_total = len(lines)
         latest = None
         if message_starts:

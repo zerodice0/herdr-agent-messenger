@@ -384,12 +384,13 @@ peer omitting any one field reports unknown (`?`) only for that field, not empty
 or zero. The strict wire envelope is unchanged; resources live inside payload.
 
 Board/TUI resource reads never refresh registry/status/display/claims or prune
-stale claims. Agents shows right-aligned PHN/EMU/SRV columns for phone, emulator,
-and server counts at 70 inner columns or wider, before the flexible summary.
-Zeros show a dim `·`; missing fields independently show `?`. Host group labels
-retain the agent count and show nonzero or unknown dead/unowned/stale-device
-findings, truncating findings first. Detail has unchanged Devices and Servers
-sections; known-empty lists show none and resource errors remain visible.
+stale claims. Agents shows centred PHN/EMU/SRV phone, emulator and server counts
+before PHASE · SUMMARY. Full-width tables keep all columns when their minimums
+fit, shrinking spare alias/role width first. Zeros show a dim `·`; missing fields
+independently show `?`. Host labels retain agent counts and nonzero or unknown
+dead/unowned/stale-device findings, truncating findings first. Agent Detail
+groups Devices and Servers under Devices & servers, with `📱 label` (for example,
+`📱 SM-A245N`) before technical IDs. Empty lists and resource errors stay explicit.
 This listing does not claim servers or change device ownership.
 
 ### Mailbox TUI and operator recovery
@@ -412,11 +413,23 @@ popup closes after a successful send result. `q` closes only the owned pane or
 popup, confirming before discarding nonempty drafts (default Cancel). Top-level
 Esc closes only popup mode; Esc leaves input/overlays without discarding drafts.
 
-Responsive **Agents**, **Threads**, **Detail** regions replace exclusive screens:
-one focused region below 80 columns or 18 rows, stacked lists plus Detail at
-80–139 columns, three columns from 140. Below 32 columns or 10 rows, resize
+Responsive **Agents**, **Threads**, **Detail** regions use stacked lists above
+full-width Detail with at least 80 columns and 18 available body rows. Lists
+are side by side only when each half fits the complete Agents column model,
+including PHN/EMU/SRV and the 16-cell summary minimum. The threshold derives
+from current alias/role widths, gaps and borders (158 columns for a 15-cell alias
+and minimum four-cell ROLE), not a fixed breakpoint. Otherwise one full-width
+list has `Agents │ Threads` tabs: active is accent/bold, inactive dim.
+Click a tab label to switch without opening input. Each tab preserves selection
+and scroll. Detail gets about 40% of usable body height, at least nine outer
+rows (six content rows, notice, borders), leaving eight outer rows for the list/tab bar.
+Header, footer, status and full-width INPUT below Detail are excluded first.
+Below 80 columns or 18 body rows, only the focused region appears; the unchanged
+Agents → Threads → Detail cycle replaces the list with Detail and retains the
+tabs for returning to a list. Below 32 columns or 10 terminal rows, resize
 instructions appear without losing mode, focus, selections, text or cursor.
-NAV keys: Tab/Shift+Tab, ←/→ or h/l changes focus; ↑/↓ or j/k selects rows;
+NAV keys: Tab/Shift+Tab, ←/→ or h/l changes focus and the active list tab;
+Detail retains the last list's tab. ↑/↓ or j/k selects rows;
 PgUp/PgDn/Home/End pages or jumps. Press `Space` on an Agents or Threads item,
 including DIRECT/OUTBOX, to open a centered read-only Detail viewer (~90% screen,
 maximum 100×40). Arrows, PgUp/PgDn, Home/End and wheel scroll; `t` toggles
@@ -426,12 +439,15 @@ a status message. Esc, q, Space, or outside click closes; inside click and Enter
 are inert. Viewing never ACKs. Detail Enter otherwise does nothing. Digits never
 navigate; `s` opens Settings, `?` help, `e` diagnostics and `r` refresh.
 
-Agents groups rows under host headers, showing stale/errors, alias, turn,
-unread, native receiver readiness and one dim role/phase/summary line.
+Agents groups single-line table rows under host headers, showing turn, alias,
+mail, receiver, role, devices/servers and phase/summary as space allows.
 Disconnected peers retain stale snapshots with unread `?`, not closed agents.
-Detail automatically previews the last-focused list selection, including full
-agent fields and separate status-update/observation timestamps with local time
-and relative age. Threads includes messages, direct submissions and OUTBOX.
+Detail previews the last-focused list. Agent Detail is single-column, grouped
+as Work (turn, phase, bold summary), Identity & role, Devices & servers, Mail,
+then dim Receiver/technical with full fields and separate status-update and
+observation timestamps. Mail contains counts and the Threads/Space reading hint,
+not bodies. Thread Detail keeps message history and optional technical fields.
+Threads includes messages, direct submissions and OUTBOX.
 **Viewing is read-only and never ACKs, delivers, handles or resolves mail.**
 
 Agents Enter opens inline FYI input; Threads Enter opens a reply to its latest
