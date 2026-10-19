@@ -664,6 +664,41 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(result, {'changed': True, 'display': {'updated': [], 'failed': ['isolated-pane']}})
         self.assertEqual(observed, [None])
 
+    def test_status_export_and_recipient_resolution_do_not_scan_by_default(self):
+        service = self.services["beta"]
+        envelope = self.services["alpha"].envelope({"repo_id": self.repo_id})
+        calls = []
+
+        class StoredPeerTransport:
+            def call(_, peer, command, payload):
+                calls.append(payload)
+                return service.receive(command, self.services["alpha"].envelope(payload))
+
+        reader = RemoteLedger(self.stores["alpha"], self.environment, StoredPeerTransport())
+        with mock.patch("resource_scan.scan_host_resources", side_effect=AssertionError("unexpected scan")):
+            exported = service.status_export(self.repo_id)
+            received = service.receive("status-export", envelope)
+            self.assertNotIn("resources", exported)
+            self.assertNotIn("servers", exported["agents"][0])
+            self.assertNotIn("resources", received)
+            self.assertEqual(exported["agents"][0]["unread"], 0)
+            self.assertEqual(reader.resolve_recipient(
+                "beta/"+self.agents["beta"]["alias"], self.agents["alpha"])["agent_id"],
+                self.agents["beta"]["agent_id"])
+        self.assertEqual(calls, [{"repo_id": self.repo_id}])
+
+    def test_status_wire_resources_are_explicitly_opted_in(self):
+        service = self.services["beta"]
+        scanned = {"listeners": [], "serve": [], "error": "fixture scan failure"}
+        with mock.patch("resource_scan.scan_host_resources", return_value=scanned) as scanner:
+            exported = service.receive("status-export", self.services["alpha"].envelope(
+                {"repo_id": self.repo_id, "refresh": False, "resources": True}))
+        scanner.assert_called_once_with()
+        self.assertEqual(exported["resources"], {
+            "servers_unowned": [], "dead_serve": [], "stale_devices": [],
+            "error": "fixture scan failure"})
+        self.assertEqual(exported["agents"][0]["servers"], [])
+
     def test_status_export_counts_queued_and_delivering_by_repo_and_terminal(self):
         beta_store = self.stores['beta']
         first = self.send()

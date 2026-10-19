@@ -293,11 +293,55 @@ native runtime journal의 증거, 모델의 이해나 작업 처리 완료가 �
 도구로 한글 입력, 자르기와 크기 변경을 처리합니다. `NO_COLOR`가 있으면 값이 비어
 있어도 색상을 끄지만 라벨 등 색상 이외의 상태 표시는 유지합니다.
 
+### 기기와 서버 표시
+
+Agents 영역의 너비가 78열 이상이면 **RESOURCES** 열을 표시하고, 더 좁으면 숨깁니다.
+실기기·에뮬레이터·서버 개수는 `📱1 🤖1 🌐2`로 표시하며 색상을 끄면 ASCII 형식인
+`P1 E1 S2`를 사용합니다. 기기 정보가 없으면 `P? E?`, 서버 정보가 없으면 `S?`를
+각각 표시합니다. 호스트 머리글은 대상 리스너가 없는 Serve 경로, 소유자가 없는
+Serve 대상, stale 기기를 `dead:N unowned:N stale-dev:N` 또는 간단한
+`D:N U:N X:N`으로 표시합니다. 호스트 자원 필드가 없으면 `?`, 탐색 오류가 있으면
+`!`를 덧붙입니다.
+
+Agent Detail에는 **Devices**와 **Servers** 구역이 있습니다. Devices는 현재 소유한
+유효한 점유를, Servers는 포트·프로세스·PID, 바인드 주소, cwd, inherited 여부,
+시작 시각·경과 시간과 URL을 표시합니다. `inherited`는 리스너가 현재 에이전트 세션보다
+먼저 시작됐다는 뜻입니다. 정보가 없으면 `Devices: ?` 또는 `Servers: ?`, 비어 있음이
+확인되면 `: none`으로 표시합니다. 이전 peer는 `devices`, `servers`, 호스트 `resources`
+중 일부를 생략할 수 있으며, 없는 정보만 알 수 없음으로 처리하고 0으로 해석하지 않습니다.
+
+표시는 에이전트 JSON의 `devices`, `servers`와 호스트의
+`resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`를 읽습니다.
+서버는 현재 사용자의 리스너와 Tailscale Serve에서 탐색하며 플러그인, adb와 에이전트
+런타임 리스너는 제외합니다. 조회는 레지스트리 갱신, 점유 정리, 토큰 변경이나 메일
+확인 처리를 하지 않습니다.
+
+기기 점유를 바꾸려면 표의 동작이 아니라 번들 CLI를 사용합니다.
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+`release`는 기본적으로 호출자 자신의 점유를 모두 해제하며 종류·기기로 범위를 좁힙니다.
+점유는 검증된 호스트·terminal·generation에 귀속됩니다. 비활성 또는 이전 generation의
+소유자는 adb 연결 여부와 관계없이 stale이므로 교체할 수 있습니다. 다른 활성 소유자가
+있으면 점유를 거부하며, `--force`는 사용자가 명시적으로 지시한 경우에만 사용합니다.
+Herdr 갱신 실패를 stale의 근거로 해석하지 않습니다. `device list`는 읽기 전용입니다.
+명령 결과와 기기 세부 사항은 [스킬 가이드](skill-guide.md#기기-점유와-자원-표시)를
+참고하세요. 제품은 기존 기기 JSON을 가져오지 않습니다. `heavy_slot.py`는 별도로
+그대로 유지하며 슬롯을 표시하지 않습니다.
+
 ### 역할, phase와 테두리 소유권
 
 역할은 `🟧 [메인] orange-rabbit`처럼 alias 앞에 붙여 주소 해석을 유지합니다.
-공유 표시 모듈이 alias, color, 표시 이름과 phase(`recap`)를 같은 HAM source로
-보고합니다. `phone`·`emu` 등 기기 토큰이나 다른 source는 덮어쓰지 않습니다.
+공유 표시 모듈이 alias, color, 표시 이름, phase(`recap`)와 원장 기반 기기 토큰을
+메타데이터 source `herdr.agent-messenger`로 보고합니다. 값은 정확히
+`phone=📱 <공백으로 연결한 라벨>`과 `emu=🤖 <공백으로 연결한 라벨>`이며, 점유가
+없으면 해당 키를 지웁니다. 상태 표시도 점유를 유지하며 강제 교체하면 이전 활성
+소유자의 표시도 갱신합니다. Herdr 토큰은 source별로 격리되지 않은 pane 단위의
+평면 맵입니다. HAM은 관련 없는 토큰 키를 바꾸지 않습니다.
 
 상태·역할 기능을 사용하면 summary는 `[메인] summary` 또는 `[워커] summary`
 형태로 테두리에 표시합니다. off 모드의 상태에는 역할 접두사가 없습니다.

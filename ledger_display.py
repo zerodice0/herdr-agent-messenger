@@ -1,4 +1,4 @@
-"""Project HAM identity/status into source-owned Herdr metadata and borders."""
+"""Project HAM identity, status and device claims into Herdr metadata and borders."""
 
 from __future__ import annotations
 
@@ -28,24 +28,31 @@ class DisplayProjection:
     color: str
     recap: str
     label: str
+    phone: str | None = None
+    emu: str | None = None
 
     def metadata_command(self, pane_id: str) -> list[str]:
-        return [
+        command = [
             "pane", "report-metadata", pane_id, "--source", SOURCE,
             "--agent", self.agent, "--display-agent", self.display_agent,
             "--token", f"alias={self.alias}", "--token", f"color={self.color}",
             "--token", f"recap={self.recap}",
         ]
+        for key, value in (("phone", self.phone), ("emu", self.emu)):
+            if value is not None:
+                command.extend(["--token", f"{key}={value}"] if value else ["--clear-token", key])
+        return command
 
 
 def build_display(agent: str, alias: str, marker: str = "", color: str = "", *,
-                  role: str | None = None, phase: str = "", summary: str = "") -> DisplayProjection:
+                  role: str | None = None, phase: str = "", summary: str = "",
+                  phone: str | None = None, emu: str | None = None) -> DisplayProjection:
     """Keep Agents addressable by suffix and put border identity before status."""
     role_label = {"main": "[메인]", "worker": "[워커]"}.get(role, "")
     display = " ".join(part for part in (marker, role_label, alias) if part)
     content = " · ".join(part for part in (alias, summary) if part)
     label = " ".join(part for part in (role_label, content) if part)
-    return DisplayProjection(agent, display, alias, color, phase, label)
+    return DisplayProjection(agent, display, alias, color, phase, label, phone, emu)
 
 
 def _run_herdr(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -126,6 +133,13 @@ class LedgerDisplay:
                       on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool:
         # The palette remains owned by agent_labels; arbitrary names are valid too.
         from agent_labels import ALIASES
+        from ledger_devices import device_rows
+
+        with self.store.read() as connection:
+            claims = [claim for claim in device_rows(connection)
+                      if not claim["stale"] and claim["holder"]["agent_id"] == agent["agent_id"]]
+        phones = " ".join(claim["label"] for claim in claims if claim["kind"] == "phone")
+        emulators = " ".join(claim["label"] for claim in claims if claim["kind"] == "emu")
         name = str(agent["alias"] if alias is None else alias)
         palette = next((item for item in ALIASES if item.name == name), None)
         role = self.settings.role(agent)
@@ -135,6 +149,8 @@ class LedgerDisplay:
             (palette.color if palette else "") if color is None else color,
             role=role, phase=str(agent.get("phase") or ""),
             summary=str(agent.get("summary") or ""),
+            phone=f"📱 {phones}" if phones else "",
+            emu=f"🤖 {emulators}" if emulators else "",
         )
         pane_id = str(agent["pane_id"])
         invoked = feature_invoked or role is not None or bool(
@@ -172,6 +188,14 @@ class LedgerDisplay:
             confirmed = None if legacy_labels is None else legacy_labels.get(agent["pane_id"])
             key = "updated" if self.refresh_agent(agent, legacy_label=confirmed, feature_invoked=feature_invoked) else "failed"
             result[key].append(agent["pane_id"])
+        if pane_id is not None and not result["updated"] and not result["failed"]:
+            command = ["pane", "report-metadata", pane_id, "--source", SOURCE,
+                       "--clear-token", "phone", "--clear-token", "emu"]
+            try:
+                cleared = _succeeded(self.runner(command))
+            except (OSError, subprocess.SubprocessError):
+                cleared = False
+            result["updated" if cleared else "failed"].append(pane_id)
         return result
 
 

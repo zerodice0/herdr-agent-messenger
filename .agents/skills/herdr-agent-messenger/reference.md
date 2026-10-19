@@ -4,7 +4,7 @@ Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloa
 
 ## Command and flag reference
 
-The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`) accept `-h` / `--help` and `--verbose` (full diagnostic JSON; default off). Mailbox/ledger/runtime commands and `status set|clear|list|board` also accept `-h` / `--help` but have no verbose flag, including `mail threads` and `mail direct-list`. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
+The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`) accept `-h` / `--help` and `--verbose` (full diagnostic JSON; default off). Mailbox/ledger/runtime/device commands and `status set|clear|list|board` also accept `-h` / `--help` but have no verbose flag, including `mail threads` and `mail direct-list`. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
 
 ### Recipient selectors
 
@@ -242,7 +242,7 @@ label. Success is one JSON object with `protocol:1`; errors retain
 | `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
 | `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target; a home relay adds `relay_home` → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
 | `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` (conditional close also has `expected_main`) → `{applied,...repo_settings}`. |
-| `status-export --wire` | Optional `{repo_id,refresh}` → `{host:{canonical_name,uuid},agents:[...]}` with roles. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation, as used by `status board`. Plain `status-export [--repo ID]` remains a fresh local export. Remote rows are never inserted into local AGENTS. |
+| `status-export --wire` | Optional `{repo_id,refresh,resources}` → `{host:{canonical_name,uuid},agents:[...],resources?:{...}}` with roles and optional resource fields. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation. Only `resources:true` opts into server discovery and adds agent `servers` plus host `resources`; `status board` sends both flags. Missing/false `resources` avoids scans for send/policy/recipient lookup and leaves those fields unknown. Plain `status-export [--repo ID]` remains a fresh local export without server discovery. Remote rows are never inserted into local AGENTS. |
 
 The Python settings service is `RepoSettings(store).mutate(repo_id,field,value)`;
 it is reserved for the user settings UI, with **no agent mutation CLI**.
@@ -306,7 +306,89 @@ Herdr's width truncation clips the summary first. `status clear` removes
 phase/summary but retains alias and any active role. Phase supplies the HAM
 `recap` token. Herdr's turn state is stored unchanged.
 `status set`/`clear` also work off, without a role prefix; invoking this feature
-removes the obsolete `user:pane-recap` token without overwriting other sources.
+removes the obsolete `user:pane-recap` token, preserves device projection and
+leaves unrelated token keys untouched. Herdr's per-pane token map is flat;
+metadata sources do not isolate identically named keys.
+
+### Device claims and resource fields
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+These use the bundled launcher and return one JSON object; domain errors are
+`{"error":{"code":"CODE","message":"TEXT"}}` (exit 1), usage errors exit 2.
+`phone` means a real device, including iOS when explicitly identified/labeled;
+`emu` accepts a number or `emulator-N` and normalizes to `emulator-N`.
+Without `--label`, a phone uses an adb model lookup with ID fallback, and an
+emulator uses its number. Claim before device use and release afterward.
+
+Claim/release refresh the registry, resolve the caller's stable terminal/session
+identity and recheck its generation under the terminal lock. They never trust an
+inherited pane ID alone. Unresolved callers or failed Herdr snapshots refuse
+mutation; a refresh failure never means all holders are gone.
+Claims belong to the agent's host+terminal+generation. A holder is live only
+while its agent row is active in the current generation. Inactive/replaced
+holders are stale, independent of whether the physical device is attached.
+
+- Reclaiming your own device updates its label idempotently.
+- Another live holder returns `device_claimed` with alias/pane/host/claimed_at.
+  `--force` replaces it **only on explicit user instruction**.
+- A stale holder can be replaced without force, with `replaced_stale:true`.
+  Claim/release and registry-refresh mutations prune stale inactive claims;
+  read paths never prune them.
+- `release` defaults to `all` and releases **only the caller's own claims**.
+  `release phone`, `release emu`, or a kind plus device narrows the selection.
+  There is no release force option.
+
+| Operation | JSON result |
+| --- | --- |
+| claim | `{device:{...},replaced:{...}\|null,replaced_stale:bool}` |
+| release | `{released:[...]}` |
+| list | `{devices:[{device_id,kind,label,claimed_at,holder,stale,attached}]}` |
+
+`holder` is `{agent_id,alias,pane_id,terminal_id,generation,active,live}`.
+`attached` is `true` for Android adb state `device`, otherwise `false`; it is
+`null` when adb is unavailable or the ID is not adb-like (for example an iOS
+UDID). adb lookups have bounded timeouts. `device list` has no registry refresh,
+token writes, claim cleanup or directory-creation side effects.
+
+HAM publishes tokens from the claim table via source `herdr.agent-messenger`,
+with exact values `phone=📱 <labels space-joined>` and
+`emu=🤖 <labels space-joined>`. It clears the corresponding token key when
+there are no claims, preserves these values during status/role refresh and
+reprojects both affected live panes after force replacement.
+No legacy device JSON is imported by product code; any one-time rollout
+migration happens outside the product. `heavy_slot.py` is a separate,
+unchanged script and is neither read nor displayed by HAM.
+
+`status board` agent rows and status-export payload agent rows add independently
+optional `devices` and `servers` lists. `devices` contains held nonstale claims
+(`stale:false`). Each server is
+`{port,bind,pid,process,cwd,started_at,urls,inherited}`. Discovery reads current-user
+Linux/macOS listeners and Tailscale Serve routes; ownership uses the active
+agent on that host/pane. Plugin processes, adb and agent runtimes are excluded.
+`inherited:true` means the listener started before `agent.first_seen`.
+
+When requested with `resources:true`, status-export adds payload-level `resources`;
+board requests it and places it on each host:
+`{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+`servers_unowned` lists proxy routes with a backend listener but no agent owner;
+`dead_serve` lists proxy routes with no backend listener, checking all users'
+listeners and all binds; `stale_devices` lists
+stale claims. Discovery failures populate `resources.error`, not invented empty
+success. Agent devices/servers and host resources remain independent: an old
+peer omitting any one field reports unknown (`?`) only for that field, not empty
+or zero. The strict wire envelope is unchanged; resources live inside payload.
+
+Board/TUI resource reads never refresh registry/status/display/claims or prune
+stale claims. Agents shows compact counts (`📱1 🤖1 🌐2`, ASCII `P1 E1 S2`
+without color), dropping the column at narrow widths. Detail has Devices and
+Servers sections; host headers summarize dead/unowned/stale-device counts.
+Missing fields show `?`, known-empty lists show none, and resource errors remain
+visible. This listing does not claim servers or change device ownership.
 
 ### Mailbox TUI and operator recovery
 

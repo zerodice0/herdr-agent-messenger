@@ -220,6 +220,42 @@ settings, user-compose/direct-send, or operator ACK bypasses. See the
 [reference terminology](.agents/skills/herdr-agent-messenger/reference.md#mailbox-terminology)
 for inbox, Threads, transport outbox, message states and unread counts.
 
+### Device claims and server presence
+
+Use the same bundled CLI prefix:
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+Claim a device before using it and release it when finished. `release` defaults
+to `all` and releases only the caller's own claims; kind/device arguments narrow
+that selection. Emulator numbers normalize to `emulator-N`. Claims belong to
+the verified host/terminal/session generation, not an inherited pane ID.
+Reclaiming your own device updates its label. Another live holder causes
+`device_claimed`; use `--force` **only on explicit user instruction**.
+Inactive or replaced-generation holders are stale and may be replaced with
+`replaced_stale:true`. A failed Herdr refresh is an error, not evidence that a
+holder disappeared. Attachment reported by adb is separate from holder liveness.
+
+`device list` and resource views on `status board` are read-only: no registry
+refresh, stale-claim cleanup or token writes. Agent JSON gains independent
+`devices` (held nonstale claims) and `servers` lists; host entries gain
+`resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+Servers are discovered from current-user listeners and Tailscale Serve routes,
+not claimed. Missing `devices`, `servers` or `resources` from an older peer
+means unknown (`?`), independently, not an empty list.
+
+HAM projects exact sidebar token values `phone=📱 <labels space-joined>` and
+`emu=🤖 <labels space-joined>` and clears each key when no claims remain.
+`status set` preserves this projection. No legacy device JSON is imported by
+the product. `heavy_slot.py` remains a separate, unchanged script; HAM does not
+read or display its slots. See the [skill guide](docs/skill-guide.md#device-claims-and-resource-presence)
+for JSON fields and the [UI reference](docs/ui-reference.md#device-and-server-presence)
+for resource displays.
+
 ### Participation and roles
 
 Choose participation in the TUI Settings view, not through an agent mutation

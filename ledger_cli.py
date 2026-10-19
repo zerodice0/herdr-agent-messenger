@@ -15,10 +15,21 @@ from ledger_store import LedgerError, LedgerStore
 from ledger_remote import RemoteLedger, SSHTransport
 from ledger_worker import ensure_worker, run_worker, worker_status
 
-COMMANDS = frozenset({"mail", "inbox", "repo", "ledger", "runtime"})
+COMMANDS = frozenset({"mail", "inbox", "repo", "ledger", "runtime", "device"})
 
 
 def add_parsers(subparsers: Any) -> None:
+    device = subparsers.add_parser("device", help="Claim and inspect generation-owned device occupancy.")
+    devices = device.add_subparsers(dest="device_command", required=True)
+    claim = devices.add_parser("claim", help="Claim a device; --force only on explicit user instruction.")
+    claim.add_argument("kind", choices=("phone", "emu"))
+    claim.add_argument("device")
+    claim.add_argument("--label")
+    claim.add_argument("--force", action="store_true")
+    release = devices.add_parser("release", help="Release only this agent's claims (default: all).")
+    release.add_argument("kind", choices=("phone", "emu", "all"), nargs="?", default="all")
+    release.add_argument("device", nargs="?")
+    devices.add_parser("list", help="Read claims and adb attachment without changing ledger or tokens.")
     installer = subparsers.add_parser("runtime", help="Explicit ownership-checked opt-in runtime installation.")
     install_commands = installer.add_subparsers(dest="runtime_operation", required=True)
     for operation in ("install", "uninstall", "status"):
@@ -137,11 +148,23 @@ def _live_context(registry: AgentRegistry, snapshot: Mapping[str, Any],
 
 
 def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    if arguments.command == "device":
+        from ledger_devices import device_operation
+        return device_operation(arguments, environment)
     if arguments.command == "runtime":
         from runtime_installer import manage
         return manage(arguments.runtime_operation, arguments.destination, client=arguments.client)
     name = arguments.name if arguments.command == "ledger" and arguments.ledger_command == "setup" else None
-    store = LedgerStore(environment=environment, canonical_name=name)
+    read_only_export = False
+    if (arguments.command == "ledger" and arguments.ledger_command == "status-export"
+            and arguments.wire):
+        arguments.wire_envelope = _stdin_object()
+        wire_payload = arguments.wire_envelope.get("payload")
+        read_only_export = isinstance(wire_payload, dict) and wire_payload.get("refresh") is False
+    store = (LedgerStore.open_readonly(environment) if read_only_export else
+             LedgerStore(environment=environment, canonical_name=name))
+    if store is None:
+        raise LedgerError("ledger_not_initialized", "No existing HAM ledger is available to read.")
     payload = _dispatch(arguments, environment, store)
     values = os.environ if environment is None else environment
     mutating = ((arguments.command == "mail" and arguments.mail_command not in {"show", "threads", "direct-list"}) or
@@ -159,7 +182,17 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
 def status_operation(operation: str, *, environment: Mapping[str, str] | None = None,
                      phase: str | None = None, summary: str = "",
                      repo_id: str | None = None, host: str | None = None) -> dict[str, Any]:
-    store = LedgerStore(environment=environment)
+    if operation in {"list", "board"}:
+        try:
+            store = LedgerStore.open_readonly(environment)
+        except LedgerError as error:
+            if error.code != "ledger_not_initialized":
+                raise
+            store = None
+        if store is None:
+            return {"repo_id": repo_id, "agents": [], **({"hosts": []} if operation == "board" else {})}
+    else:
+        store = LedgerStore(environment=environment)
     registry = AgentRegistry(store)
     if operation in {"list", "board"}:
         if repo_id == "":
@@ -219,7 +252,9 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         if command in {"reconcile", "event"}:
             return registry.refresh(environment)[1]
         if command in {"accept", "receipt", "setting", "withdraw"} or (command == "status-export" and arguments.wire):
-            envelope = _stdin_object()
+            envelope = getattr(arguments, "wire_envelope", None)
+            if envelope is None:
+                envelope = _stdin_object()
             if command == "status-export":
                 _, payload = remote.authenticate(envelope)
                 refresh = payload.get("refresh", True)

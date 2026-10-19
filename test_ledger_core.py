@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -92,7 +93,8 @@ class NewRepoDefaultsTest(unittest.TestCase):
         self.assertEqual(self.registry.repo_show(self.repo_id)["mode"], "off")
         self.assertEqual(self.settings.show("git:not-yet-observed/repo")["mode"], "off")
         self.assertTrue(all(agent["role"] is None for agent in
-                            status_board(self.store, host="local")["agents"]))
+                            status_board(self.store, host="local", resource_scanner=lambda: {
+                                "listeners": [], "serve": [], "error": None})["agents"]))
         self.assertTrue(all(agent["role"] is None for agent in RemoteLedger(self.store).status_export()["agents"]))
         self.assertEqual(Mailbox(self.store).read(self.registry.list()[0])["messages"], [])
         with self.store.read() as connection:
@@ -143,6 +145,51 @@ class NewRepoDefaultsTest(unittest.TestCase):
         with self.store.read() as connection:
             for table in ("repos", "repo_settings", "agents", "terminal_slots", "outbox"):
                 self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
+
+
+class ReadonlyLedgerBootstrapTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.directory = self.root / "ledger"
+        self.environment = {"HERDR_AGENT_LEDGER_DIR": str(self.directory)}
+
+    def test_absent_readonly_ledger_does_not_create_directory(self):
+        self.assertIsNone(LedgerStore.open_readonly(self.environment))
+        self.assertFalse(self.directory.exists())
+
+    def test_readonly_first_bootstrap_sqlite_errors_become_not_initialized(self):
+        self.directory.mkdir()
+        path = self.directory / "ledger.sqlite3"
+        for contents in (b"", b"not a sqlite database"):
+            with self.subTest(contents=contents):
+                path.write_bytes(contents)
+                before = path.read_bytes()
+                with self.assertRaises(LedgerError) as raised:
+                    LedgerStore.open_readonly(self.environment)
+                self.assertEqual(raised.exception.code, "ledger_not_initialized")
+                self.assertIsInstance(raised.exception.__cause__, sqlite3.Error)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual({item.name for item in self.directory.iterdir()}, {"ledger.sqlite3"})
+
+    def test_readonly_first_bootstrap_missing_metadata_becomes_not_initialized(self):
+        self.directory.mkdir()
+        with sqlite3.connect(self.directory / "ledger.sqlite3") as connection:
+            connection.execute("CREATE TABLE ledger_meta(key TEXT PRIMARY KEY,value TEXT)")
+        for key, value in (("self_canonical_name", "alpha"), ("self_uuid", "fixture-uuid"),
+                           ("history_cursor_key", "00" * 32)):
+            with self.subTest(missing=key):
+                with self.assertRaises(LedgerError) as raised:
+                    LedgerStore.open_readonly(self.environment)
+                self.assertEqual(raised.exception.code, "ledger_not_initialized")
+                self.assertIsInstance(raised.exception.__cause__, KeyError)
+                with sqlite3.connect(self.directory / "ledger.sqlite3") as connection:
+                    connection.execute("INSERT INTO ledger_meta VALUES (?,?)", (key, value))
+        store = LedgerStore.open_readonly(self.environment)
+        self.assertEqual((store.host, store.host_uuid), ("alpha", "fixture-uuid"))
+        self.assertFalse((self.directory / "bootstrap.lock").exists())
+        self.assertFalse((self.directory / "bell").exists())
 
 
 class LedgerCoreTest(unittest.TestCase):

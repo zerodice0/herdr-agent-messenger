@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ledger_display import LEGACY_SOURCE, RECAP_SOURCE, SOURCE
+from ledger_display import SOURCE
 from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerStore
@@ -91,7 +91,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             self.assertEqual(rows[0]["agent_id"], agent["agent_id"])
             self.assertEqual(rows[0]["pane_id"], "p-current")
             self.assertEqual(rows[0]["turn_state"], "idle")
-        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["alias"], "orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["alias"], "orange-rabbit")
 
     def test_status_redraw_observes_fresh_phase_summary_and_log(self):
         agent = self.seed()
@@ -103,8 +103,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         for command, rows in self.observations:
             self.assertEqual((rows[0]["phase"], rows[0]["summary"]),
                              ("review", "Inspect committed status"), command)
-        metadata = self.herdr.metadata["p-current"][SOURCE]
-        self.assertEqual(metadata["tokens"]["recap"], "review")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "review")
         self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Inspect committed status")
         with self.store.read() as connection:
             status = [tuple(row) for row in connection.execute(
@@ -141,7 +140,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         updated["agents"][0]["name"] = "blue-fox"
         self.registry.reconcile(updated)
         self.assertEqual(len(self.reports()), 1)
-        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["alias"], "blue-fox")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["alias"], "blue-fox")
         self.assertTrue(all(rows[0]["alias"] == "blue-fox" for _, rows in self.observations))
         self.assertEqual(self.registry.list()[0]["agent_id"], agent["agent_id"])
         self.clear_commands()
@@ -205,7 +204,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             _, result = refresh({"HERDR_TEST": "runtime"})
         self.assertEqual(result["terminals"], 1)
         self.assertEqual(result["agents"][0]["session_ref"], "session")
-        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["alias"], "orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["alias"], "orange-rabbit")
 
     def second_agent_snapshot(self):
         updated = copy.deepcopy(self.snapshot)
@@ -248,6 +247,30 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.assertIn("[메인]", self.herdr.metadata["p-moved"][SOURCE]["display_agent"])
         self.assertNotIn("[워커]", self.herdr.metadata["p-moved"][SOURCE]["display_agent"])
 
+    def test_refresh_prunes_exited_agent_claims_and_clears_shell_device_tokens(self):
+        agent = self.seed()
+        with self.store.transaction() as connection:
+            connection.executemany(
+                "INSERT INTO device_claims VALUES (?,?,?,?,?)",
+                [("serial", "phone", "Pixel", agent["agent_id"], 1.0),
+                 ("emulator-5554", "emu", "5554", agent["agent_id"], 2.0)],
+            )
+        self.registry.set_status(agent, phase="review", summary="Device holder")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["phone"], "📱 Pixel")
+        self.clear_commands()
+        remaining = {**self.snapshot, "agents": []}
+        with mock.patch("ledger_status.live_snapshot", return_value=remaining):
+            self.registry.refresh()
+        self.assertEqual(self.reports(), [
+            ["pane", "report-metadata", "p-current", "--source", SOURCE,
+             "--clear-token", "phone", "--clear-token", "emu"],
+        ])
+        self.assertNotIn("phone", self.herdr.metadata["p-current"]["tokens"])
+        self.assertNotIn("emu", self.herdr.metadata["p-current"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["other"], "keep")
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM device_claims").fetchone()[0], 0)
+
     def test_public_explicit_status_suppresses_initial_redraw_and_projects_once(self):
         with mock.patch("ledger_status.live_snapshot", return_value=self.snapshot) as snapshot:
             observed, _ = self.registry.refresh(refresh_display=False)
@@ -260,10 +283,11 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             result = self.registry.set_status(agent, phase="", summary="", feature_invoked=True)
         self.assertEqual(result["display"], {"updated": ["p-current"], "failed": []})
         self.assertEqual(len(self.reports()), 1)
-        self.assertNotIn("recap", self.herdr.metadata["p-current"][RECAP_SOURCE]["tokens"])
-        self.assertEqual(self.herdr.metadata["p-current"][RECAP_SOURCE]["tokens"]["other"], "keep")
-        self.assertEqual(self.herdr.metadata["p-current"]["device"]["tokens"]["phone"], "serial")
-        self.assertNotIn("alias", self.herdr.metadata["p-current"][LEGACY_SOURCE]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["other"], "keep")
+        self.assertNotIn("phone", self.herdr.metadata["p-current"]["tokens"])
+        self.assertNotIn("emu", self.herdr.metadata["p-current"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["alias"], "orange-rabbit")
 
     def test_default_display_runner_uses_explicit_host_environment(self):
         self.seed()
@@ -323,7 +347,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.registry.set_status(agent, phase="review", summary="New HAM title")
         self.assertEqual(self.herdr.labels["p-current"], "Human title")
         self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit · HAM title")
-        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["recap"], "review")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "review")
 
     def test_cleared_status_retains_identity_and_exact_cas_value(self):
         agent = self.seed()
@@ -331,7 +355,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.registry.set_status(agent, phase="", summary="")
         self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit")
         self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-current"][SOURCE]["tokens"]["recap"], "")
+        self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "")
         self.registry.set_status(agent, phase="review", summary="Owned after clear")
         self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Owned after clear")
         self.herdr.labels["p-current"] = "Later human rename"

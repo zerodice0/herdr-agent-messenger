@@ -218,13 +218,15 @@ class AgentRegistry:
         self.display_runner = display_runner
 
     def refresh(self, environment: Mapping[str, str] | None = None, *,
-                refresh_display: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+                refresh_display: bool = True,
+                prune_device_claims: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
         # Lock BEFORE snapshot acquisition: an older event cannot overwrite a
         # newer session snapshot merely because its Git probes took longer.
         with self.store.lock("registry"):
             snapshot = live_snapshot(environment)
             changed_panes: set[str] = set()
-            result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment)
+            result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment,
+                                     prune_device_claims=prune_device_claims)
             from ledger_settings import RepoSettings
             settings = RepoSettings(self.store, environment=environment).reconcile_local(
                 refresh_display=False, environment=environment)
@@ -248,7 +250,8 @@ class AgentRegistry:
 
     def _reconcile(self, snapshot: Mapping[str, Any], *, changed_panes: set[str],
                    now: float | None = None,
-                   environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+                   environment: Mapping[str, str] | None = None,
+                   prune_device_claims: bool = True) -> dict[str, Any]:
         at = time.time() if now is None else now
         panes = snapshot.get("panes")
         raw_agents = snapshot.get("agents")
@@ -382,6 +385,9 @@ class AgentRegistry:
                                    (reason, location.get("workspace_id", ''), location.get("pane_id", ''), row["message_id"]))
             for message_id in changed_ids:
                 save_receipt(connection, message_id)
+            if prune_device_claims:
+                from ledger_devices import prune_stale
+                changed_panes.update(prune_stale(connection))
         return {"agents": self.list(), "terminals": len(locations)}
 
     @staticmethod

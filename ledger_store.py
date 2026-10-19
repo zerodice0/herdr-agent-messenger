@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -91,6 +91,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS active_terminal ON agents(host,terminal_id) WH
 CREATE TABLE IF NOT EXISTS agent_status (
  agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id), turn_state TEXT NOT NULL,
  phase TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS device_claims (
+ device_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('phone','emu')),
+ label TEXT NOT NULL, agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+ claimed_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS status_log (
  seq INTEGER PRIMARY KEY, agent_id TEXT NOT NULL, field TEXT NOT NULL,
  value TEXT NOT NULL, at REAL NOT NULL);
@@ -196,7 +200,7 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
                 if "confirmation_source" not in columns:
@@ -238,8 +242,33 @@ class LedgerStore:
             finally:
                 connection.close()
 
+    @classmethod
+    def open_readonly(cls, environment: Mapping[str, str] | None = None) -> LedgerStore | None:
+        """Open an existing ledger without bootstrap, migrations, or mkdir."""
+        directory = ledger_directory(environment)
+        path = directory / "ledger.sqlite3"
+        if not path.is_file():
+            return None
+        store = cls.__new__(cls)
+        store.directory, store.path = directory, path
+        store.bell_directory = directory / "bell"
+        store.notification_errors = []
+        store._readonly = True
+        try:
+            with store.read() as connection:
+                metadata = dict(connection.execute("SELECT key,value FROM ledger_meta"))
+            store.host = metadata["self_canonical_name"]
+            store.host_uuid = metadata["self_uuid"]
+            store._history_cursor_key = bytes.fromhex(metadata["history_cursor_key"])
+        except (sqlite3.Error, KeyError) as error:
+            raise LedgerError("ledger_not_initialized", "No initialized HAM ledger is available to read.") from error
+        return store
+
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        connection = (sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30,
+                                      isolation_level=None)
+                      if getattr(self, "_readonly", False) else
+                      sqlite3.connect(str(self.path), timeout=30, isolation_level=None))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")

@@ -162,7 +162,7 @@ is_main_checkout, status_updated_at, last_seen and stale fields. The status
 timestamp is distinct from the registry observation time. It reads stored
 registry rows without refresh and requests peer `refresh=false`; it does not
 refresh or mutate either host's status/display/claims. Each host has
-`{host,uuid,local,stale,error,unread,agents}`. A failed peer has a structured
+`{host,uuid,local,stale,error,unread,agents}` plus optional `resources`. A failed peer has a structured
 error and unread `?`. The stateless CLI has no prior rows to invent; a TUI may
 retain a prior matching verified-host snapshot as stale. Existing `list` and
 local `status list` retain their narrower discovery/status semantics.
@@ -170,6 +170,78 @@ Read-only remote behavior requires peers with this read API version; an older
 peer may ignore `refresh=false` and perform its legacy registry refresh.
 A peer failure still exits with code 0: inspect each host's `error`, `stale` and
 unread. An unknown/ambiguous `--host` returns `peer_not_configured` with exit code 1.
+
+### Device claims and resource presence
+
+Use `python3 "$HAM_CLI"` with these commands:
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+- Claim before using a real device (`phone`) or emulator (`emu`), and release
+  after use. Emulator digits normalize to `emulator-N`. Without `--label`, a
+  phone uses its Android model when available, otherwise its ID; an emulator
+  uses its number. An explicit label also supports non-Android devices.
+- `release` defaults to `all`, meaning all **your own** claims. Specify a kind,
+  then optionally a device to narrow the selection; it never releases another
+  agent's claims, and has no force option.
+- Claim/release refresh Herdr and prove the caller's stable terminal/session
+  generation under the terminal lock. An inherited `HERDR_PANE_ID` alone is
+  insufficient. Unresolved identity or failed refresh refuses the mutation.
+- A live holder has an active agent row in the current host/terminal generation.
+  The same holder can reclaim to update a label. Another live holder returns
+  `device_claimed` with holder details; `--force` replaces it **only when the user
+  explicitly instructs you to do so**. Inactive or old-generation holders are
+  stale and can be replaced without force (`replaced_stale:true`).
+  Stale claims are pruned only on mutation paths, never by reading a view.
+
+Commands accept `-h` / `--help`, not `--verbose`, and emit one JSON object with
+the same domain/usage error conventions as mailbox commands:
+
+| Command | Result |
+| --- | --- |
+| `device claim` | `{device,replaced,replaced_stale}`; `replaced` is the previous claim or `null`. |
+| `device release` | `{released:[...]}`. |
+| `device list` | `{devices:[{device_id,kind,label,claimed_at,holder,stale,attached}]}`. |
+
+`holder` contains `{agent_id,alias,pane_id,terminal_id,generation,active,live}`.
+`attached` is adb attachment (`true` only for Android state `device`, otherwise
+`false`); it is `null` if adb is unavailable or the ID is not adb-like, such as
+an iOS UDID. Attachment is not holder liveness. `device list` is read-only:
+no registry refresh, token writes, stale pruning or directory creation.
+
+`status board` requests these read-only resource fields. Status-export includes
+`servers` and host `resources` only when its wire payload sets `resources:true`;
+the default export, send/policy checks and recipient lookup do not scan servers.
+
+- Agent `devices`: held nonstale claim rows (`stale:false`).
+- Agent `servers`: `{port,bind,pid,process,cwd,started_at,urls,inherited}` rows.
+  Discovery uses current-user listeners and Tailscale Serve routes on Linux and
+  macOS. Ownership follows the active agent's pane; plugin, adb and agent-runtime
+  listeners are excluded. `inherited:true` means the process predates the current
+  agent session, not that this session started it.
+- Host `resources`: `{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+  `servers_unowned` lists served proxy backends with listeners but no agent owner;
+  `dead_serve` lists proxy routes without a backend listener, including listeners
+  owned by other users in the liveness check; `stale_devices`
+  reports stale claims. A discovery error is reported in `resources.error`.
+
+Each resource field is optional independently. If an older peer omits `devices`,
+`servers` or `resources`, only that field is unknown (`?`), never silently empty.
+Board/TUI reads do not refresh the registry, prune claims or change tokens.
+The TUI shows compact counts plus Devices/Servers details; see the
+[UI reference](ui-reference.md#device-and-server-presence).
+
+HAM owns the exact sidebar values `phone=📱 <labels space-joined>` and
+`emu=🤖 <labels space-joined>`, clearing the corresponding token key when empty.
+Claim/release and status projection keep these values synchronized, including a
+live previous holder after force replacement. Herdr tokens are a flat per-pane
+map, not isolated by metadata source. Product code does not import the legacy
+device JSON; any one-time rollout migration is external. `heavy_slot.py` remains
+a separate, unchanged script: HAM neither reads nor displays heavy-work slots.
 
 ### Mailbox terminology
 

@@ -87,6 +87,10 @@ class StatusBoardTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.environment = dict(os.environ)
+        self.scanner = mock.Mock(return_value={"listeners": [], "serve": [], "error": None})
+        resource_patch = mock.patch("resource_scan.scan_host_resources", self.scanner)
+        resource_patch.start()
+        self.addCleanup(resource_patch.stop)
         self.stores = {name: LedgerStore(self.root/name, canonical_name=name,
                                         environment=self.environment)
                        for name in ("alpha", "beta", "gamma")}
@@ -125,7 +129,7 @@ class StatusBoardTest(unittest.TestCase):
 
     def board(self, **options):
         return status_board(self.local, environment=self.environment,
-                            transport=self.transport, **options)
+                            transport=self.transport, resource_scanner=self.scanner, **options)
 
     def enqueue(self, host, *, state="queued", agent=None):
         store = self.stores[host]
@@ -144,7 +148,7 @@ class StatusBoardTest(unittest.TestCase):
 
     def test_local_rich_rows_preserve_full_export_and_real_status_timestamp(self):
         board = self.board(host="local")
-        exported = RemoteLedger(self.local).status_export()["agents"]
+        exported = RemoteLedger(self.local).status_export(resources=True, resource_scanner=self.scanner)["agents"]
         self.assertEqual(board["agents"], [{**row, "stale": False} for row in exported])
         row = next(row for row in board["agents"] if row["repo_id"] == REPO)
         self.assertEqual({key: row[key] for key in (
@@ -158,6 +162,7 @@ class StatusBoardTest(unittest.TestCase):
         self.assertEqual(board["hosts"], [{
             "host": "alpha", "uuid": self.local.host_uuid, "local": True, "stale": False,
             "error": None, "unread": 0, "agents": board["agents"],
+            "resources": {"servers_unowned": [], "dead_serve": [], "stale_devices": [], "error": None},
         }])
         self.assertIsNone(board["repo_id"])
         self.assertEqual(self.transport.calls, [])
@@ -202,8 +207,8 @@ class StatusBoardTest(unittest.TestCase):
         self.assertIsNone(beta["error"])
         self.assertEqual(beta["agents"][0]["summary"], "Stored summary beta")
         self.assertEqual(self.transport.calls, [
-            ("beta", "status-export", {"repo_id": REPO, "refresh": False}),
-            ("gamma", "status-export", {"repo_id": REPO, "refresh": False}),
+            ("beta", "status-export", {"repo_id": REPO, "refresh": False, "resources": True}),
+            ("gamma", "status-export", {"repo_id": REPO, "refresh": False, "resources": True}),
         ])
 
     def test_host_selection_accepts_local_canonical_and_registered_alias(self):

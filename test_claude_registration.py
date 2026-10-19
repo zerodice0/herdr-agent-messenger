@@ -13,7 +13,7 @@ import ledger_cli
 from ledger_mail import Mailbox
 from ledger_runtime import NativeReceiver
 from ledger_status import AgentRegistry, _claude_ancestor_pid, claude_foreground_pid
-from ledger_store import LedgerError, LedgerStore
+from ledger_store import SCHEMA_VERSION, LedgerError, LedgerStore
 from test_ledger_core import snapshot
 
 
@@ -414,7 +414,7 @@ class ClaudeRegistrationTest(PrivateClaudeTest):
             migrated = [dict(row) for row in connection.execute('SELECT * FROM agents ORDER BY agent_id')]
             version = connection.execute("SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0]
             self.assertEqual(connection.execute('SELECT count(*) FROM native_claims').fetchone()[0], 0)
-        self.assertEqual(version, '5')
+        self.assertEqual(version, str(SCHEMA_VERSION))
         self.assertEqual(migrated, [{**row, 'native_session_pid': None} for row in historical])
         recipient = next(row for row in migrated if row['terminal_id'] == 'term-b')
         self.assertEqual((recipient['agent_id'], recipient['generation'], recipient['session_ref'],

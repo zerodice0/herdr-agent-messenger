@@ -191,15 +191,27 @@ class RemoteLedger:
         elif command == "withdraw":
             result = self.accept_withdraw(payload, source)
         elif command == "status-export":
-            result = self.status_export(payload.get("repo_id"))
+            result = self.status_export(payload.get("repo_id"), resources=payload.get("resources") is True)
         else:
             raise LedgerError("invalid_command", "Unsupported wire command.")
         return {"protocol": PROTOCOL, **result}
 
-    def status_export(self, repo_id: str | None = None) -> dict[str, Any]:
+    def status_export(self, repo_id: str | None = None, *, resources: bool = False,
+                      resource_scanner: Any = None) -> dict[str, Any]:
         settings = RepoSettings(self.store)
-        agents = AgentRegistry(self.store).list(repo_id)
+        all_agents = AgentRegistry(self.store).list()
+        agents = [agent for agent in all_agents if repo_id is None or agent["repo_id"] == repo_id]
+        from ledger_devices import device_rows
+        servers: dict[str, list[dict[str, Any]]] = {}
+        host_resources = None
+        if resources:
+            import resource_scan
+            scanned = (resource_scanner or resource_scan.scan_host_resources)()
+            servers, host_resources = resource_scan.attribute(
+                scanned["listeners"], scanned["serve"], all_agents, host=self.store.host,
+                listener_endpoints=scanned.get("listener_endpoints"))
         with self.store.read() as connection:
+            claims = device_rows(connection)
             counts = {(row["recipient_host"], row["recipient_terminal_id"], row["repo_id"]): row["unread"]
                       for row in connection.execute(
                           "SELECT d.recipient_host,d.recipient_terminal_id,m.repo_id,count(*) AS unread "
@@ -207,17 +219,28 @@ class RemoteLedger:
                           "WHERE d.state IN ('queued','delivering') GROUP BY d.recipient_host,"
                           "d.recipient_terminal_id,m.repo_id")}
         exported = [{**agent, "role": settings.role(agent),
-                     "unread": counts.get((agent["host"], agent["terminal_id"], agent["repo_id"]), 0)}
+                     "unread": counts.get((agent["host"], agent["terminal_id"], agent["repo_id"]), 0),
+                     "devices": [row for row in claims if not row["stale"]
+                                 and row["holder"]["agent_id"] == agent["agent_id"]],
+                     **({"servers": servers.get(agent["agent_id"], [])} if resources else {})}
                     for agent in agents]
-        return {"host": {"canonical_name": self.store.host, "uuid": self.store.host_uuid},
-                "agents": exported}
+        result = {"host": {"canonical_name": self.store.host, "uuid": self.store.host_uuid},
+                  "agents": exported}
+        if host_resources is not None:
+            result["resources"] = {"servers_unowned": host_resources["unowned_served"],
+                                   "dead_serve": host_resources["dead_serve"],
+                                   "stale_devices": [row for row in claims if row["stale"]],
+                                   "error": scanned["error"]}
+        return result
 
     def query_status(self, host: str, repo_id: str | None = None, *,
-                     refresh: bool = True) -> dict[str, Any]:
+                     refresh: bool = True, resources: bool = False) -> dict[str, Any]:
         peer = self.peer(host)
         payload: dict[str, Any] = {"repo_id": repo_id}
         if not refresh:
             payload["refresh"] = False
+        if resources:
+            payload["resources"] = True
         result = self.transport.call(peer, "status-export", payload)
         if result.get("host") != {"canonical_name": peer["canonical_name"], "uuid": peer["uuid"]}:
             raise LedgerError("peer_identity_conflict", "Live status endpoint identity has changed.")

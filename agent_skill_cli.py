@@ -1569,7 +1569,8 @@ def main(
         return exit_code
     except (BatchDispatchError, SkillCommandError, SpawnError, LedgerError) as error:
         _write_json(
-            {"error": {"code": error.code, "message": error.message}},
+            {"error": {"code": error.code, "message": error.message,
+                       **({"holder": error.holder} if hasattr(error, "holder") else {})}},
             compact=command == "batch",
         )
         return 1

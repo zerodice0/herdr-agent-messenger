@@ -185,7 +185,8 @@ extension_present, client, workspace_id, pane_id, generation, is_main_checkout,
 status_updated_at, last_seen, stale가 있습니다. 상태 갱신 시각과 레지스트리 관찰
 시각은 별개입니다. 저장된 레지스트리를 새로 수집하지 않고 읽으며 peer에도
 `refresh=false`를 요청합니다. 어느 호스트의 상태·표시·claim도 갱신하지 않습니다.
-호스트별 항목은 `{host,uuid,local,stale,error,unread,agents}`입니다. 실패한 peer는
+호스트별 항목은 `{host,uuid,local,stale,error,unread,agents}`이며 선택적 `resources`가
+추가됩니다. 실패한 peer는
 구조화된 오류와 unread `?`를 남깁니다. 이전 행이 없는 CLI는 행을 만들어 내지
 않습니다. TUI는 검증된 같은 호스트의 이전 스냅샷을 stale로 유지할 수 있습니다.
 기존 `list`와 로컬 `status list`는 더 좁은 탐색·상태 조회로 유지됩니다.
@@ -194,6 +195,78 @@ status_updated_at, last_seen, stale가 있습니다. 상태 갱신 시각과 레
 일부 peer 조회에 실패해도 종료 코드는 0이므로 호스트별 `error`, `stale`,
 unread를 확인하세요. 알 수 없거나 모호한 `--host`는 `peer_not_configured`와
 종료 코드 1을 반환합니다.
+
+### 기기 점유와 자원 표시
+
+`python3 "$HAM_CLI"` 뒤에 다음 명령을 붙입니다.
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+- 실기기(`phone`)나 에뮬레이터(`emu`)를 쓰기 전에 점유하고 사용을 마치면 해제합니다.
+  에뮬레이터 번호는 `emulator-N`으로 정규화합니다. `--label`을 생략하면 실기기는
+  조회 가능한 Android 모델명 또는 기기 ID를, 에뮬레이터는 번호를 사용합니다.
+  Android가 아닌 기기에도 라벨을 명시할 수 있습니다.
+- `release`의 기본값은 `all`이며 **자신의 점유만** 모두 해제합니다. 종류와 선택적
+  기기 ID로 범위를 좁힐 수 있지만 다른 에이전트의 점유는 해제하지 않습니다.
+  해제에는 force 옵션이 없습니다.
+- 점유·해제는 Herdr를 갱신하고 terminal lock 안에서 호출자의 안정적인 terminal과
+  세션 generation을 검증합니다. 상속된 `HERDR_PANE_ID`만으로는 충분하지 않습니다.
+  정체성을 확인하지 못하거나 갱신이 실패하면 변경을 거부합니다.
+- 활성 소유자는 현재 호스트·terminal generation의 활성 에이전트입니다. 자기 기기를
+  다시 점유하면 라벨을 갱신합니다. 다른 활성 소유자가 있으면 소유자 정보와 함께
+  `device_claimed`로 거부합니다. `--force`는 **사용자가 명시적으로 지시했을 때만**
+  사용하여 교체합니다. 비활성 소유자나 이전 generation의 점유는 stale이므로
+  force 없이 교체할 수 있으며 `replaced_stale:true`를 반환합니다.
+  stale 점유는 변경 경로에서만 정리하고 조회에서는 정리하지 않습니다.
+
+명령은 `-h` / `--help`를 지원하며 `--verbose`는 없습니다. JSON 객체 하나를 반환하고
+메일함 명령과 같은 도메인·사용법 오류 규칙을 따릅니다.
+
+| 명령 | 결과 |
+| --- | --- |
+| `device claim` | `{device,replaced,replaced_stale}`이며 `replaced`는 이전 점유 또는 `null`입니다. |
+| `device release` | `{released:[...]}`입니다. |
+| `device list` | `{devices:[{device_id,kind,label,claimed_at,holder,stale,attached}]}`입니다. |
+
+`holder`에는 `{agent_id,alias,pane_id,terminal_id,generation,active,live}`가 있습니다.
+`attached`는 adb 연결 여부입니다. Android 상태가 `device`이면 `true`, 아니면
+`false`이며, adb를 사용할 수 없거나 iOS UDID처럼 adb 형식이 아닌 ID이면 `null`입니다.
+연결 여부는 점유 소유자의 활성 여부와 별개입니다. `device list`는 읽기 전용이므로
+레지스트리 갱신, 토큰 쓰기, stale 정리나 디렉터리 생성을 하지 않습니다.
+
+`status board`는 다음 읽기 전용 자원 필드를 요청합니다. Status-export는 wire payload에
+`resources:true`가 있을 때만 `servers`와 호스트 `resources`를 포함합니다.
+기본 export, 전송 정책 검사와 수신자 조회에서는 서버를 탐색하지 않습니다.
+
+- 에이전트 `devices`: 현재 소유한 유효한 점유 행(`stale:false`)입니다.
+- 에이전트 `servers`: `{port,bind,pid,process,cwd,started_at,urls,inherited}` 행입니다.
+  Linux와 macOS에서 현재 사용자의 리스너와 Tailscale Serve 경로를 탐색합니다.
+  활성 에이전트의 pane으로 소유자를 연결하며 플러그인, adb와 에이전트 런타임의
+  리스너는 제외합니다. `inherited:true`는 프로세스가 현재 세션보다 먼저 시작됐다는
+  뜻이지 현재 세션이 시작했다는 뜻이 아닙니다.
+- 호스트 `resources`: `{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`입니다.
+  `servers_unowned`는 리스너는 있지만 에이전트 소유자가 없는 Serve 프록시 대상,
+  `dead_serve`는 대상 리스너가 없는 프록시 경로, `stale_devices`는 stale 점유입니다.
+  대상 리스너의 활성 여부를 확인할 때는 다른 사용자의 리스너도 포함합니다.
+  탐색 오류는 `resources.error`에 기록합니다.
+
+각 자원 필드는 서로 독립적인 선택 필드입니다. 이전 peer에 `devices`, `servers`,
+`resources` 중 어느 필드가 없으면 해당 정보만 알 수 없음(`?`)으로 표시하며,
+빈 목록으로 해석하지 않습니다. 보드와 TUI 조회는 레지스트리를 갱신하거나 점유를
+정리하거나 토큰을 바꾸지 않습니다. 간단한 개수와 Devices/Servers 상세 표시는
+[UI 참고서](ui-reference.md#기기와-서버-표시)를 참고하세요.
+
+HAM의 사이드바 값은 정확히 `phone=📱 <공백으로 연결한 라벨>`과
+`emu=🤖 <공백으로 연결한 라벨>`이며 점유가 없으면 해당 키를 지웁니다.
+점유·해제와 상태 표시는 강제 교체된 이전 활성 소유자를 포함해 이 값을 맞춥니다.
+Herdr 토큰은 source별로 격리되지 않은 pane 단위의 평면 맵입니다.
+제품은 기존 기기 JSON을 가져오지 않으며 일회성 이전은 제품 밖에서 수행합니다.
+`heavy_slot.py`는 별도 스크립트로 그대로 유지하며 HAM은 무거운 작업 슬롯을 읽거나
+표시하지 않습니다.
 
 ### 메일함 용어
 

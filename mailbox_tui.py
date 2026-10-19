@@ -177,7 +177,8 @@ def close_owned(environment: Mapping[str, str]) -> bool:
 def local_snapshot(store: LedgerStore, repo_id: str | None,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     settings = RepoSettings(store)
-    agents = status_board(store, repo_id=repo_id, host="local", environment=environment)["agents"]
+    board = status_board(store, repo_id=repo_id, host="local", environment=environment)
+    agents = board["agents"]
     if environment is not None:
         try:
             result = herdr(["api", "snapshot"], environment)
@@ -190,10 +191,14 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
             # The ledger remains inspectable while Herdr is temporarily absent.
             pass
     mail = Mailbox(store)
-    return {"host": store.host, "agents": agents, "threads": mail.list_threads(repo_id)["threads"],
-            "submissions": mail.list_direct(repo_id)["submissions"],
-            "settings": settings.show(repo_id) if repo_id else None,
-            "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
+    snapshot = {"host": store.host, "agents": agents, "threads": mail.list_threads(repo_id)["threads"],
+                "submissions": mail.list_direct(repo_id)["submissions"],
+                "settings": settings.show(repo_id) if repo_id else None,
+                "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
+    host = next((item for item in board.get("hosts", []) if item["host"] == store.host), {})
+    if "resources" in host:
+        snapshot["resources"] = host["resources"]
+    return snapshot
 
 
 def dispatch_direct(store: LedgerStore, recipient: Mapping[str, Any], body: str,
@@ -544,6 +549,32 @@ class MailboxApp:
                 values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
         return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
                       key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+
+    def host_resources(self, host: str) -> Mapping[str, Any] | None:
+        if host == self.local.get("host"):
+            return self.local.get("resources")
+        peer = next((item for item in self.local.get("peers", [])
+                     if item["canonical_name"] == host), None)
+        if peer:
+            return next((item.get("resources") for item in self.remote.get(host, {}).get("hosts", [])
+                         if item["host"] == host and item["uuid"] == peer["uuid"]), None)
+        return None
+
+    def resource_cue(self, agent: Mapping[str, Any]) -> str:
+        devices, servers = agent.get("devices"), agent.get("servers")
+        counts = ["?" if devices is None else str(sum(row.get("kind") == kind for row in devices))
+                  for kind in ("phone", "emu")]
+        counts.append("?" if servers is None else str(len(servers)))
+        glyphs = ("📱", "🤖", "🌐") if self.colors_enabled and "NO_COLOR" not in self.environment else ("P", "E", "S")
+        return " ".join(glyph + count for glyph, count in zip(glyphs, counts))
+
+    def host_resource_cue(self, host: str, *, compact: bool = False) -> str:
+        resources = self.host_resources(host) or {}
+        labels = ("D", "U", "X") if compact else ("dead", "unowned", "stale-dev")
+        counts = ["?" if resources.get(key) is None else str(len(resources[key]))
+                  for key in ("dead_serve", "servers_unowned", "stale_devices")]
+        cue = " ".join(label + ":" + count for label, count in zip(labels, counts))
+        return cue + (" !" if resources.get("error") else "")
 
     @staticmethod
     def thread_handled(item: Mapping[str, Any]) -> bool:
@@ -1506,6 +1537,9 @@ class MailboxApp:
         if width >= 55:
             columns[2] = ("alias", 14, False)
             columns.extend([("role", 7, False), ("summary", width - 44, False)])
+        if width >= 78:
+            columns[-1] = ("summary", width - 59, False)
+            columns.append(("resources", 14, False))
         return columns
 
     def column_text(self, values: Mapping[str, str], columns: list[tuple[str, int, bool]]) -> str:
@@ -1554,14 +1588,24 @@ class MailboxApp:
         columns = self.agent_columns(width)
         self.render_table_header(y, x, self.column_text(
             {"alias": "ALIAS", "turn": "TURN", "mail": "MAIL", "rx": "RX",
-             "role": "ROLE", "summary": "PHASE · SUMMARY"}, columns), width)
+             "role": "ROLE", "summary": "PHASE · SUMMARY", "resources": "RESOURCES"}, columns), width)
         agents = self.agents()
         lines: list[tuple[str, int, int, bool]] = []
-        for host in dict.fromkeys([agent["host"] for agent in agents] + sorted(self.remote_errors)):
+        hosts = list(dict.fromkeys([agent["host"] for agent in agents] +
+                                  ([self.local["host"]] if self.local.get("host") else []) +
+                                  [host for host, snapshot in self.remote.items()
+                                   if any(item["host"] == host and item["uuid"] == peer["uuid"]
+                                          for peer in self.local.get("peers", []) if peer["canonical_name"] == host
+                                          for item in snapshot.get("hosts", []))] +
+                                  sorted(self.remote_errors)))
+        for host in hosts:
             group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
             stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
-            label = f"─ {host} · {len(group)} agents" + (" · ⚠ stale" if stale else "") + " "
-            label = truncate_display_text(label, width)
+            label = f"─ {host} · {len(group)} agents · {self.host_resource_cue(host)}"
+            if display_width(label) + 1 > width:
+                label = f"─ {host} · {self.host_resource_cue(host, compact=True)}"
+            label += " · ⚠ stale" if stale else ""
+            label = truncate_display_text(label + " ", width)
             lines.append((label + "─" * max(0, width - display_width(label)),
                           -1, curses.A_BOLD, False))
             if host in self.remote_errors:
@@ -1575,7 +1619,7 @@ class MailboxApp:
                 rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
                 values = {"marker": marker, "alias": agent.get("alias") or agent["terminal_id"],
                           "turn": glyph + " " + turn, "mail": str("?" if agent.get("stale") else agent.get("unread", "?")),
-                          "rx": rx, "role": agent.get("role") or "—",
+                          "rx": rx, "role": agent.get("role") or "—", "resources": self.resource_cue(agent),
                           "summary": " · ".join(str(agent[field]) for field in ("phase", "summary")
                                                 if agent.get(field))}
                 tag = self.result_tags.get(self.identity(agent))
@@ -1587,8 +1631,8 @@ class MailboxApp:
                 if tag and tag[0].startswith("failed"):
                     attr = self.state_style("blocked", selected=chosen)
                 lines.append((text, index, attr, True))
-        if not lines:
-            lines = [(" No agents. r refresh", -1, curses.A_DIM, False)]
+        if not agents:
+            lines.append((" No agents. r refresh", -1, curses.A_DIM, False))
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 1), y + 1):
             self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
@@ -1779,6 +1823,30 @@ class MailboxApp:
                            (json.dumps(item, ensure_ascii=False, indent=2), curses.A_DIM)])
         return result
 
+    def agent_resource_lines(self, item: Mapping[str, Any], now: float) -> list[str]:
+        devices, servers = item.get("devices"), item.get("servers")
+        lines = ["Devices" + (": ?" if devices is None else ": none" if not devices else "")]
+        for device in devices or []:
+            lines.extend([
+                f"  {device.get('kind', '?')}: {device.get('label') or device.get('device_id') or '?'}",
+                f"  ID: {device.get('device_id') or '?'}",
+                f"  Claimed: {status_time(device.get('claimed_at'), now)}",
+                f"  Attached: {yes_no(device.get('attached'))}",
+            ])
+        lines.append("Servers" + (": ?" if servers is None else ": none" if not servers else ""))
+        for server in servers or []:
+            lines.extend([
+                f"  Port: {server.get('port', '?')} · {server.get('process') or '?'} · PID {server.get('pid', '?')}",
+                f"  Bind: {server.get('bind') or '?'}",
+                f"  Cwd: {server.get('cwd') or '?'}",
+                f"  Inherited: {yes_no(server.get('inherited'))}",
+                f"  Started: {status_time(server.get('started_at'), now)}",
+            ])
+            urls = server.get("urls")
+            lines.extend([f"  URL: {url}" for url in urls] if urls else
+                         ["  URL: ?" if urls is None else "  URL: none"])
+        return lines
+
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
             return ["Diagnostics", json.dumps({"connection_errors": self.remote_errors,
@@ -1806,7 +1874,7 @@ class MailboxApp:
                 f"Last seen: {status_time(item.get('last_seen'), now)}",
                 f"First seen: {status_time(item.get('first_seen'), now)}",
                 f"User border: {yes_no(item.get('user_border'))}",
-            ]
+            ] + self.agent_resource_lines(item, now)
         return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent or thread to preview."]
 
     def render_detail(self, rect: tuple[int, int, int, int]) -> None:

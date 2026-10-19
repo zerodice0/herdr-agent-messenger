@@ -28,8 +28,8 @@ class HerdrDisplay:
         self.labels = dict.fromkeys(pane_ids, "")
         self.terminals = {} if terminals is None else dict(terminals)
         self.metadata = {pane: {
-            "device": {"tokens": {"phone": "serial", "emu": "5554"}},
-            RECAP_SOURCE: {"tokens": {"recap": "legacy phase", "other": "keep"}},
+            "tokens": {"phone": "serial", "emu": "5554", "recap": "legacy phase", "other": "keep"},
+            RECAP_SOURCE: {},
         } for pane in pane_ids}
         self.rename_fails = False
         self.metadata_fails = False
@@ -59,7 +59,8 @@ class HerdrDisplay:
                 code = 1
             else:
                 source = command[command.index("--source") + 1]
-                fields = self.metadata[pane_id].setdefault(source, {"tokens": {}})
+                fields = self.metadata[pane_id].setdefault(source, {})
+                tokens = self.metadata[pane_id]["tokens"]
                 index = 5
                 while index < len(command):
                     option = command[index]
@@ -70,9 +71,9 @@ class HerdrDisplay:
                     value = command[index + 1]
                     if option == "--token":
                         key, _, text = value.partition("=")
-                        fields["tokens"][key] = text
+                        tokens[key] = text
                     elif option == "--clear-token":
-                        fields["tokens"].pop(value, None)
+                        tokens.pop(value, None)
                     else:
                         fields[option.removeprefix("--").replace("-", "_")] = value
                     index += 2
@@ -128,12 +129,152 @@ class LedgerDisplayTest(unittest.TestCase):
         with mock.patch.object(LedgerDisplay, "refresh", return_value={"updated": [], "failed": []}):
             return self.registry.set_status(self.agent(), phase=phase, summary=summary)
 
+    def claim(self, device_id, kind, label, *, terminal="main", claimed_at=1.0):
+        agent_id = self.agent(terminal)["agent_id"]
+        with self.store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO device_claims(device_id,kind,label,agent_id,claimed_at) VALUES (?,?,?,?,?)",
+                (device_id, kind, label, agent_id, claimed_at),
+            )
+
+    def test_metadata_tokens_are_flat_across_sources_and_isolated_by_pane(self):
+        self.herdr(["pane", "report-metadata", "p-main", "--source", "device",
+                    "--display-agent", "device-owned name", "--token", "phone=old"])
+        self.herdr(["pane", "report-metadata", "p-main", "--source", SOURCE,
+                    "--display-agent", "HAM-owned name", "--token", "phone=📱 Pixel"])
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["phone"], "📱 Pixel")
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["phone"], "serial")
+        self.herdr(["pane", "report-metadata", "p-main", "--source", "unrelated",
+                    "--clear-display-agent", "--clear-token", "phone"])
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "HAM-owned name")
+        self.assertEqual(self.herdr.metadata["p-main"]["device"]["display_agent"], "device-owned name")
+        self.assertTrue(all("tokens" not in fields for source, fields in self.herdr.metadata["p-main"].items()
+                            if source != "tokens"))
+
+    def test_refresh_projects_only_held_claims_with_exact_resource_tokens(self):
+        self.claim("device-a", "phone", "Pixel 9")
+        self.claim("device-b", "phone", "iPhone SE", claimed_at=2.0)
+        self.claim("emulator-5554", "emu", "5554", claimed_at=3.0)
+        self.claim("worker-device", "phone", "Worker phone", terminal="worker", claimed_at=4.0)
+        self.herdr.labels["p-main"] = "Manual border"
+        self.assertEqual(self.display.refresh()["failed"], [])
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"], {
+            "alias": "orange-rabbit", "color": "orange", "recap": "", "other": "keep",
+            "phone": "📱 Pixel 9 iPhone SE", "emu": "🤖 5554",
+        })
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["phone"], "📱 Worker phone")
+        self.assertNotIn("emu", self.herdr.metadata["p-worker"]["tokens"])
+        self.assertEqual(self.herdr.labels["p-main"], "Manual border")
+        resource_reports = [command for command in self.herdr.commands
+                            if command[:2] == ["pane", "report-metadata"]
+                            and any(value.startswith(("phone=", "emu=")) for value in command)]
+        self.assertTrue(resource_reports)
+        self.assertTrue(all(command[4] == SOURCE for command in resource_reports))
+
+    def test_status_set_and_clear_retain_claim_tokens(self):
+        self.claim("device-a", "phone", "Pixel")
+        self.claim("emulator-5554", "emu", "5554")
+        for phase, summary in (("Implement", "First task"), ("Review", "Second task"), ("", "")):
+            with self.subTest(phase=phase):
+                result = self.registry.set_status(self.agent(), phase=phase, summary=summary,
+                                                  feature_invoked=True)
+                self.assertEqual(result["display"]["failed"], [])
+                self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["phone"], "📱 Pixel")
+                self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["emu"], "🤖 5554")
+                self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], phase)
+
+    def test_refresh_clears_released_claim_keys_but_retains_remaining_kind(self):
+        self.claim("device-a", "phone", "Pixel")
+        self.claim("emulator-5554", "emu", "5554")
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        with self.store.transaction() as connection:
+            connection.execute("DELETE FROM device_claims WHERE kind='phone'")
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["emu"], "🤖 5554")
+        with self.store.transaction() as connection:
+            connection.execute("DELETE FROM device_claims")
+        result = self.registry.set_status(self.agent(), phase="Released", summary="No devices",
+                                          feature_invoked=True)
+        self.assertEqual(result["display"]["failed"], [])
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertNotIn("emu", self.herdr.metadata["p-main"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["other"], "keep")
+        report = next(command for command in reversed(self.herdr.commands)
+                      if command[:2] == ["pane", "report-metadata"] and command[4] == SOURCE)
+        self.assertIn(["--clear-token", "phone"], [report[index:index + 2] for index in range(len(report) - 1)])
+        self.assertIn(["--clear-token", "emu"], [report[index:index + 2] for index in range(len(report) - 1)])
+
+    def test_claim_transfer_reprojects_previous_holder_without_cross_pane_leak(self):
+        self.claim("device-a", "phone", "Pixel")
+        self.assertEqual(self.display.refresh()["failed"], [])
+        worker_id = self.agent("worker")["agent_id"]
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE device_claims SET agent_id=?", (worker_id,))
+        self.assertEqual(self.display.refresh()["failed"], [])
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["phone"], "📱 Pixel")
+
+    def test_stale_claim_does_not_project_even_for_its_former_holder(self):
+        self.claim("device-a", "phone", "Stale phone")
+        former_holder = self.agent()
+        self.herdr.labels["p-main"] = "Manual border"
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE agent_id=?", (former_holder["agent_id"],))
+        self.assertTrue(self.display.refresh_agent(former_holder))
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertNotIn("emu", self.herdr.metadata["p-main"]["tokens"])
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM device_claims").fetchone()[0], 1)
+
+    def test_requested_pane_without_active_local_agent_clears_only_device_tokens(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE pane_id='p-main'")
+        self.herdr.labels["p-main"] = "Shell border"
+        before = copy.deepcopy(self.herdr.metadata["p-worker"])
+        result = self.display.refresh("p-main")
+        self.assertEqual(result, {"updated": ["p-main"], "failed": []})
+        self.assertEqual(self.herdr.commands, [
+            ["pane", "report-metadata", "p-main", "--source", SOURCE,
+             "--clear-token", "phone", "--clear-token", "emu"],
+        ])
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"],
+                         {"recap": "legacy phase", "other": "keep"})
+        self.assertEqual(self.herdr.labels["p-main"], "Shell border")
+        self.assertEqual(self.herdr.metadata["p-worker"], before)
+
+    def test_requested_pane_with_only_remote_agent_still_clears_device_tokens(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET host='remote' WHERE pane_id='p-main'")
+        result = self.display.refresh("p-main")
+        self.assertEqual(result, {"updated": ["p-main"], "failed": []})
+        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
+        self.assertNotIn("emu", self.herdr.metadata["p-main"]["tokens"])
+
+    def test_inactive_pane_device_clear_reports_metadata_and_runner_failures(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE pane_id='p-main'")
+        self.herdr.metadata_fails = True
+        self.assertEqual(self.display.refresh("p-main"), {"updated": [], "failed": ["p-main"]})
+        for error in (OSError("offline"), subprocess.TimeoutExpired("herdr", 10)):
+            with self.subTest(error=type(error).__name__):
+                display = LedgerDisplay(self.store, runner=mock.Mock(side_effect=error))
+                self.assertEqual(display.refresh("p-main"), {"updated": [], "failed": ["p-main"]})
+
+    def test_unscoped_refresh_does_not_clear_inactive_panes(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE pane_id='p-main'")
+        self.assertEqual(self.display.refresh(), {"updated": ["p-worker"], "failed": []})
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["phone"], "serial")
+        self.assertFalse(any(command[2] == "p-main" for command in self.herdr.commands))
+
     def test_status_service_projects_with_injected_selected_host_runner(self):
         result = self.registry.set_status(self.agent(), phase="구현 중", summary="Status service route",
                                           feature_invoked=True)
         self.assertEqual(result["display"]["failed"], [])
         self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Status service route")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_pure_builder_keeps_role_before_address_suffix(self):
         for role, prefix in ((None, ""), ("main", "[메인] "), ("worker", "[워커] ")):
@@ -175,7 +316,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.display.refresh("p-main")["failed"], [])
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["alias"], "orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["alias"], "orange-rabbit")
 
     def test_auto_roles_use_actual_main_and_linked_worktree(self):
         self.settings.mutate(self.repo_id, "mode", "auto")
@@ -187,14 +328,17 @@ class LedgerDisplayTest(unittest.TestCase):
         worker = self.herdr.metadata["p-worker"][SOURCE]
         self.assertEqual(main["display_agent"], "🟧 [메인] orange-rabbit")
         self.assertEqual(worker["display_agent"], "[워커] review-worker")
-        self.assertEqual(main["tokens"], {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중"})
-        self.assertEqual(worker["tokens"], {"alias": "review-worker", "color": "", "recap": ""})
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"],
+                         {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중", "other": "keep"})
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"],
+                         {"alias": "review-worker", "color": "", "recap": "", "other": "keep"})
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
         for metadata in self.herdr.metadata.values():
-            self.assertEqual(metadata["device"]["tokens"], {"phone": "serial", "emu": "5554"})
-            self.assertEqual(metadata[RECAP_SOURCE]["tokens"], {"other": "keep"})
+            self.assertNotIn("phone", metadata["tokens"])
+            self.assertNotIn("emu", metadata["tokens"])
+            self.assertEqual(metadata["tokens"]["other"], "keep")
 
     def test_manual_roles_and_off_keep_status_without_role(self):
         self.settings.mutate(self.repo_id, "mode", "manual")
@@ -209,7 +353,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_manual_border_is_not_captured_even_when_equal_to_summary(self):
         self.status()
@@ -231,7 +375,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.display.refresh("p-main")
         self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
         self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "")
         self.status(summary="Third task")
         self.display.refresh("p-main")
         self.herdr.labels["p-main"] = "My manual title"
@@ -282,7 +426,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.display.refresh("p-main")["failed"], [])
         self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
         self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit · Implement mailbox")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "구현 중")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_invalid_or_wrong_binding_fails_closed_before_any_metadata_or_rename(self):
         valid = {"pane_id": "p-main", "terminal_id": "main"}
@@ -310,10 +454,11 @@ class LedgerDisplayTest(unittest.TestCase):
                 self.assertEqual(self.herdr.labels["p-main"], "")
                 self.assertIsNone(self.agent()["last_ham_label"])
 
-    def test_plain_label_report_does_not_clear_user_recap(self):
+    def test_plain_label_report_overwrites_flat_recap_without_legacy_cleanup(self):
         self.assertTrue(report_metadata(self.herdr, "p-main", build_display("omp", "orange-rabbit", "🟧", "orange")))
-        self.assertEqual(self.herdr.metadata["p-main"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
-        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["tokens"]["recap"], "")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["other"], "keep")
+        self.assertNotIn(RECAP_SOURCE, [command[4] for command in self.herdr.commands])
 
     def test_named_assignment_refreshes_arbitrary_alias_without_renaming(self):
         self.herdr.labels["p-worker"] = "User review border"
@@ -324,7 +469,7 @@ class LedgerDisplayTest(unittest.TestCase):
             self.assertEqual(agent_labels.assign_label("p-worker"), 0)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["tokens"]["alias"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["alias"], "review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
         self.assertFalse(any(command[:2] == ["agent", "rename"] for command in self.herdr.commands))
 
@@ -347,7 +492,7 @@ class LedgerDisplayTest(unittest.TestCase):
               mock.patch("sys.stdout", new_callable=io.StringIO) as output):
             self.assertEqual(agent_labels.assign_label("p-worker"), 0)
         self.assertEqual(output.getvalue(), "")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["tokens"]["alias"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["alias"], "review-worker")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
 
@@ -363,13 +508,14 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(initial.metadata["p-unregistered"][SOURCE], {
             "agent": "codex", "display_agent": "initial-reviewer",
-            "tokens": {"alias": "initial-reviewer", "color": "", "recap": ""},
         })
         self.assertEqual([command[4] for command in initial.commands], [LEGACY_SOURCE, SOURCE])
         self.assertTrue(all(command[:2] == ["pane", "report-metadata"] for command in initial.commands))
         self.assertEqual(initial.labels["p-unregistered"], "User's existing border")
-        self.assertEqual(initial.metadata["p-unregistered"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
-        self.assertEqual(initial.metadata["p-unregistered"]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+        self.assertEqual(initial.metadata["p-unregistered"]["tokens"], {
+            "alias": "initial-reviewer", "color": "", "recap": "", "other": "keep",
+            "phone": "serial", "emu": "5554",
+        })
         self.assertEqual(len(self.registry.list()), 2)
 
     def test_reconcile_refreshes_alias_metadata_without_replacing_existing_names(self):
@@ -407,9 +553,14 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertTrue(infos["p-new"].get("name"))
         self.assertEqual(output.getvalue(), infos["p-new"]["name"] + "\n")
         for pane_id, info in infos.items():
-            self.assertEqual(surface.metadata[pane_id][SOURCE]["tokens"]["alias"], info["name"])
+            self.assertEqual(surface.metadata[pane_id]["tokens"]["alias"], info["name"])
             self.assertIn(info["name"], surface.metadata[pane_id][SOURCE]["display_agent"])
-            self.assertEqual(surface.metadata[pane_id]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
+            if pane_id == "p-new":
+                self.assertEqual(surface.metadata[pane_id]["tokens"]["phone"], "serial")
+                self.assertEqual(surface.metadata[pane_id]["tokens"]["emu"], "5554")
+            else:
+                self.assertNotIn("phone", surface.metadata[pane_id]["tokens"])
+                self.assertNotIn("emu", surface.metadata[pane_id]["tokens"])
         self.assertEqual(surface.labels["p-worker"], "User review border")
 
     def test_spawn_local_refresh_preserves_authoritative_role_and_status(self):
@@ -421,7 +572,7 @@ class LedgerDisplayTest(unittest.TestCase):
                 self.herdr, "p-main", "omp", agent_labels.Alias("orange-rabbit", "🟧", "orange")))
         metadata = self.herdr.metadata["p-main"][SOURCE]
         self.assertEqual(metadata["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(metadata["tokens"]["recap"], "구현 중")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
 
     def test_metadata_failures_are_returned_without_dropping_other_reports(self):
@@ -430,12 +581,14 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual([command[4] for command in self.herdr.commands], [LEGACY_SOURCE, RECAP_SOURCE, SOURCE])
 
 
-    def test_global_refresh_off_without_status_keeps_legacy_recap(self):
+    def test_global_refresh_off_reprojects_flat_recap_without_legacy_cleanup(self):
         self.assertEqual(self.display.refresh()["failed"], [])
         self.assertEqual(self.display.refresh()["failed"], [])
         self.assertFalse(border_owned("", "previous HAM title"))
         for metadata in self.herdr.metadata.values():
-            self.assertEqual(metadata[RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+            self.assertEqual(metadata["tokens"]["recap"], "")
+        self.assertNotIn(RECAP_SOURCE, [command[4] for command in self.herdr.commands
+                                       if command[:2] == ["pane", "report-metadata"]])
 
     def test_failed_label_cas_is_reported_after_rename_without_fake_persistence(self):
         self.status()
@@ -446,12 +599,12 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
         self.assertIsNone(self.agent()["last_ham_label"])
 
-    def test_released_agent_clears_only_owned_display_tokens(self):
+    def test_released_agent_clears_flat_display_tokens_but_not_resources(self):
         with mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: self.herdr(args)):
             self.assertTrue(agent_labels.clear_agent_label_metadata("p-main"))
         self.assertEqual([command[4] for command in self.herdr.commands], [SOURCE, LEGACY_SOURCE])
-        self.assertEqual(self.herdr.metadata["p-main"]["device"]["tokens"], {"phone": "serial", "emu": "5554"})
-        self.assertEqual(self.herdr.metadata["p-main"][RECAP_SOURCE]["tokens"]["recap"], "legacy phase")
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"],
+                         {"phone": "serial", "emu": "5554", "other": "keep"})
 
 
     def test_manual_border_clear_after_ham_ownership_is_preserved(self):

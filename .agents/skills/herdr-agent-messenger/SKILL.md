@@ -60,6 +60,37 @@ Unknown/ambiguous `--host` returns `peer_not_configured` with exit code 1.
 
 All three accept `-h` / `--help`, no `--verbose`, and emit one JSON object; domain errors use `{"error":{"code":"CODE","message":"TEXT"}}` (exit1), usage errors exit2. No read ACK or public settings/user-compose/direct-send/operator ACK bypass. See reference terminology for inbox, mixed TUI Threads, transport outbox, states and unread (`queued` + `delivering`, not a view flag).
 
+## Device claims and resource presence
+
+Use the same `python3 scripts/herdr_agent_messenger.py` prefix:
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+Claim before use; release when finished. `release` defaults to all **your own**
+claims; kind/device arguments narrow it, never another agent's claims.
+Emulator numbers normalize to `emulator-N`. Claim/release require a verified
+host/terminal/session generation; inherited pane IDs alone are insufficient.
+Reclaiming your own device updates its label. Another live holder returns
+`device_claimed`; use `--force` **only on explicit user instruction**.
+Inactive/old-generation holders are stale and may be replaced
+(`replaced_stale:true`). A failed Herdr refresh refuses mutation; adb attachment
+is independent of holder liveness.
+
+`device list` and board/TUI resource views are read-only: no registry refresh,
+stale cleanup or token writes. Agent JSON has independent optional `devices`
+(held nonstale claims) and `servers`; host entries have optional
+`resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+An absent field from an older peer is unknown (`?`), not empty; missing devices
+does not hide known servers. Servers are discovered, not claimed.
+Sidebar values stay exactly `phone=📱 <labels space-joined>` and
+`emu=🤖 <labels space-joined>`; clear the key when no claims remain.
+Product code imports no legacy device JSON. `heavy_slot.py` stays separate and
+unchanged; HAM does not read or display its slots. See reference for row fields.
+
 ## New labeled session and first prompt
 
 The working directory must exist on the selected host. A message file is read on the caller's host. All HAM flags precede `--` agent arguments.

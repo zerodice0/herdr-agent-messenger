@@ -83,6 +83,10 @@ class MailboxUiTest(unittest.TestCase):
         isolated = patch('mailbox_tui.herdr', side_effect=LedgerError('isolated', 'No live Herdr in tests'))
         isolated.start()
         self.addCleanup(isolated.stop)
+        resources = patch('resource_scan.scan_host_resources',
+                          return_value={'listeners': [], 'serve': [], 'error': None})
+        resources.start()
+        self.addCleanup(resources.stop)
         self.cursors = patch('mailbox_tui.curses.curs_set')
         self.cursors.start()
         self.addCleanup(self.cursors.stop)
@@ -131,6 +135,178 @@ class MailboxUiTest(unittest.TestCase):
         self.assertTrue(all(call.column + display_width(call.requested_text) <= width
                             for call in app.screen.draw_calls))
         return app.screen.snapshot()
+
+    def resource_app(self, **options):
+        app = self.app(wall_clock=lambda: 1_800_000_000, **options)
+        app.environment['NO_COLOR'] = '1'
+        agent = app.local['agents'][0]
+        app.local['agents'] = [{
+            **agent, 'alias': 'reviewer', 'turn_state': 'working', 'unread': 0,
+            'extension_present': True, 'role': 'builder', 'phase': 'review', 'summary': 'ready',
+            'devices': [
+                {'kind': 'phone', 'device_id': 'phone-serial', 'label': 'Pixel',
+                 'claimed_at': 1_799_999_880, 'stale': False, 'attached': True},
+                {'kind': 'emu', 'device_id': 'emulator-5554', 'label': '5554',
+                 'claimed_at': 1_799_999_940, 'stale': False, 'attached': None}],
+            'servers': [
+                {'port': 5180, 'bind': '127.0.0.1', 'pid': 321, 'process': 'node',
+                 'cwd': '/work/game', 'started_at': 1_799_996_400, 'inherited': True,
+                 'urls': ['https://review.example/game/', 'https://review.example/other/']},
+                {'port': 8787, 'bind': '::1', 'pid': 654, 'process': 'bun',
+                 'cwd': '/work/api', 'started_at': 1_799_999_970, 'inherited': False, 'urls': []}],
+        }]
+        app.local['resources'] = {
+            'dead_serve': [{'url': 'https://dead.example/'}],
+            'servers_unowned': [{'url': 'https://unowned.example/'}],
+            'stale_devices': [{'device_id': 'retired-phone'}], 'error': None,
+        }
+        return app
+
+    def test_resource_presence_captures_at_40_and_160_columns(self):
+        for width in (40, 160):
+            with self.subTest(width=width):
+                app = self.resource_app()
+                before = json.dumps(app.local, sort_keys=True)
+                bell = self.store.bell_directory.joinpath('_board').stat().st_mtime_ns
+                snapshot = self.capture(app, height=35, width=width)
+                text = '\n'.join(snapshot.lines())
+                self.assertIn('reviewer', text)
+                if width == 40:
+                    self.assertNotIn('RESOURCES', text)
+                    self.assertNotIn('P1 E1 S2', text)
+                    self.assertIn('D:1 U:1 X:1', text)
+                else:
+                    self.assertIn('RESOURCES', text)
+                    self.assertIn('P1 E1 S2', text)
+                    self.assertIn('dead:1 unowned:1 stale-dev:1', text)
+                app.focus = 'detail'
+                pages = []
+                while True:
+                    pages.extend(self.capture(app, height=35, width=width).lines())
+                    previous = app.scrolls['detail']
+                    app.key(curses.KEY_NPAGE)
+                    if app.scrolls['detail'] == previous:
+                        break
+                detail = '\n'.join(pages)
+                for evidence in ('Devices', 'phone: Pixel', 'emu: 5554', 'Servers',
+                                 'Port: 5180', 'node', 'Cwd: /work/game', 'Inherited: yes',
+                                 '(1h ago)', 'URL: https://review.example/game/',
+                                 'Port: 8787', 'URL: none', 'Read-only'):
+                    self.assertIn(evidence, detail)
+                self.assertEqual(json.dumps(app.local, sort_keys=True), before)
+                self.assertEqual(app.jobs, {})
+                self.assertEqual(self.store.bell_directory.joinpath('_board').stat().st_mtime_ns, bell)
+
+    def test_agent_resource_details_include_device_and_server_evidence(self):
+        app = self.resource_app()
+        app.detail = app.agents()[0]
+        lines = app.detail_lines()
+        text = '\n'.join(lines)
+        for evidence in ('Devices', 'phone: Pixel', 'ID: phone-serial', 'emu: 5554',
+                         'ID: emulator-5554', 'Attached: yes', 'Attached: unknown',
+                         'Servers', 'Port: 5180 · node · PID 321', 'Bind: 127.0.0.1',
+                         'Cwd: /work/game', 'Inherited: yes', '(1h ago)',
+                         'URL: https://review.example/game/', 'URL: https://review.example/other/',
+                         'Port: 8787 · bun · PID 654', 'Inherited: no', '(30s ago)', 'URL: none'):
+            self.assertIn(evidence, text)
+        self.assertIn('(2m ago)', text)
+        self.assertLess(lines.index('Devices'), lines.index('Servers'))
+
+    def test_resource_fields_are_independently_unknown_or_known_empty(self):
+        for devices in (None, [], [{'kind': 'phone', 'device_id': 'serial'}]):
+            for servers in (None, [], [{'port': 5180, 'process': 'node'}]):
+                for resources in (None, {}, {'dead_serve': [], 'error': None}):
+                    with self.subTest(devices=devices, servers=servers, resources=resources):
+                        app = self.resource_app()
+                        agent = app.local['agents'][0]
+                        for key, value in (('devices', devices), ('servers', servers)):
+                            agent.pop(key)
+                            if value is not None:
+                                agent[key] = value
+                        app.local.pop('resources')
+                        if resources is not None:
+                            app.local['resources'] = resources
+                        app.detail = agent
+                        cue = app.resource_cue(agent)
+                        self.assertIn('P?' if devices is None else 'P0' if not devices else 'P1', cue)
+                        self.assertIn('E?' if devices is None else 'E0', cue)
+                        self.assertIn('S?' if servers is None else 'S0' if not servers else 'S1', cue)
+                        self.assertIn('unowned:? stale-dev:?', app.host_resource_cue(self.store.host))
+                        self.assertIn('dead:0' if resources and 'dead_serve' in resources else 'dead:?',
+                                      app.host_resource_cue(self.store.host))
+                        lines = app.detail_lines()
+                        self.assertIn('Devices: ?' if devices is None else 'Devices: none' if not devices
+                                      else 'Devices', lines)
+                        self.assertIn('Servers: ?' if servers is None else 'Servers: none' if not servers
+                                      else 'Servers', lines)
+
+    def test_resource_cues_use_unicode_with_color_and_ascii_without_color(self):
+        app = self.resource_app()
+        agent = app.agents()[0]
+        for colors, no_color, expected in ((True, False, '📱1 🤖1 🌐2'),
+                                           (False, False, 'P1 E1 S2'),
+                                           (True, True, 'P1 E1 S2')):
+            with self.subTest(colors=colors, no_color=no_color):
+                app.colors_enabled = colors
+                app.environment.pop('NO_COLOR', None)
+                if no_color:
+                    app.environment['NO_COLOR'] = '1'
+                self.assertEqual(app.resource_cue(agent), expected)
+                app.screen = Screen(6, 160)
+                with patch('mailbox_tui.curses.color_pair', side_effect=lambda pair: pair << 8):
+                    app.render_agents((0, 0, 6, 160))
+                self.assertIn(expected, '\n'.join(app.screen.snapshot().lines()))
+                self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_old_peer_resource_fields_render_unknown_and_wrong_uuid_is_ignored(self):
+        app = self.resource_app()
+        app.local['peers'] = [{'canonical_name': 'old-peer', 'uuid': 'peer-uuid'}]
+        old_agent = {key: value for key, value in app.local['agents'][0].items()
+                     if key not in {'devices', 'servers'}}
+        old_agent.update(host='old-peer', alias='legacy')
+        app.remote['old-peer'] = {'agents': [old_agent],
+                                  'hosts': [{'host': 'old-peer', 'uuid': 'peer-uuid'}]}
+        app.screen = Screen(10, 160)
+        app.render_agents((0, 0, 10, 160))
+        text = '\n'.join(app.screen.snapshot().lines())
+        self.assertIn('P? E? S?', text)
+        self.assertIn('old-peer · 1 agents · dead:? unowned:? stale-dev:?', text)
+        app.detail = next(agent for agent in app.agents() if agent['host'] == 'old-peer')
+        self.assertIn('Devices: ?', app.detail_lines())
+        self.assertIn('Servers: ?', app.detail_lines())
+        app.remote['old-peer']['hosts'][0].update(
+            uuid='wrong-uuid', resources={'dead_serve': [], 'servers_unowned': [], 'stale_devices': []})
+        app.screen.erase()
+        app.render_agents((0, 0, 10, 160))
+        self.assertNotIn('old-peer', '\n'.join(app.screen.snapshot().lines()))
+        self.assertIsNone(app.host_resources('old-peer'))
+
+    def test_host_resource_counts_show_without_agents_and_report_scan_error(self):
+        app = self.resource_app()
+        app.local['agents'] = []
+        app.local['resources']['error'] = 'listener discovery unavailable'
+        app.screen = Screen(6, 160)
+        app.render_agents((0, 0, 6, 160))
+        text = '\n'.join(app.screen.snapshot().lines())
+        self.assertIn('0 agents · dead:1 unowned:1 stale-dev:1 !', text)
+        self.assertIn(' No agents. r refresh', text)
+
+    def test_local_snapshot_preserves_host_resources_and_missing_fields(self):
+        for resources in (None, {'dead_serve': [], 'servers_unowned': [],
+                                  'stale_devices': [], 'error': None}):
+            with self.subTest(resources=resources):
+                exported = {
+                    'host': {'canonical_name': self.store.host, 'uuid': self.store.host_uuid},
+                    'agents': [{**self.recipient, 'unread': 0}],
+                }
+                if resources is not None:
+                    exported['resources'] = resources
+                with patch('mailbox_tui.RemoteLedger.status_export', return_value=exported):
+                    snapshot = local_snapshot(self.store, self.repo_id)
+                if resources is None:
+                    self.assertNotIn('resources', snapshot)
+                else:
+                    self.assertEqual(snapshot['resources'], resources)
 
     def mouse_at_text(self, app, needle, action='press', offset=0):
         call = next(call for call in reversed(app.screen.draw_calls) if needle in call.requested_text)
@@ -1853,7 +2029,7 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(snapshot.cells[row][column].attribute, 1)
             host_row = next(row for row, line in enumerate(snapshot.lines()) if ' · 2 agents' in line)
             host = snapshot.line(host_row)
-            self.assertTrue(host.startswith('─ ui-test · 2 agents ─'))
+            self.assertTrue(host.startswith('─ ui-test · 2 agents · dead:'))
             self.assertTrue(host.endswith('─'))
             self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[host_row]))
             agent_row = snapshot.rows_containing(app.agents()[0]['alias'])[0]
@@ -3212,6 +3388,32 @@ class MailboxUiTest(unittest.TestCase):
         self.assertTrue(all(display_width(part) <= 35 for part in parts))
         for word in ('Review', 'transport', 'fixtures.'):
             self.assertTrue(any(word in part for part in parts))
+
+
+def resource_render_text(scratch, widths=(40, 160)):
+    """Return isolated Agents and paged Detail text; do not run a test case."""
+    directory = Path(scratch)
+    directory.mkdir(parents=True, exist_ok=True)
+    result = {}
+    with patch.object(sys.modules[__name__], 'SCRATCH', directory):
+        case = MailboxUiTest('test_resource_presence_captures_at_40_and_160_columns')
+        try:
+            case.setUp()
+            for width in widths:
+                app = case.resource_app()
+                agents = '\n'.join(case.capture(app, height=35, width=width).lines())
+                app.focus = 'detail'
+                pages = []
+                while True:
+                    pages.append('\n'.join(case.capture(app, height=35, width=width).lines()))
+                    previous = app.scrolls['detail']
+                    app.key(curses.KEY_NPAGE)
+                    if app.scrolls['detail'] == previous:
+                        break
+                result[width] = {'agents': agents, 'detail_pages': pages}
+        finally:
+            case.doCleanups()
+    return result
 
 
 if __name__ == '__main__':

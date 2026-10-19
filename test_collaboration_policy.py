@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from agent_batch_dispatch import BatchRequest, DispatchOutcome, SUBMITTED, dispatch_batch
 from agent_directory import parse_agent_payload
@@ -36,6 +37,10 @@ class StatusEndpoint:
 
 class CollaborationPolicyTest(unittest.TestCase):
     def setUp(self):
+        scanner = mock.patch("resource_scan.scan_host_resources",
+                             side_effect=AssertionError("policy must not scan host resources"))
+        scanner.start()
+        self.addCleanup(scanner.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

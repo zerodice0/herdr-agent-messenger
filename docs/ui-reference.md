@@ -296,12 +296,56 @@ only its own workers; these checks do not create model turns. Display-cell-aware
 text helpers support Korean input, clipping and resizing. The presence of `NO_COLOR`
 disables colors without removing labels or other non-color state cues.
 
+### Device and server presence
+
+The Agents **RESOURCES** column appears when the agent pane is at least 78
+columns wide and drops at narrower widths. It shows `📱1 🤖1 🌐2` for phone,
+emulator and server counts. With color disabled it uses the ASCII equivalents
+`P1 E1 S2`. Missing device data shows `P? E?`; missing server data shows `S?`,
+independently. Host headers show `dead:N unowned:N stale-dev:N`, or compact
+`D:N U:N X:N`, for dead Serve routes, unowned served backends and stale devices.
+An unavailable host resource field shows `?`; a discovery error adds `!`.
+
+Agent Detail has **Devices** and **Servers** sections. Devices show held
+nonstale claims; Servers show port/process/PID, bind address, cwd, inherited
+flag, start timestamp/age and URLs. `inherited` means the listener predates this
+agent session. Missing data shows `Devices: ?` or `Servers: ?`; known-empty
+data shows `: none`. Old peers may omit `devices`, `servers` or host `resources`
+independently: absence is unknown, not zero.
+
+These are read-only views of agent JSON `devices` and `servers` plus host
+`resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+Server discovery uses current-user listeners and Tailscale Serve; it excludes
+plugin, adb and agent-runtime listeners. Viewing never refreshes the registry,
+prunes device claims, changes tokens or acknowledges mail.
+
+Device mutations use the bundled CLI, not table actions:
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+`release` defaults to all of the caller's own claims; kind/device arguments
+narrow it. Claims use verified host/terminal/generation identity. Inactive or
+old-generation holders are stale, independent of adb attachment, and may be
+replaced; a different live holder blocks claiming unless the user explicitly
+instructs `--force`. Failed Herdr refresh does not imply a stale holder.
+`device list` is read-only. See the [skill guide](skill-guide.md#device-claims-and-resource-presence)
+for command results and device details. Product code imports no legacy device
+JSON. `heavy_slot.py` remains separate and unchanged; its slots are not displayed.
+
 ### Role, phase and border ownership
 
 HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
 the alias remains addressable. A shared projection reports alias, color,
-display name and phase (`recap`) under the HAM metadata source. Device tokens
-such as `phone` and `emu` and other sources are not overwritten.
+display name, phase (`recap`) and ledger-backed device tokens under metadata
+source `herdr.agent-messenger`. Exact values are `phone=📱 <labels space-joined>`
+and `emu=🤖 <labels space-joined>`; each token key is cleared when no claims remain.
+Status projection preserves these claims, and force replacement reprojects the
+previous live holder too. Herdr uses a flat per-pane token map: metadata sources
+do not isolate keys. HAM leaves unrelated token keys untouched.
 
 When status/roles are invoked, summary supplies `[메인] summary` or
 `[워커] summary` on the border; off-mode status has no role prefix. HAM updates

@@ -1,19 +1,23 @@
 """Public read commands against private SQLite and a model-free peer endpoint."""
 
+import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
+import ledger_cli
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_status import AgentRegistry
-from ledger_store import LedgerStore
+from ledger_store import LedgerError, LedgerStore
 from test_ledger_core import snapshot
 
 
@@ -125,6 +129,90 @@ class ReadCliTest(unittest.TestCase):
                        + "," + repr(peer_environment) + ")\n")
         ssh.chmod(0o700)
         return failure
+
+    def test_status_views_without_ledger_keep_empty_shapes_without_bootstrap(self):
+        missing = self.root / "absent-ledger-home"
+        environment = {**self.environment, "HOME": str(missing),
+                       "HERDR_AGENT_LEDGER_DIR": str(missing / "ledger")}
+        for operation in ("list", "board"):
+            for repo_id in (None, self.repo_id):
+                with self.subTest(operation=operation, repo_id=repo_id):
+                    arguments = ["status", operation]
+                    if repo_id is not None:
+                        arguments += ["--repo", repo_id]
+                    completed, result = self.cli(*arguments, environment=environment)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(result, {"repo_id": repo_id, "agents": [],
+                                             **({"hosts": []} if operation == "board" else {})})
+        self.assertFalse(missing.exists())
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_status_views_during_first_bootstrap_return_empty_without_mutation(self):
+        directory = self.root / "bootstrapping-ledger"
+        directory.mkdir()
+        path = directory / "ledger.sqlite3"
+        environment = {**self.environment, "HERDR_AGENT_LEDGER_DIR": str(directory)}
+        with sqlite3.connect(path) as connection:
+            pass
+        for metadata_table in (False, True):
+            if metadata_table:
+                with sqlite3.connect(path) as connection:
+                    connection.execute("CREATE TABLE ledger_meta(key TEXT PRIMARY KEY,value TEXT)")
+            before = path.read_bytes()
+            for operation in ("list", "board"):
+                with self.subTest(metadata_table=metadata_table, operation=operation):
+                    completed, result = self.cli("status", operation, environment=environment)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(result, {"repo_id": None, "agents": [],
+                                             **({"hosts": []} if operation == "board" else {})})
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertEqual({item.name for item in directory.iterdir()}, {"ledger.sqlite3"})
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_status_views_do_not_hide_other_ledger_errors(self):
+        for operation in ("list", "board"):
+            with self.subTest(operation=operation), mock.patch.object(
+                    LedgerStore, "open_readonly", side_effect=LedgerError("invalid_metadata", "broken")):
+                with self.assertRaises(LedgerError) as raised:
+                    ledger_cli.status_operation(operation, environment=self.environment)
+                self.assertEqual(raised.exception.code, "invalid_metadata")
+
+    def test_wire_readonly_export_during_bootstrap_returns_structured_ledger_error(self):
+        directory = self.root / "bootstrapping-export"
+        directory.mkdir()
+        path = directory / "ledger.sqlite3"
+        path.touch()
+        environment = {**self.environment, "HERDR_AGENT_LEDGER_DIR": str(directory)}
+        envelope = {"protocol": 1, "transport_host": "peer", "transport_uuid": str(uuid.uuid4()),
+                    "payload": {"refresh": False, "resources": True}}
+        completed, result = self.cli("ledger", "status-export", "--wire",
+                                     stdin=envelope, environment=environment)
+        self.assertEqual((completed.returncode, result["error"]["code"]), (1, "ledger_not_initialized"))
+        self.assertEqual(path.read_bytes(), b"")
+        self.assertEqual({item.name for item in directory.iterdir()}, {"ledger.sqlite3"})
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_wire_export_resources_require_literal_true_without_registry_refresh(self):
+        peer_id = str(uuid.uuid4())
+        RemoteLedger(self.store, self.environment).add_peer(
+            canonical_name="peer", uuid=peer_id, ssh_alias="fixture", remote_ham_root=str(ROOT))
+        scanned = {"listeners": [], "serve": [], "error": None}
+        before = self.database_state(self.store)
+        for requested in (None, False, 1, "true", True):
+            with self.subTest(resources=requested):
+                envelope = {"protocol": 1, "transport_host": "peer", "transport_uuid": peer_id,
+                            "payload": {"repo_id": self.repo_id, "refresh": False}}
+                if requested is not None:
+                    envelope["payload"]["resources"] = requested
+                arguments = argparse.Namespace(command="ledger", ledger_command="status-export", wire=True)
+                with mock.patch("ledger_cli._stdin_object", return_value=envelope), \
+                     mock.patch("resource_scan.scan_host_resources", return_value=scanned) as scanner, \
+                     mock.patch.object(AgentRegistry, "refresh", side_effect=AssertionError("mutation")):
+                    result = ledger_cli.dispatch(arguments, self.environment)
+                self.assertEqual(scanner.call_count, 1 if requested is True else 0)
+                self.assertEqual("resources" in result, requested is True)
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
 
     def test_threads_enumerate_sent_received_and_pending_without_touching_delivery(self):
         sent = self.mail.send(self.sender, self.recipient, body="Sent locally")

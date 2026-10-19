@@ -224,6 +224,41 @@ peer도 이 읽기 API를 지원해야 합니다. 이전 버전은 `refresh=fals
 제공하지 않습니다. inbox·Threads·전송 outbox·상태·unread의 구분은
 [참고서 용어](.agents/skills/herdr-agent-messenger/reference.md#mailbox-terminology)를 참고하세요.
 
+### 기기 점유와 서버 표시
+
+위의 번들 CLI 경로 뒤에 다음 명령을 붙입니다.
+
+```text
+device claim phone|emu DEVICE [--label TEXT] [--force]
+device release [phone|emu|all] [DEVICE]
+device list
+```
+
+기기를 쓰기 전에 점유하고 사용을 마치면 해제합니다. `release`의 기본값은 `all`이며
+호출자 자신의 점유만 해제합니다. 종류나 기기를 지정하면 해제 범위를 좁힙니다.
+에뮬레이터 번호는 `emulator-N`으로 정규화합니다. 점유는 상속된 pane ID가 아니라
+검증된 호스트·terminal·세션 generation에 귀속됩니다. 같은 기기를 다시 점유하면
+라벨을 갱신합니다. 다른 활성 소유자가 있으면 `device_claimed`로 거부하며,
+`--force`는 **사용자가 명시적으로 지시했을 때만** 사용합니다. 소유자가 비활성이거나
+이전 generation이면 stale로 판단하여 교체하고 `replaced_stale:true`를 반환합니다.
+Herdr 갱신 실패는 오류이지 소유자가 사라졌다는 근거가 아닙니다. adb 연결 여부와
+점유 소유자의 활성 여부도 별개입니다.
+
+`device list`와 `status board`의 자원 조회는 읽기 전용입니다. 레지스트리 갱신,
+stale 점유 정리, 토큰 쓰기를 하지 않습니다. 에이전트 JSON에는 독립적인
+`devices`(유효한 점유)와 `servers` 목록이 추가되며, 호스트 항목에는
+`resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`이 추가됩니다.
+서버는 점유하지 않고 현재 사용자의 리스너와 Tailscale Serve 경로에서 탐색합니다.
+이전 peer에 `devices`, `servers`, `resources` 중 어느 필드가 없으면 해당 정보만
+알 수 없음(`?`)으로 표시하며, 빈 목록으로 해석하지 않습니다.
+
+사이드바 토큰은 정확히 `phone=📱 <공백으로 연결한 라벨>`과
+`emu=🤖 <공백으로 연결한 라벨>` 형식이며, 점유가 없으면 해당 키를 지웁니다.
+`status set`도 이 표시를 유지합니다. 제품은 기존 기기 JSON을 가져오지 않습니다.
+`heavy_slot.py`는 별도 스크립트로 그대로 유지하며 HAM은 슬롯을 읽거나 표시하지
+않습니다. JSON 필드는 [스킬 가이드](docs/ko/skill-guide.md#기기-점유와-자원-표시),
+화면 표시는 [UI 참고서](docs/ko/ui-reference.md#기기와-서버-표시)를 참고하세요.
+
 ### 참여 모드와 역할
 
 참여 설정은 에이전트용 변경 명령이 아니라 TUI의 Settings 화면에서 선택합니다.
