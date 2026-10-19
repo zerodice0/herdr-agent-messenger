@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import ham_test_support  # Protect the live ledger before product imports.
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
 import importlib
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -490,6 +492,145 @@ class AgentDeliveryTest(unittest.TestCase):
             store, {}, transport_factory=factory, now=lambda: 100.0,
         ))
         factory.assert_not_called()
+
+
+class RequestCancelCliTest(ham_test_support.IsolatedLedgerTest):
+    def setUp(self):
+        super().setUp()
+        import agent_skill_cli
+
+        self.cli = agent_skill_cli
+        self.environment["HERDR_PANE_ID"] = "sender-pane"
+        self.sender = agent_skill_cli.AgentRecord(
+            host="sandbox", name="writer", pane_id="sender-pane",
+            workspace_id="workspace", workspace_label="sandbox", status="working",
+            session_id="sender-session", cwd="/sandbox", local=True,
+            terminal_id="sender-terminal", agent_kind="omp",
+        )
+        self.store = JsonRequestStateStore(Path(self.environment["HERDR_AGENT_REQUEST_STATE_DIR"]))
+        self.record = held_record(state="awaiting_decision")
+        self.record.update(
+            sender=agent_skill_cli._record_payload(self.sender),
+            phase="awaiting_decision", submitted=False, terminal=False,
+        )
+        self.store.save(self.record["request_id"], self.record)
+        self.probe = mock.patch.object(
+            agent_skill_cli, "probe_local_agents",
+            return_value=mock.Mock(success=True, agents=(self.sender,)),
+        )
+        self.probe.start()
+        self.addCleanup(self.probe.stop)
+
+    def run_cli(self, command, request_id=None):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = self.cli.main(
+                [command, "--request-id", request_id or self.record["request_id"]],
+                environment=self.environment,
+            )
+        text = output.getvalue()
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertNotIn('": ', text)
+        return code, json.loads(text)
+
+    def test_sender_cancels_held_request_and_status_reports_cancellation(self):
+        for state in ("deferred", "awaiting_decision"):
+            with self.subTest(state=state):
+                self.record.update(state=state, phase=state)
+                self.store.save(self.record["request_id"], self.record)
+                with mock.patch.object(
+                    self.cli, "transport_for_record", side_effect=AssertionError("recipient contacted"),
+                ), mock.patch.object(agent_delivery, "ensure_worker") as worker:
+                    code, payload = self.run_cli("request-cancel")
+                    status_code, status = self.run_cli("request-status")
+                self.assertEqual(code, 0)
+                self.assertEqual(payload, {
+                    "request_id": self.record["request_id"],
+                    "state": "submission_failed", "phase": "delivery_cancelled",
+                    "cancelled": True, "error_code": "delivery_cancelled",
+                })
+                self.assertEqual(status_code, 1)
+                self.assertEqual(status["phase"], "delivery_cancelled")
+                self.assertEqual(status["error_code"], "delivery_cancelled")
+                worker.assert_not_called()
+
+    def test_non_sender_is_refused_without_mutating_held_request(self):
+        self.record["sender"]["session_id"] = "another-session"
+        self.store.save(self.record["request_id"], self.record)
+        code, payload = self.run_cli("request-cancel")
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error_code"], "not_sender")
+        self.assertFalse(payload["cancelled"])
+        self.assertEqual(payload["state"], "awaiting_decision")
+        self.assertEqual(self.store.load(self.record["request_id"]), self.record)
+
+    def test_submitted_request_returns_current_state_without_mutation(self):
+        for state, expected_code in (
+            ("submitted_working", 3), ("submitted_unknown", 3), ("submitted_settled", 1),
+        ):
+            with self.subTest(state=state):
+                self.record.update(
+                    state=state, phase="observing", submitted=True,
+                    terminal=state == "submitted_settled",
+                )
+                self.store.save(self.record["request_id"], self.record)
+                code, payload = self.run_cli("request-cancel")
+                self.assertEqual(code, expected_code)
+                self.assertEqual(payload["state"], state)
+                self.assertEqual(payload["error_code"], "already_submitted")
+                self.assertFalse(payload["cancelled"])
+                self.assertEqual(self.store.load(self.record["request_id"]), self.record)
+
+    def test_terminal_cancellation_is_not_repeated_or_mutated(self):
+        self.assertEqual(self.run_cli("request-cancel")[0], 0)
+        before = self.store.load(self.record["request_id"])
+        code, payload = self.run_cli("request-cancel")
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["cancelled"])
+        self.assertEqual(payload["error_code"], "already_terminal")
+        self.assertEqual(self.store.load(self.record["request_id"]), before)
+
+    def test_unknown_request_uses_existing_not_found_error(self):
+        code, payload = self.run_cli("request-cancel", "f" * 32)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "request_not_found")
+
+    def test_invalid_request_id_uses_existing_error(self):
+        code, payload = self.run_cli("request-cancel", "../invalid")
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "invalid_request_id")
+
+    def test_missing_pane_identity_is_refused_without_mutation(self):
+        self.environment.pop("HERDR_PANE_ID")
+        code, payload = self.run_cli("request-cancel")
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "sender_unavailable")
+        self.assertEqual(self.store.load(self.record["request_id"]), self.record)
+
+    def test_real_cli_entry_preserves_request_not_found_error(self):
+        snapshot = {"result": {"snapshot": {"agents": [{
+            "agent": "omp", "agent_session": {"value": "sender-session"},
+            "agent_status": "working", "cwd": "/sandbox", "name": "writer",
+            "pane_id": "sender-pane", "terminal_id": "sender-terminal",
+            "workspace_id": "workspace",
+        }], "workspaces": []}}}
+        executable = self.root / "herdr-fixture"
+        executable.write_text(
+            "#!/usr/bin/env python3\nimport json, sys\n"
+            "assert sys.argv[1:] == ['api', 'snapshot']\n"
+            f"print(json.dumps({snapshot!r}))\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        result = subprocess.run(
+            [sys.executable, str(Path(self.cli.__file__).resolve()),
+             "request-cancel", "--request-id", "f" * 32],
+            env={**os.environ, **self.environment, "HERDR_BIN_PATH": str(executable)},
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "request_not_found")
 
 
 if __name__ == "__main__":

@@ -735,13 +735,21 @@ class RequestLifecycleMachine(Generic[TargetT]):
                 return record
             return self._submit(record, target)
 
-    def cancel_deferred(self, request_id: str) -> dict[str, Any]:
-        """Cancel an undelivered request without contacting the recipient."""
+    def cancel_deferred(
+        self,
+        request_id: str,
+        *,
+        can_cancel: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Cancel undelivered work, optionally checking ownership under its lock."""
 
         with self.store.lock(request_id):
-            record = _validate_deferred_record(
-                self.store, _load_request(self.store, request_id)
-            )
+            record = _load_request(self.store, request_id)
+            if can_cancel is not None and not can_cancel(record):
+                return record
+            if not _is_deferred(record) or record.get("submitted") or record.get("terminal"):
+                return record
+            record = _validate_deferred_record(self.store, record)
             if not _is_deferred(record):
                 return record
             return self._finish_without_target(

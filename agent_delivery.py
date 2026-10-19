@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 import fcntl
 import os
@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from agent_directory import (
+    AgentRecord,
     decode_json_object,
     herdr_executable,
     local_host_name,
@@ -328,6 +329,72 @@ def decide(
     if record.get("state") in {"deferred", "awaiting_decision"}:
         ensure_worker(environment)
     return store.load(request_id) or record
+
+
+def request_cancel_command(
+    *,
+    request_id: str,
+    sender: AgentRecord,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Cancel only the verified caller's held request, without a recipient probe."""
+
+    from ledger_store import LedgerError
+
+    sender_fields = {field.name for field in fields(AgentRecord)}
+    owned = False
+    applicable = False
+
+    def can_cancel(record: Mapping[str, Any]) -> bool:
+        nonlocal owned, applicable
+        stored_sender = record.get("sender")
+        if isinstance(stored_sender, Mapping):
+            try:
+                owner = AgentRecord(**{
+                    key: value for key, value in stored_sender.items()
+                    if key in sender_fields
+                })
+                owned = owner.identity == sender.identity
+            except TypeError:
+                owned = False
+        applicable = (
+            record.get("state") in {"deferred", "awaiting_decision"}
+            and not record.get("submitted") and not record.get("terminal")
+        )
+        return owned
+
+    try:
+        record = RequestLifecycleMachine(None, open_request_store(environment)).cancel_deferred(
+            request_id, can_cancel=can_cancel,
+        )
+    except KeyError:
+        raise LedgerError(
+            "request_not_found",
+            f"No stored request state was found for {request_id!r}.",
+        ) from None
+    except ValueError as error:
+        raise LedgerError("invalid_request_id", str(error)) from error
+    except OSError as error:
+        raise LedgerError("request_state_unavailable", str(error)) from error
+
+    cancelled = owned and applicable and record.get("phase") == "delivery_cancelled"
+    payload = {
+        "request_id": record["request_id"],
+        "state": record["state"],
+        "phase": record.get("phase"),
+        "cancelled": cancelled,
+    }
+    if not owned:
+        payload["error_code"] = "not_sender"
+    elif cancelled:
+        payload["error_code"] = "delivery_cancelled"
+    elif record.get("submitted"):
+        payload["error_code"] = "already_submitted"
+    elif not applicable:
+        payload["error_code"] = "already_terminal"
+    else:
+        payload["error_code"] = record.get("error_code") or "request_not_held"
+    return payload
 
 
 def main(argv: Sequence[str] | None = None) -> int:

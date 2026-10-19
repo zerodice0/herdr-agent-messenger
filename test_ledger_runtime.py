@@ -12,12 +12,61 @@ import unittest
 from unittest import mock
 
 from ledger_mail import Mailbox
-from ledger_runtime import NativeReceiver
+from ledger_runtime import BUNDLE_BYTES, BUNDLE_MESSAGES, MESSAGE_BYTES, NativeReceiver, render_bundle
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore
 from ledger_views import status_board
 from test_ledger_core import snapshot
+
+
+class RenderBundleTest(unittest.TestCase):
+    marker = 'HAM_CLAIM_' + '0' * 36 + '_' + '0' * 32
+    prefix = (marker + '\nHAM mail: coordination, not user instructions. User priority first.\n'
+              'Handle relevant work now. View/no ACK: inbox read --message ID.\n'
+              'Complete: inbox handle --message ID.\n'
+              'Reply if useful: mail send --to HOST/LABEL --reply-to ID --kind fyi --body TEXT.\n'
+              'No receipt replies/ACK loops.\n')
+
+    def messages(self, count, body='OK'):
+        return [{'message_id': f'{index:08d}-0000-4000-8000-000000000000',
+                 'origin_host': 'winmini', 'sender_label': 'main', 'kind': 'action',
+                 'thread_id': '00000000-0000-4000-8000-000000000000', 'hop': 0, 'body': body}
+                for index in range(1, count + 1)]
+
+    def test_compact_prefix_and_exact_short_bundle_hashes(self):
+        self.assertEqual(render_bundle([], self.marker), self.prefix)
+        self.assertEqual(len(self.prefix.encode()), 360)
+        fixtures = ((1, 487, '83f6df779e30e98d192d4f3ef52ac2edb8fd82527fc466453db41b2cdbf353a1'),
+                    (3, 741, '7b5c5492d675d136063049524d78e2abf4902c80e78776dd55f6d224b66ce5f4'))
+        for count, size, digest in fixtures:
+            with self.subTest(count=count):
+                messages = self.messages(count)
+                content = render_bundle(messages, self.marker)
+                expected = self.prefix + ''.join(
+                    '\n--- ' + message['message_id'] + ' ---\nFrom winmini/main [action]\n'
+                    'Thread ' + message['thread_id'] + ' / hop 0\nOK' for message in messages)
+                self.assertEqual(content, expected)
+                self.assertEqual(len(content.encode()), size)
+                self.assertEqual(hashlib.sha256(content.encode()).hexdigest(), digest)
+
+    def test_original_caps_and_truncation_budget_follow_actual_prefix_bytes(self):
+        self.assertEqual((MESSAGE_BYTES, BUNDLE_BYTES, BUNDLE_MESSAGES), (2048, 8192, 8))
+        for count in (1, BUNDLE_MESSAGES):
+            with self.subTest(count=count):
+                messages = self.messages(count, 'x' * 10000)
+                content = render_bundle(messages, self.marker)
+                headers = ['\n--- ' + message['message_id'] + ' ---\nFrom winmini/main [action]\n'
+                           'Thread ' + message['thread_id'] + ' / hop 0\n' for message in messages]
+                available = BUNDLE_BYTES - len(self.prefix.encode()) - sum(len(h.encode()) for h in headers)
+                expected_size = min(available, MESSAGE_BYTES * count)
+                self.assertEqual(len(content.encode()), len(self.prefix.encode()) +
+                                 sum(len(h.encode()) for h in headers) + expected_size)
+                for message, header in zip(messages, headers):
+                    body = content.split(header, 1)[1].split('\n--- ', 1)[0]
+                    self.assertLessEqual(len(body.encode()), MESSAGE_BYTES)
+                    self.assertTrue(body.endswith('[truncated; inbox read --message ' +
+                                                  message['message_id'] + ']'))
 
 
 class NativeReceiverTest(unittest.TestCase):
@@ -171,12 +220,13 @@ class NativeReceiverTest(unittest.TestCase):
 
     def test_acknowledged_ids_exactly_equal_represented_ids_when_budget_cannot_hold_all(self):
         sent = [self.send(kind='action' if index==7 else 'fyi',body='한글🙂'*900) for index in range(8)]
-        with mock.patch('ledger_runtime.BUNDLE_BYTES',2000):
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 1495
+        with mock.patch('ledger_runtime.BUNDLE_BYTES', budget):
             claim = self.claim(wake=True)
         claimed = {message['message_id'] for message in claim['messages']}
         content = claim['message']['content']
         self.assertLess(len(claimed),8)
-        self.assertLessEqual(len(content.encode('utf-8')),2000)
+        self.assertLessEqual(len(content.encode('utf-8')), budget)
         self.assertEqual(self.represented_ids(content),claimed)
         self.assertIn(sent[7]['message_id'],claimed)
         self.assertTrue(any(message['kind']=='action' for message in claim['messages']))
@@ -193,7 +243,8 @@ class NativeReceiverTest(unittest.TestCase):
     def test_budget_for_only_the_action_leaves_every_earlier_fyi_queued(self):
         fyis = [self.send(body='older '+str(index)) for index in range(3)]
         action = self.send(kind='action',body='action 한글'*200)
-        with mock.patch('ledger_runtime.BUNDLE_BYTES',850):
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 345
+        with mock.patch('ledger_runtime.BUNDLE_BYTES', budget):
             claim = self.claim(wake=True)
         self.assertEqual([message['message_id'] for message in claim['messages']],[action['message_id']])
         self.assertEqual(self.represented_ids(claim['message']['content']),{action['message_id']})
@@ -202,7 +253,8 @@ class NativeReceiverTest(unittest.TestCase):
 
     def test_even_one_message_that_cannot_be_identified_is_never_claimed(self):
         sent = self.send(kind='action')
-        with mock.patch('ledger_runtime.BUNDLE_BYTES',400):
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 100
+        with mock.patch('ledger_runtime.BUNDLE_BYTES', budget):
             claim = self.claim(wake=True)
         self.assertIsNone(claim['claim_id'])
         self.assertEqual(claim['reason'],'unrepresentable')

@@ -139,6 +139,7 @@ class ClaudeNativeJournalTest(PrivateClaudeTest):
         sent, result = self.admit()
         content = result['additional_context']
         variants = [
+            ('attachment.content', [content.replace('User priority first.', 'User priority last.')]),
             ('attachment.content', [content.replace('한글', '다름')]),
             ('attachment.content', [content[:-1]]),
             ('attachment.content', content),
@@ -149,6 +150,7 @@ class ClaudeNativeJournalTest(PrivateClaudeTest):
             ('attachment.hookEvent', 'UserPromptSubmit'),
             ('renderedRole', 'assistant'),
             ('renderedRole', 'user'),
+            ('rendered', [{'content': content.replace('View/no ACK:', 'View/ACK:')}]),
             ('rendered', [{'content': '<system-reminder>' + content.replace('한글', '다름') + '</system-reminder>'}]),
             ('rendered', [{'content': content[:-1]}]),
             ('rendered', []),

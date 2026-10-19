@@ -21,7 +21,7 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 - `spawn --message`로 라벨이 있는 세션과 첫 프롬프트를 생성하며, 단독 사용과 정책이 허용하는 기존 요청·대기·읽기·배치·원격 배포 도구도 지원합니다.
 - omp와 Claude 수신 런타임은 별도로 선택해 설치합니다. Codex는 작업 경계에서 받은 메일을 명시적으로 읽습니다.
 - 정책이 허용하는 기존 에이전트 프롬프트는 수신 pane에 포커스가 있으면 보류하고, 기본 3분 후 **HAM: Held Messages**에서 Push 또는 Cancel을 선택하도록 합니다.
-- 기존 CLI는 간결한 출력, `--verbose` 진단 정보, `request-status --wait`를 통한 후속 관찰을 지원합니다.
+- 에이전트용 CLI는 `status board|list`, `inbox read`, 기존 라우팅 명령에서 간결한 기본 출력과 `--verbose` 진단 정보를 제공합니다. JSON은 불필요한 공백 없이 UTF-8로 출력하며, 반복 조회 대신 범위를 정한 `request-status --wait`를 사용합니다.
 
 사용자가 직접 붙인 이름은 변경하지 않습니다. 에이전트 주소는
 `local/blue-otter`, `macbook-pro/purple-koala`처럼 항상 호스트를
@@ -212,7 +212,7 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
 ```text
 mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
 mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
-status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verbose]
 ```
 
 이력 조회는 기본적으로 정체성을 검증한 호출자의 저장소를 선택합니다.
@@ -231,10 +231,12 @@ HMAC 서명된 불투명 cursor는 원장·쿼리·저장소에 귀속되므로 
 보드는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
 값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
 `--host`는 로컬 원장 또는 등록된 정규 호스트·SSH 별칭 하나만 선택합니다.
-결과는 `{repo_id,agents,hosts}`이며 역할·턴·phase·summary·unread와 수신 확장,
-배치 정보를 포함합니다. `status_updated_at`은 상태 갱신 시각이며 `last_seen`은
-레지스트리 관찰 시각입니다. 저장된 스냅샷을 읽을 뿐 레지스트리를 새로 수집하거나
-상태·표시·claim을 바꾸지 않으며, peer에도 `refresh=false`를 전달합니다.
+결과는 `{repo_id,agents,hosts}`이며 주소·workspace·역할·턴·phase·summary·unread·수신
+상태와 기기·서버 개수를 간결하게 표시합니다. `hosts[].agents` 중복은 없으며 호스트별
+오류·stale·unread와 자원 개수·탐색 오류는 유지합니다. `--verbose`는 전체 레지스트리·상태·
+자원 필드와 `status_updated_at`(상태 갱신), `last_seen`(레지스트리 관찰)을 복원합니다.
+Python·TUI·peer export의 전체 구조는 바뀌지 않습니다. 조회는 레지스트리를 수집하거나
+상태·표시·claim을 바꾸지 않으며 peer에도 `refresh=false`를 전달합니다.
 peer 조회에 실패하면 `hosts`에 구조화된 오류와 `stale:true`, unread `?`를 남깁니다.
 이전 스냅샷이 없는 CLI는 에이전트 행을 만들어 내지 않습니다. TUI는 검증된 이전
 행을 stale로 유지할 수 있습니다. 기존 `list`와 로컬 `status list`는 더 좁은
@@ -244,8 +246,11 @@ peer도 이 읽기 API를 지원해야 합니다. 이전 버전은 `refresh=fals
 호스트별 `error`, `stale`, unread를 확인하세요. `--host` 대상이 등록되지 않았거나 모호하면
 `peer_not_configured`와 종료 코드 1을 반환합니다.
 
-세 명령 모두 `-h` / `--help`를 지원하며 `--verbose`는 없습니다. 결과는 JSON 객체
-하나이고, 도메인 오류는 `{"error":{"code":"CODE","message":"TEXT"}}`와 종료 코드
+세 명령 모두 `-h` / `--help`를 지원하며 JSON 객체 하나를 반환합니다. 세 명령 중
+보드만 `--verbose`를 지원합니다. `status list`와 `inbox read`도 간결한 기본 출력에
+`--verbose`를 붙이면 전체 진단 정보를 반환합니다. inbox는 ID·발신자·본문·상태·답장
+문맥을 유지하며 조회로 ACK하지 않습니다. verbose를 포함한 CLI JSON은 불필요한 공백 없이
+UTF-8로 출력합니다. 도메인 오류는 `{"error":{"code":"CODE","message":"TEXT"}}`와 종료 코드
 1을 반환합니다. 사용법 오류는 종료 코드 2입니다. 조회는 메일을 확인 처리하지
 않으며 설정 변경, 사용자 작성·직접 전송, 운영자 ACK를 우회하는 공개 명령도
 제공하지 않습니다. inbox·Threads·전송 outbox·상태·unread의 구분은
@@ -272,9 +277,10 @@ Herdr 갱신 실패는 오류이지 소유자가 사라졌다는 근거가 아�
 점유 소유자의 활성 여부도 별개입니다.
 
 `device list`와 `status board`의 자원 조회는 읽기 전용입니다. 레지스트리 갱신,
-stale 점유 정리, 토큰 쓰기를 하지 않습니다. 에이전트 JSON에는 독립적인
+stale 점유 정리, 토큰 쓰기를 하지 않습니다. verbose 보드·peer JSON에는 독립적인
 `devices`(유효한 점유)와 `servers` 목록이 추가되며, 호스트 항목에는
 `resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`이 추가됩니다.
+간결한 CLI에서는 이 목록을 개수로 표시하며 `--verbose`로 전체 행을 조회할 수 있습니다.
 서버는 점유하지 않고 현재 사용자의 리스너와 Tailscale Serve 경로에서 탐색합니다.
 이전 peer에 `devices`, `servers`, `resources` 중 어느 필드가 없으면 해당 정보만
 알 수 없음(`?`)으로 표시하며, 빈 목록으로 해석하지 않습니다.

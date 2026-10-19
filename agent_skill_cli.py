@@ -61,6 +61,8 @@ from agent_output import (
     agent_address,
     clean_agent_text,
     compact_batch_item,
+    compact_board_payload,
+    compact_inbox_payload,
     compact_read_payload,
     compact_request_payload,
     compact_status_payload,
@@ -94,12 +96,12 @@ class SkillCommandError(Exception):
         self.message = message
 
 
-def _write_json(payload: Mapping[str, Any], *, compact: bool = False) -> None:
+def _write_json(payload: Mapping[str, Any]) -> None:
     json.dump(
         payload,
         sys.stdout,
         ensure_ascii=False,
-        separators=(",", ":") if compact else None,
+        separators=(",", ":"),
     )
     sys.stdout.write("\n")
 
@@ -1304,6 +1306,11 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
                               help="Optional exact repository; bare --repo selects the current caller repository.")
     status_board.add_argument("--host", dest="board_host",
                               help="Local/canonical/registered SSH alias; default: local and all registered peers.")
+    for command_parser in (status_list, status_board):
+        command_parser.add_argument(
+            "--verbose", action="store_true", default=argparse.SUPPRESS,
+            help="Include full registry and diagnostic fields instead of compact output.",
+        )
 
     send_parser = subparsers.add_parser(
         "send",
@@ -1416,6 +1423,14 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     request_status_parser.add_argument(
         "--wait", type=int, default=0,
         help="Observe until state or phase changes, terminal, or deadline in ms (default: 0).",
+    )
+    request_cancel_parser = subparsers.add_parser(
+        "request-cancel",
+        help="Cancel your held request without contacting its recipient.",
+        description="Cancel your held request without contacting its recipient.",
+    )
+    request_cancel_parser.add_argument(
+        "--request-id", required=True, help="Request ID returned by request or send."
     )
     for command_parser in (
         send_parser, read_parser, request_parser, request_status_parser, batch_parser,
@@ -1543,6 +1558,16 @@ def main(
                 environment=environment,
                 on_report=reports.append,
             )
+        elif arguments.command == "request-cancel":
+            payload = agent_delivery.request_cancel_command(
+                request_id=arguments.request_id,
+                sender=current_sender(environment),
+                environment=environment,
+            )
+            exit_code = 0 if payload["cancelled"] else (
+                3 if payload["error_code"] == "already_submitted"
+                and payload["state"] in {"submitted_working", "submitted_unknown"} else 1
+            )
         elif arguments.command == "spawn":
             payload = spawn_command(arguments, environment)
             initial_prompt = payload.get("initial_prompt")
@@ -1561,7 +1586,12 @@ def main(
                 "deferred": 3,
                 "awaiting_decision": 3,
             }[payload["state"]]
-        _write_json(payload, compact=command == "batch")
+        if not getattr(arguments, "verbose", False):
+            if command == "status" and getattr(arguments, "status_operation", None) in {"list", "board"}:
+                payload = compact_board_payload(payload)
+            elif command == "inbox" and arguments.inbox_command == "read":
+                payload = compact_inbox_payload(payload)
+        _write_json(payload)
         if reports:
             sys.stdout.flush()
             for report in reports:
@@ -1571,13 +1601,11 @@ def main(
         _write_json(
             {"error": {"code": error.code, "message": error.message,
                        **({"holder": error.holder} if hasattr(error, "holder") else {})}},
-            compact=command == "batch",
         )
         return 1
     except Exception as error:
         _write_json(
             {"error": {"code": "internal_error", "message": str(error)}},
-            compact=command == "batch",
         )
         return 1
 

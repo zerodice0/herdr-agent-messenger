@@ -1,4 +1,4 @@
 interface:
   display_name: "HAM — Herdr Agent Messenger"
-  short_description: "Start labeled Herdr sessions and coordinate agents"
-  default_prompt: "Use $herdr-agent-messenger to start or message the requested Herdr agents, follow saved requests without resending held or uncertain deliveries, and verify the results."
+  short_description: "Durable agent mail, inbox handling and status/roles"
+  default_prompt: "Use $herdr-agent-messenger for durable mail and status/roles; create sessions only when requested, never replay uncertain delivery, and distinguish receipt from completed work."

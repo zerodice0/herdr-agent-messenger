@@ -1,5 +1,5 @@
 import ham_test_support  # Protect the live ledger before product imports.
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import fcntl
 import os
@@ -644,6 +644,64 @@ class DeferredRequestTest(unittest.TestCase):
         self.assertEqual(again, result)
         self.assertEqual(transport.prompts, [])
 
+    def test_cancel_checks_ownership_under_lock_before_mutating_corrupt_state(self):
+        machine, _transport = self.machine([self.focused])
+        record = self.enqueue(machine)
+        record.pop("_defer")
+        self.store.save(self.request_id, record)
+        locked = False
+
+        @contextmanager
+        def lock(request_id):
+            nonlocal locked
+            self.assertEqual(request_id, self.request_id)
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def refuse(current):
+            self.assertTrue(locked)
+            self.assertEqual(current, record)
+            return False
+
+        with mock.patch.object(self.store, "lock", lock):
+            result = machine.cancel_deferred(self.request_id, can_cancel=refuse)
+        self.assertEqual(result, record)
+        self.assertEqual(self.store.load(self.request_id), record)
+
+    def test_cancel_returns_actual_state_when_delivery_wins_lock(self):
+        machine, transport = self.machine([self.focused])
+        self.enqueue(machine)
+        submitted = None
+        original_lock = self.store.lock
+
+        @contextmanager
+        def delivery_wins(request_id):
+            nonlocal submitted
+            with mock.patch.object(self.store, "lock", original_lock):
+                submitted = machine.deliver_deferred(request_id, force=True)
+            yield
+
+        with mock.patch.object(self.store, "lock", delivery_wins):
+            result = machine.cancel_deferred(self.request_id, can_cancel=lambda record: True)
+        self.assertEqual(result, submitted)
+        self.assertEqual(self.store.load(self.request_id), submitted)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(len(transport.prompts), 1)
+
+    def test_cancel_never_rewrites_held_state_already_marked_submitted_or_terminal(self):
+        machine, _transport = self.machine([self.focused])
+        held = self.enqueue(machine)
+        for flags in ({"submitted": True}, {"terminal": True}):
+            with self.subTest(flags=flags):
+                record = {**held, **flags}
+                self.store.save(self.request_id, record)
+                result = machine.cancel_deferred(self.request_id)
+                self.assertEqual(result, record)
+                self.assertEqual(self.store.load(self.request_id), record)
+
     def test_deferred_recipient_disappearing_or_changing_fails_before_submission(self):
         for target, code in (
             (replace(self.focused, identity="replacement"), "recipient_changed"),
@@ -1082,12 +1140,17 @@ class AgentRequestCliIntegrationTest(ham_test_support.IsolatedLedgerTest):
         status = agent_skill_cli.parse_cli_arguments(
             ["request-status", "--request-id", "d" * 32]
         )
+        cancel = agent_skill_cli.parse_cli_arguments(
+            ["request-cancel", "--request-id", "d" * 32]
+        )
 
         self.assertEqual(request.command, "request")
         self.assertEqual(request.route, "opaque-route")
         self.assertEqual(request.output_lines, 40)
         self.assertEqual(status.command, "request-status")
         self.assertEqual(status.request_id, "d" * 32)
+        self.assertEqual(cancel.command, "request-cancel")
+        self.assertEqual(cancel.request_id, "d" * 32)
 
     def test_request_command_uses_injected_resolver_without_herdr_wait(self):
         sender = agent_skill_cli.AgentRecord(

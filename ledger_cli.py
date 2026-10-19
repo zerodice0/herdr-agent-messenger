@@ -67,6 +67,8 @@ def add_parsers(subparsers: Any) -> None:
     read.add_argument("--message", help="Read one message UUID, including final states.")
     read.add_argument("--all", action="store_true", help="Include handled and other final messages.")
     read.add_argument("--limit", type=int, default=100, help="Maximum rows, 1..1000 (default 100).")
+    read.add_argument("--verbose", action="store_true",
+                      help="Include full message and delivery diagnostic fields.")
     handle = inbox_commands.add_parser("handle", help="Explicitly mark messages handled, without inventing delivered_at.")
     handle.add_argument("--message", required=True, action="append", help="Message UUID; repeat for atomic batch handling.")
 

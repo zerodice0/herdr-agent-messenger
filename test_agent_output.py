@@ -84,6 +84,54 @@ OMP_TOOL_RESPONSE = "\n".join(
 )
 
 
+class LedgerProjectionTest(unittest.TestCase):
+    def test_board_keeps_selection_and_stale_resource_findings_without_full_rows(self):
+        row = {"host": "peer", "alias": "", "terminal_id": "term", "workspace_id": "w1",
+               "repo_id": "repo", "turn_state": "unknown", "role": None, "unread": "?",
+               "phase": "review", "summary": "Saved status", "stale": True,
+               "extension_present": 0, "devices": [{"device_id": "phone"}],
+               "servers": [{"port": 4000}], "agent_id": "private", "generation": 9}
+        error = {"code": "transport_unavailable", "message": "Offline"}
+        payload = {"repo_id": None, "agents": [row], "hosts": [
+            {"host": "peer", "uuid": "private", "agents": [row], "stale": True,
+             "unread": "?", "error": error, "resources": {
+                 "servers_unowned": [{"port": 5000}], "dead_serve": [{"port": 6000}],
+                 "stale_devices": [{"device_id": "old"}], "error": "Scan unavailable"}}]}
+        compact = agent_output.compact_board_payload(payload)
+        agent = compact["agents"][0]
+        self.assertEqual((agent["address"], agent["workspace"], agent["unread"], agent["stale"]),
+                         ("peer/term", "w1", "?", True))
+        self.assertEqual((agent["devices"], agent["servers"], agent["extension_present"]), (1, 1, 0))
+        self.assertTrue({"agent_id", "generation", "repo_id"}.isdisjoint(agent))
+        host = compact["hosts"][0]
+        self.assertNotIn("agents", host)
+        self.assertEqual(host["error"], error)
+        self.assertEqual(host["resources"], {"servers_unowned": 1, "dead_serve": 1,
+                                             "stale_devices": 1, "error": "Scan unavailable"})
+        self.assertIs(payload["hosts"][0]["agents"][0], row)
+        self.assertEqual(row["devices"], [{"device_id": "phone"}])
+
+    def test_inbox_keeps_priority_reply_and_truncation_without_delivery_internals(self):
+        row = {"message_id": "message", "thread_id": "thread", "reply_to": "parent", "hop": 2,
+               "origin_host": "peer", "sender_label": "main", "sender": "private",
+               "kind": "action", "priority": "high", "body": "Partial", "state": "delivering",
+               "truncated": True, "body_omitted": False, "payload_hash": "hash",
+               "claim_id": "claim", "delivered_at": None, "hold_reason": "recipient_changed",
+               "withdraw_requested": 1}
+        payload = {"terminal_id": "term", "messages": [row],
+                   "warnings": [{"code": "diagnostic_warning"}]}
+        compact = agent_output.compact_inbox_payload(payload)
+        message = compact["messages"][0]
+        self.assertEqual(message["sender"], "peer/main")
+        for key in ("priority", "reply_to", "hop", "truncated", "body_omitted",
+                    "hold_reason", "withdraw_requested"):
+            self.assertEqual(message[key], row[key])
+        self.assertTrue({"payload_hash", "claim_id", "delivered_at"}.isdisjoint(message))
+        self.assertNotIn("terminal_id", compact)
+        self.assertEqual(compact["warnings"], payload["warnings"])
+        self.assertEqual(row["sender"], "private")
+
+
 class AgentTextTest(unittest.TestCase):
     def test_real_omp_request_keeps_reply_without_echo_input_box_or_footer(self):
         self.assertEqual(

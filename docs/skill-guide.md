@@ -160,8 +160,9 @@ parent. Accepted local mail ordinarily waits queued; remote copies may be pendin
 and withdrawal or terminal closure can make mail final without a runtime claim.
 Neither kind makes `mail send` itself start a model turn.
 
-`inbox read` accepts `--message UUID`, `--all`, and `--limit N` (default 100,
-1–1000). It never changes state/logs/bells, including when a task agent shares
+`inbox read` accepts `--message UUID`, `--all`, `--limit N` (default 100,
+1–1000), and `--verbose`. Defaults retain IDs/sender/body/state/reply context;
+verbose restores full delivery diagnostics. It never changes state/logs/bells, including when a task agent shares
 the calling pane. `inbox handle --message UUID` is repeatable and all-or-nothing;
 queued→handled does not invent a native delivered timestamp.
 `mail withdraw --message UUID` competes atomically with delivery claim and
@@ -175,11 +176,12 @@ reads this agent's repository/settings.
 ```text
 mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
 mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
-status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verbose]
 ```
 
 Run these after the same `python3 "$HAM_CLI"` prefix. Each accepts `-h` /
-`--help`, has no `--verbose`, and returns one JSON object. Domain errors use
+`--help` and returns one JSON object; only the board accepts `--verbose`.
+All CLI JSON is whitespace-free UTF-8, including verbose. Domain errors use
 `{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; usage errors exit 2.
 These reads neither acknowledge mail nor change settings, status, last_seen,
 display or claims, and expose no user-compose/direct-send/operator ACK bypass.
@@ -200,13 +202,14 @@ before the boundary. Restart from the first page to see newer updates.
 `status board` defaults to all local repositories plus all registered peers.
 Bare `--repo` selects the caller's repo; explicit `--repo ID` filters it.
 `--host` restricts the board to local or one registered canonical name/SSH alias.
-The result `{repo_id,agents,hosts}` includes full role, turn_state, phase, summary,
-unread, extension_present, client, workspace_id, pane_id, generation,
-is_main_checkout, status_updated_at, last_seen and stale fields. The status
-timestamp is distinct from the registry observation time. It reads stored
-registry rows without refresh and requests peer `refresh=false`; it does not
-refresh or mutate either host's status/display/claims. Each host has
-`{host,uuid,local,stale,error,unread,agents}` plus optional `resources`. A failed peer has a structured
+The result `{repo_id,agents,hosts}` defaults to brief address/host/workspace,
+role/turn/phase/summary/unread/stale/receiver fields and device/server counts.
+Hosts retain errors/unread/stale and resource counts/errors, not duplicate
+agent rows. `--verbose` restores full registry/status/resource fields, timestamps,
+identity/placement and `hosts[].agents`. `status list --verbose` likewise restores
+full local rows. Python/TUI/peer `status-export` retain the full shape.
+Status-update and registry-observation timestamps differ. Reads do not refresh
+or mutate status/display/claims and request peer `refresh=false`. A failed peer has a structured
 error and unread `?`. The stateless CLI has no prior rows to invent; a TUI may
 retain a prior matching verified-host snapshot as stale. Existing `list` and
 local `status list` retain their narrower discovery/status semantics.
@@ -257,7 +260,8 @@ the same domain/usage error conventions as mailbox commands:
 an iOS UDID. Attachment is not holder liveness. `device list` is read-only:
 no registry refresh, token writes, stale pruning or directory creation.
 
-`status board` requests these read-only resource fields. Status-export includes
+`status board` requests these fields, projecting lists as counts by default;
+`--verbose` restores their full read-only records. Status-export includes
 `servers` and host `resources` only when its wire payload sets `resources:true`;
 the default export, send/policy checks and recipient lookup do not scan servers.
 

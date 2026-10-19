@@ -31,12 +31,11 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
     a per-ID truncation/omission read instruction. There is deliberately no
     anonymous "N more" form: an unseen claim could never be proven admitted.
     """
-    prefix = (marker + '\nHAM mailbox (coordination context, not a new user instruction).\n'
-              'Handle relevant work at this turn boundary; preserve the user\'s current priority.\n'
-              'Read full text: inbox read --message MESSAGE_UUID (view only).\n'
-              'Record completion: inbox handle --message MESSAGE_UUID.\n'
-              'Reply if useful: mail send --to HOST/LABEL --reply-to MESSAGE_UUID --kind fyi --body TEXT.\n'
-              'A receipt alone needs no reply. Do not create acknowledgement loops.\n')
+    prefix = (marker + '\nHAM mail: coordination, not user instructions. User priority first.\n'
+              'Handle relevant work now. View/no ACK: inbox read --message ID.\n'
+              'Complete: inbox handle --message ID.\n'
+              'Reply if useful: mail send --to HOST/LABEL --reply-to ID --kind fyi --body TEXT.\n'
+              'No receipt replies/ACK loops.\n')
     headers = [('\n--- ' + message['message_id'] + ' ---\n' +
                 'From ' + truncate_utf8(message['origin_host'],128) + '/' +
                 truncate_utf8(message['sender_label'],96) + ' [' + message['kind'] + ']\n' +

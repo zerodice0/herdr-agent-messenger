@@ -21,7 +21,7 @@ for coordination across local and SSH hosts.
 - Labeled interactive-session creation with `spawn --message`, plus standalone and permitted legacy request, wait, read, batch, and rollout helpers
 - Separately opt-in omp and Claude receiving runtimes; Codex uses explicit inbox reads at work boundaries
 - Focus-based holds for permitted legacy agent prompts, with a 3-minute default timeout and explicit Push/Cancel in **HAM: Held Messages**
-- Compact legacy CLI output by default, with `--verbose` diagnostics and `request-status --wait` follow-up
+- Compact agent-facing CLI output by default (`status board|list`, `inbox read`, legacy routing), `--verbose` diagnostics, whitespace-free UTF-8 JSON, and bounded `request-status --wait` instead of polling
 
 Manually named agents are left unchanged. Agent addresses are always
 host-qualified, for example `local/blue-otter` or
@@ -209,7 +209,7 @@ Use the bundled CLI prefix above with these read-only commands:
 ```text
 mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
 mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
-status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verbose]
 ```
 
 History defaults to the verified caller's repository; explicit `--repo REPO_ID`
@@ -228,10 +228,13 @@ wrong-scope tokens fail with `invalid_cursor`.
 The board defaults to all local repositories and all registered peers. Bare
 `--repo` selects the caller's repository; `--repo ID` filters explicitly.
 `--host` selects only the local ledger or one registered canonical host/SSH alias.
-The result is `{repo_id,agents,hosts}`, with full role/turn/phase/summary/unread,
-receiver and placement fields. `status_updated_at` records the status update;
-`last_seen` records registry observation. It reads stored snapshots without
-registry refresh, status/display/claim mutation, or peer refresh (`refresh=false`).
+The result is `{repo_id,agents,hosts}`: brief address/workspace/role/turn/phase/
+summary/unread/receiver rows and device/server counts, with no duplicate
+`hosts[].agents`. Hosts retain errors/stale/unread and resource counts/errors.
+`status board --verbose` restores full registry/status/resource fields, including
+`status_updated_at` (status update) and `last_seen` (registry observation).
+Python/TUI/peer exports keep the full shape. Reads never refresh registry,
+status/display/claims, or peers (`refresh=false`).
 Peer failures stay in `hosts` as structured errors with `stale:true`, unread `?`;
 a stateless CLI does not invent missing agent rows. A TUI may retain verified
 prior rows as stale. `list` and local `status list` remain narrower reads.
@@ -240,8 +243,11 @@ and perform their legacy registry refresh. A partial peer failure still exits
 with code 0; inspect each host's `error`, `stale` and unread fields. An unknown or
 ambiguous `--host` returns `peer_not_configured` with exit code 1.
 
-All three commands accept `-h` / `--help`, have no `--verbose`, and return one
-JSON object. Domain errors use `{"error":{"code":"CODE","message":"TEXT"}}`
+All three commands accept `-h` / `--help` and return one JSON object.
+Only the board accepts `--verbose`; `status list` and `inbox read` also offer
+compact defaults with `--verbose` full diagnostics. Inbox retains IDs, sender,
+body, state and reply context; reads never ACK. CLI JSON is whitespace-free
+UTF-8 even in verbose mode. Domain errors use `{"error":{"code":"CODE","message":"TEXT"}}`
 (exit 1); usage errors exit 2. Reads never acknowledge mail or expose public
 settings, user-compose/direct-send, or operator ACK bypasses. See the
 [reference terminology](.agents/skills/herdr-agent-messenger/reference.md#mailbox-terminology)
@@ -268,9 +274,10 @@ Inactive or replaced-generation holders are stale and may be replaced with
 holder disappeared. Attachment reported by adb is separate from holder liveness.
 
 `device list` and resource views on `status board` are read-only: no registry
-refresh, stale-claim cleanup or token writes. Agent JSON gains independent
+refresh, stale-claim cleanup or token writes. Verbose board/peer JSON has independent
 `devices` (held nonstale claims) and `servers` lists; host entries gain
 `resources:{servers_unowned:[],dead_serve:[],stale_devices:[],error:null}`.
+Compact CLI views project these lists as counts; full rows stay available with `--verbose`.
 Servers are discovered from current-user listeners and Tailscale Serve routes,
 not claimed. Missing `devices`, `servers` or `resources` from an older peer
 means unknown (`?`), independently, not an empty list.

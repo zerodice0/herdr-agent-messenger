@@ -186,8 +186,9 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 철회나 terminal 종료로 claim 없이 최종 상태가 될 수도 있습니다.
 어느 종류든 `mail send` 자체가 모델 턴을 시작하지는 않습니다.
 
-`inbox read`는 `--message UUID`, `--all`, `--limit N`을 받습니다.
-기본 한도는 100개이며 1~1000개를 지정할 수 있습니다. 조회는 상태·로그·초인종을
+`inbox read`는 `--message UUID`, `--all`, `--limit N`, `--verbose`를 받습니다.
+기본 한도는 100개이며 1~1000개를 지정할 수 있습니다. 기본 출력은 ID·발신자·본문·상태·
+답장 문맥을 유지하며 `--verbose`는 전체 전달 진단 정보를 반환합니다. 조회는 상태·로그·초인종을
 바꾸지 않으며, 같은 pane을 쓰는 서브에이전트도 같습니다.
 `inbox handle --message UUID`는 여러 번 지정할 수 있고 전체를 검증한 뒤
 한꺼번에 handled로 바꿉니다. queued 메시지를 처리해도 delivered 시각을 만들지
@@ -201,11 +202,12 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 ```text
 mail threads [--repo REPO_ID] [--limit N] [--cursor TOKEN]
 mail direct-list [--repo REPO_ID] [--limit N] [--cursor TOKEN]
-status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
+status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verbose]
 ```
 
 위의 `python3 "$HAM_CLI"` 뒤에 붙여 실행합니다. 각 명령은 `-h` / `--help`를
-지원하며 `--verbose`는 없습니다. JSON 객체 하나를 반환하고, 도메인 오류는
+지원하며 JSON 객체 하나를 반환합니다. 세 명령 중 보드만 `--verbose`를 지원합니다.
+verbose를 포함한 CLI JSON은 불필요한 공백 없이 UTF-8로 출력합니다. 도메인 오류는
 `{"error":{"code":"CODE","message":"TEXT"}}`와 종료 코드 1을 사용합니다.
 사용법 오류는 종료 코드 2입니다. 조회는 메일 확인, 설정·상태·last_seen·표시·claim
 변경을 하지 않으며 사용자 작성·직접 전송·운영자 ACK 우회 명령을 제공하지 않습니다.
@@ -226,13 +228,14 @@ status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS]
 `status board`는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
 값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
 `--host`는 로컬 또는 등록된 정규 호스트·SSH 별칭 하나로 범위를 좁힙니다.
-결과 `{repo_id,agents,hosts}`의 행에는 role, turn_state, phase, summary, unread,
-extension_present, client, workspace_id, pane_id, generation, is_main_checkout,
-status_updated_at, last_seen, stale가 있습니다. 상태 갱신 시각과 레지스트리 관찰
-시각은 별개입니다. 저장된 레지스트리를 새로 수집하지 않고 읽으며 peer에도
-`refresh=false`를 요청합니다. 어느 호스트의 상태·표시·claim도 갱신하지 않습니다.
-호스트별 항목은 `{host,uuid,local,stale,error,unread,agents}`이며 선택적 `resources`가
-추가됩니다. 실패한 peer는
+결과 `{repo_id,agents,hosts}`는 주소·호스트·workspace와 역할·턴·phase·summary·unread·
+stale·수신 상태, 기기·서버 개수를 간결하게 표시합니다. 호스트는 중복 에이전트 행 없이
+오류·unread·stale와 자원 개수·탐색 오류를 유지합니다. `--verbose`는 전체 레지스트리·
+상태·자원 필드와 시각·정체성·배치 정보, `hosts[].agents`를 복원합니다.
+`status list --verbose`도 전체 로컬 행을 복원합니다. Python·TUI·peer `status-export`의
+전체 구조는 바뀌지 않습니다. 상태 갱신 시각과 레지스트리 관찰 시각은 별개입니다.
+어느 호스트의 상태·표시·claim도 갱신하지 않으며 peer에도 `refresh=false`를 요청합니다.
+실패한 peer는
 구조화된 오류와 unread `?`를 남깁니다. 이전 행이 없는 CLI는 행을 만들어 내지
 않습니다. TUI는 검증된 같은 호스트의 이전 스냅샷을 stale로 유지할 수 있습니다.
 기존 `list`와 로컬 `status list`는 더 좁은 탐색·상태 조회로 유지됩니다.
@@ -284,7 +287,8 @@ device list
 연결 여부는 점유 소유자의 활성 여부와 별개입니다. `device list`는 읽기 전용이므로
 레지스트리 갱신, 토큰 쓰기, stale 정리나 디렉터리 생성을 하지 않습니다.
 
-`status board`는 다음 읽기 전용 자원 필드를 요청합니다. Status-export는 wire payload에
+`status board`는 이 자원 필드를 요청하되 기본 출력에서는 목록을 개수로 표시합니다.
+`--verbose`로 읽기 전용 전체 행을 조회할 수 있습니다. Status-export는 wire payload에
 `resources:true`가 있을 때만 `servers`와 호스트 `resources`를 포함합니다.
 기본 export, 전송 정책 검사와 수신자 조회에서는 서버를 탐색하지 않습니다.
 

@@ -4,7 +4,7 @@ Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloa
 
 ## Command and flag reference
 
-The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`) accept `-h` / `--help` and `--verbose` (full diagnostic JSON; default off). Mailbox/ledger/runtime/device commands and `status set|clear|list|board` also accept `-h` / `--help` but have no verbose flag, including `mail threads` and `mail direct-list`. Numeric arguments are integers. Optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
+All commands accept `-h` / `--help`. Legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`), `status board|list` and `inbox read` accept `--verbose` (full diagnostic JSON; default off); other mailbox/ledger/runtime/device/status commands, including `mail threads` and `mail direct-list`, do not. Numeric arguments are integers; optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
 
 ### Recipient selectors
 
@@ -51,7 +51,7 @@ python3 scripts/herdr_agent_messenger.py repo show
 | Command | Flags and semantics |
 | --- | --- |
 | `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, or symbolic `main`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh same-repository status export. |
-| `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000). Without `--all`, shows queued, uncertain delivering, and delivered mail. Reads never change delivery, logs, or bells, even from subagents. |
+| `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000), `--verbose`. Without `--all`, shows queued, uncertain delivering, and delivered mail. Compact IDs/sender/body/state/reply context by default; verbose restores delivery diagnostics (see Compact versus verbose payloads). Reads never change delivery, logs, or bells, even from subagents. |
 | `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
 | `mail show` | Required `--thread UUID`; reads a known retained thread, including sent mail, without caller-recipient filtering. Returns retained bodies and delivery state from this ledger. |
 | `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; repository-wide retained sent/received threads, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
@@ -67,6 +67,8 @@ is advisory only when the exported row says absent; unknown receiver state and
 Codex pull-only recipients do not produce this warning. Run `runtime status`
 on the recipient host, request consent before installing a missing runtime,
 then restart only the selected sessions if registration is pending.
+
+#### History and cursor paging
 
 `mail threads` and `mail direct-list` default to the verified caller's repository.
 Explicit `--repo REPO_ID` avoids fetching Herdr caller identity. Both enumerate
@@ -307,6 +309,8 @@ including remote-origin sends and home relays, fail with `legacy_symbolic_main`
 and an instruction to upgrade every host. Upgrade and run `ledger reconcile`
 on every host before using `--to main` across hosts.
 
+#### Workspace role migration
+
 Schema v7 creates local workspace settings. During v6→v7 migration, legacy
 repo-level main/member targets matching active local agents are mapped to each
 agent's current scope; members are grouped by scope. Other hosts migrate their
@@ -414,7 +418,7 @@ No legacy device JSON is imported by product code; any one-time rollout
 migration happens outside the product. `heavy_slot.py` is a separate,
 unchanged script and is neither read nor displayed by HAM.
 
-`status board` agent rows and status-export payload agent rows add independently
+`status board --verbose` and status-export payload agent rows add independently
 optional `devices` and `servers` lists. `devices` contains held nonstale claims
 (`stale:false`). Each server is
 `{port,bind,pid,process,cwd,started_at,urls,inherited}`. Discovery reads current-user
@@ -588,6 +592,23 @@ instructions and the launcher. Neither alone supplies native receiving. Runtime
 installation is a separate, consented, ownership-checked per-host opt-in.
 Plugin loading never modifies OMP or Claude configuration, and runtime setup
 does not change the new-repository `auto` default.
+
+#### Native mailbox bundles
+
+The compact OMP/Claude coordination prefix retains user priority, turn-boundary
+work, view-only/no-ACK reads, explicit completion handling, useful replies and no
+receipt/ACK loops. Headers retain every message ID, sender, kind, thread and hop.
+The random marker and exact content/hash support native journal evidence, not
+proof of provider success, understanding or completed work.
+
+Bounds remain 8 messages, 2,048 UTF-8 bytes per body, 8,192 bytes per bundle.
+Pull missing/truncated context with `inbox read --message UUID`; do not reread
+complete bodies solely because native mail arrived. Budgets include actual
+prefix/header bytes. The review's fixed marker/prefix fixture is now 360 bytes
+(formerly 505); one/three ASCII `OK` messages are 487/741 bytes (formerly 632/886),
+with unchanged per-message headers.
+
+#### Runtime installation and health
 
 On **each selected host**, inspect the read-only health summary first, then
 install/check/remove only the client the user selects:
@@ -777,17 +798,23 @@ python3 scripts/herdr_agent_messenger.py status board --repo 'git:host/stable/re
 | --- | --- |
 | `status set` | Required positional `phase` and `--summary TEXT`; no `--phase` flag. Reports the current agent's public phase/summary. |
 | `status clear` | No extra arguments; clear current phase/summary. |
-| `status list` | Optional `--repo [ID]`: absent lists all local repository statuses, bare `--repo` selects the caller's repo, explicit ID filters it. |
-| `status board` | Optional `--repo [ID]`, `--host local\|CANONICAL\|REGISTERED_SSH_ALIAS`. No repo flag selects all repositories; bare `--repo` resolves the caller's repository; explicit ID filters without fetching Herdr caller identity. No host flag selects local plus all registered peers; explicit host selects only that ledger. Returns `{repo_id,agents,hosts}`. |
+| `status list` | Optional `--repo [ID]`, `--verbose`: absent repo lists all local repository statuses, bare `--repo` selects caller's repo, explicit ID filters. Brief rows/counts by default; verbose restores full rows. |
+| `status board` | Optional `--repo [ID]`, `--host local\|CANONICAL\|REGISTERED_SSH_ALIAS`, `--verbose`. No repo flag selects all repositories; bare `--repo` resolves caller's repository; explicit ID filters without fetching Herdr caller identity. No host flag selects local plus all registered peers; explicit host selects only that ledger. Returns `{repo_id,agents,hosts}`. |
 
-These subcommands accept `-h` / `--help` and have no `--verbose`. `status board`
+These subcommands accept `-h` / `--help`; board/list also accept `--verbose` after the subcommand or on parent `status`. `status board`
 has its own host selector; do not treat legacy `status --host HOST list` as
 remote board syntax. Legacy `list` and stored local `status list` remain
 available with narrower semantics.
 
-Board agent rows preserve the registry fields and include role, turn_state,
-phase, summary, unread, extension_present, client, workspace_id, pane_id,
-generation, is_main_checkout, status_updated_at, last_seen and stale.
+#### Status board output and fields
+
+Compact board/list rows have `address` (`canonical-host/alias`, terminal fallback),
+`host`, `workspace` (label, ID fallback), and existing `turn_state`, `status`,
+`role`, `unread`, `phase`, `summary`, `stale`, `extension_present`, `client`.
+Row `repo_id` appears only in multi-repo results; optional devices/servers become
+counts. Omitted old-peer resources remain unknown, not zero.
+`--verbose` preserves full registry rows, receiver/placement/generation,
+`status_updated_at`, `last_seen`, and complete device/server records.
 Roles are computed on each agent's origin host for its own host-qualified
 workspace; all-repository/all-host boards do not imply one global main.
 `status_updated_at` is the actual agent status update timestamp, separate from
@@ -798,7 +825,12 @@ last_seen, display, settings or claims; peer requests explicitly use
 Peers must run this read API version to honor `refresh=false`; an older peer
 may ignore it and perform its legacy registry refresh.
 
-Each `hosts` entry contains `{host,uuid,local,stale,error,unread,agents}`.
+Compact `hosts` entries retain `host`, `stale`, `error`, `unread`; optional
+`resources` has `servers_unowned`, `dead_serve`, `stale_devices` counts and scan
+`error`. Agents appear only once in top-level `agents`.
+Verbose retains `{host,uuid,local,stale,error,unread,agents}` and full resources.
+Python `status_board()`, TUI, remote/peer `status-export` retain the full shape:
+compaction is only the CLI projection, not a transport change.
 Peer failures produce a structured per-host `{code,message}` error,
 `stale:true` and unread `"?"`, not a false closure or fabricated agents.
 The board envelope exits with code 0 even if a peer fails: inspect each host's
@@ -910,6 +942,32 @@ Run on the original sender host with access to the saved request state. Without 
 
 The wait stop condition differs from changed-only reporting: response-text growth can set `changed: true` at return without ending the wait early.
 
+Use a bounded wait matching the task instead of repeatedly polling request status
+or the board. Wait expiry/unchanged output is not a reason to resend; inbox work
+remains boundary-driven, not a polling loop.
+
+### `request-cancel`
+
+```bash
+python3 scripts/herdr_agent_messenger.py request-cancel --request-id REQUEST_ID
+```
+
+Cancels your held request before submission without contacting its recipient or
+SSH. It still requires `HERDR_PANE_ID` and verified local Herdr sender identity;
+missing pane returns `sender_unavailable` (exit 1). This is not mailbox withdrawal
+(use `mail withdraw --message UUID`) and adds no CLI push operation.
+
+Compact result fields are `request_id`, `state`, `phase`, `cancelled`, `error_code`.
+- Held `deferred`/`awaiting_decision`: `cancelled:true`, state `submission_failed`,
+  phase/error `delivery_cancelled`, exit 0.
+- Already submitted working/unknown: unchanged state, `cancelled:false`,
+  `already_submitted`, exit 3; never replay.
+- Other terminal or repeated cancellation: `cancelled:false`, `already_terminal`,
+  exit 1.
+- Non-owner: `cancelled:false`, `not_sender`, exit 1.
+- Unknown ID: standard nested `request_not_found` error, exit 1.
+Usage errors exit 2; `--request-id ID` is required (ID returned by request/send).
+
 ### `spawn`
 
 ```bash
@@ -979,10 +1037,12 @@ Focus is not a draft-text detector: a person who leaves a pane containing unsent
 
 ### Compact versus verbose payloads
 
-`--verbose` is available on the legacy prompt-routing commands, not mailbox/ledger/runtime or status subcommands. Compact responses omit bulky identities/routes and optional null/absent fields. Verbose preserves the full public diagnostic result; private fields are never printed. Do not rely on compact output to provide a route token.
+`--verbose` is available on legacy prompt-routing commands, `status board|list` and `inbox read`. Compact responses omit bulky identities/routes and optional null/absent fields; verbose preserves full public diagnostics, never private fields. Do not rely on compact output for routes. All launcher/ledger CLI JSON uses whitespace-free separators and UTF-8 characters (`ensure_ascii=False`), including verbose; parse JSON rather than whitespace/escaped spelling.
 
 | Operation | Compact fields | Additional/full `--verbose` fields |
 | --- | --- | --- |
+| `status board`, `status list` | Brief address/host/workspace/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents` and full host metadata. See Status board output and fields. |
+| `inbox read` | `{messages,...warnings}`; nonnull `message_id`, `thread_id`, `sender` (`origin_host/sender_label`), `kind`, `priority` if provided, `state`, `body`, `reply_to`, `hop`, truncation/omission flags; nonempty `hold_reason`, true `withdraw_requested` | Full original message/delivery fields including hashes, routing, claim/recipient identity and timestamps/nulls. Priority is not synthesized if absent. Python `Mailbox.read()` is unchanged. |
 | `list` | `host`, `agents` with `address`, `status`, `workspace` | Full agent records with the fields listed below. |
 | `status` | `address`, `status`; `stale: true` only if stale | `agent` full record, `route`, `route_refreshed`. |
 | `spawn` | `address`, `marker`, `created`, `pane_id`, optional `tab_id`, `workspace_id`; metadata flags only when false; optional `initial_prompt` operation/submission/acceptance/evidence when requested | `label`, `color`, `host`, `kind`, `cwd`, `route`, `agent`, both metadata flags even on success, plus compact fields. `created` is `pane`, `tab`, or `workspace`. |
@@ -1057,6 +1117,24 @@ Never modify SSH trust settings, bypass host-key verification, or send through a
 ## Client onboarding and installation
 
 Install with **HAM Skill** in Herdr's command palette (or `Ctrl+G` in Agent Messenger). Installer targets are `codex`, `claude`, `omp`, or `all`.
+
+### Installation checklist
+
+For each selected host:
+1. Install/enable the HAM plugin (ledger, mailbox, UI and transport).
+2. Install/update the complete skill bundle (instructions/launcher, not a receiver).
+3. Run read-only no-client `runtime status`.
+4. Explain a missing receiver for a used OMP/Claude client and request consent.
+   OMP supports eligible action wake; Claude receives only at turn boundaries.
+5. Only with consent, run `runtime install <client>` or installer `--runtime`.
+   The interactive default is **Not now**.
+6. Report ownership conflicts; never replace foreign or modified files.
+7. Identify sessions needing restart; restart only those the user selects.
+8. Confirm `extension_present=1` after restart, or report **installed, activation pending**.
+
+Codex has no adapter and pulls with the skill; its missing receiver is not broken.
+Plugin loading never writes client configuration or changes the new-repo `auto`
+default. Installation files alone do not prove active receiving.
 
 From the plugin/source checkout root:
 

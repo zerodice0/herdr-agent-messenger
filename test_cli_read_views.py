@@ -467,6 +467,47 @@ class ReadCliTest(unittest.TestCase):
             self.assertEqual((completed.returncode, error["error"]["code"]), (1, "invalid_cursor"))
         self.assertEqual(self.database_state(self.store), before)
 
+    def test_inbox_compact_and_verbose_keep_reply_context_without_acknowledging(self):
+        parent = self.mail.send(self.sender, self.recipient, body="Review this")
+        reply = self.mail.send(self.recipient, self.sender, body="OK", reply_to=parent["message_id"])
+        before = self.database_state(self.store)
+        for selection in ((), ("--message", reply["message_id"])):
+            with self.subTest(selection=selection):
+                completed, compact = self.cli("inbox", "read", *selection)
+                self.assertEqual(completed.returncode, 0)
+                self.assertNotIn("terminal_id", compact)
+                message = compact["messages"][0]
+                self.assertEqual(
+                    (message["message_id"], message["thread_id"], message["sender"],
+                     message["reply_to"], message["hop"], message["body"], message["state"]),
+                    (reply["message_id"], parent["thread_id"], "alpha/" + self.recipient["alias"],
+                     parent["message_id"], 1, "OK", "queued"))
+                self.assertTrue({"payload_hash", "claimed_generation", "delivered_at"}.isdisjoint(message))
+                completed, verbose = self.cli("inbox", "read", *selection, "--verbose")
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(verbose, self.mail.read(self.sender, message_id=reply["message_id"]))
+                self.assertIn("payload_hash", verbose["messages"][0])
+                self.assertIn("delivered_at", verbose["messages"][0])
+        self.assertEqual(self.database_state(self.store), before)
+
+    def test_status_list_compact_and_verbose_preserve_the_python_api(self):
+        before = self.database_state(self.store)
+        completed, compact = self.cli("status", "list")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual({row["repo_id"] for row in compact["agents"]},
+                         {self.repo_id, self.other["repo_id"]})
+        self.assertTrue(all("agent_id" not in row and "session_ref" not in row
+                            for row in compact["agents"]))
+        expected = ledger_cli.status_operation("list", environment=self.environment)
+        for arguments in (("status", "list", "--verbose"), ("status", "--verbose", "list")):
+            completed, verbose = self.cli(*arguments)
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(verbose, expected)
+        completed, filtered = self.cli("status", "list", "--repo", self.repo_id)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(all("repo_id" not in row for row in filtered["agents"]))
+        self.assertEqual(self.database_state(self.store), before)
+
     def test_board_queries_real_private_peer_and_reports_failure_without_inventing_agents(self):
         failure = self.add_peer_endpoint()
         before = [self.database_state(store) for store in (self.store, self.peer_store)]
@@ -474,16 +515,25 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertEqual({row["host"] for row in board["hosts"]}, {"alpha", "beta"})
         self.assertEqual({row["phase"] for row in board["agents"] if row["host"] == "beta"}, {"remote-review"})
-        local = next(row for row in board["agents"] if row["agent_id"] == self.sender["agent_id"])
-        self.assertEqual((local["summary"], local["status_updated_at"]), ("Read-only summary", 125.0))
-        self.assertTrue({"role", "turn_state", "phase", "summary", "unread", "extension_present", "client",
-                         "workspace_id", "pane_id", "generation", "is_main_checkout", "status_updated_at", "last_seen"} <= local.keys())
+        local = next(row for row in board["agents"] if row["address"] == "alpha/" + self.sender["alias"])
+        self.assertEqual(local["summary"], "Read-only summary")
+        self.assertTrue({"role", "turn_state", "phase", "summary", "unread", "extension_present",
+                         "workspace", "devices", "servers", "stale"} <= local.keys())
+        self.assertTrue({"agent_id", "session_ref", "generation", "status_updated_at", "last_seen"}.isdisjoint(local))
+        self.assertTrue(all("agents" not in row for row in board["hosts"]))
+        completed, verbose = self.cli("status", "board", "--repo", self.repo_id, "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        full = next(row for row in verbose["agents"] if row["agent_id"] == self.sender["agent_id"])
+        self.assertEqual(full["status_updated_at"], 125.0)
+        self.assertEqual(full, next(row for row in verbose["hosts"][0]["agents"]
+                                   if row["agent_id"] == self.sender["agent_id"]))
         failure.write_text("offline")
         completed, failed = self.cli("status", "board", "--repo", self.repo_id)
         self.assertEqual(completed.returncode, 0)
         peer = next(row for row in failed["hosts"] if row["host"] == "beta")
-        self.assertEqual((peer["stale"], peer["unread"], peer["error"]["code"], peer["agents"]),
-                         (True, "?", "transport_unavailable", []))
+        self.assertEqual((peer["stale"], peer["unread"], peer["error"]["code"]),
+                         (True, "?", "transport_unavailable"))
+        self.assertNotIn("agents", peer)
         self.assertTrue(all(row["host"] == "alpha" for row in failed["agents"]))
         self.assertEqual([self.database_state(store) for store in (self.store, self.peer_store)], before)
         self.assertFalse(self.herdr_calls.exists(), "Stored-board reads must not inspect or mutate Herdr")

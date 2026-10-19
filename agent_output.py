@@ -71,6 +71,69 @@ def compact_agent_payload(agent: AgentSummary) -> dict[str, str]:
     }
 
 
+def compact_board_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project stored status for agents without changing TUI or peer records."""
+
+    rows = payload["agents"]
+    multi_repo = len({row.get("repo_id") for row in rows}) > 1
+    agents = []
+    for row in rows:
+        agent = {
+            "address": f"{row['host']}/{row.get('alias') or row['terminal_id']}",
+            "host": row["host"],
+            "workspace": row.get("workspace_label") or row["workspace_id"],
+        }
+        for key in ("turn_state", "status", "role", "unread", "phase", "summary",
+                    "stale", "extension_present", "client"):
+            if key in row:
+                agent[key] = row[key]
+        if multi_repo:
+            agent["repo_id"] = row["repo_id"]
+        for key in ("devices", "servers"):
+            if key in row:
+                agent[key] = len(row[key])
+        agents.append(agent)
+    compact = {key: value for key, value in payload.items() if key not in {"agents", "hosts"}}
+    compact["agents"] = agents
+    if "hosts" in payload:
+        hosts = []
+        for row in payload["hosts"]:
+            host = {key: row[key] for key in ("host", "stale", "error", "unread") if key in row}
+            resources = row.get("resources")
+            if isinstance(resources, Mapping):
+                host["resources"] = {
+                    key: len(resources[key])
+                    for key in ("servers_unowned", "dead_serve", "stale_devices")
+                    if key in resources
+                }
+                if "error" in resources:
+                    host["resources"]["error"] = resources["error"]
+            hosts.append(host)
+        compact["hosts"] = hosts
+    return compact
+
+
+def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep readable mail and safe reply context, not delivery diagnostics."""
+
+    messages = []
+    for row in payload["messages"]:
+        message = {
+            key: row[key]
+            for key in ("message_id", "thread_id", "kind", "priority", "state", "body",
+                        "reply_to", "hop", "truncated", "body_truncated", "body_omitted")
+            if row.get(key) is not None
+        }
+        message["sender"] = f"{row['origin_host']}/{row['sender_label']}"
+        for key in ("hold_reason", "withdraw_requested"):
+            if row.get(key):
+                message[key] = row[key]
+        messages.append(message)
+    return {**{key: value for key, value in payload.items()
+               if key not in {"terminal_id", "messages"} and value is not None},
+            "messages": messages}
+
+
 def _box_rule(line: str) -> bool:
     characters = [character for character in line if not character.isspace()]
     return len(characters) >= 3 and all(
