@@ -1932,6 +1932,8 @@ class MailboxApp:
     def render_detail(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
         x, width = x + 1, width - 1
+        at_latest = (self.detail_latest is not None and
+                     self.scrolls["detail"] == self.detail_latest[1])
         self.detail_available = max(0, height - 1)
         if height <= 0 or width <= 0:
             self.detail_total = 0
@@ -1955,12 +1957,10 @@ class MailboxApp:
         latest = None
         if message_starts:
             latest = (self.detail["messages"][-1]["message_id"], self.clamp_detail(latest_row))
-        # Follow arrivals only at the previous latest header (or its clamped
-        # end-page position). Other same-thread refreshes preserve numeric position.
-        follow_latest = (latest is not None and self.detail_latest is not None and
-                         latest[0] != self.detail_latest[0] and
-                         self.scrolls["detail"] == self.detail_latest[1])
-        if self.detail_anchor_pending or follow_latest:
+        # Keep the latest header anchored through arrivals and reflow. Readers
+        # elsewhere retain their numeric position; diagnostics leave anchors pending.
+        follow_latest = latest is not None and at_latest
+        if not self.diagnostics and (self.detail_anchor_pending or follow_latest):
             self.scrolls["detail"] = latest[1] if latest else 0
         self.scrolls["detail"] = self.clamp_detail(self.scrolls["detail"])
         if not self.diagnostics:

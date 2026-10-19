@@ -1612,6 +1612,33 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.last_error, error)
         self.assertIn(error, '\n'.join(app.detail_lines()))
 
+    def test_narrow_diagnostics_pages_without_consuming_pending_detail_anchor(self):
+        app = self.app()
+        app.remote_errors = {f'host-{index}': f'Connection failure {index}' for index in range(50)}
+        self.capture(app, 24, 60)
+        self.assertEqual(app.layout, 'single')
+        self.assertEqual(app.focus, 'agents')
+        self.assertTrue(app.detail_anchor_pending)
+        app.key('e')
+        snapshot = self.capture(app, 24, 60)
+        y = next(rect[0] for rect, target, value in app.hit_map
+                 if target == 'region' and value == 'detail')
+        self.assertEqual(app.scrolls['detail'], 0)
+        self.assertIn(f'1-{app.detail_available}/{app.detail_total}', snapshot.line(y + 1))
+        app.key(curses.KEY_NPAGE)
+        offset = app.detail_available - 1
+        snapshot = self.capture(app, 24, 60)
+        self.assertEqual(app.scrolls['detail'], offset)
+        self.assertIn(f'{offset + 1}-{offset + app.detail_available}/{app.detail_total}',
+                      snapshot.line(y + 1))
+        self.assertTrue(app.detail_anchor_pending)
+        self.capture(app, 24, 60)
+        self.assertEqual(app.scrolls['detail'], offset)
+        app.key(ESCAPE)
+        self.capture(app, 24, 60)
+        self.assertFalse(app.detail_anchor_pending)
+        self.assertEqual(app.scrolls['detail'], 0)
+
     def test_error_status_uses_error_pair_and_bold_glyph_without_color(self):
         for no_color in (False, True):
             with self.subTest(no_color=no_color):
@@ -2646,6 +2673,54 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertIn('Message 4/4', snapshot.line(y + 2))
                     self.assertIn('NEW-ARRIVAL', snapshot.line(y + 4))
                 self.assertEqual(app.jobs, {})
+
+    def test_thread_reflow_preserves_latest_following_but_not_scrolled_away_readers(self):
+        for initial_width, resized_width in ((110, 160), (160, 110)):
+            for scrolled in (False, True):
+                with self.subTest(initial_width=initial_width, resized_width=resized_width,
+                                  scrolled=scrolled):
+                    app = self.app()
+                    thread = self.thread_fixture('reflow-latest', 'queued', 'queued')
+                    thread['messages'][0]['body'] = 'Earlier paragraph wraps differently. ' * 40
+                    thread['messages'][1]['body'] = '\n'.join(
+                        f'LATEST line {index}' for index in range(8))
+                    app.local['threads'] = [thread]
+                    app.focus, app.preview = 'detail', 'threads'
+                    app.tick()
+                    app.jobs['snapshot'].result = json.loads(json.dumps(app.local))
+                    app.tick()
+                    snapshot = self.capture(app, 35, initial_width)
+                    y = next(rect[0] for rect, target, value in app.hit_map
+                             if target == 'region' and value == 'detail')
+                    self.assertIn('Message 2/2', snapshot.line(y + 2))
+                    previous_latest = app.detail_latest
+                    if scrolled:
+                        app.key(curses.KEY_HOME)
+                        app.key(curses.KEY_DOWN)
+                    offset = app.scrolls['detail']
+                    snapshot = self.capture(app, 35, resized_width)
+                    self.assertEqual(app.detail_latest[0], previous_latest[0])
+                    self.assertNotEqual(app.detail_latest[1], previous_latest[1])
+                    if scrolled:
+                        self.assertEqual(app.scrolls['detail'], offset)
+                    else:
+                        self.assertIn('Message 2/2', snapshot.line(y + 2))
+                        self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
+                    updated = json.loads(json.dumps(app.local))
+                    updated['threads'][0]['messages'].append(
+                        {**thread['messages'][-1], 'message_id': 'reflow-new-arrival',
+                         'body': '\n'.join(f'ARRIVAL line {index}' for index in range(8))})
+                    app.start_job('snapshot', 'snapshot')
+                    app.jobs['snapshot'].result = updated
+                    app.tick()
+                    snapshot = self.capture(app, 35, resized_width)
+                    if scrolled:
+                        self.assertEqual(app.scrolls['detail'], offset)
+                        self.assertNotIn('Message 3/3', snapshot.line(y + 2))
+                    else:
+                        self.assertIn('Message 3/3', snapshot.line(y + 2))
+                        self.assertIn('ARRIVAL line 0', snapshot.line(y + 4))
+                    self.assertEqual(app.jobs, {})
 
     def test_short_latest_message_uses_clamped_last_page(self):
         app = self.app()
