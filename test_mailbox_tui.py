@@ -1467,15 +1467,69 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn('choose a repository', app.status)
         self.assertNotIn('mutation', app.jobs)
 
-    def test_settings_missing_opener_disables_edits_without_using_selected_workspace(self):
+    def test_unknown_workspace_disables_only_main_and_members(self):
         app = self.app()
         app.environment.pop(OPENER_TERMINAL)
         app.environment[OPENER_PANE] = 'missing:pane'
+        app.local = local_snapshot(self.store, self.repo_id, app.environment)
+        self.assertIsNone(app.local['scope']['workspace_id'])
+        self.assertEqual(app.local['settings'], RepoSettings(self.store).show(self.repo_id))
         app.key('s')
+        for field in ('main', 'members'):
+            self.assertFalse(app.settings_ready(field))
+            self.assertIn('opener workspace is unavailable', app.status)
+        for field in ('mode', 'idle_minutes', 'coalesce_seconds', 'wakes_per_hour', 'max_hop'):
+            self.assertTrue(app.settings_ready(field))
         app.key('\r')
-        self.assertIn('opener workspace is unavailable', app.status)
+        self.assertIsNotNone(app.settings_picker)
         self.assertNotIn('mutation', app.jobs)
-        self.assertIsNone(app.settings_picker)
+
+    def test_repo_settings_jobs_need_only_repo_id_without_workspace(self):
+        environment = {**self.environment, OPENER_TERMINAL: 'unknown', OPENER_PANE: 'missing:pane'}
+        thresholds = {'idle_minutes': 12, 'coalesce_seconds': 300, 'wakes_per_hour': 5, 'max_hop': 6}
+        with patch('ledger_display.LedgerDisplay.refresh', return_value={'updated': [], 'failed': []}), \
+             patch('mailbox_tui.maintain', side_effect=lambda store, result, environment: result):
+            for field, value in (('mode', 'manual'), ('thresholds', thresholds)):
+                result = execute_job({'operation': 'setting', 'repo_id': self.repo_id,
+                                      'field': field, 'value': value}, environment)
+                self.assertIsNone(result['workspace_id'])
+                self.assertEqual(result['settings'][field]['value'], value)
+            for field, value in (('main', None), ('members', [])):
+                with self.assertRaises(LedgerError) as failure:
+                    execute_job({'operation': 'setting', 'repo_id': self.repo_id,
+                                 'field': field, 'value': value}, environment)
+                self.assertEqual(failure.exception.code, 'invalid_settings_scope')
+
+    def test_live_pane_scope_fallback_is_cached_across_settings_frames(self):
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                environment = {**self.environment, OPENER_TERMINAL: 'fresh-shell',
+                               OPENER_PANE: 'w9:p1', 'HERDR_PANE_ID': 'w9:p2'}
+                panes = [{'pane_id': 'w9:p2', 'terminal_id': 'mailbox', 'workspace_id': 'w9'}]
+                if not closed:
+                    panes.insert(0, {'pane_id': 'w9:p1', 'terminal_id': 'fresh-shell', 'workspace_id': 'w8'})
+                workspace = 'w9' if closed else 'w8'
+                with patch('mailbox_tui.herdr', return_value={'snapshot': {'panes': panes}}) as transport:
+                    app = MailboxApp(Screen(), environment, job_factory=PendingJob, clock=lambda: self.now)
+                    app.local = local_snapshot(self.store, self.repo_id, environment)
+                    transport.assert_called_once_with(['api', 'snapshot'], environment)
+                    self.assertEqual(app.local['scope']['workspace_id'], workspace)
+                    self.assertEqual(app.local['settings']['workspace_id'], workspace)
+                    for width in (80, 160, 80):
+                        self.capture(app, 32, width)
+                        app.key('s')
+                        self.capture(app, 32, width)
+                        self.assertIn('workspace ' + workspace, '\n'.join(app.settings_lines()))
+                        self.assertTrue(app.settings_ready('main'))
+                        app.key(ESCAPE)
+                    transport.assert_called_once()
+                    with patch('ledger_display.LedgerDisplay.refresh', return_value={'updated': [], 'failed': []}), \
+                         patch('mailbox_tui.maintain', side_effect=lambda store, result, environment: result):
+                        result = execute_job({'operation': 'setting', 'repo_id': self.repo_id,
+                                              'field': 'main', 'value': None,
+                                              'scope': app.current_settings_scope()}, environment)
+                    self.assertEqual(result['workspace_id'], workspace)
+                    self.assertEqual(transport.call_count, 2)
 
     def test_settings_members_picker_excludes_known_moved_and_foreign_targets(self):
         app = self.app()

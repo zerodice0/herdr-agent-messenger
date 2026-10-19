@@ -54,11 +54,23 @@ workspace-scoped roles there.
 `--to main` now resolves on the sender's host when sending and saves a concrete
 terminal target for the sender's current workspace main. If there is no main,
 it fails visibly instead of waiting for a repo home or choosing another
-workspace. Retained unresolved symbolic messages use their recorded sender's
-local scope where available, or fail visibly with `main_unresolved`.
+workspace. Legacy unresolved symbolic messages, including remote-origin sends
+and home relays, fail with `legacy_symbolic_main` and an instruction to upgrade
+every host. Upgrade every host before using `--to main` across hosts.
 Mailbox Settings labels repo-wide Mode/Thresholds separately from the
 opener's workspace Main/Members. Update copied skills along with the host
 code so agents use this routing and role contract.
+
+Deploy schema v7 on **every host**, in this order:
+
+1. Update the HAM code and copied skills on every host; replace old Mailbox
+   panes and restart receiving runtimes/workers with the upgraded code.
+2. On **every host**, run the upgraded skill's command:
+   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`
+   from the HAM checkout. This explicit writable step upgrades that host's
+   ledger before read-only status or peer exports are used.
+3. Only after every host is upgraded and reconciled, resume cross-host
+   `--to main` use. Explicit `HOST/LABEL` addressing is unchanged.
 
 ## Migrate from 0.7.x
 

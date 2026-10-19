@@ -310,8 +310,12 @@ discards unsaved inline changes.
 Mode and Thresholds are repository-wide. Main and Members show the Mailbox
 opener's workspace (`Main (workspace …)` / `Members (workspace …)`), resolved
 from `HERDR_HAM_OPENER_PANE_ID`, on the canonical local host. Their scope is
-`(repo_id, host, workspace_id)`, not the selected agent's workspace. The
-all-repositories view keeps its existing repository selection; without one
+`(repo_id, host, workspace_id)`, not the selected agent's workspace.
+The refresh reuses its live Herdr pane snapshot if the opener is not yet in the
+ledger, falling back to the Mailbox's own workspace if the opener has closed.
+If no workspace is available, only Main/Members are disabled; Mode and Thresholds
+still load and save for the selected repository.
+The all-repositories view keeps its existing repository selection; without one
 repository, settings stays disabled with an explanation. Workspace role
 settings stay host-local and are not replicated.
 
@@ -332,7 +336,8 @@ settings stay host-local and are not replicated.
   digits-only input instead. `Esc` cancels an open picker, checklist, or numeric input.
 
 The mouse wheel scrolls picker/checklist entries or overlay metadata.
-The overlay shows `Target: host/alias` for the selected Agents row:
+The overlay shows `Target: repository REPO_ID · workspace WORKSPACE_ID @ HOST`
+for the settings scope, not the selected agent. For the selected Agents row,
 `m` sets that agent as main; `Space` toggles its manual membership, only for
 active targets in the opener's settings scope. These two shortcuts still
 require confirmation, with Cancel selected by default.

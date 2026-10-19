@@ -303,6 +303,10 @@ Mode와 Thresholds는 저장소 전체에 적용합니다. Main·Members에는
 따라 바뀌지 않습니다. 모든 저장소 보기에서도 기존 저장소 선택 방식을 유지하며,
 저장소를 하나로 정할 수 없으면 설명과 함께 설정을 비활성화합니다.
 workspace 역할 설정은 해당 호스트에만 저장하며 복제하지 않습니다.
+시작 pane이 아직 원장에 없으면 새로고침에서 가져온 Herdr pane 스냅샷으로
+workspace를 찾습니다. 시작 pane이 닫혔다면 Mailbox 자체의 workspace를 사용합니다.
+workspace를 찾을 수 없어도 Main·Members만 비활성화하며, 선택한 저장소의
+Mode·Thresholds는 계속 조회하고 저장할 수 있습니다.
 
 - **Mode (repo-wide):** `Enter`로 각 선택지의 의미가 표시된 **PICK** 목록을 엽니다.
   `↑`·`↓`로 고른 뒤 `Enter`를 누르거나 항목을 클릭하면 바로 저장합니다.
@@ -322,8 +326,9 @@ workspace 역할 설정은 해당 호스트에만 저장하며 복제하지 않�
   누르면 해당 편집을 취소합니다.
 
 마우스 휠로 목록이나 설정 메타데이터를 스크롤합니다.
-선택한 Agents 행은 `Target: host/alias`로 표시됩니다. 대상이 활성 상태이며
-Mailbox 시작 pane의 설정 범위 안에 있을 때만 `m`으로 main을 지정하고
+설정 범위는 `Target: repository REPO_ID · workspace WORKSPACE_ID @ HOST`로
+표시하며 선택한 에이전트의 범위와 구분합니다. 선택한 Agents 행의 대상이
+활성 상태이며 Mailbox 시작 pane의 설정 범위 안에 있을 때만 `m`으로 main을 지정하고
 `Space`로 수동 구성원에 넣거나 뺄 수 있습니다. 이 두 단축키는 기본 선택이
 Cancel인 확인창을 그대로 거칩니다. Home, computed main, 버전·origin, 전파
 대기와 충돌 정보는 읽기 전용이며 저장소 단위 설정만 전파합니다. 요청·snapshot·저장

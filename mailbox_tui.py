@@ -208,7 +208,8 @@ def close_owned(environment: Mapping[str, str]) -> bool:
 
 
 def settings_scope(store: LedgerStore, repo_id: str | None,
-                   environment: Mapping[str, str]) -> dict[str, Any]:
+                   environment: Mapping[str, str], panes: Sequence[Mapping[str, Any]] = (),
+                   *, live: bool = False) -> dict[str, Any]:
     """Resolve the opener's current host-local workspace, never the selected agent's."""
     pane_id = environment.get(OPENER_PANE)
     terminal_id = environment.get(OPENER_TERMINAL)
@@ -223,6 +224,24 @@ def settings_scope(store: LedgerStore, repo_id: str | None,
                 if row is not None:
                     workspace_id = row["workspace_id"]
                     break
+    if not workspace_id:
+        if live:
+            try:
+                result = herdr(["api", "snapshot"], environment)
+                panes = result.get("snapshot", result).get("panes", [])
+            except LedgerError:
+                panes = ()
+        # Reuse the refresh's live panes. A shell need not be in the ledger,
+        # and the Mailbox itself remains in the opener's workspace if it closes.
+        opener = next((pane for pane in panes if
+                       (pane.get("terminal_id") == terminal_id if terminal_id else
+                        pane.get("pane_id") == pane_id)), None) if terminal_id or pane_id else None
+        mailbox = next((pane for pane in panes
+                        if pane.get("pane_id") == environment.get("HERDR_PANE_ID")), None)
+        for pane in (opener, mailbox):
+            if pane and pane.get("workspace_id"):
+                workspace_id = pane["workspace_id"]
+                break
     return {"repo_id": repo_id, "host": store.host, "workspace_id": workspace_id}
 
 
@@ -231,6 +250,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
     settings = RepoSettings(store)
     board = status_board(store, repo_id=repo_id, host="local", environment=environment)
     agents = board["agents"]
+    panes = []
     if environment is not None:
         try:
             result = herdr(["api", "snapshot"], environment)
@@ -245,12 +265,14 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
     mail = Mailbox(store)
     snapshot = {"host": store.host, "agents": agents, "threads": mail.list_threads(repo_id)["threads"],
                 "submissions": mail.list_direct(repo_id)["submissions"],
-                "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ),
+                "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ, panes),
+                "panes": panes,
                 "settings": None,
                 "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
     scope = snapshot["scope"]
-    if repo_id and scope["workspace_id"]:
-        snapshot["settings"] = settings.show(repo_id, scope["host"], scope["workspace_id"])
+    if repo_id:
+        snapshot["settings"] = (settings.show(repo_id, scope["host"], scope["workspace_id"])
+                                if scope["workspace_id"] else settings.show(repo_id))
     host = next((item for item in board.get("hosts", []) if item["host"] == store.host), {})
     if "resources" in host:
         snapshot["resources"] = host["resources"]
@@ -337,13 +359,17 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
         return dispatch_direct(store, request["recipient"], request["body"], environment,
                                subject=request.get("subject") or "")
     if operation == "setting":
-        scope = settings_scope(store, repo_id, environment)
-        if not repo_id or not scope["workspace_id"] or request.get("scope") != scope:
+        if not repo_id:
+            raise LedgerError("invalid_settings_scope", "Select a repository before saving Settings.")
+        scope = settings_scope(store, repo_id, environment, live=True)
+        scoped = request["field"] in {"main", "members"}
+        if scoped and (not scope["workspace_id"] or request.get("scope") != scope):
             raise LedgerError("invalid_settings_scope",
                               "Settings scope changed or the opener workspace is unavailable; reload Settings.")
         settings = RepoSettings(store)
         result = settings.mutate(repo_id, request["field"], request["value"],
-                                 host=scope["host"], workspace_id=scope["workspace_id"])
+                                 host=scope["host"] if scope["workspace_id"] else None,
+                                 workspace_id=scope["workspace_id"])
         from ledger_display import LedgerDisplay
         result["display"] = LedgerDisplay(store).refresh()
         return maintain(store, result, environment)
@@ -982,7 +1008,7 @@ class MailboxApp:
                 self.set_status("Select a pending or failed outbox item to retry.", "error")
 
     def current_settings_scope(self) -> dict[str, Any]:
-        scope = settings_scope(self.store, self.repo_id, self.environment)
+        scope = settings_scope(self.store, self.repo_id, self.environment, self.local.get("panes", ()))
         if scope != self.settings_context:
             self.settings_context = scope
             self.settings_pending.clear()
@@ -992,8 +1018,12 @@ class MailboxApp:
         return scope
 
     def matches_settings_scope(self, settings: Mapping[str, Any] | None) -> bool:
-        return bool(settings) and all(settings.get(key) == value
-                                      for key, value in self.current_settings_scope().items())
+        scope = self.current_settings_scope()
+        if not scope["workspace_id"]:
+            return (bool(settings) and settings.get("repo_id") == scope["repo_id"]
+                    and settings.get("workspace_id") is None
+                    and settings.get("host") in {None, scope["host"]})
+        return bool(settings) and all(settings.get(key) == value for key, value in scope.items())
 
     def settings_agent_in_scope(self, agent: Mapping[str, Any]) -> bool:
         scope = self.current_settings_scope()
@@ -1033,7 +1063,7 @@ class MailboxApp:
     def settings_ready(self, field: str) -> bool:
         if not self.repo_id:
             message = "Select an agent to choose a repository first."
-        elif not self.current_settings_scope()["workspace_id"]:
+        elif field in {"main", "members"} and not self.current_settings_scope()["workspace_id"]:
             message = "The opener workspace is unavailable. Reopen Mailbox from a live workspace pane."
         elif not self.matches_settings_scope(self.local.get("settings")):
             message = "Loading settings…"

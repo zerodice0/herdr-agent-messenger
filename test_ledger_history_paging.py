@@ -162,7 +162,7 @@ class LedgerHistoryPagingTest(unittest.TestCase):
         self.assertEqual(result["state"], "pending")
         # No member selection is involved in reading repository history.
         with self.store.read() as connection:
-            self.assertEqual(connection.execute("SELECT count(*) FROM repo_members").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM workspace_settings").fetchone()[0], 0)
         page = self.mail.list_threads(self.repo_id)
         self.assertEqual([row["thread_id"] for row in page["threads"]], [sent, received, pending])
         self.assertEqual(page["threads"][-1]["messages"][0]["state"], "pending")

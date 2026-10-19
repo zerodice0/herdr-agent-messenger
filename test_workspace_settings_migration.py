@@ -32,6 +32,17 @@ class WorkspaceSettingsMigrationTest(unittest.TestCase):
             with reopened.read() as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM workspace_settings").fetchone()[0], 0)
 
+    def test_readonly_newer_schema_requires_matching_version_not_reconcile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LedgerStore(Path(directory) / "ledger", canonical_name="alpha")
+            with store.transaction() as connection:
+                connection.execute("UPDATE ledger_meta SET value=? WHERE key='schema_version'",
+                                   (str(SCHEMA_VERSION + 1),))
+            with self.assertRaises(LedgerError) as failure:
+                LedgerStore.open_readonly({"HERDR_AGENT_LEDGER_DIR": str(store.directory)})
+            self.assertEqual(failure.exception.code, "unsupported_schema")
+            self.assertNotIn("reconcile", failure.exception.message)
+
     def test_v6_roles_group_local_active_targets_and_retire_legacy_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

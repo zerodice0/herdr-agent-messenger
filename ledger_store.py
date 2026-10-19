@@ -294,9 +294,12 @@ class LedgerStore:
             store.host = metadata["self_canonical_name"]
             store.host_uuid = metadata["self_uuid"]
             store._history_cursor_key = bytes.fromhex(metadata["history_cursor_key"])
-            if metadata.get("schema_version") != str(SCHEMA_VERSION):
-                raise LedgerError("schema_upgrade_required",
-                                  "HAM ledger schema upgrade required; run ledger reconcile on this host before read-only commands.")
+            version = metadata.get("schema_version", "")
+            if version != str(SCHEMA_VERSION):
+                if version.isdecimal() and int(version) < SCHEMA_VERSION:
+                    raise LedgerError("schema_upgrade_required",
+                                      "HAM ledger schema upgrade required; run ledger reconcile on this host before read-only commands.")
+                raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
         except (sqlite3.Error, KeyError) as error:
             raise LedgerError("ledger_not_initialized", "No initialized HAM ledger is available to read.") from error
         return store

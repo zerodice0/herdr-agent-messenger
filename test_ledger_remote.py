@@ -547,33 +547,30 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(self.services['alpha'].resolve_recipient('main', other)['terminal_id'],
                          other['terminal_id'])
 
-    def test_legacy_local_symbolic_resolves_recorded_sender_scope_and_replay_stays_fixed(self):
-        settings = self.settings_for('alpha')
-        settings.mutate(self.repo_id, 'mode', 'auto')
-        value = self.legacy_message()
-        with self.stores['alpha'].transaction() as connection:
-            first = self.services['alpha'].submit(connection, value)
-        self.assertEqual(first['recipient_terminal_id'], 'term-alpha')
-        self.assertEqual(first['state'], 'queued')
-        other = self.add_agent('alpha', 'new-w1-main', 'w1')
-        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': other['terminal_id']},
-                        host='alpha', workspace_id='w1')
-        with self.stores['alpha'].transaction() as connection:
-            replay = self.services['alpha'].submit(connection, value)
-        self.assertEqual(replay['recipient_terminal_id'], 'term-alpha')
-        self.assertEqual(replay['payload_hash'], first['payload_hash'])
-        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 1)
+    def test_legacy_symbolic_submit_requires_upgrading_every_host(self):
+        for host in ('alpha', 'beta'):
+            with self.subTest(host=host):
+                with self.assertRaises(LedgerError) as failure:
+                    with self.stores[host].transaction() as connection:
+                        self.services[host].submit(connection, self.legacy_message(host))
+                self.assertEqual(failure.exception.code, 'legacy_symbolic_main')
+                self.assertIn('upgrade every host', failure.exception.message)
+                self.assertEqual(self.stores[host].doctor()['counts']['messages'], 0)
 
-    def test_legacy_symbolic_without_main_reports_recorded_workspace(self):
-        self.settings_for('alpha').mutate(self.repo_id, 'mode', 'manual')
-        with self.assertRaises(LedgerError) as failure:
-            with self.stores['alpha'].transaction() as connection:
-                self.services['alpha'].submit(connection, self.legacy_message())
-        self.assertEqual(failure.exception.code, 'main_unresolved')
-        self.assertIn('w1', failure.exception.message)
-        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 0)
+    def test_legacy_remote_origin_and_home_relay_share_explicit_upgrade_error(self):
+        value = self.legacy_message('beta')
+        for terminal in (None, 'term-beta'):
+            for source in ('alpha', 'gamma'):
+                with self.subTest(terminal=terminal, source=source):
+                    payload = {'message': value, 'resolved': {
+                        'recipient_host': 'beta', 'recipient_terminal_id': terminal,
+                        'recipient_address': 'main'}}
+                    result = self.wire('beta', 'accept', self.services[source].envelope(payload), expected=1)
+                    self.assertEqual(result['error']['code'], 'legacy_symbolic_main')
+                    self.assertIn('upgrade every host', result['error']['message'])
+        self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
 
-    def test_stored_legacy_home_route_fails_visibly_without_sender_scope(self):
+    def test_stored_legacy_home_route_fails_visibly_with_upgrade_error(self):
         self.settings_for('beta').mutate(self.repo_id, 'mode', 'auto')
         self.drain()
         value = self.legacy_message('beta')
@@ -588,8 +585,8 @@ class RemoteLedgerTest(unittest.TestCase):
                       if item['message_id'] == value['message_id'])
         self.assertEqual(failed['state'], 'failed')
         error = json.loads(failed['last_error'])
-        self.assertEqual(error['code'], 'main_unresolved')
-        self.assertIn('workspace', error['message'])
+        self.assertEqual(error['code'], 'legacy_symbolic_main')
+        self.assertIn('upgrade every host', error['message'])
         self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
 
     def test_concrete_main_wire_cannot_change_target_or_use_home_relay(self):

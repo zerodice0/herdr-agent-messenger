@@ -283,24 +283,10 @@ class RemoteLedger:
             if old[0] != digest:
                 raise LedgerError("message_conflict", "This UUID already identifies a different immutable message.")
             return public_receipt(receipt(connection, value["message_id"]))
+        if value["recipient_terminal_id"] is None and value["recipient_address"] == "main":
+            raise LedgerError("legacy_symbolic_main",
+                              "Legacy symbolic --to main is unsupported; upgrade every host before using --to main across hosts.")
         target = dict(resolved or {key: value[key] for key in ("recipient_host", "recipient_terminal_id", "recipient_address")})
-        if target["recipient_terminal_id"] is None and target["recipient_address"] == "main":
-            # Protocol-1 ledgers may retain symbolic messages from before
-            # send-time resolution. Only the sender's recorded scope is safe:
-            # the former repo home is not a workspace-routing authority.
-            sender = connection.execute(
-                "SELECT * FROM agents WHERE agent_id=? AND host=? AND repo_id=?",
-                (value["sender"], value["origin_host"], value["repo_id"])).fetchone()
-            selected = (RepoSettings(self.store).main(
-                connection, value["repo_id"], sender["host"], sender["workspace_id"])
-                if sender is not None else None)
-            if selected is None:
-                workspace = sender["workspace_id"] if sender is not None else "(unknown sender workspace)"
-                raise LedgerError(
-                    "main_unresolved",
-                    f"Legacy main message cannot resolve workspace {workspace} on {value['origin_host']}.")
-            target = {"recipient_host": selected["host"], "recipient_terminal_id": selected["terminal_id"],
-                      "recipient_address": "main"}
         forward = target["recipient_host"] if target["recipient_host"] != self.store.host else None
         if forward:
             self.peer(forward)
@@ -313,6 +299,9 @@ class RemoteLedger:
         if set(payload) != {"message", "resolved"} or not isinstance(payload["message"], dict):
             raise LedgerError("invalid_message", "Accept requires immutable message and a routing resolution.")
         value = validate_payload(payload["message"])
+        if value["recipient_terminal_id"] is None and value["recipient_address"] == "main":
+            raise LedgerError("legacy_symbolic_main",
+                              "Legacy symbolic --to main is unsupported; upgrade every host before using --to main across hosts.")
         resolved = payload["resolved"]
         if not isinstance(resolved, dict) or set(resolved) != {"recipient_host", "recipient_terminal_id", "recipient_address"}:
             raise LedgerError("invalid_recipient", "Invalid routing resolution.")

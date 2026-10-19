@@ -54,11 +54,24 @@ workspace별 역할을 적용할 수 있습니다.
 
 `--to main`은 보낼 때 송신 호스트에서 송신자의 현재 workspace main을 찾아
 구체적인 terminal 대상을 저장합니다. main이 없으면 저장소 home을 기다리거나
-다른 workspace를 선택하지 않고 명확한 오류로 실패합니다. 기존의 미해석 심볼릭
-메시지는 기록된 송신자의 로컬 범위를 찾을 수 있으면 그 범위를 사용하며,
-그렇지 않으면 `main_unresolved`로 실패합니다. Mailbox Settings는 저장소 전체의
-Mode·Thresholds와 시작 pane의 workspace Main·Members를 구분해 표시합니다.
-호스트 코드를 갱신할 때 복사한 스킬도 갱신해 새 주소 해석·역할 규칙을 적용하세요.
+다른 workspace를 선택하지 않고 명확한 오류로 실패합니다. 원격 송신 메시지와
+home 경유 메시지를 포함한 이전 버전의 미해석 심볼릭 메시지는
+`legacy_symbolic_main` 오류로 거부하며 모든 호스트를 업그레이드하라고 안내합니다.
+호스트 간에 `--to main`을 사용하기 전에 모든 호스트를 업그레이드해야 합니다.
+Mailbox Settings는 저장소 전체의 Mode·Thresholds와 시작 pane의 workspace
+Main·Members를 구분해 표시합니다. 호스트 코드를 갱신할 때 복사한 스킬도
+갱신해 새 주소 해석·역할 규칙을 적용하세요.
+
+스키마 v7은 **모든 호스트**에 다음 순서로 배포합니다.
+
+1. 모든 호스트의 HAM 코드와 복사한 스킬을 갱신합니다. 이전 Mailbox pane을
+   새로 열고 수신 런타임과 worker를 업그레이드한 코드로 다시 시작합니다.
+2. **모든 호스트**의 HAM 체크아웃에서 업그레이드한 스킬의 명령을 실행합니다.
+   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`
+   이 쓰기 단계를 명시적으로 수행해 읽기 전용 상태 조회나 peer 내보내기 전에
+   해당 호스트의 원장을 업그레이드합니다.
+3. 모든 호스트의 업그레이드와 reconcile이 끝난 뒤에만 호스트 간 `--to main`
+   사용을 재개합니다. 주소를 명시하는 `HOST/LABEL` 방식은 바뀌지 않습니다.
 
 ## 0.7.x에서 마이그레이션
 

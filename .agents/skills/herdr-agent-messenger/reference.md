@@ -240,9 +240,9 @@ label. Success is one JSON object with `protocol:1`; errors retain
 
 | Command | `payload` / result |
 | --- | --- |
-| `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. New sends always carry a concrete terminal target matching the immutable target, including sends addressed to `main`. Persisted legacy symbolic messages use sender-scope compatibility handling or fail visibly; they never select another workspace's main. |
+| `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. New sends always carry a concrete terminal target matching the immutable target, including sends addressed to `main`. Legacy symbolic sends and relays fail with `legacy_symbolic_main`; upgrade every host before using `--to main` across hosts. |
 | `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
-| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target → withdrawn/current receipt. Retained legacy relay routes may include `relay_home`. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
+| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance only when sent by the message origin. |
 | `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` → `{applied,...repo_settings}` for repo-wide `home`, `mode`, `thresholds`. Protocol-1 legacy `main`, `members`, `computed_main` payloads (including an old conditional `expected_main`) succeed as no-ops. Workspace settings never use this endpoint for replication. |
 | `status-export --wire` | Optional `{repo_id,refresh,resources}` → `{host:{canonical_name,uuid},agents:[...],resources?:{...}}` with roles and optional resource fields. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation. Only `resources:true` opts into server discovery and adds agent `servers` plus host `resources`; `status board` sends both flags. Missing/false `resources` avoids scans for send/policy/recipient lookup and leaves those fields unknown. Plain `status-export [--repo ID]` remains a fresh local export without server discovery. Remote rows are never inserted into local AGENTS. |
 
@@ -282,10 +282,10 @@ current scope and stores the concrete terminal target in the immutable message.
 Missing main produces `main_unresolved` naming the workspace; there is no
 fallback to a repo-global main, another workspace, or an offline home route.
 Receipts and withdrawals follow the saved target. Explicit named mail still
-crosses workspaces within a repository. An already-stored unresolved symbolic
-message uses its recorded sender agent ID, origin host and repo to find the
-sender's local workspace. If that scope cannot be found or has no main, it fails
-visibly with `main_unresolved`, never by silently routing to another scope.
+crosses workspaces within a repository. Legacy unresolved symbolic messages,
+including remote-origin sends and home relays, fail with `legacy_symbolic_main`
+and an instruction to upgrade every host. Upgrade and run `ledger reconcile`
+on every host before using `--to main` across hosts.
 
 Schema v7 creates local workspace settings. During v6→v7 migration, legacy
 repo-level main/member targets matching active local agents are mapped to each
@@ -519,10 +519,14 @@ Mailbox opener's workspace on its canonical host, resolved from
 scope is the full `(repo_id,host,workspace_id)`. All-repositories view retains
 repository selection; without one repo, settings is disabled with an
 explanation. The Main picker includes only active in-scope agents and `(none)`.
+Refreshes reuse the live Herdr snapshot to resolve a fresh shell opener or,
+if it has closed, the Mailbox's own workspace. If neither workspace is known,
+only Main/Members are unavailable; repository Mode/Thresholds remain editable.
 
 ↑/↓ selects a row and Enter edits its value; all mutations require confirmation.
-The overlay's `Target: host/alias` is the selected Agents row: `m` designates it
-main and Space toggles manual membership, only if the active target belongs to
+The overlay shows `Target: repository REPO_ID · workspace WORKSPACE_ID @ HOST`.
+For the selected Agents row, `m` designates it main and Space toggles manual
+membership, only if the active target belongs to
 the opener's full settings scope. The service rejects inactive/out-of-scope
 targets. Esc closes Settings. The four threshold rows edit one repo-wide
 versioned `thresholds` field, preserving its other values. Home, computed main,
