@@ -163,8 +163,8 @@ class MailboxUiTest(unittest.TestCase):
         }
         return app
 
-    def test_resource_presence_captures_at_40_and_160_columns(self):
-        for width in (40, 160):
+    def test_resource_presence_captures_at_40_and_200_columns(self):
+        for width in (40, 200):
             with self.subTest(width=width):
                 app = self.resource_app()
                 before = json.dumps(app.local, sort_keys=True)
@@ -258,7 +258,7 @@ class MailboxUiTest(unittest.TestCase):
                 labels, values = header.split('│'), row.split('│')
                 for label, expected in (('PHN', '1'), ('EMU', '1'), ('SRV', '2')):
                     self.assertEqual(values[next(index for index, cell in enumerate(labels)
-                                                 if cell.strip() == label)], '  ' + expected)
+                                                 if cell.strip() == label)], '  ' + expected + '  ')
                 for emoji in ('📱', '🤖', '🌐'):
                     self.assertNotIn(emoji, '\n'.join(snapshot.lines()))
                 self.assertEqual(app.screen.out_of_bounds, [])
@@ -274,7 +274,7 @@ class MailboxUiTest(unittest.TestCase):
         app.screen = Screen(10, 160)
         app.render_agents((0, 0, 10, 160))
         text = '\n'.join(app.screen.snapshot().lines())
-        self.assertIn('  ?│  ?│  ?', text)
+        self.assertIn('  ?  │  ?  │  ?  ', text)
         self.assertIn('old-peer · 1 agent · dead ? · unowned ? · stale-dev ?', text)
         app.detail = next(agent for agent in app.agents() if agent['host'] == 'old-peer')
         self.assertIn('Devices: ?', app.detail_lines())
@@ -1703,7 +1703,7 @@ class MailboxUiTest(unittest.TestCase):
                     label_column = snapshot.line(row).index('[failed:')
                     for cell in snapshot.cells[row][label_column:boundaries[-3]]:
                         if color:
-                            self.assertEqual(cell.attribute & curses.A_COLOR, 9 << 8)
+                            self.assertEqual(cell.attribute & curses.A_COLOR, 5 << 8)
                             self.assertFalse(cell.attribute & curses.A_REVERSE)
                         else:
                             self.assertTrue(cell.attribute & curses.A_REVERSE)
@@ -1959,8 +1959,9 @@ class MailboxUiTest(unittest.TestCase):
             return display_width(line[:line.index(needle)])
         for row in rows:
             self.assertEqual(cell_column(row, 'working'), cell_column(header, 'TURN'))
-            self.assertEqual(cell_column(row, '12') + 2, cell_column(header, 'MAIL') + 4)
-            self.assertEqual(cell_column(row, '✓'), cell_column(header, 'RX'))
+            self.assertEqual(cell_column(row, '12') + 1, cell_column(header, 'MAIL') + 2)
+            self.assertLessEqual(abs(cell_column(row, '✓') + .5 -
+                                     (cell_column(header, 'RX') + 1)), .5)
         self.assertEqual(cell_column(rows[0], '한글별칭'), cell_column(header, 'ALIAS'))
         chosen_row = snapshot.rows_containing('한글별칭')[0]
         self.assertTrue(all(cell.attribute & curses.A_REVERSE
@@ -1976,8 +1977,8 @@ class MailboxUiTest(unittest.TestCase):
             {**base, 'terminal_id': f'term-{index}', 'alias': alias,
              'role': '', 'phase': '', 'summary': '', **fields}
             for index, (alias, fields) in enumerate(zip(aliases, metadata))]
-        app.screen = Screen(20, 79)
-        app.render_agents((0, 0, 20, 79))
+        app.screen = Screen(20, 100)
+        app.render_agents((0, 0, 20, 100))
         snapshot = app.screen.snapshot()
         rows = [snapshot.rows_containing(alias)[0] for alias in aliases]
         self.assertEqual(rows, list(range(rows[0], rows[0] + len(aliases))))
@@ -1986,14 +1987,14 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn('ready', snapshot.line(rows[4]))
         self.assertNotIn('— ·', '\n'.join(snapshot.lines()))
         app.selections['agents'] = 3
-        app.screen = Screen(6, 79)
-        app.render_agents((0, 0, 6, 79))
+        app.screen = Screen(6, 100)
+        app.render_agents((0, 0, 6, 100))
         snapshot = app.screen.snapshot()
         self.assertEqual(snapshot.rows_containing('delta'), [5])
         self.assertNotIn('echo', '\n'.join(snapshot.lines()))
         app.key(curses.KEY_DOWN)
         app.screen.erase()
-        app.render_agents((0, 0, 6, 79))
+        app.render_agents((0, 0, 6, 100))
         snapshot = app.screen.snapshot()
         self.assertEqual(app.selected('agents')['alias'], 'echo')
         self.assertEqual(snapshot.rows_containing('echo'), [5])
@@ -2001,66 +2002,144 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.screen.out_of_bounds, [])
 
     def test_agent_table_alignment_boundaries_and_responsive_columns(self):
-        for width in (53, 54, 55, 69, 70, 76, 150):
+        app = self.app()
+        base = app.local['agents'][0]
+        app.local['resources'] = {'dead_serve': [], 'servers_unowned': [], 'stale_devices': []}
+        app.local['agents'] = [
+            {**base, 'terminal_id': str(index), 'alias': alias,
+             'turn_state': 'working', 'unread': unread, 'extension_present': receiver,
+             'role': 'builder', 'phase': 'review', 'summary': 'checking',
+             'devices': devices, 'servers': [] if index < 2 else None}
+            for index, (alias, unread, receiver, devices) in enumerate(
+                (('alpha', 0, True, []), ('bravo', 12, False, [{'kind': 'phone'}]),
+                 ('charm', '?', None, None)))]
+        for width in range(30, 201):
             with self.subTest(width=width):
-                app = self.app()
-                base = app.local['agents'][0]
-                app.local['resources'] = {'dead_serve': [], 'servers_unowned': [], 'stale_devices': []}
-                app.local['agents'] = [
-                    {**base, 'terminal_id': str(index), 'alias': alias,
-                     'turn_state': 'working', 'unread': unread, 'extension_present': True,
-                     'role': 'builder', 'phase': 'review', 'summary': 'checking',
-                     'devices': [] if index == 0 else [{'kind': 'phone'}], 'servers': []}
-                    for index, (alias, unread) in enumerate((('한글별칭', 12), ('latin-alias', 3)))]
-                app.selections['agents'] = next(index for index, agent in enumerate(app.agents())
-                                                if agent['alias'] == '한글별칭')
+                app.hit_map.clear()
                 app.screen = Screen(8, width)
                 app.render_agents((0, 0, 8, width))
                 snapshot = app.screen.snapshot()
-                header, rule = snapshot.line(0), snapshot.line(1)
+                columns = app.agent_columns(width, app.agents())
+                names = [name for name, _, _ in columns]
+                expected_columns = {
+                    30: ['turn', 'alias', 'mail', 'rx'],
+                    38: ['turn', 'alias', 'mail', 'rx'],
+                    53: ['turn', 'alias', 'mail', 'rx', 'summary'],
+                    76: ['turn', 'alias', 'mail', 'rx', 'role', 'summary'],
+                    100: ['turn', 'alias', 'mail', 'rx', 'role', 'phone', 'emu', 'server', 'summary'],
+                    150: ['turn', 'alias', 'mail', 'rx', 'role', 'phone', 'emu', 'server', 'summary']}
+                if width in expected_columns:
+                    self.assertEqual(names, expected_columns[width])
+                self.assertEqual(columns[0][1], 3 if width < 34 else 11)
+                self.assertGreaterEqual(columns[1][1], 8)
+                if 'summary' in names:
+                    self.assertGreaterEqual(columns[-1][1], 16)
                 boundaries = [index for index, cell in enumerate(snapshot.cells[0]) if cell.text == '│']
                 self.assertEqual(boundaries, [index for index, cell in enumerate(snapshot.cells[1])
                                               if cell.text == '┼'])
+                self.assertNotIn(0, boundaries)
+                self.assertNotIn(width - 1, boundaries)
+                self.assertEqual((snapshot.cells[1][0].text, snapshot.cells[1][-1].text), ('─', '─'))
                 self.assertTrue(all(cell.text in {'─', '┼'} for cell in snapshot.cells[1]))
-                self.assertTrue(all(cell.attribute & curses.A_DIM for cell in snapshot.cells[1]))
-                labels = header.split('│')
-                for alias, unread in (('한글별칭', 12), ('latin-alias', 3)):
-                    row_index = snapshot.rows_containing(alias)[0]
-                    row = snapshot.line(row_index)
-                    cells = row.split('│')
-                    def column(line, text):
-                        return display_width(line[:line.index(text)])
-                    self.assertEqual(column(row, 'working'), column(header, 'TURN'))
-                    self.assertEqual(column(row, alias), column(header, 'ALIAS'))
-                    self.assertEqual(column(row, str(unread)) + len(str(unread)),
-                                     column(header, 'MAIL') + 4)
-                    self.assertEqual(column(row, '✓'), column(header, 'RX'))
+                self.assertFalse(any(cell.attribute & curses.A_UNDERLINE for cell in snapshot.cells[0]))
+                headers = snapshot.line(0).split(' │ ')
+                expected_headers = {'turn': '' if width < 34 else 'TURN',
+                                    'alias': 'ALIAS', 'mail': 'MAIL', 'rx': 'RX', 'role': 'ROLE',
+                                    'phone': 'PHN', 'emu': 'EMU', 'server': 'SRV',
+                                    'summary': 'PHASE · SUMMARY'}
+                self.assertEqual([cell.strip() for cell in headers],
+                                 [expected_headers[name] for name in names])
+                for agent in app.agents():
+                    row_index = snapshot.rows_containing(agent['alias'])[0]
+                    row = snapshot.line(row_index).ljust(width)
                     self.assertEqual(boundaries, [index for index, cell in enumerate(snapshot.cells[row_index])
                                                   if cell.text == '│'])
-                    self.assertTrue(all(snapshot.cells[row_index][index].attribute & curses.A_DIM
-                                        for index in boundaries))
-                    if width >= 55:
-                        self.assertEqual(column(row, 'builder'), column(header, 'ROLE'))
-                        self.assertEqual(column(row, 'review'), column(header, 'PHASE'))
-                        self.assertTrue(labels[-1].startswith('PHASE'))
-                    else:
-                        self.assertNotIn('ROLE', header)
-                        self.assertNotIn('review', row)
-                    for label in ('PHN', 'EMU', 'SRV'):
-                        if width >= 70:
-                            cell_index = next(index for index, cell in enumerate(labels) if cell == label)
-                            self.assertEqual(len(cells[cell_index]), 3)
-                            self.assertTrue(cells[cell_index].endswith('1' if label == 'PHN' and
-                                                                     alias == 'latin-alias' else '·'))
-                            end = sum(display_width(cell) + 1 for cell in cells[:cell_index + 1]) - 2
-                            resource = snapshot.cells[row_index][end]
-                            self.assertEqual(bool(resource.attribute & curses.A_DIM), resource.text == '·')
+                    self.assertFalse(any(snapshot.cells[row_index][index].attribute & curses.A_DIM
+                                         for index in boundaries))
+                    for boundary in boundaries:
+                        for line in (snapshot.cells[0], snapshot.cells[row_index]):
+                            self.assertEqual((line[boundary - 1].text, line[boundary + 1].text), (' ', ' '))
+                    cells = row.split(' │ ')
+                    for (name, size, centered), header, value in zip(columns, headers, cells):
+                        self.assertEqual(display_width(value), size)
+                        if name == 'turn':
+                            if size == 11:
+                                self.assertEqual(header.index('TURN'), value.index('working'))
+                            continue
+                        if not value.strip() or not header.strip():
+                            continue
+                        def start(cell):
+                            return len(cell) - len(cell.lstrip())
+                        if centered:
+                            self.assertLessEqual(abs(start(header) + display_width(header.strip()) / 2 -
+                                                     start(value) - display_width(value.strip()) / 2), .5)
                         else:
-                            self.assertNotIn(label, header)
+                            self.assertEqual(start(header), start(value))
+                    values = dict(zip(names, (cell.strip() for cell in cells)))
+                    self.assertEqual(values['mail'], '·' if agent['unread'] == 0 else str(agent['unread']))
+                    if agent['unread'] == 12:
+                        mail_start = sum(size + 3 for name, size, _ in columns[:names.index('mail')])
+                        mail_end = mail_start + 4
+                        digits = [cell for cell in snapshot.cells[row_index][mail_start:mail_end]
+                                  if cell.text.isdigit()]
+                        self.assertTrue(digits and all(cell.attribute & curses.A_BOLD for cell in digits))
+                    if 'phone' in names:
+                        self.assertEqual(values['phone'], app.resource_counts(agent)['phone'])
                     self.assertLessEqual(display_width(row), width)
-                selected = snapshot.rows_containing('한글별칭')[0]
-                self.assertTrue(all(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[selected]))
+                    self.assertIn(((row_index, 0, 1, width), 'list-row', app.agents().index(agent)), app.hit_map)
                 self.assertEqual(app.screen.out_of_bounds, [])
+
+    def test_agent_column_content_widths_follow_alias_and_role_limits(self):
+        for alias, role, alias_width, role_width in (
+                ('short', '', 8, 4), ('long-agent-name', 'builder', 15, 7),
+                ('an-agent-name-over-eighteen-cells', 'coordinator', 18, 8)):
+            with self.subTest(alias=alias, role=role):
+                agents = [{'alias': alias, 'terminal_id': 'terminal', 'role': role}]
+                columns = MailboxApp.agent_columns(150, agents)
+                sizes = {name: size for name, size, _ in columns}
+                self.assertEqual(sizes['alias'], alias_width)
+                self.assertEqual(sizes['role'], role_width)
+                self.assertGreaterEqual(sizes['summary'], 16)
+                for width in (30, 38, 76, 100):
+                    columns = MailboxApp.agent_columns(width, agents)
+                    names = [name for name, _, _ in columns]
+                    self.assertEqual(sum(size for _, size, _ in columns) + 3 * (len(columns) - 1), width)
+                    self.assertGreaterEqual(columns[1][1], 8)
+                    if width == 76:
+                        self.assertIn('summary', names)
+                        self.assertIn('role', names)
+                        self.assertNotIn('phone', names)
+                    elif width == 100:
+                        self.assertTrue(all(name in names for name in ('phone', 'emu', 'server', 'summary')))
+
+    def test_selected_agent_bars_and_turn_use_high_contrast_foreground(self):
+        for color in (False, True):
+            for width in (30, 38, 53, 76, 100, 150):
+                with self.subTest(color=color, width=width), \
+                     patch.multiple('mailbox_tui.curses', A_BOLD=1, A_UNDERLINE=2,
+                                    A_REVERSE=4, A_DIM=8), \
+                     patch('mailbox_tui.curses.color_pair', side_effect=lambda pair: pair << 8):
+                    app = self.app()
+                    app.colors_enabled = color
+                    if not color:
+                        app.environment['NO_COLOR'] = '1'
+                    agent = {**app.local['agents'][0], 'alias': 'alpha', 'turn_state': 'working'}
+                    app.local['agents'] = [agent]
+                    app.screen = Screen(8, width)
+                    app.render_agents((0, 0, 8, width))
+                    snapshot = app.screen.snapshot()
+                    row = snapshot.rows_containing('alpha')[0]
+                    for cell in snapshot.cells[row]:
+                        self.assertFalse(cell.attribute & 8)
+                        self.assertEqual(cell.attribute & 0xff00, 5 << 8 if color else 0)
+                        self.assertEqual(bool(cell.attribute & 4), not color)
+                    glyph = snapshot.line(row).index('●')
+                    self.assertTrue(snapshot.cells[row][glyph].attribute & 1)
+                    if width >= 34:
+                        word = snapshot.line(row).index('working')
+                        self.assertTrue(snapshot.cells[row][word].attribute & 1)
+                    self.assertTrue(all(cell.attribute & 1 and not cell.attribute & 2
+                                        for cell in snapshot.cells[0]))
 
     def test_agent_host_group_counts_survive_truncation_and_zero_findings_are_omitted(self):
         for count in (0, 1, 2):
@@ -2098,9 +2177,7 @@ class MailboxUiTest(unittest.TestCase):
             snapshot = app.screen.snapshot()
             for cell in snapshot.cells[8]:
                 self.assertEqual(cell.attribute, 3 if cell.text.isalpha() else 1)
-            for cell in snapshot.cells[0]:
-                self.assertEqual(cell.attribute, 8 if cell.text == '│' else
-                                 3 if cell.text.isalpha() else 1)
+            self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[0]))
             self.assertIn('STATE / TITLE', snapshot.line(8))
             self.assertIn('PHASE · SUMMARY', snapshot.line(0))
             for row, separator in ((0, '·'), (8, '/')):
@@ -2108,9 +2185,9 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(snapshot.cells[row][column].attribute, 1)
             host_row = next(row for row, line in enumerate(snapshot.lines()) if ' · 2 agents' in line)
             host = snapshot.line(host_row)
-            self.assertTrue(host.startswith('ui-test · 2 agents'))
+            self.assertTrue(host.startswith('▾ ui-test · 2 agents'))
             self.assertNotIn('─', host)
-            self.assertTrue(all(cell.attribute == 9 for cell in snapshot.cells[host_row]))
+            self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[host_row]))
             agent_row = snapshot.rows_containing(app.agents()[0]['alias'])[0]
             thread_row = snapshot.rows_containing('DIRECT accepted')[0]
             for row in (agent_row, thread_row, thread_row + 1):
@@ -2147,14 +2224,14 @@ class MailboxUiTest(unittest.TestCase):
                     snapshot = app.screen.snapshot()
                     row = snapshot.rows_containing('target-agent')[0]
                     base_pair = 5 if selected else 0
-                    state_pair = 5 + pair if selected else pair
+                    state_pair = 5 if selected else pair
                     for column, cell in enumerate(snapshot.cells[row]):
                         self.assertFalse(cell.attribute & 4)
-                        if not 2 <= column < 12:
+                        if not 1 <= column < 10:
                             self.assertEqual(cell.attribute & 0xff00, base_pair << 8)
-                    state_cell = snapshot.cells[row][2]
+                    state_cell = snapshot.cells[row][1]
                     self.assertEqual(state_cell.attribute & 0xff00, state_pair << 8)
-                    if pair:
+                    if selected or pair:
                         self.assertTrue(state_cell.attribute & 1)
                     else:
                         self.assertTrue(state_cell.attribute & 8)
@@ -2166,10 +2243,10 @@ class MailboxUiTest(unittest.TestCase):
                     colored = [call for call in snapshot.draw_calls
                                if call.row == row and call.attribute & 0xff00
                                and call.attribute & 0xff00 != 5 << 8]
-                    if pair:
+                    if pair and not selected:
                         self.assertTrue(colored)
-                        self.assertTrue(all(call.column >= 2
-                                            and call.column + display_width(call.requested_text) <= 12
+                        self.assertTrue(all(call.column >= 1
+                                            and call.column + display_width(call.requested_text) <= 10
                                             for call in colored))
                     else:
                         self.assertEqual(colored, [])
@@ -3653,13 +3730,13 @@ class MailboxUiTest(unittest.TestCase):
             self.assertTrue(any(word in part for part in parts))
 
 
-def resource_render_text(scratch, widths=(40, 160)):
+def resource_render_text(scratch, widths=(40, 200)):
     """Return isolated Agents and paged Detail text; do not run a test case."""
     directory = Path(scratch)
     directory.mkdir(parents=True, exist_ok=True)
     result = {}
     with patch.object(sys.modules[__name__], 'SCRATCH', directory):
-        case = MailboxUiTest('test_resource_presence_captures_at_40_and_160_columns')
+        case = MailboxUiTest('test_resource_presence_captures_at_40_and_200_columns')
         try:
             case.setUp()
             for width in widths:

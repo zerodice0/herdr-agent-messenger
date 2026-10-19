@@ -95,26 +95,38 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
   selects terminal text. Set `HAM_MAILBOX_NO_MOUSE=1` to disable mouse handling.
 
 Digits never navigate. Agents uses a **one-line, aligned table**, not a second
-metadata line per agent. Header words are **bold and underlined**; dim `│`
-boundaries align with every row and the `┼` joints in the rule below the header.
-The TURN heading starts over the state word, leaving its glyph unlabeled;
-numeric headings and values are right-aligned. Each host group starts with a
-**dim, bold label and agent count**, such as `winmini · 1 agent` or
-`winmini · 2 agents`. Findings follow only when nonzero (or unknown), with
-stale/error information when applicable; findings truncate before the count.
-The selected row has a **common light background across the full table width**,
-including boundaries and padding, while retaining state foreground colors.
-Without color, the selected row uses full-width reverse video instead.
+metadata line per agent. Header words are **bold, without underlines**. Columns
+are joined by ` │ ` with a space on both sides of every normal-intensity bar;
+the panel border is the table edge, with no extra leading/trailing bar. Header,
+agent rows and `┼` joints share the same boundary offsets. TURN starts with
+the selection marker and state glyph; its heading aligns with the state word.
+ALIAS, ROLE and SUMMARY are left-aligned. MAIL, RX, PHN, EMU and SRV headings
+and values are centered; known-zero counts show `·` and unknown counts show `?`.
+Nonzero MAIL counts are bold in unselected rows.
+Each host group starts with a **bold section label and agent count**, such as
+`▾ winmini · 1 agent` or `▾ winmini · 2 agents`. Findings follow only when
+nonzero (or unknown), with stale/error information when applicable; findings
+truncate before the count. The selected row has a **common light background
+and high-contrast foreground across the full table width**, including bars,
+padding and the bold turn glyph/word. Unselected turn states retain semantic
+colors. Without color, selection uses full-width reverse video instead.
 
-Columns show **state glyph + word**, **alias**, **MAIL** (unread count), and
-**RX** (native receiver flag: `✓` ready, `⚠` absent, `?` unknown). At 55 inner
-columns, **role** and a final flexible **phase · summary** column appear.
-At 70 inner columns, **PHN**, **EMU**, and **SRV** counts appear before the
-summary. Full summaries remain in Detail. Send-result labels stay inside the
-alias or summary cell and may truncate. MAIL is `?` for a stale host.
+Columns show **state glyph + word**, **alias**, **MAIL** (unread count),
+**RX** (native receiver flag: `✓` ready, `⚠` absent, `?` unknown), **ROLE**,
+resource counts and a final flexible **phase · summary** column. TURN, ALIAS
+and MAIL are required. Add RX first, then SUMMARY when at least 16 content
+cells remain, then ROLE, then PHN/EMU/SRV together. Extra columns preserve
+16 SUMMARY cells, or at least eight ALIAS cells when SUMMARY is absent.
+ALIAS prefers the longest visible alias, clamped to 8–18 cells; ROLE uses the
+longest role clamped to 4–8. Without SUMMARY, ALIAS absorbs leftover width.
+At 30 inner cells TURN shows only marker + glyph and has a blank heading;
+at 38 it shows the complete state word. At 76 SUMMARY remains visible, while
+all columns fit at 100 and above. Headings are never cut mid-word. Full
+summaries remain in Detail. Send-result labels stay bounded inside ALIAS or
+SUMMARY and may truncate. MAIL is `?` for a stale host.
 A disconnected host keeps its last snapshot marked stale; it is not treated as closed.
 
-Threads uses the same **full-width bold column header with underlined words**
+Threads retains its **full-width bold column header with underlined words**
 and **full-width selected-row background** (reverse video without color).
 Unselected state, kind and transport-operation labels use semantic foreground
 colors; titles and participants retain their normal foreground. On the pale
@@ -319,10 +331,11 @@ disables colors without removing labels or other non-color state cues.
 ### Device and server presence
 
 The Agents **PHN**, **EMU**, and **SRV** columns show phone, emulator, and server
-counts, respectively, when the agent pane has at least 70 inner columns.
-Each uses three right-aligned cells with ASCII headings regardless of color
-settings; there are no resource emoji. Known-zero counts show a dim `·`;
-nonzero counts have normal brightness. Missing device data shows `?` in PHN
+counts, respectively, when space permits after RX, SUMMARY and ROLE.
+Each uses three centered content cells, with space-padded bars between
+columns and ASCII headings regardless of color settings; there are no resource
+emoji. Known-zero counts show `·`; nonzero counts have normal brightness.
+Missing device data shows `?` in PHN
 and EMU; missing server data independently shows `?` in SRV.
 Host group labels show findings such as `dead 1 · unowned 1 · stale-dev 1`
 for dead Serve routes, unowned served backends, and stale devices. Zero
