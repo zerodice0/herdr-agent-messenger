@@ -413,9 +413,14 @@ one focused region below 80 columns or 18 rows, stacked lists plus Detail at
 80–139 columns, three columns from 140. Below 32 columns or 10 rows, resize
 instructions appear without losing mode, focus, selections, text or cursor.
 NAV keys: Tab/Shift+Tab, ←/→ or h/l changes focus; ↑/↓ or j/k selects rows;
-PgUp/PgDn/Home/End pages or jumps. In focused Detail, arrows/PgUp/PgDn scroll.
-Digits never navigate. `s` opens Settings, `?` opens help, `e` shows full
-connection/pending-operation diagnostics in Detail, and `r` refreshes.
+PgUp/PgDn/Home/End pages or jumps. Press `Space` on an Agents or Threads item,
+including DIRECT/OUTBOX, to open a centered read-only Detail viewer (~90% screen,
+maximum 100×40). Arrows, PgUp/PgDn, Home/End and wheel scroll; `t` toggles
+technical information. It opens at the latest message and follows new arrivals
+only while at that position. If the item disappears on refresh, it closes with
+a status message. Esc, q, Space, or outside click closes; inside click and Enter
+are inert. Viewing never ACKs. Detail Enter otherwise does nothing. Digits never
+navigate; `s` opens Settings, `?` help, `e` diagnostics and `r` refresh.
 
 Agents groups rows under host headers, showing stale/errors, alias, turn,
 unread, native receiver readiness and one dim role/phase/summary line.

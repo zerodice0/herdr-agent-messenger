@@ -65,11 +65,17 @@ Agents와 Threads가 1~25행, Detail이 26~33행을 사용합니다. 좌표는 0
 이 높이에는 패널 테두리도 포함합니다.
 
 헤더는 현재 모드(`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`, `EVIDENCE`)를,
-하단은 현재 문맥의 키를 표시합니다. **NAV** 모드에서는 다음 키를 사용합니다.
-
-| 키 | 동작 |
+**NAV**에서 Agents 또는 Threads 항목(DIRECT·OUTBOX 포함)을 선택하고 `Space`를
+누르면 화면 중앙에 읽기 전용 Detail 뷰어가 열립니다. 화면의 약 90% 크기이며
+최대 100×40칸입니다. `↑`·`↓`, `PgUp`·`PgDn`, `Home`·`End`와 휠로 스크롤하고
+`t`로 Detail과 같은 기술 정보를 토글합니다. 최신 메시지 위치를 기준으로 열리며,
+그 위치에 있을 때만 새 도착 메시지를 따라갑니다. 새로고침 중 항목이 사라지면
+상태 메시지와 함께 닫힙니다. `Esc`, `q`, `Space` 또는 바깥 클릭으로 닫습니다.
+안쪽 클릭과 `Enter`는 동작하지 않으며, 보기만 해서는 ACK하지 않습니다.
+INPUT에서 Space는 문자로 입력되고, CONFIRM·Settings 선택 목록의 기존 Space
+동작은 유지됩니다.
 | --- | --- |
-| `Tab` / `Shift+Tab`, `←` / `→`, `h` / `l` | 영역 사이에서 포커스를 옮깁니다. `Tab`은 Agents → Threads → Detail → Agents 순서로, `Shift+Tab`은 반대 순서로 이동합니다. 단일 영역 모드에서는 포커스가 있는 영역을 표시합니다. |
+| `Space` | 선택한 Agents 또는 Threads 항목을 읽기 전용 뷰어로 엽니다. |
 | `↑` / `↓`, `j` / `k` | 목록의 선택 항목을 옮깁니다. Detail에 포커스가 있으면 방향키로 스크롤합니다. |
 | `PgUp` / `PgDn`, `Home` / `End` | 포커스가 있는 영역에서 페이지를 넘기거나 처음·끝으로 이동합니다. Detail은 실제로 보이는 본문 행 수를 기준으로 한 행씩 겹치게 페이지를 넘기며, Home/End는 첫 페이지와 마지막 페이지로 이동합니다. |
 | `Enter` | Agents에서는 입력창을, Threads에서는 답장 입력창을 엽니다. Detail에서는 동작하지 않습니다. |
@@ -195,11 +201,12 @@ Detail은 마지막으로 포커스를 둔 목록의 선택 항목을 자동으�
 OUTBOX가 포함됩니다. `delivering`은 **UNCERTAIN**으로 표시합니다.
 
 보내거나 받은 메일을 읽으려면 `Tab`으로 **Threads**에 포커스를 옮겨 스레드를
-선택한 뒤, **Detail**로 이동해 메시지를 스크롤합니다. 에이전트를 선택하면 메시지
-본문 대신 상태와 리소스를 보여 줍니다. 에이전트 Detail의 Unread 다음에는 **Mail**
-구역이 있으며, 현재 불러온 스레드 중 해당 에이전트가 참여한 Active·Handled 개수와
-읽는 방법을 흐리게 표시합니다. 해당 스레드가 없으면 `No threads with this agent yet`를
-표시합니다. Devices와 Servers는 그 아래에서 계속 확인할 수 있습니다.
+선택한 뒤 `Space`를 눌러 뷰어를 엽니다. 기존 **Detail**에서도 메시지를 읽을 수 있습니다.
+에이전트를 선택하면 메시지 본문 대신 상태와 리소스를 보여 줍니다. 에이전트 Detail의
+Unread 다음에는 **Mail** 구역이 있으며, 현재 불러온 스레드 중 해당 에이전트가 참여한
+Active·Handled 개수와 `Read: Tab → Threads, select a thread, Space opens it` 안내를
+흐리게 표시합니다. 해당 스레드가 없으면 `No threads with this agent yet`를 표시합니다.
+Devices와 Servers는 그 아래에서 계속 확인할 수 있습니다.
 
 메시지 Detail은 **메시지 i/N, 현지 시각·경과 시간, 기록된 발신자 → 수신자**를
 짧은 헤더로 보여 준 뒤 종류·상태 요약과 일반 밝기의 본문을 표시합니다.

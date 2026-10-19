@@ -2411,6 +2411,274 @@ class MailboxUiTest(unittest.TestCase):
              'recipient_terminal_id': self.recipient['terminal_id']}
             for index, state in enumerate(states)]}
 
+    def viewer_thread(self):
+        thread = self.thread_fixture('Release review', 'handled', 'delivered', 'queued')
+        for index, message in enumerate(thread['messages'], 1):
+            message.update(created_at=1_799_999_940, body='\n'.join(
+                f'Message {index} content line {line:02}' for line in range(12)))
+        return thread
+
+    def test_viewer_agent_reuses_detail_and_scrolls_all_sections(self):
+        app = self.resource_app()
+        self.capture(app, 20, 40)
+        expected = app.detail_lines()
+        app.key(' ')
+        self.assertEqual(app.mode, 'viewer')
+        self.assertEqual(app.detail_lines(), expected)
+        snapshot = self.capture(app, 20, 40)
+        self.assertIn('reviewer', '\n'.join(snapshot.lines()))
+        self.assertIn('Turn state: working', '\n'.join(snapshot.lines()))
+        pages = []
+        while True:
+            pages.append('\n'.join(self.capture(app, 20, 40).lines()))
+            previous = app.scrolls['detail']
+            app.key(curses.KEY_NPAGE)
+            if app.scrolls['detail'] == previous:
+                break
+        for section in ('Mail', 'Devices', 'Servers', 'phone-serial', 'Port: 5180'):
+            self.assertIn(section, '\n'.join(pages))
+        app.key('t')
+        self.assertFalse(app.detail_technical)
+        app.key(ESCAPE)
+        self.assertEqual(app.mode, 'nav')
+
+    def test_viewer_threads_open_latest_reopen_and_toggle_at_latest(self):
+        app = self.app(wall_clock=lambda: 1_800_000_000)
+        app.local['threads'] = [self.viewer_thread()]
+        app.key('\t')
+        self.capture(app, 24, 80)
+        app.key(' ')
+        text = '\n'.join(self.capture(app, 24, 80).lines())
+        self.assertIn('Message 3/3', text)
+        self.assertIn('Message 3 content line 00', text)
+        self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
+        app.key(curses.KEY_HOME)
+        self.assertIn('Message 1/3', '\n'.join(self.capture(app, 24, 80).lines()))
+        for _ in range(2):
+            app.key('t')
+            text = '\n'.join(self.capture(app, 24, 80).lines())
+            self.assertIn('Message 3/3', text)
+            self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
+        app.key(curses.KEY_HOME)
+        app.key(' ')
+        app.key(' ')
+        self.capture(app, 24, 80)
+        self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
+
+    def test_viewer_direct_and_outbox_reuse_detail_content(self):
+        records = [
+            ('submissions', {'submission_id': 'direct-view', 'acceptance': 'accepted',
+                             'sender': 'user', 'target': self.recipient, 'body': 'Direct content'}),
+            ('outbox', {'item_id': 'outbox-view', 'state': 'failed', 'kind': 'message',
+                        'target_host': 'peer', 'payload': json.dumps({
+                            'message': {'body': 'Outbox content'}})}),
+        ]
+        for collection, record in records:
+            with self.subTest(collection=collection):
+                app = self.app()
+                app.local[collection] = [record]
+                app.key('\t')
+                app.key(' ')
+                text = '\n'.join(self.capture(app, 24, 80).lines())
+                expected = 'Direct content' if collection == 'submissions' else 'Outbox content'
+                self.assertIn(expected, text)
+                self.assertEqual(app.scrolls['detail'], 0)
+                app.key('t')
+                self.assertTrue(app.detail_technical)
+                self.assertIn('full recorded source', '\n'.join(app.detail_lines()))
+                self.assertEqual(app.mode, 'viewer')
+                self.assertEqual(app.jobs, {})
+
+    def test_viewer_scroll_keys_and_close_preserve_focus_and_selection(self):
+        for region in ('agents', 'threads'):
+            for close in (ESCAPE, 'q', ' '):
+                with self.subTest(region=region, close=close):
+                    app = self.app()
+                    app.local['threads'] = [self.thread_fixture('other', 'queued'),
+                                            self.viewer_thread()]
+                    app.focus = app.preview = region
+                    app.selections[region] = 1
+                    before = app.selections.copy()
+                    app.key(' ')
+                    self.capture(app, 20, 40)
+                    app.key(curses.KEY_HOME)
+                    app.key(curses.KEY_DOWN)
+                    self.assertEqual(app.scrolls['detail'], 1)
+                    app.key(curses.KEY_UP)
+                    self.assertEqual(app.scrolls['detail'], 0)
+                    app.key(curses.KEY_NPAGE)
+                    self.assertEqual(app.scrolls['detail'], app.detail_available - 1)
+                    app.key(curses.KEY_PPAGE)
+                    self.assertEqual(app.scrolls['detail'], 0)
+                    app.key(curses.KEY_END)
+                    self.assertEqual(app.scrolls['detail'], app.clamp_detail(app.detail_total))
+                    app.key(close)
+                    self.assertEqual((app.mode, app.focus), ('nav', region))
+                    self.assertEqual(app.selections, before)
+                    self.assertIsNone(app.viewer)
+                    self.assertTrue(app.running)
+
+    def test_viewer_mouse_wheel_inside_inert_and_outside_closes(self):
+        app = self.resource_app()
+        app.key(' ')
+        self.capture(app, 20, 40)
+        y, x, height, width = app.viewer_rect()
+        app.key(MouseEvent(y + 2, x + 2, 'wheel_down'))
+        self.assertEqual(app.scrolls['detail'], 3)
+        app.key(MouseEvent(y + 2, x + 2, 'wheel_up'))
+        self.assertEqual(app.scrolls['detail'], 0)
+        app.key(MouseEvent(y + 2, x + 2, 'press'))
+        self.assertEqual(app.mode, 'viewer')
+        app.key(MouseEvent(0, 0, 'press'))
+        self.assertEqual((app.mode, app.focus), ('nav', 'agents'))
+        self.assertEqual(app.jobs, {})
+
+    def test_viewer_space_scope_preserves_input_confirm_and_picker(self):
+        app = self.app()
+        app.key('\r')
+        app.key(' ')
+        self.assertEqual((app.mode, app.body, app.body_cursor), ('input', ' ', 1))
+        app.key(ESCAPE)
+        app.open_confirm('No mutation', ['Read'], 'withdraw', {})
+        app.key(' ')
+        self.assertEqual(app.mode, 'confirm')
+        self.assertIsNone(app.viewer)
+        app.key(ESCAPE)
+        app.key('s')
+        app.open_settings_picker('members')
+        self.assertIsNotNone(app.settings_picker)
+        app.key(' ')
+        self.assertEqual(app.mode, 'settings')
+        self.assertIsNone(app.viewer)
+        self.assertNotIn('mutation', app.jobs)
+
+    def test_viewer_enter_and_action_keys_never_ack_or_mutate(self):
+        sent = self.mail.send_user(self.repo_id, self.recipient, body='Read without ACK')
+        before = self.mail.show_thread(sent['thread_id'])
+        bell = self.store.bell_directory.joinpath('_board').stat().st_mtime_ns
+        app = self.app()
+        with patch.object(app, 'start_job') as start_job, \
+             patch.object(app, 'choose_agent') as choose_agent, \
+             patch.object(app, 'reply') as reply, \
+             patch.object(app, 'thread_action') as action:
+            for region in ('agents', 'threads'):
+                app.focus = app.preview = region
+                app.key(' ')
+                for key in ('\r', 'a', 'n', 'w', 's', 'r', '\t', 't', curses.KEY_NPAGE):
+                    app.key(key)
+                    self.capture(app, 24, 80)
+                    self.assertEqual(app.mode, 'viewer')
+                app.key(ESCAPE)
+            start_job.assert_not_called()
+            choose_agent.assert_not_called()
+            reply.assert_not_called()
+            action.assert_not_called()
+        self.assertEqual(self.mail.show_thread(sent['thread_id']), before)
+        self.assertEqual(self.store.bell_directory.joinpath('_board').stat().st_mtime_ns, bell)
+
+    def test_viewer_refresh_keeps_scroll_and_follows_only_at_latest(self):
+        for scrolled in (False, True):
+            with self.subTest(scrolled=scrolled):
+                app = self.app()
+                app.local['threads'] = [self.viewer_thread()]
+                app.key('\t')
+                app.key(' ')
+                self.capture(app, 24, 80)
+                if scrolled:
+                    app.key(curses.KEY_HOME)
+                    app.key(curses.KEY_DOWN)
+                offset = app.scrolls['detail']
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = json.loads(json.dumps(app.local))
+                app.tick()
+                self.capture(app, 24, 80)
+                self.assertEqual(app.scrolls['detail'], offset)
+                updated = json.loads(json.dumps(app.local))
+                updated['threads'][0]['messages'].append({
+                    **updated['threads'][0]['messages'][-1], 'message_id': 'new-arrival',
+                    'body': '\n'.join(f'Arrival line {index}' for index in range(24))})
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = updated
+                app.tick()
+                text = '\n'.join(self.capture(app, 24, 80).lines())
+                self.assertEqual(app.mode, 'viewer')
+                if scrolled:
+                    self.assertEqual(app.scrolls['detail'], offset)
+                else:
+                    self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
+                    self.assertIn('Message 4/4', text)
+                    self.assertIn('Arrival line 0', text)
+
+    def test_viewer_refresh_follows_identity_and_closes_disappeared_item(self):
+        for region, collection in (('agents', 'agents'), ('threads', 'threads')):
+            with self.subTest(region=region):
+                app = self.app()
+                app.local['threads'] = [self.viewer_thread(), self.thread_fixture('other', 'queued')]
+                app.focus = app.preview = region
+                app.key(' ')
+                self.capture(app, 24, 80)
+                identity = app.identity(app.detail)
+                updated = json.loads(json.dumps(app.local))
+                updated[collection].reverse()
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = updated
+                app.tick()
+                self.assertEqual(app.identity(app.detail), identity)
+                self.assertEqual(app.mode, 'viewer')
+                updated[collection] = [item for item in updated[collection]
+                                       if app.identity({'type': 'thread', **item}
+                                                       if region == 'threads' else item) != identity]
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = updated
+                app.tick()
+                self.assertEqual((app.mode, app.focus), ('nav', region))
+                self.assertIsNone(app.viewer)
+                self.assertIn('no longer available', app.status)
+
+    def test_viewer_fits_tiny_narrow_and_large_screens(self):
+        for height, width in ((8, 24), (20, 40), (24, 80), (50, 160), (60, 200)):
+            for region in ('agents', 'threads'):
+                with self.subTest(height=height, width=width, region=region):
+                    app = self.resource_app()
+                    app.local['threads'] = [self.viewer_thread()]
+                    app.focus = app.preview = region
+                    app.key(' ')
+                    self.capture(app, height, width)
+                    y, x, rows, columns = app.viewer_rect()
+                    self.assertGreaterEqual(y, 1)
+                    self.assertGreaterEqual(x, 1)
+                    self.assertLessEqual(y + rows, height - 1)
+                    self.assertLessEqual(x + columns, width - 1)
+                    self.assertLessEqual(rows, 40)
+                    self.assertLessEqual(columns, 100)
+                    self.assertEqual(app.mode, 'viewer')
+                    self.assertTrue(any(call.requested_text.startswith('┌')
+                                        and call.row == y and call.column == x
+                                        for call in app.screen.draw_calls))
+                    self.assertNotIn('/', app.screen.snapshot().line(y)[x:x + columns])
+                    self.assertTrue(any(call.row == y + 1 and '/' in call.requested_text
+                                        for call in app.screen.draw_calls))
+                    if width >= 40:
+                        self.assertIn('↑↓ scroll · t technical · Esc close',
+                                      app.screen.snapshot().line(y + rows - 2))
+                    app.key(ESCAPE)
+                    self.assertEqual(app.focus, region)
+
+    def test_viewer_title_only_names_item_and_truncates_with_ellipsis(self):
+        for region in ('agents', 'threads'):
+            with self.subTest(region=region):
+                app = self.resource_app()
+                title = 'Readable modal title ' * 8
+                app.local['agents'][0]['alias'] = title
+                app.local['threads'] = [{**self.viewer_thread(), 'subject': title}]
+                app.focus = app.preview = region
+                app.key(' ')
+                snapshot = self.capture(app, 20, 40)
+                y, _, _, _ = app.viewer_rect()
+                self.assertIn('Readable modal title', snapshot.line(y))
+                self.assertIn('…', snapshot.line(y))
+                self.assertNotIn('/', snapshot.line(y))
+
     def test_thread_groups_stably_partition_all_handled_below_active_and_transport(self):
         app = self.app()
         app.local['threads'] = [
@@ -2884,7 +3152,7 @@ class MailboxUiTest(unittest.TestCase):
         app.refresh_detail()
         lines = app.detail_lines()
         self.assertIn('No threads with this agent yet', lines)
-        self.assertIn('Read: Tab → Threads, select a thread; its messages appear here', lines)
+        self.assertIn('Read: Tab → Threads, select a thread, Space opens it', lines)
 
     def test_compact_direct_body_preserves_real_and_literal_newlines_and_actual_sender(self):
         body = 'DIRECT-FIRST\n\nLiteral \\n stays literal\nDIRECT-LAST'

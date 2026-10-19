@@ -482,6 +482,7 @@ class MailboxApp:
         self.detail_available, self.detail_total = 0, 0
         self.detail_anchor_pending = False
         self.detail_latest: tuple[Any, int] | None = None
+        self.viewer: tuple[str, Any] | None = None
         self.diagnostics = False
         self.status, self.input_error = "", ""
         self.status_level, self.last_error = "info", ""
@@ -615,11 +616,20 @@ class MailboxApp:
         return items[index] if items else None
 
     def refresh_detail(self, identities: Mapping[str, Any] | None = None) -> None:
+        if self.viewer is not None:
+            region, identity = self.viewer
+            if not any(self.identity(item) == identity for item in self.items(region)):
+                self.close_viewer()
+                self.set_status("The viewed item is no longer available.")
         if identities:
             for region, identity in identities.items():
                 self.selections[region] = next((index for index, item in enumerate(self.items(region))
                                                if self.identity(item) == identity), self.selections[region])
                 self.selected(region)
+        if self.viewer is not None:
+            region, identity = self.viewer
+            self.selections[region] = next(index for index, item in enumerate(self.items(region))
+                                           if self.identity(item) == identity)
         if not self.diagnostics:
             identity = self.identity(self.selected(self.preview))
             if identity != self.detail_identity:
@@ -1176,6 +1186,45 @@ class MailboxApp:
                 self.body, self.body_cursor = text, cursor
                 self.save_draft()
 
+    def open_viewer(self) -> None:
+        if self.mode != "nav" or self.focus not in {"agents", "threads"}:
+            return
+        item = self.selected(self.focus)
+        if item is None:
+            return
+        self.preview, self.diagnostics = self.focus, False
+        self.refresh_detail()
+        self.viewer = self.focus, self.identity(item)
+        self.mode = "viewer"
+        self.detail_anchor_pending = True
+
+    def close_viewer(self) -> None:
+        self.viewer = None
+        self.mode = "nav"
+
+    def scroll_detail(self, key: Any) -> None:
+        direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
+        amount = max(1, self.detail_available - 1) if key in (
+            curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+        self.scrolls["detail"] = self.clamp_detail(
+            0 if key == curses.KEY_HOME else self.detail_total if key == curses.KEY_END
+            else self.scrolls["detail"] + direction * amount)
+
+    def toggle_detail(self) -> None:
+        if self.technical_supported():
+            self.detail_technical = not self.detail_technical
+            self.scrolls["detail"] = 0
+            self.detail_anchor_pending = True
+
+    def viewer_key(self, key: Any) -> None:
+        if key in (key_input.ESCAPE, "q", " "):
+            self.close_viewer()
+        elif key == "t":
+            self.toggle_detail()
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, "j", "k", curses.KEY_PPAGE,
+                     curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            self.scroll_detail(key)
+
     def key(self, key: Any) -> None:
         if key is None or key == curses.KEY_RESIZE:
             return
@@ -1183,6 +1232,9 @@ class MailboxApp:
             self.mouse_key(key)
             return
         self.set_status("")
+        if self.mode == "viewer":
+            self.viewer_key(key)
+            return
         if self.focus == "agents" and self.mode == "nav":
             self.result_tags.pop(self.identity(self.selected("agents")), None)
         if self.mode == "input":
@@ -1222,11 +1274,7 @@ class MailboxApp:
             direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
             amount = 1
             if self.focus == "detail":
-                if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
-                    amount = max(1, self.detail_available - 1)
-                self.scrolls["detail"] = self.clamp_detail(
-                    0 if key == curses.KEY_HOME else self.detail_total if key == curses.KEY_END
-                    else self.scrolls["detail"] + direction * amount)
+                self.scroll_detail(key)
             else:
                 if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
                     visible = {value for _, target, value in self.hit_map if target == "list-row"
@@ -1240,6 +1288,8 @@ class MailboxApp:
                 self.selected()
                 self.preview, self.diagnostics = self.focus, False
                 self.refresh_detail()
+        elif key == " ":
+            self.open_viewer()
         elif key == "\r":
             if self.focus == "agents":
                 self.choose_agent()
@@ -1261,9 +1311,7 @@ class MailboxApp:
         elif key == "r":
             self.refresh()
         elif key == "t" and self.focus == "detail" and self.technical_supported():
-            self.detail_technical = not self.detail_technical
-            self.scrolls["detail"] = 0
-            self.detail_anchor_pending = True
+            self.toggle_detail()
         elif self.focus == "threads" and key in ("w", "t", "a", "n"):
             self.thread_action(key)
 
@@ -1273,6 +1321,17 @@ class MailboxApp:
 
     def mouse_key(self, event: key_input.MouseEvent) -> None:
         height, width = self.screen.getmaxyx()
+        if self.mode == "viewer":
+            if self.environment.get("HAM_MAILBOX_NO_MOUSE"):
+                return
+            y, x, rows, columns = self.viewer_rect()
+            inside = y <= event.row < y + rows and x <= event.column < x + columns
+            if event.action in {"wheel_up", "wheel_down"}:
+                self.scrolls["detail"] = self.clamp_detail(
+                    self.scrolls["detail"] + (-3 if event.action == "wheel_up" else 3))
+            elif event.action == "press" and not inside:
+                self.close_viewer()
+            return
         if (self.environment.get("HAM_MAILBOX_NO_MOUSE") or width < 32 or height < 10
                 or not 0 < event.row < height - 1 or not 0 <= event.column < width):
             return
@@ -1432,6 +1491,8 @@ class MailboxApp:
         return self.mode.upper()
 
     def footer_hints(self) -> list[str]:
+        if self.mode == "viewer":
+            return ["↑↓ scroll", "t technical", "Esc close"]
         if self.mode == "input":
             return ["Enter send", "Shift+Enter / Alt+Enter newline", "Esc keep draft",
                     "^D direct", "F1 help", "^R refresh"]
@@ -1448,8 +1509,8 @@ class MailboxApp:
             return ["↑↓ select", "Enter pick/save", "←→ adjust", "m main", "Space member", "Esc discard/close"]
         if self.mode == "help":
             return ["Esc close", "↑↓ scroll", "PgUp/PgDn", "F1 close"]
-        context = (["Enter send"] if self.focus == "agents" else
-                   ["Enter reply", "w withdraw", "t retry", "a/n recover"] if self.focus == "threads" else
+        context = (["Space view", "Enter send"] if self.focus == "agents" else
+                   ["Space view", "Enter reply", "w withdraw", "t retry", "a/n recover"] if self.focus == "threads" else
                    ["↑↓ scroll", "PgUp/PgDn"] + (["t technical"] if self.technical_supported() else []))
         return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
 
@@ -1467,6 +1528,8 @@ class MailboxApp:
         self.screen.erase()
         self.cursor_position = None
         self.hit_map.clear()
+        if self.mode == "viewer":
+            self.refresh_detail()
         height, width = self.screen.getmaxyx()
         self.layout = "tiny" if width < 32 or height < 10 else "single"
         word = self.mode_word()
@@ -1514,12 +1577,14 @@ class MailboxApp:
                     self.render_agents(inner)
                 elif region == "threads":
                     self.render_threads(inner)
-                else:
+                elif self.mode != "viewer":
                     self.render_detail(inner)
             if input_rect:
                 self.render_input(input_rect)
             if self.mode in {"confirm", "settings", "help", "evidence"}:
                 self.render_overlay((1, 0, max(0, bottom - 1), width))
+        if self.mode == "viewer":
+            self.render_viewer()
         if self.cursor_position is not None:
             row, column = self.cursor_position
             if 0 <= row < height - 1 and 0 <= column < width:
@@ -1937,7 +2002,7 @@ class MailboxApp:
         summary = (f"Threads: {len(threads) - handled} active · {handled} handled with this agent"
                    if threads else "No threads with this agent yet")
         return ["Mail", summary,
-                "Read: Tab → Threads, select a thread; its messages appear here"]
+                "Read: Tab → Threads, select a thread, Space opens it"]
 
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
@@ -1969,6 +2034,33 @@ class MailboxApp:
                 f"User border: {yes_no(item.get('user_border'))}",
             ] + self.agent_resource_lines(item, now)
         return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent or thread to preview."]
+
+    def viewer_rect(self) -> tuple[int, int, int, int]:
+        height, width = self.screen.getmaxyx()
+        rows = max(0, min(40, round(height * .9), height - 2))
+        # Keep the full viewer hint readable at the 40-column breakpoint.
+        columns = max(0, min(100, max(37, round(width * .9)), width - 2))
+        return (height - rows) // 2, (width - columns) // 2, rows, columns
+
+    def render_viewer(self) -> None:
+        y, x, height, width = self.viewer_rect()
+        for row in range(y, y + height):
+            self.put(row, x, " " * width)
+        self.render_detail((y + 1, x + 1, max(0, height - 3), max(0, width - 2)))
+        item = self.detail or {}
+        if item.get("type") == "thread":
+            body = (item.get("messages") or [{}])[-1].get("body") or ""
+            title = item.get("subject") or (body.splitlines() or ["Thread"])[0]
+        elif item.get("type"):
+            title = item["type"].upper() + (" · " + item["subject"] if item.get("subject") else "")
+        else:
+            title = item.get("alias") or item.get("terminal_id") or "Agent"
+        self.box((y, x, height, width), title, True)
+        if height > 3:
+            self.put(y + height - 2, x + 1,
+                     truncate_display_text("↑↓ scroll · t technical · Esc close", max(0, width - 2)),
+                     curses.A_DIM)
+        self.cursor_position = None
 
     def render_detail(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
@@ -2116,6 +2208,9 @@ class MailboxApp:
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
+                    "Agents / Threads Space view: read-only modal; Enter inside does nothing.",
+                    "Viewer: ↑↓ / PgUp/PgDn / Home/End / wheel scroll · t technical · Esc/q/Space close.",
+                    "Viewer: outside click closes; inside click is inert. Live arrivals follow only at latest.",
                     "Detail: t toggles technical source; threads reopen latest, single items reopen top.",
                     "Detail PgUp/PgDn: viewport page with one row overlap; range + ↑/↓ show more.",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
@@ -2232,9 +2327,9 @@ class MailboxApp:
 
     def footer_hints_for_nav(self) -> list[str]:
         if self.focus == "agents":
-            return ["Agents: Enter opens quick send"]
+            return ["Agents: Space view; Enter opens quick send"]
         if self.focus == "threads":
-            return ["Threads: Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
+            return ["Threads: Space view; Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (
             ["t technical details (opens latest message)"] if self.technical_supported() else [])
 

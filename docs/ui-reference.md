@@ -65,10 +65,18 @@ Coordinates are zero-based; panel borders count toward these heights.
 The header names the current mode (`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`,
 or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 
+In **NAV**, press `Space` on an Agents or Threads item (including DIRECT and
+OUTBOX entries) to open a centered, read-only Detail viewer. The viewer is about
+90% of the screen, capped at 100×40 cells. `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`
+and the wheel scroll; `t` toggles technical information as in Detail. It anchors
+at the latest message and follows new arrivals only while still at the latest
+position. If the item disappears on refresh, it closes with a status message.
+`Esc`, `q`, `Space`, or a click outside closes it; clicks inside and `Enter` do
+nothing. Viewing never ACKs. Space remains text in INPUT and retains its existing
+CONFIRM/Settings picker bindings.
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab`, `←` / `→`, `h` / `l` | Move focus between regions: `Tab` follows Agents → Threads → Detail → Agents; `Shift+Tab` reverses it. In single mode, this reveals the focused region. |
-| `↑` / `↓`, `j` / `k` | Move the list selection; arrows scroll when Detail is focused. |
+| `Space` | Open the selected Agents or Threads item in the read-only viewer. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
 | `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
@@ -198,10 +206,12 @@ delivers, handles or resolves mail.** Threads includes message histories, direct
 submissions and pending/failed OUTBOX entries; `delivering` is **UNCERTAIN**.
 
 To read sent or received mail, press `Tab` to focus **Threads**, select a thread,
-then focus **Detail** to scroll its messages. Selecting an agent shows its status
-and resources, not message bodies. After Unread, Agent Detail has a **Mail**
-section with counts of loaded active/handled threads involving that agent and a
-dim reading hint; if none are loaded, it says `No threads with this agent yet`.
+then press `Space` to open its messages in the viewer. Detail remains available
+for inline reading. Selecting an agent shows its status and resources, not message
+bodies. After Unread, Agent Detail has a **Mail** section with counts of loaded
+active/handled threads involving that agent and the dim hint
+`Read: Tab → Threads, select a thread, Space opens it`.
+If none are loaded, it says `No threads with this agent yet`.
 Devices and Servers remain available below.
 
 Message Detail starts with a bounded **message i/N, local timestamp/age and
