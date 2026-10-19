@@ -189,11 +189,11 @@ class MailboxUiTest(unittest.TestCase):
                     app.key(curses.KEY_NPAGE)
                     if app.scrolls['detail'] == previous:
                         break
-                detail = '\n'.join(pages)
-                for evidence in ('Devices', 'phone: Pixel', 'emu: 5554', 'Servers',
-                                 'Port: 5180', 'node', 'Cwd: /work/game', 'Inherited: yes',
-                                 '(1h ago)', 'URL: https://review.example/game/',
-                                 'Port: 8787', 'URL: none', 'Read-only'):
+                detail = ' '.join('\n'.join(pages).split())
+                for evidence in ('Devices', 'phone:', '📱', 'Pixel', 'emu:', '🤖', '5554',
+                                 'Servers', 'Port: 5180', 'node', '/work/game', 'Inherited: yes',
+                                 '(1h ago)', 'https://review.example/', 'Port: 8787', 'URL: none',
+                                 'Read-only'):
                     self.assertIn(evidence, detail)
                 self.assertEqual(json.dumps(app.local, sort_keys=True), before)
                 self.assertEqual(app.jobs, {})
@@ -203,8 +203,8 @@ class MailboxUiTest(unittest.TestCase):
         app = self.resource_app()
         app.detail = app.agents()[0]
         lines = app.detail_lines()
-        text = '\n'.join(lines)
-        for evidence in ('Devices', 'phone: Pixel', 'ID: phone-serial', 'emu: 5554',
+        text = ' '.join('\n'.join(lines).split())
+        for evidence in ('Devices', 'phone: 📱 Pixel', 'ID: phone-serial', 'emu: 🤖 5554',
                          'ID: emulator-5554', 'Attached: yes', 'Attached: unknown',
                          'Servers', 'Port: 5180 · node · PID 321', 'Bind: 127.0.0.1',
                          'Cwd: /work/game', 'Inherited: yes', '(1h ago)',
@@ -213,6 +213,60 @@ class MailboxUiTest(unittest.TestCase):
             self.assertIn(evidence, text)
         self.assertIn('(2m ago)', text)
         self.assertLess(lines.index('Devices'), lines.index('Servers'))
+
+    def test_agent_detail_groups_work_identity_resources_mail_and_dim_technical(self):
+        app = self.resource_app()
+        agent = app.agents()[0]
+        agent.update(summary='휴대전화 검증 결과를 정리하고 있습니다',
+                     devices=[{'kind': 'phone', 'device_id': 'serial-a', 'label': 'SM-A245N'},
+                              {'kind': 'emu', 'device_id': 'emulator-5554'}])
+        app.detail = agent
+        entries = app.agent_detail()
+        titles = ['Work', 'Identity & role', 'Devices & servers', 'Mail', 'Receiver/technical']
+        lines = [text for text, _attribute in entries]
+        self.assertEqual([line for line in lines if line in titles], titles)
+        self.assertTrue(lines[1].startswith('Turn state: '))
+        self.assertTrue(lines[2].startswith('Phase:'))
+        summary, attribute = entries[3]
+        self.assertIn(agent['summary'], summary)
+        self.assertTrue(attribute & curses.A_BOLD)
+        text = ' '.join('\n'.join(lines).split())
+        self.assertIn('phone: 📱 SM-A245N', text)
+        self.assertIn('emu: 🤖 emulator-5554', text)
+        self.assertIn('URL: https://review.example/game/', text)
+        self.assertIn('Read: Tab → Threads, select a thread, Space opens it', text)
+        technical = lines.index('Receiver/technical')
+        self.assertTrue(all(attribute & curses.A_DIM for _text, attribute in entries[technical:]))
+        self.assertFalse(app.technical_supported())
+
+    def test_agent_detail_values_align_and_wrap_with_hanging_display_indent(self):
+        app = self.resource_app()
+        app.detail = app.agents()[0]
+        app.detail.update(summary='한글 검증 중입니다 여러 줄에 걸친 요약 문장입니다')
+        app.detail['devices'][0]['kind'] = '휴대전화'
+        for width in (8, 20, 38, 100):
+            with self.subTest(width=width):
+                entries = app.agent_detail(width)
+                self.assertTrue(all(display_width(line) <= width for line, _attribute in entries))
+        entries = app.agent_detail(38)
+        lines = [text for text, _attribute in entries]
+        work = lines[:lines.index('Identity & role')]
+        fields = [line for line in work if ':' in line]
+        starts = [display_width(line[:line.index(':') + 1]) +
+                  len(line[line.index(':') + 1:]) - len(line[line.index(':') + 1:].lstrip())
+                  for line in fields]
+        self.assertEqual(starts, [12, 12, 12])
+        summary = next(index for index, line in enumerate(work) if line.startswith('Summary:'))
+        continuation = work[summary + 1]
+        self.assertTrue(continuation.startswith(' ' * 12))
+        self.assertFalse(continuation.startswith(' ' * 13))
+        self.assertTrue(entries[summary + 1][1] & curses.A_BOLD)
+        # A non-ASCII field label aligns by terminal cells, not Python length.
+        resource = app.agent_detail()
+        phone = next(line for line, _attribute in resource if line.startswith('휴대전화:'))
+        identifier = next(line for line, _attribute in resource if line.startswith('ID:'))
+        self.assertEqual(display_width(phone[:phone.index('•')]),
+                         display_width(identifier[:identifier.index('phone-serial')]))
 
     def test_resource_fields_are_independently_unknown_or_known_empty(self):
         for devices in (None, [], [{'kind': 'phone', 'device_id': 'serial'}]):
@@ -238,7 +292,7 @@ class MailboxUiTest(unittest.TestCase):
                             self.assertNotIn('dead', app.host_resource_cue(self.store.host))
                         else:
                             self.assertIn('dead ?', app.host_resource_cue(self.store.host))
-                        lines = app.detail_lines()
+                        lines = [' '.join(line.split()) for line in app.detail_lines()]
                         self.assertIn('Devices: ?' if devices is None else 'Devices: none' if not devices
                                       else 'Devices', lines)
                         self.assertIn('Servers: ?' if servers is None else 'Servers: none' if not servers
@@ -281,8 +335,9 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn(' ?    ?    ? ', text)
         self.assertIn('old-peer · 1 agent · dead ? · unowned ? · stale-dev ?', text)
         app.detail = next(agent for agent in app.agents() if agent['host'] == 'old-peer')
-        self.assertIn('Devices: ?', app.detail_lines())
-        self.assertIn('Servers: ?', app.detail_lines())
+        lines = [' '.join(line.split()) for line in app.detail_lines()]
+        self.assertIn('Devices: ?', lines)
+        self.assertIn('Servers: ?', lines)
         app.remote['old-peer']['hosts'][0].update(
             uuid='wrong-uuid', resources={'dead_serve': [], 'servers_unowned': [], 'stale_devices': []})
         app.screen.erase()
@@ -318,6 +373,11 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(snapshot['resources'], resources)
 
     def mouse_at_text(self, app, needle, action='press', offset=0):
+        tab = next((rect for rect, target, value in app.hit_map
+                    if target == 'list-tab' and value == needle.strip().lower()), None)
+        if tab is not None:
+            app.key(MouseEvent(tab[0], tab[1] + offset, action))
+            return tab[0], tab[1] + offset
         call = next(call for call in reversed(app.screen.draw_calls) if needle in call.requested_text)
         column = call.column + display_width(call.requested_text[:call.requested_text.index(needle)]) + offset
         app.key(MouseEvent(call.row, column, action))
@@ -337,6 +397,9 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(app.focus, 'threads')
                     self.assertEqual(app.mode, 'nav')
                     self.capture(app, 32, width)
+                    if app.layout == 'tabbed':
+                        self.mouse_at_text(app, ' Agents ')
+                        self.capture(app, 32, width)
                     point = self.mouse_at_text(app, 'summary-1' if summary else 'agent-1')
                     self.assertEqual(app.focus, 'agents')
                     self.assertEqual(app.selections['agents'], 1)
@@ -375,6 +438,7 @@ class MailboxUiTest(unittest.TestCase):
                             for index, agent in enumerate(app.agents())]
                     app.local = local_snapshot(self.store, self.repo_id, self.environment)
                     app.selections['threads'] = 0
+                    app.focus = app.preview = 'threads'
                     snapshot = self.capture(app, 36, width)
                     rows = [call for call in snapshot.draw_calls
                             if 'queued · thread-' in call.requested_text]
@@ -394,7 +458,7 @@ class MailboxUiTest(unittest.TestCase):
                         self.assertIsNone(message['delivered_at'])
 
     def test_mouse_wheels_scroll_target_region_without_changing_focus(self):
-        for width in (100, 160):
+        for width in (160, 200):
             with self.subTest(width=width):
                 app = self.app()
                 base = app.agents()[0]
@@ -1783,44 +1847,125 @@ class MailboxUiTest(unittest.TestCase):
         app.tick()
         self.assertEqual(app.jobs, {})
 
-    def test_stacked_region_rects_fall_back_for_short_or_narrow_body(self):
+    def test_layout_uses_full_column_model_at_split_threshold(self):
         app = self.app()
-        app.layout = 'stacked'
-        for focus in ('agents', 'threads', 'detail'):
-            app.focus = focus
-            for height, width in ((0, 120), (14, 100), (17, 200), (18, 79)):
-                with self.subTest(focus=focus, height=height, width=width):
-                    self.assertEqual(app.region_rects(3, height, width),
-                                     {focus: (3, 0, height, width)})
-        app.focus = 'agents'
-        self.assertEqual(app.region_rects(3, 18, 81), {
-            'agents': (3, 0, 10, 40),
-            'threads': (3, 40, 10, 41),
-            'detail': (13, 0, 8, 81)})
-        self.assertEqual(app.region_rects(1, 80, 200)['detail'], (69, 0, 12, 200))
+        for agent in app.local['agents']:
+            agent.update(alias='fifteen-letters', role='')
+        columns = app.agent_columns(None, app.agents())
+        threshold = 2 * (sum(size for _, size, _ in columns) + 2 * (len(columns) - 1) + 2)
+        self.assertEqual(threshold, app.side_by_side_width())
+        self.assertEqual(threshold, 158)
+        for height in (24, 40):
+            for width in (80, 100, 120, 157, 160, threshold - 1, threshold, threshold + 1):
+                with self.subTest(height=height, width=width):
+                    snapshot = self.capture(app, height, width)
+                    self.assertEqual(app.layout, 'tabbed' if width < threshold else 'stacked')
+                    regions = {value: rect for rect, kind, value in app.hit_map if kind == 'region'}
+                    if width < threshold:
+                        self.assertEqual(set(regions), {'agents', 'detail'})
+                        self.assertEqual(regions['agents'][3], width)
+                        self.assertIn('Agents │ Threads', snapshot.line(1))
+                    else:
+                        self.assertEqual(set(regions), {'agents', 'threads', 'detail'})
+                        self.assertEqual(regions['agents'][3], width // 2)
+                    header = next(line for line in snapshot.lines() if 'ALIAS' in line)
+                    for label in ('PHN', 'EMU', 'SRV', 'PHASE · SUMMARY'):
+                        self.assertIn(label, header)
 
-    def test_stacked_top_bottom_geometry_at_large_terminal_sizes(self):
-        for height, width, top_height in ((35, 110, 25), (40, 120, 28), (50, 200, 36)):
-            with self.subTest(height=height, width=width):
-                app = self.app()
-                self.capture(app, height, width)
-                self.assertEqual(app.layout, 'stacked')
-                regions = {value: rect for rect, kind, value in app.hit_map if kind == 'region'}
-                self.assertEqual(regions, {
-                    'agents': (1, 0, top_height, width // 2),
-                    'threads': (1, width // 2, top_height, width - width // 2),
-                    'detail': (1 + top_height, 0, height - 2 - top_height, width)})
-                for _ in range(2):
-                    for focus in ('threads', 'detail', 'agents'):
-                        app.key('\t')
-                        self.assertEqual(app.focus, focus)
-                        self.capture(app, height, width)
-                        self.assertEqual({value: rect for rect, kind, value in app.hit_map
-                                          if kind == 'region'}, regions)
+    def test_split_threshold_tracks_alias_and_role_column_widths(self):
+        app = self.app()
+        thresholds = []
+        for alias, role in (('short', ''), ('long-agent-name', 'builder'),
+                            ('an-agent-name-over-eighteen-cells', 'coordinator')):
+            app.local['agents'] = [{**app.local['agents'][0], 'alias': alias, 'role': role}]
+            threshold = app.side_by_side_width()
+            thresholds.append(threshold)
+            for width in (threshold - 1, threshold):
+                self.capture(app, 40, width)
+                self.assertEqual(app.layout, 'tabbed' if width < threshold else 'stacked')
+            snapshot = self.capture(app, 24, 80)
+            header = next(line for line in snapshot.lines() if 'ALIAS' in line)
+            for label in ('PHN', 'EMU', 'SRV', 'SUMMARY'):
+                self.assertIn(label, header)
+        self.assertEqual(thresholds, sorted(set(thresholds)))
+
+    def test_detail_height_reserves_list_and_content_rows(self):
+        app = self.app()
+        for height in (0, 3, 8, 17, 18, 19, 22, 38, 48, 80):
+            for width in (79, 100, 200):
+                with self.subTest(height=height, width=width):
+                    regions = app.region_rects(3, height, width)
+                    if height < 18 or width < 80:
+                        self.assertEqual(regions, {'agents': (3, 0, height, width)})
+                        continue
+                    detail = regions['detail']
+                    listing = regions['agents']
+                    self.assertGreaterEqual(listing[2], 8)
+                    self.assertGreaterEqual(detail[2] - 3, 6)
+                    self.assertEqual(detail[2], min(height - 8, max(9, round(height * .4))))
+                    self.assertEqual(listing[0] + listing[2], detail[0])
+                    self.assertEqual(detail[0] + detail[2], 3 + height)
+
+    def test_tab_focus_keys_preserve_each_lists_selection_and_scroll(self):
+        for height in (17, 24, 40):
+            for forward, backward in (('\t', SHIFT_TAB), (curses.KEY_RIGHT, curses.KEY_LEFT), ('l', 'h')):
+                with self.subTest(height=height, forward=forward):
+                    app = self.app()
+                    base = app.local['agents'][0]
+                    app.local['agents'] = [{**base, 'terminal_id': f'term-{index}', 'alias': f'agent-{index:02}'}
+                                           for index in range(30)]
+                    app.local['threads'] = [self.thread_fixture(f'thread-{index:02}', 'queued')
+                                            for index in range(30)]
+                    app.selections.update(agents=20, threads=15)
+                    self.capture(app, height, 100)
+                    agents_scroll = app.scrolls['agents']
+                    app.key(forward)
+                    snapshot = self.capture(app, height, 100)
+                    self.assertEqual((app.focus, app.preview), ('threads', 'threads'))
+                    self.assertIn('Agents │ Threads', snapshot.line(1))
+                    threads_scroll = app.scrolls['threads']
+                    app.key(forward)
+                    self.capture(app, height, 100)
+                    self.assertEqual((app.focus, app.preview), ('detail', 'threads'))
+                    if height < 18:
+                        self.assertEqual({value for _, kind, value in app.hit_map if kind == 'region'}, {'detail'})
+                    app.key(backward)
+                    self.capture(app, height, 100)
+                    self.assertEqual(app.focus, 'threads')
+                    app.key(backward)
+                    self.capture(app, height, 100)
+                    self.assertEqual((app.focus, app.preview), ('agents', 'agents'))
+                    self.assertEqual(app.selections, {'agents': 20, 'threads': 15})
+                    self.assertEqual((app.scrolls['agents'], app.scrolls['threads']),
+                                     (agents_scroll, threads_scroll))
+
+    def test_mouse_tabs_switch_without_opening_input_and_keep_selection(self):
+        for height in (17, 24, 40):
+            app = self.app()
+            app.local['threads'] = [self.thread_fixture('first', 'queued'), self.thread_fixture('second', 'queued')]
+            app.selections.update(agents=1, threads=1)
+            app.colors_enabled = True
+            for focus, tab in (('agents', 'threads'), ('threads', 'agents'), ('detail', 'threads')):
+                with self.subTest(height=height, focus=focus, tab=tab), \
+                     patch('mailbox_tui.curses.color_pair', side_effect=lambda pair: pair << 8):
+                    app.focus = focus
+                    snapshot = self.capture(app, height, 100)
+                    active = app.preview if focus == 'detail' else focus
+                    for rect, kind, value in app.hit_map:
+                        if kind != 'list-tab':
+                            continue
+                        attribute = snapshot.cells[rect[0]][rect[1]].attribute
+                        self.assertEqual(bool(attribute & curses.A_BOLD), value == active)
+                        self.assertEqual(bool(attribute & curses.A_DIM), value != active)
+                        self.assertEqual(attribute & curses.A_COLOR, (1 << 8) if value == active else 0)
+                    rect = next(rect for rect, kind, value in app.hit_map if kind == 'list-tab' and value == tab)
+                    app.key(MouseEvent(rect[0], rect[1], 'press'))
+                    self.assertEqual((app.mode, app.focus, app.preview), ('nav', tab, tab))
+                    self.assertEqual(app.selections, {'agents': 1, 'threads': 1})
 
     def test_layout_uses_body_height_after_header_footer_and_status(self):
-        for height, status, layout in ((19, '', 'single'), (20, '', 'stacked'),
-                                       (20, 'Notice', 'single'), (21, 'Notice', 'stacked')):
+        for height, status, layout in ((19, '', 'single'), (20, '', 'tabbed'),
+                                       (20, 'Notice', 'single'), (21, 'Notice', 'tabbed')):
             with self.subTest(height=height, status=status):
                 app = self.app()
                 app.status = status
@@ -1839,7 +1984,7 @@ class MailboxUiTest(unittest.TestCase):
                 with patch.object(app, 'render_input', wraps=app.render_input) as render_input:
                     self.capture(app, 40, 120)
                 input_rect = render_input.call_args.args[0]
-                self.assertEqual(app.layout, 'stacked')
+                self.assertEqual(app.layout, 'tabbed')
                 detail = next(rect for rect, kind, value in app.hit_map
                               if kind == 'region' and value == 'detail')
                 self.assertEqual((input_rect[1], input_rect[3]), (0, 120))
@@ -1946,22 +2091,23 @@ class MailboxUiTest(unittest.TestCase):
                     rows = snapshot.rows_containing('[failed:')
                     self.assertEqual(len(rows), 1)
                     row = rows[0]
-                    self.assertEqual(app.layout, 'stacked')
-                    columns = app.agent_columns(38, app.agents())
-                    alias_start = 1 + columns[0][1] + 2
-                    alias_end = alias_start + columns[1][1]
-                    self.assertNotIn('│', snapshot.line(row)[1:39])
+                    self.assertEqual(app.layout, 'tabbed')
+                    columns = app.agent_columns(78, app.agents())
+                    tag_column = next(index for index, column in enumerate(columns) if column[0] == 'summary')
+                    tag_start = 1 + sum(size + 2 for _, size, _ in columns[:tag_column])
+                    tag_end = tag_start + columns[tag_column][1]
+                    self.assertNotIn('│', snapshot.line(row)[1:79])
                     label_column = snapshot.line(row).index('[failed:')
-                    self.assertGreaterEqual(label_column, alias_start)
-                    self.assertLess(label_column, alias_end)
-                    for cell in snapshot.cells[row][label_column:alias_end]:
+                    self.assertGreaterEqual(label_column, tag_start)
+                    self.assertLess(label_column, tag_end)
+                    for cell in snapshot.cells[row][label_column:tag_end]:
                         if color:
                             self.assertEqual(cell.attribute & curses.A_COLOR, 5 << 8)
                             self.assertFalse(cell.attribute & curses.A_REVERSE)
                         else:
                             self.assertTrue(cell.attribute & curses.A_REVERSE)
                     self.assertIn(error, app.result_tags[app.identity(app.recipient)][0])
-                    self.assertIn(((row, 1, 1, 38), 'list-row', 0), app.hit_map)
+                    self.assertIn(((row, 1, 1, 78), 'list-row', 0), app.hit_map)
                     app.key(MouseEvent(row, 38, 'press'))
                     self.assertEqual(app.mode, 'input')
                     self.assertEqual(app.body, 'retain this draft')
@@ -2153,8 +2299,8 @@ class MailboxUiTest(unittest.TestCase):
     def test_layout_breakpoints_preserve_input_focus_selection_and_draft(self):
         cases = [(24, 31, 'tiny'), (24, 32, 'single'), (24, 79, 'single'),
                  (24, 80, 'single'), (24, 139, 'single'), (24, 140, 'single'),
-                 (32, 79, 'single'), (32, 80, 'stacked'), (32, 140, 'stacked'),
-                 (40, 120, 'stacked'), (50, 200, 'stacked'),
+                 (32, 79, 'single'), (32, 80, 'tabbed'), (32, 140, 'tabbed'),
+                 (40, 120, 'tabbed'), (50, 200, 'stacked'),
                  (9, 160, 'tiny'), (10, 160, 'single'),
                  (17, 160, 'single'), (18, 160, 'single'),
                  (17, 100, 'single'), (18, 100, 'single')]
@@ -2685,7 +2831,7 @@ class MailboxUiTest(unittest.TestCase):
             if app.scrolls['detail'] == previous:
                 break
         for section in ('Mail', 'Devices', 'Servers', 'phone-serial', 'Port: 5180'):
-            self.assertIn(section, '\n'.join(pages))
+            self.assertIn(section, ' '.join('\n'.join(pages).split()))
         app.key('t')
         self.assertFalse(app.detail_technical)
         app.key(ESCAPE)
@@ -3008,6 +3154,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(handled['messages'][0]['confirmation_source'], 'operator')
         self.assertTrue(handled['messages'][0]['evidence'])
         self.assertTrue(app.thread_handled(handled))
+        app.focus = app.preview = 'threads'
         self.capture(app, 35, 110)
         self.assertIn('Handled (1)', '\n'.join(app.screen.snapshot().lines()))
 
@@ -3167,7 +3314,10 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertTrue(input_hit[0] < row < input_hit[0] + input_hit[2] - 1)
                 detail = next(rect for rect, target, value in app.hit_map
                               if target == 'region' and value == 'detail')
-                self.assertTrue(8 <= detail[2] <= 12)
+                self.assertGreaterEqual(app.detail_available, 6)
+                listing = next(rect for rect, target, value in app.hit_map
+                               if target == 'region' and value != 'detail')
+                self.assertGreaterEqual(listing[2], 8)
 
     def test_compact_initial_native_body_paragraphs_and_followup_remain_readable(self):
         now = 1700000000
@@ -3192,8 +3342,9 @@ class MailboxUiTest(unittest.TestCase):
                 y, _, outer_height, _ = rect
                 visible = snapshot.lines()[y + 2:y + outer_height - 1]
                 text = '\n'.join(visible)
-                self.assertIn('Message 2/2', visible[0])
-                self.assertIn('FOLLOWUP-BODY', visible[2])
+                self.assertIn('Message 2/2', text)
+                self.assertIn('FOLLOWUP-BODY', text)
+                self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
                 self.assertIn('↑more', snapshot.line(y + 1))
                 app.key(curses.KEY_HOME)
                 snapshot = self.capture(app, height, width)
@@ -3238,18 +3389,19 @@ class MailboxUiTest(unittest.TestCase):
             snapshot = self.capture(app, 35, 110)
             y, _, height, _ = next(rect for rect, target, value in app.hit_map
                                    if target == 'region' and value == 'detail')
-            self.assertEqual(app.detail_available, 5)
+            self.assertEqual(app.detail_available, height - 3)
             return snapshot, y, snapshot.lines()[y + 2:y + height - 1]
 
         snapshot, y, lines = visible()
-        self.assertIn('Message 3/3', lines[0])
-        self.assertIn('MAIL-3 line 0', lines[2])
+        self.assertIn('Message 3/3', '\n'.join(lines))
+        self.assertIn('MAIL-3 line 0', '\n'.join(lines))
+        self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
         self.assertIn('↑more', snapshot.line(y + 1))
         app.key(curses.KEY_HOME)
         self.assertIn('Message 1/3', visible()[2][0])
         for _ in range(2):
             app.key('t')
-            self.assertIn('Message 3/3', visible()[2][0])
+            self.assertIn('Message 3/3', '\n'.join(visible()[2]))
         app.key(SHIFT_TAB)
         app.key('j')
         app.key('\t')
@@ -3258,7 +3410,7 @@ class MailboxUiTest(unittest.TestCase):
         app.key(SHIFT_TAB)
         app.key('k')
         app.key('\t')
-        self.assertIn('Message 3/3', visible()[2][0])
+        self.assertIn('Message 3/3', '\n'.join(visible()[2]))
         self.assertFalse(app.detail_technical)
         self.assertEqual(app.jobs, {})
 
@@ -3293,8 +3445,10 @@ class MailboxUiTest(unittest.TestCase):
                 else:
                     y = next(rect[0] for rect, target, value in app.hit_map
                              if target == 'region' and value == 'detail')
-                    self.assertIn('Message 4/4', snapshot.line(y + 2))
-                    self.assertIn('NEW-ARRIVAL', snapshot.line(y + 4))
+                    detail = '\n'.join(snapshot.lines()[y + 2:y + 2 + app.detail_available])
+                    self.assertIn('Message 4/4', detail)
+                    self.assertIn('NEW-ARRIVAL', detail)
+                    self.assertEqual(app.scrolls['detail'], app.detail_latest[1])
                 self.assertEqual(app.jobs, {})
 
     def test_thread_reflow_preserves_latest_following_but_not_scrolled_away_readers(self):
@@ -3379,18 +3533,23 @@ class MailboxUiTest(unittest.TestCase):
         app.refresh_detail()
         lines = app.detail_lines()
         self.assertIn('Threads: 2 active · 1 handled with this agent', lines)
-        self.assertEqual(lines[0], 'Address: ' + app.address(agent))
-        self.assertTrue(lines[1].startswith('Alias: '))
+        fields = {label: value.lstrip() for line in lines
+                  for label, separator, value in [line.partition(':')] if separator}
+        self.assertEqual(fields['Address'], app.address(agent))
+        self.assertEqual(fields['Alias'], agent['alias'])
         mail = lines.index('Mail')
-        self.assertEqual(mail, next(index for index, line in enumerate(lines)
-                                   if line.startswith('Unread: ')) + 1)
-        self.assertLess(mail, next(index for index, line in enumerate(lines) if line.startswith('Devices')))
-        self.assertLess(mail, next(index for index, line in enumerate(lines) if line.startswith('Servers')))
+        self.assertLess(mail, next(index for index, line in enumerate(lines)
+                                   if line.startswith('Unread: ')))
+        self.assertLess(lines.index('Devices & servers'), mail)
         self.capture(app, 35, 110)
         app.focus = 'detail'
-        for _ in range(2):
+        snapshot = self.capture(app, 35, 110)
+        while not any(call.visible_text.startswith('Read: Tab → Threads,')
+                      for call in app.screen.draw_calls):
+            previous = app.scrolls['detail']
             app.key(curses.KEY_NPAGE)
             snapshot = self.capture(app, 35, 110)
+            self.assertNotEqual(app.scrolls['detail'], previous)
         hint = next(call for call in app.screen.draw_calls if call.visible_text.startswith('Read: Tab → Threads,'))
         self.assertTrue(hint.attribute & curses.A_DIM)
         self.assertIn('Threads: 2 active', '\n'.join(snapshot.lines()))
@@ -3439,7 +3598,7 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(app.jobs, {})
 
     def test_detail_pages_use_actual_compact_viewport_and_show_range_and_more(self):
-        for height, width, available in ((35, 110, 5), (50, 200, 9)):
+        for height, width in ((35, 110), (50, 200)):
             with self.subTest(height=height):
                 app = self.app()
                 thread = self.thread_fixture('paging', 'queued')
@@ -3447,6 +3606,7 @@ class MailboxUiTest(unittest.TestCase):
                 app.local['threads'] = [thread]
                 app.focus, app.preview = 'detail', 'threads'
                 snapshot = self.capture(app, height, width)
+                available = app.detail_available
                 y = next(rect[0] for rect, target, region in app.hit_map
                          if target == 'region' and region == 'detail')
                 self.assertIn(f'1-{available}/32', snapshot.line(y + 1))
@@ -3959,7 +4119,7 @@ class MailboxUiTest(unittest.TestCase):
                 initialize.assert_not_called()
                 pair.assert_not_called()
                 self.assertFalse(app.colors_enabled)
-                self.assertEqual(app.layout, 'stacked')
+                self.assertEqual(app.layout, 'tabbed')
                 text = '\n'.join(snapshot.lines())
                 for label in ('Agents', 'Threads', 'Detail', 'Turn state: working'):
                     self.assertIn(label, text)
@@ -4184,7 +4344,8 @@ class MailboxUiTest(unittest.TestCase):
         app.key('h')
         self.capture(app, height=50, width=79)
         self.assertIn('Unread: ?', app.detail_lines())
-        self.assertIn('Host: remote  STALE/offline', app.detail_lines())
+        self.assertIn('Host: remote STALE/offline',
+                      [' '.join(line.split()) for line in app.detail_lines()])
 
     def test_agent_detail_preserves_full_summary_timestamps_and_boolean_labels(self):
         now = 1700000000.25
@@ -4197,12 +4358,15 @@ class MailboxUiTest(unittest.TestCase):
         app.key('h')
         self.capture(app, height=100, width=79)
         lines = app.detail_lines()
-        self.assertIn('Summary: ' + summary, lines)
-        self.assertIn('Last updated: ' + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now - 12)) + ' (12s ago)', lines)
+        fields = {label: value.lstrip() for line in lines
+                  for label, separator, value in [line.partition(':')] if separator}
+        self.assertEqual(fields['Summary'], summary)
+        self.assertEqual(fields['Last updated'],
+                         time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now - 12)) + ' (12s ago)')
         self.assertTrue(any('(2m ago)' in line for line in lines))
         self.assertTrue(any('(1d ago)' in line for line in lines))
-        for expected in ('Main checkout: yes', 'Extension present: no', 'User border: no'):
-            self.assertIn(expected, lines)
+        for label, expected in (('Main checkout', 'yes'), ('Extension present', 'no'), ('User border', 'no')):
+            self.assertEqual(fields[label], expected)
 
     def test_execute_snapshot_passes_isolated_environment_and_labels(self):
         with patch('mailbox_tui.herdr', return_value={'snapshot': {'panes': [

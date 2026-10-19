@@ -26,46 +26,58 @@ closes a popup but does nothing in split/tab mode; in input or overlays it backs
 
 ### Responsive regions and navigation
 
-The body contains **Agents**, **Threads**, and **Detail** regions, not tabs.
-**Layout v2 replaces the old width-based two-/three-column layout with Detail
-on the right.** Wider terminals no longer put all three regions side by side.
+The body contains **Agents**, **Threads**, and **Detail**. Detail is always below
+the lists when there is room; it is never a third column on the right.
 
-- **Stacked:** at least 80 columns and 18 available body rows. Agents and Threads
-  share the top row in left/right halves; Detail spans the full width below.
-  Detail's outer height is roughly one quarter of the usable body, clamped
-  to 8–12 rows; the top panels receive the remaining rows
-  (at least 10). Detail content remains fully scrollable.
-- Available body height excludes the global header, footer, any status line,
-  and the INPUT panel. INPUT stays full width below Detail and above the
-  status/footer area; opening or growing it can force single-region mode.
-- **Single:** below 80 columns or 18 available body rows, only the focused region
-  fills the body. INPUT, when open, remains a separate full-width panel below it.
+- **Stacked, side by side:** with at least 80 columns and 18 available body rows,
+  the lists share the top row only if each half can fit the complete Agents
+  column model: TURN, ALIAS, MAIL, RX, ROLE, PHN, EMU, SRV and at least 16
+  cells of PHASE · SUMMARY. The threshold is calculated from current alias/role
+  widths, column gaps and borders, not a fixed terminal width (for example,
+  158 columns with a 15-cell alias and the four-cell ROLE minimum).
+- **Tabbed:** below that split threshold, the top list uses the full width.
+  Its border shows `Agents │ Threads`; the active tab is accent-coloured and
+  bold, and the inactive tab is dim. Click a label to select its list.
+  Detail stays full width below. Long aliases/roles give up spare width before
+  the full-width Agents table drops resource columns.
+- Detail's outer height is `round(available_body * 0.4)`, with at least nine
+  outer rows (six content rows, a notice and borders) and at least eight outer
+  rows left for the list, including its border/tab bar. Detail scrolls fully.
+- Available body height excludes the header, footer, any status line and INPUT.
+  INPUT stays full width below Detail; opening or growing it can force the
+  single-region fallback.
+- **Single:** below 80 columns or 18 available body rows, the focused region
+  fills the body. The list tab bar remains on its top border. The unchanged
+  focus cycle `Agents → Threads → Detail → Agents` reaches Detail by replacing
+  the list; its border retains the tabs plus a Detail label. Clicking a tab
+  returns to its list. INPUT remains a separate full-width panel below.
+- `Tab`/`Shift+Tab`, `←`/`→` and `h`/`l` follow that focus cycle in every layout,
+  switching the active tab with list focus. Detail keeps the last-focused
+  list's tab active. Each list preserves its own selection and scroll.
 - **Tiny:** below 32 columns or 10 terminal rows, a resize notice replaces the
-  body. Resizing preserves drafts, selections, cursor and mode;
-  `Esc`/`q` retain their mode-specific behavior.
+  body without losing drafts, selections, cursor or mode.
 
 ```text
-Stacked (width >= 80; available body height >= 18)
-+-------------------------+-------------------------+
-| Agents                  | Threads                 | remaining rows, min 10
-+-------------------------+-------------------------+
-| Detail                                            | body / 4, clamped 8–12
+Tabbed (split Agents columns would not fit)
++-- Agents | Threads -------------------------------+
+| Active list                                       | remaining rows, min 8
 +---------------------------------------------------+
-| INPUT (when open; full width, outside body height)  |
+| Detail                                            | about 40%, min 9 rows
 +---------------------------------------------------+
-
-Single (width < 80 or available body height < 18)
-+---------------------------------------------------+
-| Focused region: Agents / Threads / Detail          |
-+---------------------------------------------------+
-| INPUT (when open; full width, outside body height)  |
+| INPUT (when open; excluded from body height)       |
 +---------------------------------------------------+
 ```
 
-For example, without INPUT or a status line, a 200×50 terminal has 48 usable
-body rows: Agents/Threads occupy rows 1–36 and Detail rows 37–48 (12 outer rows).
-At 110×35, Agents/Threads occupy rows 1–25 and Detail rows 26–33 (8 outer rows).
-Coordinates are zero-based; panel borders count toward these heights.
+For example, without INPUT or status, 200×50 has 48 usable body rows: the
+side-by-side lists use 29 outer rows and Detail uses 19. At 110×35, the active
+tab uses 20 outer rows and Detail uses 13. Borders count toward these heights.
+
+Agent Detail is a single-column, sectioned view: **Work** (turn, phase, bold
+summary), **Identity & role**, **Devices & servers**, **Mail**, then dim
+**Receiver/technical**. Device entries show the icon and human-readable label
+(for example, `📱 SM-A245N`) before technical IDs. Mail contains counts and the
+Threads/Space reading hint, not message bodies. Thread Detail retains its
+message history and optional technical information.
 
 The header names the current mode (`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`,
 or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
