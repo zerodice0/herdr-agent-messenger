@@ -2480,7 +2480,8 @@ class MailboxUiTest(unittest.TestCase):
                     body=first_body, created_at=now - 60, sender_label='sender-' * 100,
                     recipient_address='host/recipient-' * 100, hold_reason='Long routing reason ' * 100)
                 thread['messages'][1].update(
-                    body='FOLLOWUP-BODY', sender_label='actual-second-sender',
+                    body='FOLLOWUP-BODY\n' + '\n'.join(f'Followup line {i}' for i in range(8)),
+                    sender_label='actual-second-sender',
                     recipient_address='actual-second-recipient', created_at=now)
                 app.local['threads'] = [thread]
                 app.focus, app.preview = 'detail', 'threads'
@@ -2490,7 +2491,13 @@ class MailboxUiTest(unittest.TestCase):
                 y, _, outer_height, _ = rect
                 visible = snapshot.lines()[y + 2:y + outer_height - 1]
                 text = '\n'.join(visible)
-                self.assertEqual(app.scrolls['detail'], 0)
+                self.assertIn('Message 2/2', visible[0])
+                self.assertIn('FOLLOWUP-BODY', visible[2])
+                self.assertIn('↑more', snapshot.line(y + 1))
+                app.key(curses.KEY_HOME)
+                snapshot = self.capture(app, height, width)
+                visible = snapshot.lines()[y + 2:y + outer_height - 1]
+                text = '\n'.join(visible)
                 self.assertIn('Message 1/2', visible[0])
                 self.assertIn(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now - 60)), visible[0])
                 self.assertIn('→', visible[0])
@@ -2517,6 +2524,135 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertIn(value, all_text)
                 self.assertLess(all_text.index('FIRST-BODY'), all_text.index('FOLLOWUP-BODY'))
                 self.assertEqual(app.jobs, {})
+
+    def test_new_thread_selection_opens_latest_and_toggle_reanchors_without_losing_history(self):
+        app = self.app()
+        thread = self.thread_fixture('latest-three', 'queued', 'delivered', 'queued')
+        for index, message in enumerate(thread['messages'], 1):
+            message['body'] = '\n'.join(f'MAIL-{index} line {line}' for line in range(6))
+        app.local['threads'] = [thread, self.thread_fixture('single', 'queued')]
+        app.focus, app.preview = 'detail', 'threads'
+
+        def visible():
+            snapshot = self.capture(app, 35, 110)
+            y, _, height, _ = next(rect for rect, target, value in app.hit_map
+                                   if target == 'region' and value == 'detail')
+            self.assertEqual(app.detail_available, 5)
+            return snapshot, y, snapshot.lines()[y + 2:y + height - 1]
+
+        snapshot, y, lines = visible()
+        self.assertIn('Message 3/3', lines[0])
+        self.assertIn('MAIL-3 line 0', lines[2])
+        self.assertIn('↑more', snapshot.line(y + 1))
+        app.key(curses.KEY_HOME)
+        self.assertIn('Message 1/3', visible()[2][0])
+        for _ in range(2):
+            app.key('t')
+            self.assertIn('Message 3/3', visible()[2][0])
+        app.key(SHIFT_TAB)
+        app.key('j')
+        app.key('\t')
+        self.assertIn('Message 1/1', visible()[2][0])
+        self.assertEqual(app.scrolls['detail'], 0)
+        app.key(SHIFT_TAB)
+        app.key('k')
+        app.key('\t')
+        self.assertIn('Message 3/3', visible()[2][0])
+        self.assertFalse(app.detail_technical)
+        self.assertEqual(app.jobs, {})
+
+    def test_thread_refresh_preserves_position_and_only_follows_arrivals_at_latest(self):
+        for scrolled in (False, True):
+            with self.subTest(scrolled=scrolled):
+                app = self.app()
+                thread = self.thread_fixture('refresh-latest', 'queued', 'queued', 'queued')
+                for index, message in enumerate(thread['messages'], 1):
+                    message['body'] = '\n'.join(f'MAIL-{index} line {line}' for line in range(8))
+                app.local['threads'] = [thread]
+                app.focus, app.preview = 'detail', 'threads'
+                self.capture(app, 35, 110)
+                if scrolled:
+                    app.key(curses.KEY_PPAGE)
+                offset = app.scrolls['detail']
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = json.loads(json.dumps(app.local))
+                app.tick()
+                self.capture(app, 35, 110)
+                self.assertEqual(app.scrolls['detail'], offset)
+                updated = json.loads(json.dumps(app.local))
+                updated['threads'][0]['messages'].append(
+                    {**thread['messages'][-1], 'message_id': 'new-arrival',
+                     'body': 'NEW-ARRIVAL\nNew line 1\nNew line 2\nNew line 3'})
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = updated
+                app.tick()
+                snapshot = self.capture(app, 35, 110)
+                if scrolled:
+                    self.assertEqual(app.scrolls['detail'], offset)
+                else:
+                    y = next(rect[0] for rect, target, value in app.hit_map
+                             if target == 'region' and value == 'detail')
+                    self.assertIn('Message 4/4', snapshot.line(y + 2))
+                    self.assertIn('NEW-ARRIVAL', snapshot.line(y + 4))
+                self.assertEqual(app.jobs, {})
+
+    def test_short_latest_message_uses_clamped_last_page(self):
+        app = self.app()
+        app.local['threads'] = [self.thread_fixture('short-latest', 'queued', 'queued', 'queued')]
+        app.focus, app.preview = 'detail', 'threads'
+        snapshot = self.capture(app, 35, 110)
+        y, _, height, _ = next(rect for rect, target, value in app.hit_map
+                               if target == 'region' and value == 'detail')
+        text = '\n'.join(snapshot.lines()[y + 2:y + height - 1])
+        self.assertEqual(app.scrolls['detail'], app.detail_total - app.detail_available)
+        self.assertIn('Message 3/3', text)
+        self.assertIn('short-latest body 2', text)
+        app.key(curses.KEY_HOME)
+        self.assertIn('Message 1/3', self.capture(app, 35, 110).line(y + 2))
+
+    def test_agent_detail_mail_counts_loaded_participant_threads_and_explains_reading(self):
+        app = self.app()
+        agent = self.select_agent(app)
+        active = self.thread_fixture('active-mail', 'queued', 'handled')
+        sent = self.thread_fixture('sent-mail', 'delivered')
+        sent['messages'][0].update(sender=agent['agent_id'], sender_label=agent['alias'],
+                                   origin_host=agent['host'], recipient_address='elsewhere/other',
+                                   recipient_host='elsewhere', recipient_terminal_id='other')
+        handled = self.thread_fixture('handled-mail', 'handled', 'handled')
+        unrelated = self.thread_fixture('unrelated', 'queued')
+        unrelated['messages'][0].update(recipient_address='elsewhere/other',
+                                        recipient_host='elsewhere', recipient_terminal_id='other')
+        app.local['threads'] = [active, sent, handled, unrelated]
+        app.local['submissions'] = [{'submission_id': 'not-native', 'acceptance': 'accepted',
+                                     'target': agent, 'body': 'DIRECT is not a thread'}]
+        app.local['outbox'] = [{'item_id': 'not-thread', 'state': 'pending',
+                               'kind': 'message', 'target_host': agent['host']}]
+        app.refresh_detail()
+        lines = app.detail_lines()
+        self.assertIn('Threads: 2 active · 1 handled with this agent', lines)
+        self.assertEqual(lines[0], 'Address: ' + app.address(agent))
+        self.assertTrue(lines[1].startswith('Alias: '))
+        mail = lines.index('Mail')
+        self.assertEqual(mail, next(index for index, line in enumerate(lines)
+                                   if line.startswith('Unread: ')) + 1)
+        self.assertLess(mail, next(index for index, line in enumerate(lines) if line.startswith('Devices')))
+        self.assertLess(mail, next(index for index, line in enumerate(lines) if line.startswith('Servers')))
+        self.capture(app, 35, 110)
+        app.focus = 'detail'
+        for _ in range(2):
+            app.key(curses.KEY_NPAGE)
+            snapshot = self.capture(app, 35, 110)
+        hint = next(call for call in app.screen.draw_calls if call.visible_text.startswith('Read: Tab → Threads,'))
+        self.assertTrue(hint.attribute & curses.A_DIM)
+        self.assertIn('Threads: 2 active', '\n'.join(snapshot.lines()))
+        self.assertEqual(app.jobs, {})
+
+    def test_agent_detail_mail_zero_case_still_explains_where_to_read(self):
+        app = self.app()
+        app.refresh_detail()
+        lines = app.detail_lines()
+        self.assertIn('No threads with this agent yet', lines)
+        self.assertIn('Read: Tab → Threads, select a thread; its messages appear here', lines)
 
     def test_compact_direct_body_preserves_real_and_literal_newlines_and_actual_sender(self):
         body = 'DIRECT-FIRST\n\nLiteral \\n stays literal\nDIRECT-LAST'
