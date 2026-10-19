@@ -251,10 +251,13 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
     board = status_board(store, repo_id=repo_id, host="local", environment=environment)
     agents = board["agents"]
     panes = []
+    workspaces = []
     if environment is not None:
         try:
             result = herdr(["api", "snapshot"], environment)
-            panes = result.get("snapshot", result).get("panes", [])
+            live_snapshot = result.get("snapshot", result)
+            panes = live_snapshot.get("panes", [])
+            workspaces = live_snapshot.get("workspaces", [])
             labels = {pane["terminal_id"]: pane.get("label") or "" for pane in panes}
             for agent in agents:
                 current = labels.get(agent["terminal_id"], "")
@@ -267,6 +270,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
                 "submissions": mail.list_direct(repo_id)["submissions"],
                 "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ, panes),
                 "panes": panes,
+                "workspaces": workspaces,
                 "settings": None,
                 "repo_modes": {repo: settings.show(repo)["mode"]
                                for repo in {agent["repo_id"] for agent in agents}},
@@ -643,8 +647,36 @@ class MailboxApp:
             for agent in snapshot.get("agents", []):
                 stale = host in self.remote_errors or agent.get("stale", False)
                 values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
+        local_host = self.local.get("host")
+        workspace = self.agents_workspace()
         return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
-                      key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+                      key=lambda agent: (agent["host"] != local_host, agent["host"],
+                                         not (agent["host"] == local_host and workspace
+                                              and agent.get("workspace_id") == workspace),
+                                         not bool(agent.get("workspace_id")), agent.get("workspace_id") or "",
+                                         agent.get("alias") or "", agent["terminal_id"]))
+
+    def agents_workspace(self) -> str | None:
+        # settings_scope() resolves this alongside the local snapshot. Keep its
+        # order stable until tick() can restore selection by identity on refresh;
+        # reading the live ledger here could reorder the OLD snapshot first.
+        # current_settings_scope() would also discard pending Settings edits.
+        return self.local.get("scope", self.settings_context).get("workspace_id")
+
+    def workspace_label(self, host: str, workspace: str | None,
+                        agents: Sequence[Mapping[str, Any]]) -> str:
+        if not workspace:
+            return "No workspace"
+        snapshot = self.local if host == self.local.get("host") else self.remote.get(host, {})
+        for item in snapshot.get("workspaces", []):
+            if item.get("workspace_id") == workspace and item.get("label"):
+                return str(item["label"])
+        # Pane labels name panes, not workspaces. Only explicit workspace labels
+        # are suitable here; current remote ledger boards normally carry IDs only.
+        for item in [*snapshot.get("panes", []), *agents]:
+            if item.get("workspace_id") == workspace and item.get("workspace_label"):
+                return str(item["workspace_label"])
+        return workspace
 
     def receiver_notice(self) -> str:
         """Only current local, participating OMP/Claude sessions need a receiver."""
@@ -1923,9 +1955,16 @@ class MailboxApp:
                     scroll = min(scroll, section)
                 elif scroll > section and height > 1:
                     # Long sections retain context without hiding the selected row.
-                    context = lines[section:first_agent][:height - 1]
+                    context = [line for line in lines[section:first_agent]
+                               if line[1] in {-2, -3}][:height - 1]
+                    workspace = next((index for index in range(chosen, section, -1)
+                                      if lines[index][1] == -4), None)
+                    body_start = first_agent
+                    if workspace is not None and len(context) < height - 1:
+                        context.append(lines[workspace])
+                        body_start = workspace + 1
                     body_height = height - len(context)
-                    scroll = max(first_agent, min(scroll, chosen), chosen - body_height + 1)
+                    scroll = max(body_start, min(scroll, chosen), chosen - body_height + 1)
                     self.scrolls[region] = scroll
                     return context + lines[scroll:scroll + body_height]
         scroll = min(max(0, scroll), max(0, len(lines) - height))
@@ -1943,13 +1982,15 @@ class MailboxApp:
                    "mail": "MAIL", "rx": "RX", "role": "ROLE", "phone": "PHN",
                    "emu": "EMU", "server": "SRV", "summary": "PHASE · SUMMARY"}
         lines: list[tuple[str, int, int, bool]] = []
-        hosts = list(dict.fromkeys([agent["host"] for agent in agents] +
-                                  ([self.local["host"]] if self.local.get("host") else []) +
-                                  [host for host, snapshot in self.remote.items()
-                                   if any(item["host"] == host and item["uuid"] == peer["uuid"]
-                                          for peer in self.local.get("peers", []) if peer["canonical_name"] == host
-                                          for item in snapshot.get("hosts", []))] +
-                                  sorted(self.remote_errors)))
+        hosts = sorted(set([agent["host"] for agent in agents] +
+                           ([self.local["host"]] if self.local.get("host") else []) +
+                           [host for host, snapshot in self.remote.items()
+                            if any(item["host"] == host and item["uuid"] == peer["uuid"]
+                                   for peer in self.local.get("peers", []) if peer["canonical_name"] == host
+                                   for item in snapshot.get("hosts", []))] +
+                           list(self.remote_errors)),
+                       key=lambda host: (host != self.local.get("host"), host))
+        current_workspace = self.agents_workspace()
         for host in hosts:
             group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
             stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
@@ -1966,7 +2007,18 @@ class MailboxApp:
                 lines.append((self.column_text(headers, columns), -3, header_style, False))
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
+            previous_workspace: Any = object()
             for index, agent in group:
+                workspace = agent.get("workspace_id") or None
+                if workspace != previous_workspace:
+                    members = [item for _, item in group if (item.get("workspace_id") or None) == workspace]
+                    current = bool(workspace and host == self.local.get("host")
+                                   and workspace == current_workspace)
+                    suffix = f" · {len(members)}" + (" · current" if current else "")
+                    name = self.workspace_label(host, workspace, members)
+                    label = "  " + truncate_display_text(name, max(0, width - 2 - display_width(suffix))) + suffix
+                    lines.append((label, -4, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
+                    previous_workspace = workspace
                 chosen = index == self.selections["agents"]
                 marker = "▌" if chosen and self.focus == "agents" else " "
                 turn = agent.get("turn_state") or "unknown"

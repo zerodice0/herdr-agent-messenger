@@ -125,10 +125,21 @@ vertical separators or horizontal rules inside the panel. Header labels are
 **cyan and bold, without underlines**; without color they are bold only.
 Each host section starts with a **bold host label and agent count**, such as
 `▾ winmini · 1 agent` or `▾ winmini · 2 agents`, followed by its column header
-and agent rows. Empty hosts have no column header. Sections have no blank
-separator rows, preserving space on small screens. Host/header rows are inert
-to mouse selection and skipped by keyboard selection. Scrolling keeps the
-selected agent visible and retains its host/header whenever space permits.
+and workspace groups. The list remains repository-scoped: the local host comes
+first, with the opener's current workspace first, then other local workspaces
+by workspace ID; remote hosts follow alphabetically, grouped by workspace ID.
+Agents within each workspace sort by alias, then terminal ID. Missing workspace
+IDs sort last within their host.
+Every workspace group has an indented `workspace label · N` line, even when it
+is the host's only group; the opener's host-local group adds **`· current`**.
+Local labels come from Herdr snapshot workspace labels (or explicit
+`workspace_label` data), falling back to the workspace ID; older remote boards
+usually supply IDs only. Missing IDs display `No workspace`. Current workspace
+lines are cyan/bold (bold without color); other workspace lines are dim.
+Empty hosts have no column header. Sections have no blank separator rows.
+Host, column-header and workspace lines are inert to mouse selection and skipped
+by keyboard selection. Scrolling keeps the selected agent visible and retains
+its host/header, plus the workspace line when at least four rows fit.
 Findings follow only when nonzero (or unknown), with stale/error information
 when applicable; findings truncate before the count.
 

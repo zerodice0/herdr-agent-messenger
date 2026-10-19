@@ -25,7 +25,7 @@ from mailbox_tui import (Job, MailboxApp, OPENER_PANE, OPENER_TERMINAL, REPO_ENV
                          execute_job, launch, local_snapshot, maintain, wrap_summary)
 
 
-SCRATCH = Path('/home/zerodice0/.cache/agent-work/herdr-agent-labels-resource-presence-e726754b00/workspace-main')
+SCRATCH = Path(tempfile.gettempdir())
 
 
 class Screen(FakeCursesWindow):
@@ -1460,6 +1460,7 @@ class MailboxUiTest(unittest.TestCase):
         app.environment['HERDR_WORKSPACE_ID'] = 'mailbox'
         self.select_agent(app, 'term-b')
         app.selected('agents')['workspace_id'] = 'elsewhere'
+        self.select_agent(app, 'term-b')
         app.key('s')
         self.assertEqual(app.current_settings_scope(),
                          {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1'})
@@ -2461,6 +2462,162 @@ class MailboxUiTest(unittest.TestCase):
                     self.capture(app, height, width)
                     self.assertEqual((app.mode, app.focus, app.drafts), before)
 
+    def workspace_app(self):
+        app = self.app()
+        base = app.local['agents'][0]
+        def agent(terminal, workspace, alias, host=None):
+            return {**base, 'terminal_id': terminal, 'workspace_id': workspace,
+                    'alias': alias, 'host': host or self.store.host}
+        app.local['agents'] = [
+            agent('local-other-z', 'w3', 'alpha'),
+            agent('local-missing', None, 'aaa'),
+            agent('local-current-z', 'w1', 'zulu'),
+            agent('local-other-a', 'w0', 'bravo'),
+            agent('local-current-b', 'w1', 'same'),
+            agent('local-current-a', 'w1', 'same'),
+            {**agent('wrong-repo', 'w1', 'aaa'), 'repo_id': 'another-repo'}]
+        app.local['workspaces'] = [{'workspace_id': 'w1', 'label': 'Main workspace'},
+                                   {'workspace_id': 'w0', 'label': 'Other workspace'}]
+        for host in ('zz-peer', 'aa-peer'):
+            app.local['peers'].append({'canonical_name': host, 'uuid': host + '-uuid'})
+            app.remote[host] = {
+                'hosts': [{'host': host, 'uuid': host + '-uuid'}],
+                'agents': [agent(host + '-missing', '', 'aaa', host),
+                           agent(host + '-w1', 'w1', 'alpha', host),
+                           agent(host + '-w0', 'w0', 'zulu', host)]}
+        return app
+
+    def test_agents_order_current_workspace_then_local_then_remote_and_missing_last(self):
+        app = self.workspace_app()
+        self.assertEqual([agent['terminal_id'] for agent in app.agents()], [
+            'local-current-a', 'local-current-b', 'local-current-z',
+            'local-other-a', 'local-other-z', 'local-missing',
+            'aa-peer-w0', 'aa-peer-w1', 'aa-peer-missing',
+            'zz-peer-w0', 'zz-peer-w1', 'zz-peer-missing'])
+        app.settings_pending = {'mode': 'auto'}
+        app.settings_context = {**app.settings_context, 'workspace_id': 'old-workspace'}
+        self.assertEqual(app.agents()[0]['workspace_id'], 'w1')
+        app.screen = Screen(30, 100)
+        app.render_agents((0, 0, 30, 100))
+        self.assertEqual(app.settings_pending, {'mode': 'auto'})
+        self.assertEqual(app.settings_context['workspace_id'], 'old-workspace')
+
+    def test_workspace_lines_are_inert_and_labels_fall_back_without_pane_names(self):
+        app = self.workspace_app()
+        app.environment['NO_COLOR'] = '1'
+        app.local['panes'].append({'workspace_id': 'w3', 'label': 'Not a workspace label'})
+        app.remote['aa-peer']['agents'][2]['workspace_label'] = 'Remote workspace'
+        snapshot = self.capture(app, 60, 160)
+        text = '\n'.join(snapshot.lines())
+        for label in ('Main workspace · 3 · current', 'Other workspace · 1',
+                      'w3 · 1', 'No workspace · 1', 'Remote workspace · 1', 'w1 · 1'):
+            self.assertIn(label, text)
+        self.assertNotIn('Not a workspace label', text)
+        self.assertEqual(text.count('· current'), 1)
+        headings = [row for row, line in enumerate(snapshot.lines())
+                    if any(label in line for label in
+                           ('Main workspace ·', 'Other workspace ·', 'Remote workspace ·',
+                            'No workspace ·', 'w3 ·', 'w1 ·', 'w0 ·'))]
+        self.assertTrue(headings)
+        for row in headings:
+            self.assertFalse(any(rect[0] == row for rect, kind, _ in app.hit_map if kind == 'list-row'))
+            before = app.identity(app.selected('agents'))
+            app.key(MouseEvent(row, 5, 'press'))
+            self.assertEqual(app.identity(app.selected('agents')), before)
+            self.assertEqual(app.mode, 'nav')
+        for index in range(len(app.agents())):
+            self.assertEqual(app.selections['agents'], index)
+            app.key('j')
+        for index in reversed(range(len(app.agents()))):
+            self.assertEqual(app.selections['agents'], index)
+            app.key('k')
+        current = snapshot.rows_containing('Main workspace · 3 · current')[0]
+        self.assertTrue(snapshot.cells[current][2].attribute & curses.A_BOLD)
+        self.assertFalse(snapshot.cells[current][2].attribute & curses.A_REVERSE)
+        self.assertTrue(snapshot.cells[snapshot.rows_containing('Other workspace · 1')[0]][2].attribute
+                        & curses.A_DIM)
+
+    def test_workspace_order_refresh_preserves_selection_detail_viewer_and_send_target(self):
+        for viewer in (False, True):
+            with self.subTest(viewer=viewer):
+                app = self.workspace_app()
+                self.select_agent(app, 'local-other-z')
+                app.refresh_detail()
+                identity = app.identity(app.detail)
+                if viewer:
+                    app.key(' ')
+                updated = json.loads(json.dumps(app.local))
+                target = next(agent for agent in updated['agents']
+                              if agent['terminal_id'] == 'local-other-z')
+                target.update(workspace_id='w1', alias='aaa')
+                app.start_job('snapshot', 'snapshot')
+                app.jobs['snapshot'].result = updated
+                app.tick()
+                self.assertEqual(app.selections['agents'], 0)
+                self.assertEqual(app.identity(app.selected('agents')), identity)
+                self.assertEqual(app.identity(app.detail), identity)
+                if viewer:
+                    self.assertEqual(app.viewer, ('agents', identity))
+                    app.key(' ')
+                app.key('\r')
+                self.assertEqual(app.identity(app.recipient), identity)
+
+    def test_opener_workspace_move_reorders_only_with_snapshot_and_preserves_selection(self):
+        app = self.workspace_app()
+        self.select_agent(app, 'local-current-z')
+        app.refresh_detail()
+        identity = app.identity(app.detail)
+        self.move_opener('w3')
+        self.assertEqual(app.identity(app.selected('agents')), identity)
+        self.assertEqual(app.agents_workspace(), 'w1')
+        updated = json.loads(json.dumps(app.local))
+        updated['scope']['workspace_id'] = 'w3'
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = updated
+        app.tick()
+        self.assertEqual(app.agents_workspace(), 'w3')
+        self.assertEqual(app.agents()[0]['terminal_id'], 'local-other-z')
+        self.assertEqual(app.identity(app.selected('agents')), identity)
+        self.assertEqual(app.identity(app.detail), identity)
+
+    def test_workspace_mouse_hit_opens_matching_agent_and_sticky_context_keeps_selection(self):
+        app = self.workspace_app()
+        self.capture(app, 60, 160)
+        expected = next(agent for agent in app.agents() if agent['terminal_id'] == 'aa-peer-w1')
+        index = app.agents().index(expected)
+        rect = next(rect for rect, kind, value in app.hit_map if kind == 'list-row' and value == index)
+        app.key(MouseEvent(rect[0], rect[1] + 10, 'press'))
+        self.assertEqual(app.identity(app.detail), app.identity(expected))
+        self.capture(app, 60, 160)
+        app.key(MouseEvent(rect[0], rect[1] + 10, 'press'))
+        self.assertEqual(app.identity(app.recipient), app.identity(expected))
+        app = self.workspace_app()
+        base = app.local['agents'][0]
+        app.local['agents'].extend({**base, 'terminal_id': f'long-{index}', 'alias': f'long-{index:02d}'}
+                                   for index in range(20))
+        self.select_agent(app, 'long-19')
+        for height in range(1, 9):
+            app.screen = Screen(height, 100)
+            app.render_agents((0, 0, height, 100))
+            snapshot = app.screen.snapshot()
+            self.assertTrue(snapshot.rows_containing('long-19'))
+            if height >= 3:
+                self.assertTrue(snapshot.line(0).startswith('▾ ' + self.store.host))
+                self.assertIn('ALIAS', snapshot.line(1))
+            if height >= 4:
+                self.assertIn('w3 · 21', snapshot.line(2))
+
+    def test_local_snapshot_retains_human_workspace_labels(self):
+        live = {**self.snapshot, 'workspaces': [{'workspace_id': 'w1', 'label': 'Human workspace'}]}
+        with patch('mailbox_tui.herdr', return_value={'snapshot': live}):
+            snapshot = local_snapshot(self.store, self.repo_id, self.environment)
+        self.assertEqual(snapshot['workspaces'], live['workspaces'])
+        app = self.app()
+        app.local = snapshot
+        app.screen = Screen(8, 100)
+        app.render_agents((0, 0, 8, 100))
+        self.assertIn('Human workspace · 2 · current', '\n'.join(app.screen.snapshot().lines()))
+
     def test_agents_header_rows_share_display_cell_columns_with_hangul_alias(self):
         app = self.app()
         app.local['agents'] = [
@@ -2702,7 +2859,8 @@ class MailboxUiTest(unittest.TestCase):
         snapshot = app.screen.snapshot()
         self.assertTrue(snapshot.line(0).startswith('▾ '))
         self.assertIn('ALIAS', snapshot.line(1))
-        self.assertIn('local-0', snapshot.line(2))
+        self.assertIn('w1 · 8 · current', snapshot.line(2))
+        self.assertIn('local-0', snapshot.line(3))
 
     def test_table_headers_host_rules_and_unfocused_selection_have_distinct_styles(self):
         with patch.multiple('mailbox_tui.curses', A_BOLD=1, A_UNDERLINE=2,
@@ -4405,7 +4563,7 @@ class MailboxUiTest(unittest.TestCase):
         app.jobs['remote:aaa-peer'].result = {
             'agents': [remote], 'hosts': [{'host': 'aaa-peer', 'uuid': 'peer-uuid', 'error': None}]}
         app.tick()
-        self.assertEqual(app.selections['agents'], 2)
+        self.assertEqual(app.selections['agents'], 1)  # Remote hosts follow all local rows.
         self.assertEqual(app.selected('agents')['terminal_id'], selected['terminal_id'])
         app.remote_errors['aaa-peer'] = 'SSH unavailable'
         app.start_job('remote:aaa-peer', 'remote', host='aaa-peer')
