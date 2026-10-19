@@ -195,8 +195,16 @@ class Mailbox:
                     parent["recipient_terminal_id"] == sender["terminal_id"] and
                     parent["state"] in {"queued", "delivered"}):
                 self._handled(connection, reply_to, time.time())
-        return self.store.annotate({"message_id": payload["message_id"],
-                                    "thread_id": payload["thread_id"], **result})
+        submission = self.store.annotate({"message_id": payload["message_id"],
+                                         "thread_id": payload["thread_id"], **result})
+        client = recipient.get("client")
+        if client in {"omp", "claude"} and recipient.get("extension_present") in (False, 0):
+            submission.setdefault("warnings", []).append({
+                "code": "recipient_no_receiver", "client": client,
+                "message": f"{client} recipient has no registered HAM receiver; the message remains queued. "
+                           f"Run runtime status on {recipient['host']}; with user consent install the runtime "
+                           "if missing, then restart the selected session."})
+        return submission
 
     def enqueue(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Idempotent local acceptance; remote authentication lives at the transport boundary."""

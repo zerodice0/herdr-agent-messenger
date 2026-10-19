@@ -268,6 +268,8 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
                 "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ, panes),
                 "panes": panes,
                 "settings": None,
+                "repo_modes": {repo: settings.show(repo)["mode"]
+                               for repo in {agent["repo_id"] for agent in agents}},
                 "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
     scope = snapshot["scope"]
     if repo_id:
@@ -643,6 +645,25 @@ class MailboxApp:
                 values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
         return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
                       key=lambda agent: (agent["host"], agent.get("alias") or "", agent["terminal_id"]))
+
+    def receiver_notice(self) -> str:
+        """Only current local, participating OMP/Claude sessions need a receiver."""
+        missing: dict[str, int] = {}
+        modes = self.local.get("repo_modes", {})
+        for agent in self.local.get("agents", []):
+            repo = agent.get("repo_id")
+            mode = modes.get(repo, (self.local.get("settings") or {}).get("mode", "off"))
+            if (agent.get("host") == self.local.get("host") and
+                    (self.repo_id is None or repo == self.repo_id) and
+                    agent.get("active", True) and not agent.get("stale") and
+                    mode in {"auto", "manual"} and agent.get("client") in {"omp", "claude"} and
+                    agent.get("extension_present") in (False, 0)):
+                client = agent["client"]
+                missing[client] = missing.get(client, 0) + 1
+        if not missing:
+            return ""
+        clients = ", ".join(sorted(missing))
+        return f"⚠ {sum(missing.values())} sessions without HAM receiver ({clients}) — runtime status"
 
     def host_resources(self, host: str) -> Mapping[str, Any] | None:
         if host == self.local.get("host"):
@@ -1741,11 +1762,14 @@ class MailboxApp:
         self.put(height - 1, 0, hints, curses.A_DIM)
         bottom = height - 1
         input_visible = self.layout != "tiny" and self.input_active()
-        if self.status and not (input_visible and self.status == self.input_error):
+        notice = self.receiver_notice()
+        status = self.status if not (input_visible and self.status == self.input_error) else ""
+        if notice or status:
             bottom -= 1
-            error = self.status_level == "error"
-            self.put(bottom, 0, ("✕ " if error else "") + self.status,
-                     self.style(4 if error else 0, curses.A_BOLD if error else 0))
+            error = bool(status) and self.status_level == "error"
+            text = notice + (" · " if notice and status else "") + ("✕ " if error else "") + status
+            self.put(bottom, 0, text,
+                     self.style(4 if error else 0, curses.A_BOLD if error or notice else 0))
         if self.layout == "tiny":
             self.put(min(2, height - 2), 0, "Resize terminal", curses.A_BOLD)
         else:
@@ -2266,6 +2290,9 @@ class MailboxApp:
         section("Receiver/technical", [
             f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
             f"Extension present: {yes_no(item.get('extension_present'))}",
+            *([f"Remedy: runtime status on {item['host']}; ask the user before runtime install "
+               f"{item['client']}, then restart only the selected sessions."]
+              if item.get("client") in {"omp", "claude"} and not item.get("extension_present") else []),
             f"Repo ID: {item.get('repo_id') or '—'}",
             f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
             f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",
@@ -2484,6 +2511,8 @@ class MailboxApp:
                     "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",
                     "FYI mailbox sends immediately; direct input always asks for confirmation.",
                     "Inspection never acknowledges messages. Direct acceptance ≠ native delivery.",
+                    "Receiver warning: runtime status on the recipient host; ask before runtime install omp/claude.",
+                    "If already installed, restart only the selected sessions to register their receiver.",
                     "Mouse: click focus/select; click selected row to send/reply. Wheel scrolls.",
                     "Shift+drag selects terminal text. HAM_MAILBOX_NO_MOUSE=1 disables mouse.",
                     "Esc closes overlays. Top-level Esc closes popups only."]

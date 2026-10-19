@@ -1,6 +1,6 @@
 ---
 name: herdr-agent-messenger
-description: Use HAM (Herdr Agent Messenger) for durable same-repository agent mail, inbox handling, status/roles, and explicitly requested new labeled Herdr sessions. Also supports legacy prompt routing where coordination policy permits. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, and omp.
+description: Use HAM (Herdr Agent Messenger) for durable same-repository agent mail, inbox handling, status/roles, installing or updating HAM, and explicitly requested new labeled Herdr sessions. Also supports legacy prompt routing where coordination policy permits. Trigger on HAM, Herdr delegation, installation/update requests, or host/label addresses; supports Codex, Claude, and omp.
 ---
 
 # HAM — Herdr Agent Messenger
@@ -14,6 +14,27 @@ description: Use HAM (Herdr Agent Messenger) for durable same-repository agent m
 - **Nonparticipating legacy traffic:** `request` / `send` / `batch` remain available where permitted. Manual/auto participating same-repo pairs get `use_mailbox`, with each endpoint's role determined in its own workspace; never bypass it. Batch preflights all targets; any lookup/refusal prevents all submissions.
 
 Use bundled `scripts/herdr_agent_messenger.py` relative to this skill directory, or its absolute path, not reconstructed SSH. Agent operations use verified stable terminal/session identity after pane moves, not an inherited pane ID alone. Never guess labels. Legacy transport uses literal `local` or concrete configured SSH aliases; mail also accepts registered canonical hosts.
+
+## Installing HAM (agent checklist)
+
+When asked to install or update HAM, on every selected host:
+1. Install or enable the plugin (ledger, mailbox, UI, transport).
+2. Install/update the skill (instructions and launcher, not a receiver).
+3. Run read-only `runtime status` without a client for the health summary.
+4. For a used `omp`/`claude` client with a missing runtime, explain the dependency
+   and ask for consent: OMP receives natively and can wake eligible actions;
+   Claude receives at turn boundaries, with no idle wake.
+5. Only with consent, run `runtime install <client>` (or the skill installer's
+   explicit `--runtime omp|claude|all`; interactive default is **Not now**).
+6. Report conflicts; never replace foreign or modified files.
+7. Tell the user which sessions must restart; restart only those they select.
+8. After restart, confirm receiver registration (`extension_present=1`), or
+   report **installed, activation pending**.
+
+Plugin/skill installation alone never proves receiving readiness. Codex pulls
+with the skill and has no adapter; never diagnose that as broken. Plugin loading
+does not write client configuration; keep the new-repo `auto` default unchanged.
+See `reference.md` for summary fields, consent, destinations and ownership.
 
 ## Mailbox and status commands
 
@@ -148,4 +169,4 @@ python3 scripts/herdr_agent_messenger.py read --address CONFIGURED_HOST/EXACT_LA
 
 Keep `request_id`; `deferred`/`awaiting_decision` means HAM owns delivery, not resend/unfocus. Held Messages offers Push/Cancel after default180000 ms; no auto-push. Observe `submitted_working|submitted_unknown`, never blindly resend. Self-send fails. Exit3 means nonsettled owned work; exit1 does not prove non-delivery; usage exits2. Exit0/settled proves no answer correctness. Terminal text is not a structured assistant-message API. Never bypass SSH host-key checks.
 
-Read `reference.md` for complete flags, legacy batch/results, host setup, per-host runtime install/status/uninstall, TUI controls, durable worker/recovery and deployment order. Skill installation does not install a receiving runtime or change global bindings.
+Read `reference.md` for complete flags, legacy batch/results, host setup, per-host runtime install/status/uninstall, TUI controls, durable worker/recovery and deployment order. Skill copying alone does not install a receiving runtime or change global bindings.

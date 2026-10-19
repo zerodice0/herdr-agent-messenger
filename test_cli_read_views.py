@@ -18,7 +18,8 @@ import ledger_cli
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_status import AgentRegistry
-from ledger_store import LedgerError, LedgerStore
+from ledger_store import SCHEMA_VERSION, LedgerError, LedgerStore
+from runtime_installer import MANIFEST, RUNTIME, manage
 from test_ledger_core import snapshot
 
 
@@ -130,6 +131,200 @@ class ReadCliTest(unittest.TestCase):
                        + "," + repr(peer_environment) + ")\n")
         ssh.chmod(0o700)
         return failure
+
+    def test_runtime_status_without_client_reports_healthy_readonly_summary(self):
+        home = Path(self.environment["HOME"])
+        destinations = {"omp": home / ".omp/agent/extensions", "claude": home / ".claude"}
+        for client, destination in destinations.items():
+            manage("install", destination, client=client)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET extension_present=1")
+        before = self.database_state(self.store)
+        files = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+        completed, result = self.cli("runtime", "status")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(set(result), {"clients", "sessions", "ledger", "next_steps"})
+        self.assertEqual(result["clients"], [
+            {**manage("status", destination, client=client), "error": None}
+            for client, destination in destinations.items()
+        ])
+        self.assertEqual(result["sessions"], {
+            "omp": {"receiver_registered": 1, "receiver_absent": 0},
+            "claude": {"receiver_registered": 0, "receiver_absent": 0},
+            "codex": {"receiver_registered": 2, "receiver_absent": 0},
+        })
+        self.assertEqual(result["ledger"], {"available": True, "error": None})
+        self.assertEqual(result["next_steps"], [])
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertEqual({path: path.read_bytes() for path in home.rglob("*") if path.is_file()}, files)
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_without_ledger_reports_unknown_counts_without_creating_home(self):
+        home = self.root / "absent-runtime-home"
+        environment = {**self.environment, "HOME": str(home),
+                       "HERDR_AGENT_LEDGER_DIR": str(home / "ledger")}
+        completed, result = self.cli("runtime", "status", environment=environment)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(set(result), {"clients", "sessions", "ledger", "next_steps"})
+        self.assertEqual(result["clients"], [
+            {"client": client, "destination": str(destination), "installed": False,
+             "owner": None, "error": None}
+            for client, destination in (("omp", home / ".omp/agent/extensions"),
+                                        ("claude", home / ".claude"))
+        ])
+        self.assertEqual(result["sessions"], {
+            client: {"receiver_registered": None, "receiver_absent": None}
+            for client in ("omp", "claude", "codex")
+        })
+        self.assertIs(result["ledger"]["available"], False)
+        self.assertEqual(result["ledger"]["error"]["code"], "ledger_not_initialized")
+        self.assertTrue(result["ledger"]["error"]["message"])
+        self.assertTrue(any("ledger reconcile" in step for step in result["next_steps"]))
+        for client in ("omp", "claude"):
+            step = next(step for step in result["next_steps"] if f"runtime install {client}" in step)
+            self.assertIn("user", step.lower())
+            self.assertIn("restart", step.lower())
+        self.assertFalse(any("runtime install codex" in step for step in result["next_steps"]))
+        self.assertFalse(home.exists())
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_during_bootstrap_reports_unavailable_without_schema_writes(self):
+        directory = self.root / "runtime-bootstrapping-ledger"
+        directory.mkdir()
+        path = directory / "ledger.sqlite3"
+        path.touch()
+        environment = {**self.environment, "HERDR_AGENT_LEDGER_DIR": str(directory)}
+        completed, result = self.cli("runtime", "status", environment=environment)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(result["ledger"]["error"]["code"], "ledger_not_initialized")
+        self.assertIs(result["ledger"]["available"], False)
+        self.assertEqual(result["sessions"], {
+            client: {"receiver_registered": None, "receiver_absent": None}
+            for client in ("omp", "claude", "codex")
+        })
+        self.assertEqual(path.read_bytes(), b"")
+        self.assertEqual({item.name for item in directory.iterdir()}, {"ledger.sqlite3"})
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_reports_schema_upgrade_without_migrating_or_inventing_zero_counts(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE ledger_meta SET value=? WHERE key='schema_version'",
+                               (str(SCHEMA_VERSION - 1),))
+        before = self.database_state(self.store)
+        completed, result = self.cli("runtime", "status")
+        self.assertEqual(completed.returncode, 0)
+        self.assertIs(result["ledger"]["available"], False)
+        self.assertEqual(result["ledger"]["error"]["code"], "schema_upgrade_required")
+        self.assertEqual(result["sessions"], {
+            client: {"receiver_registered": None, "receiver_absent": None}
+            for client in ("omp", "claude", "codex")
+        })
+        self.assertTrue(any("ledger reconcile" in step for step in result["next_steps"]))
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_counts_only_active_local_clients_across_repositories_and_gives_remedies(self):
+        current = json.loads(json.dumps(self.snapshot))
+        states = []
+        for scope in ("local", "remote", "inactive"):
+            for client in ("omp", "claude", "codex"):
+                for registered in (0, 1):
+                    terminal = f"{scope}-{client}-{registered}"
+                    pane = {"terminal_id": terminal, "pane_id": terminal, "workspace_id": "w1"}
+                    current["panes"].append(pane)
+                    current["agents"].append({
+                        **pane, "agent": client, "agent_status": "idle", "name": terminal,
+                        "agent_session": {"value": terminal},
+                        "cwd": str(self.root / "other" if client == "codex" else self.repo),
+                    })
+                    states.append((registered, "beta" if scope == "remote" else self.store.host,
+                                   int(scope != "inactive"), terminal))
+        AgentRegistry(self.store).reconcile(current, refresh_display=False)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0")
+            connection.executemany(
+                "UPDATE agents SET extension_present=?,host=?,active=? WHERE terminal_id=?", states)
+        manage("install", Path(self.environment["HOME"]) / ".omp/agent/extensions")
+        before = self.database_state(self.store)
+        completed, result = self.cli("runtime", "status")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(result["sessions"], {
+            client: {"receiver_registered": 1, "receiver_absent": 1}
+            for client in ("omp", "claude", "codex")
+        })
+        self.assertEqual(result["ledger"], {"available": True, "error": None})
+        omp = next(step for step in result["next_steps"] if step.startswith("omp:"))
+        self.assertIn("1 sessions without receiver", omp)
+        self.assertIn("activation pending", omp)
+        self.assertIn("restart", omp)
+        self.assertNotIn("`runtime install", omp)
+        claude = next(step for step in result["next_steps"] if step.startswith("claude:"))
+        self.assertIn("1 sessions without receiver", claude)
+        self.assertIn("user", claude)
+        self.assertIn("runtime install claude", claude)
+        self.assertIn("restart", claude)
+        self.assertFalse(any(step.startswith("codex:") for step in result["next_steps"]))
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_reports_conflict_without_recommending_replacement_or_hiding_other_client(self):
+        home = Path(self.environment["HOME"])
+        omp = home / ".omp/agent/extensions"
+        claude = home / ".claude"
+        omp.mkdir(parents=True)
+        (omp / RUNTIME).write_text("Foreign receiver; preserve.")
+        manage("install", claude, client="claude")
+        before = self.database_state(self.store)
+        completed, result = self.cli("runtime", "status")
+        self.assertEqual(completed.returncode, 0)
+        rows = {row["client"]: row for row in result["clients"]}
+        self.assertEqual(rows["omp"]["error"]["code"], "foreign_runtime")
+        self.assertIs(rows["omp"]["installed"], False)
+        self.assertEqual(rows["claude"], {**manage("status", claude, client="claude"), "error": None})
+        step = next(step for step in result["next_steps"] if step.startswith("omp:"))
+        self.assertIn("foreign_runtime", step)
+        self.assertIn("conflict", step.lower())
+        self.assertNotIn("runtime install omp", step)
+        self.assertEqual((omp / RUNTIME).read_text(), "Foreign receiver; preserve.")
+        self.assertFalse((omp / MANIFEST).exists())
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_with_client_preserves_existing_status_shape_and_environment_destinations(self):
+        home = Path(self.environment["HOME"])
+        claude = self.root / "custom-claude"
+        environment = {**self.environment, "CLAUDE_CONFIG_DIR": str(claude)}
+        destinations = {"omp": home / ".omp/agent/extensions", "claude": claude}
+        before = self.database_state(self.store)
+        for client, destination in destinations.items():
+            for installed in (False, True):
+                with self.subTest(client=client, installed=installed):
+                    if installed:
+                        manage("install", destination, client=client)
+                    completed, result = self.cli("runtime", "status", client, environment=environment)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(result, manage("status", destination, client=client))
+                    self.assertNotIn("sessions", result)
+                    self.assertNotIn("clients", result)
+            explicit = self.root / f"explicit-{client}"
+            completed, result = self.cli("runtime", "status", client, "--destination", str(explicit),
+                                         environment=environment)
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(result, manage("status", explicit, client=client))
+            self.assertFalse(explicit.exists())
+        self.assertFalse((home / ".claude").exists())
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_destination_without_client_is_rejected_without_side_effects(self):
+        destination = self.root / "ambiguous-runtime"
+        before = self.database_state(self.store)
+        completed, result = self.cli("runtime", "status", "--destination", str(destination))
+        self.assertEqual((completed.returncode, result["error"]["code"]), (1, "invalid_destination"))
+        self.assertIn("client", result["error"]["message"].lower())
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
 
     def test_status_views_without_ledger_keep_empty_shapes_without_bootstrap(self):
         missing = self.root / "absent-ledger-home"

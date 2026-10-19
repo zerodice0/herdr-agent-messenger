@@ -51,6 +51,33 @@ herdr plugin link "$PWD" --enabled
 Upgrading from 0.7.x requires migrating the former `herdr.agent-labels` ID.
 Follow the [migration guide](docs/migration.md) before removing the old plugin.
 
+### Receiving dependency
+
+- **Plugin:** ledger, mailbox, UI, and transport.
+- **Skill:** agent instructions and CLI launcher, not a receiver.
+- **OMP adapter:** native receiving and eligible automatic action wake.
+- **Claude hooks:** native receiving at turn boundaries, with no idle wake.
+- **Codex:** skill-guided inbox pull; no adapter is needed.
+
+Plugin and skill installation alone do not make native receiving ready. Install
+the [client skill](#install-the-client-skill), then run the read-only health
+summary on **each selected host**, from the plugin/checkout root:
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# Only after user consent, for a client actually used on this host:
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+Use `claude` instead of `omp` for Claude hooks. The skill installer offers
+missing runtimes with **Not now** selected by default; noninteractive
+`install all --runtime omp|claude|all` is explicit consent, never an implicit
+dependency install. Runtime ownership conflicts must not be overwritten.
+Restart only the sessions the user selects, then confirm `extension_present=1`;
+otherwise report **installed, activation pending**. Installation is not proof
+of activation. Plugin loading never changes client configuration, and the
+`auto` default for new repositories is unchanged. See the [skill guide](docs/skill-guide.md#receiving-dependency).
+
 ## Use
 
 Use the [durable mailbox](#durable-mailbox) for participating agents coordinating
@@ -315,7 +342,8 @@ current workspace scopes and removes obsolete repo-level role settings.
 Protocol 1 remains unchanged: legacy `main`, `members` and `computed_main`
 setting payloads succeed as no-ops. See [migration details](docs/migration.md#workspace-role-migration-schema-v7).
 
-Skill installation does **not** install a receiving runtime. Opt in separately
+Skill installation does **not implicitly** install a receiving runtime. Opt in
+through the installer's explicit runtime choice/flag or separately
 on each host with `runtime install omp` or `runtime install claude`; inspect or
 remove it with the corresponding `runtime status` / `runtime uninstall` command.
 Restart only the selected sessions. The installers own only HAM's extension or

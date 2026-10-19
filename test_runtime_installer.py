@@ -6,9 +6,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from ledger_store import LedgerError
-from runtime_installer import MANIFEST, RUNTIME, manage
+from runtime_installer import MANIFEST, OWNER, RUNTIME, manage, summary
 
 
 class RuntimeInstallerTest(unittest.TestCase):
@@ -73,6 +74,97 @@ class RuntimeInstallerTest(unittest.TestCase):
         with self.assertRaises(LedgerError):
             manage('install',self.destination)
         self.assertEqual(other.read_text(),'unchanged')
+
+    def test_summary_normalizes_missing_clients_without_creating_their_home(self):
+        home = self.root/'absent-home'
+        environment = {'HOME':str(home)}
+        with mock.patch('runtime_installer.manage', wraps=manage) as status:
+            result = summary(environment)
+        destinations = [home/'.omp'/'agent'/'extensions', home/'.claude']
+        self.assertEqual(result, {'clients':[
+            {'client':client,'destination':str(destination),'installed':False,'owner':None,'error':None}
+            for client,destination in zip(('omp','claude'),destinations)
+        ]})
+        self.assertEqual(status.call_args_list, [
+            mock.call('status',destination,client=client)
+            for client,destination in zip(('omp','claude'),destinations)
+        ])
+        self.assertFalse(home.exists())
+
+    def test_summary_respects_environment_home_claude_override_and_selected_client_order(self):
+        home = self.root/'selected-home'
+        claude = self.root/'selected-claude'
+        destinations = {'omp':home/'.omp'/'agent'/'extensions','claude':claude}
+        environment = {'HOME':str(home),'CLAUDE_CONFIG_DIR':str(claude)}
+        for client,destination in destinations.items():
+            manage('install',destination,client=client)
+        before = {path:path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        with mock.patch.dict(os.environ, {'HOME':str(self.root/'wrong-home'),
+                                         'CLAUDE_CONFIG_DIR':str(self.root/'wrong-claude')}):
+            result = summary(environment,clients=('claude','omp'))
+        self.assertEqual(result, {'clients':[
+            {**manage('status',destinations[client],client=client),'error':None}
+            for client in ('claude','omp')
+        ]})
+        for row in result['clients']:
+            self.assertEqual(set(row), {'client','destination','installed','owner','error'})
+            self.assertIs(row['installed'],True)
+            self.assertEqual(row['owner'],OWNER)
+        self.assertEqual({path:path.read_bytes() for path in self.root.rglob('*') if path.is_file()},before)
+        self.assertFalse((home/'.claude').exists())
+        self.assertFalse((self.root/'wrong-home').exists())
+        self.assertFalse((self.root/'wrong-claude').exists())
+        self.assertEqual(summary(environment,clients=('claude',))['clients'],result['clients'][:1])
+
+    def test_summary_keeps_reporting_other_runtime_after_ownership_or_modification_errors(self):
+        for broken_client in ('omp','claude'):
+            for kind in ('foreign','modified'):
+                with self.subTest(client=broken_client,kind=kind):
+                    home = self.root/(broken_client+'-'+kind)
+                    environment = {'HOME':str(home)}
+                    destinations = {'omp':home/'.omp'/'agent'/'extensions','claude':home/'.claude'}
+                    for client,destination in destinations.items():
+                        manage('install',destination,client=client)
+                    destination = destinations[broken_client]
+                    if kind=='foreign':
+                        (destination/MANIFEST).unlink()
+                    else:
+                        runtime = RUNTIME if broken_client=='omp' else 'hooks/ham-mailbox.py'
+                        (destination/runtime).write_text('User modification; do not replace.')
+                    with self.assertRaises(LedgerError) as expected:
+                        manage('status',destination,client=broken_client)
+                    before = {path:path.read_bytes() for path in home.rglob('*') if path.is_file()}
+                    rows = {row['client']:row for row in summary(environment)['clients']}
+                    broken = rows[broken_client]
+                    self.assertEqual(broken, {'client':broken_client,'destination':str(destination),
+                                             'installed':False,'owner':None,
+                                             'error':{'code':expected.exception.code,
+                                                      'message':expected.exception.message}})
+                    other = 'claude' if broken_client=='omp' else 'omp'
+                    self.assertEqual(rows[other], {
+                        **manage('status',destinations[other],client=other),'error':None})
+                    self.assertEqual({path:path.read_bytes() for path in home.rglob('*') if path.is_file()},before)
+
+    def test_summary_isolates_filesystem_error_and_still_validates_the_other_runtime(self):
+        home = self.root/'home'
+        claude = home/'.claude'
+        manage('install',claude,client='claude')
+
+        def status(operation,destination,*,client):
+            if client=='omp':
+                raise PermissionError('Private fixture permission denied')
+            return manage(operation,destination,client=client)
+
+        with mock.patch('runtime_installer.manage',side_effect=status) as validator:
+            result = summary({'HOME':str(home)})
+        self.assertEqual(validator.call_count,2)
+        self.assertEqual(result['clients'][0], {
+            'client':'omp','destination':str(home/'.omp'/'agent'/'extensions'),
+            'installed':False,'owner':None,
+            'error':{'code':'runtime_unavailable','message':'Private fixture permission denied'}})
+        self.assertEqual(result['clients'][1], {
+            **manage('status',claude,client='claude'),'error':None})
+        self.assertFalse((home/'.omp').exists())
 
     def test_actual_public_cli_does_not_create_a_ledger_or_require_herdr(self):
         environment = {**os.environ,'HERDR_AGENT_LEDGER_DIR':str(self.root/'must-not-exist'),'HERDR_BIN_PATH':str(self.root/'absent-herdr')}

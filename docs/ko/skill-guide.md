@@ -63,6 +63,52 @@ python3 agent_skill_installer.py install all
 스킬만으로 체크아웃을 찾을 수 없으므로 아래의
 [플러그인 없는 설치 방법](#플러그인-없이-ham-사용)에 따라 심볼릭 링크를 사용하세요.
 
+### 수신 의존성
+
+- **플러그인:** 원장, 메일함, UI와 전송을 담당합니다.
+- **스킬:** 에이전트 지침과 CLI 실행기를 제공하며 수신기는 아닙니다.
+- **OMP 어댑터:** 네이티브 수신과 조건을 충족하는 action의 자동 깨우기를 제공합니다.
+- **Claude 훅:** 턴 경계에서 네이티브 수신을 제공하며 유휴 깨우기는 없습니다.
+- **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
+
+플러그인과 스킬을 설치·갱신한 뒤 **선택한 모든 호스트**에서 읽기 전용 상태
+요약을 확인하세요.
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# 사용자가 동의한 경우에만, 실제로 쓰는 클라이언트(omp 또는 claude)에 설치합니다.
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+요약의 `clients`는 런타임 소유권과 충돌, `sessions`는 활성 로컬 세션의 수신기
+등록 수, `ledger`는 원장의 사용 가능 여부와 오류, `next_steps`는 권장 조치를
+보여 줍니다. 원장이 없거나 구버전이어도 읽기 과정에서 생성·업그레이드하지 않고
+그 상태를 보고합니다. `runtime status omp|claude`는 기존 클라이언트별 출력 형식을
+유지합니다. Codex의 직접 조회 방식은 의도된 동작이며 수신기 누락 오류가 아닙니다.
+
+스킬 설치에 성공하면 대화형 설치기는 두 런타임의 상태를 보여 주고 누락된
+런타임의 설치를 제안합니다. 기본 선택은 **Not now(나중에)**입니다. 동의하기 전에
+대상 경로와 기록할 파일을 확인하세요. 비대화형 설치는 누락된 런타임과 정확한
+설치 명령을 포함한 최종 요약을 **stderr**에 출력하므로 stdout은 섞이지 않습니다.
+아래의 선택적 플래그는 스킬 대상과 별개로 지정한 런타임의 설치에 명시적으로
+동의한다는 뜻입니다.
+
+```bash
+python3 agent_skill_installer.py install omp --runtime omp
+python3 agent_skill_installer.py install all --runtime all
+```
+
+`--runtime`은 `omp`, `claude`, `all`을 받습니다. 생략하면 런타임을 자동 설치하지
+않습니다. 충돌을 보고하되 관련 없는 파일이나 수정된 파일을 교체하지 않습니다.
+다시 시작해야 할 세션을 알리고 사용자가 선택한 세션만 다시 시작하세요.
+이후 수신기 등록(`extension_present=1`)을 확인하거나 **설치됨, 활성화 대기**로
+보고합니다. 플러그인과 스킬 설치만으로 수신 준비가 끝났다고 판단하지 마세요.
+파일 소유권은 활성화나 컨텍스트 수신의 증거가 아닙니다. 플러그인 로드는
+클라이언트 설정을 쓰지 않습니다. 새 저장소의 기본 `auto` 모드는 유지되며
+런타임 설치 동의로 모드를 바꾸지 않습니다.
+
+### 클라이언트별 호출
+
 클라이언트별 호출 방법은 다음과 같습니다.
 
 - **Codex CLI와 IDE 확장**에서는 `$ham`을 입력한 뒤 스킬 선택기에서
@@ -621,11 +667,13 @@ Codex 자동 수신/깨우기 adapter는 없으므로 조회를 native delivery�
 
 ### 호스트별 runtime 설치와 안전한 배포 순서
 
-**스킬 설치**는 클라이언트 지침을 복사할 뿐 수신 runtime을 설치하거나 조정 모드와
-전역 바인딩을 바꾸지 않습니다. 각 호스트에서 실제로 선택한 클라이언트에만 다음
-명령을 별도로 사용하세요.
+**스킬 설치**는 클라이언트 지침을 복사합니다. 수신 런타임은 대화형 설치기,
+`--runtime omp|claude|all` 플래그 또는 아래 명령을 통해 별도로 명시적 동의를
+받아 설치합니다. 스킬 설치는 조정 모드나 전역 바인딩을 바꾸지 않습니다.
+각 호스트에서 읽기 전용 요약을 확인하고 실제로 쓰는 클라이언트만 선택하세요.
 
 ```bash
+python3 "$HAM_CLI" runtime status
 python3 "$HAM_CLI" runtime install omp
 python3 "$HAM_CLI" runtime status omp
 python3 "$HAM_CLI" runtime install claude
@@ -635,7 +683,8 @@ python3 "$HAM_CLI" runtime uninstall omp
 python3 "$HAM_CLI" runtime uninstall claude
 ```
 
-세 작업 모두 `--destination DIR`을 받습니다. OMP의 기본 경로는
+클라이언트를 지정한 세 작업 모두 `--destination DIR`을 받지만, 클라이언트를
+생략한 요약은 받지 않습니다. OMP의 기본 경로는
 `~/.omp/agent/extensions`이며 `ham-mailbox.ts`와 `ham-mailbox.install.json`만
 소유합니다. 기존 Herdr 확장은 건드리지 않습니다. Claude는 `CLAUDE_CONFIG_DIR`,
 없으면 `~/.claude`를 사용하며 `hooks/ham-mailbox.py`, manifest, `settings.json`의

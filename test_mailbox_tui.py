@@ -139,6 +139,44 @@ class MailboxUiTest(unittest.TestCase):
                             for call in app.screen.draw_calls))
         return app.screen.snapshot()
 
+    def test_receiver_banner_is_persistent_and_reuses_notice_row(self):
+        app = self.app()
+        missing = app.local["agents"][0]
+        missing.update(client="omp", extension_present=0)
+        self.assertIn("1 sessions without HAM receiver (omp)", app.receiver_notice())
+        app.set_status("Saved")
+        snapshot = self.capture(app, height=40, width=160)
+        notices = [line for line in snapshot.lines() if "sessions without HAM receiver" in line]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Saved", notices[0])
+        app.key("j")
+        self.assertEqual(app.status, "")
+        self.assertIn("sessions without HAM receiver", "\n".join(self.capture(app, 40, 160).lines()))
+        self.select_agent(app, missing["terminal_id"])
+        app.refresh_detail()
+        self.assertIn("runtime install omp", "\n".join(app.detail_lines()))
+
+    def test_receiver_banner_filters_scope_modes_and_local_active_clients(self):
+        app = self.app()
+        base = app.local["agents"][0]
+        app.repo_id = None
+        app.local["repo_modes"] = {"auto-repo": "auto", "manual-repo": "manual", "off-repo": "off"}
+        app.local["agents"] = [
+            {**base, "repo_id": repo, "client": client, "extension_present": present, **extra}
+            for repo, client, present, extra in (
+                ("auto-repo", "omp", 0, {}), ("manual-repo", "claude", 0, {}),
+                ("off-repo", "omp", 0, {}), ("auto-repo", "codex", 0, {}),
+                ("auto-repo", "omp", 1, {}), ("auto-repo", "omp", 0, {"active": 0}),
+                ("auto-repo", "omp", 0, {"host": "remote"}),
+                ("auto-repo", "claude", 0, {"stale": True}))]
+        self.assertIn("2 sessions without HAM receiver (claude, omp)", app.receiver_notice())
+        app.repo_id = "manual-repo"
+        self.assertIn("1 sessions without HAM receiver (claude)", app.receiver_notice())
+        app.repo_id = "off-repo"
+        self.assertEqual(app.receiver_notice(), "")
+        app.repo_id = "unshown-repo"
+        self.assertEqual(app.receiver_notice(), "")
+
     def resource_app(self, **options):
         app = self.app(wall_clock=lambda: 1_800_000_000, **options)
         app.environment['NO_COLOR'] = '1'

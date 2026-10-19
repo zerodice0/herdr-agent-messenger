@@ -19,6 +19,32 @@ herdr plugin link "$PWD" --enabled
 기존 이름 없는 에이전트는 **Assign Agent Label** 액션으로 라벨을 지정할 수
 있습니다. 설치 후 감지되는 에이전트에는 자동으로 라벨이 붙습니다.
 
+### 수신 의존성
+
+- **플러그인:** 원장, 메일함, UI와 전송을 담당합니다.
+- **스킬:** 에이전트 지침과 CLI 실행기를 제공하며 수신기는 아닙니다.
+- **OMP 어댑터:** 네이티브 수신과 조건을 충족하는 action의 자동 깨우기를 제공합니다.
+- **Claude 훅:** 턴 경계에서 네이티브 수신을 제공하며 유휴 깨우기는 없습니다.
+- **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
+
+새로 설치하거나 업그레이드할 때는 [클라이언트 스킬](skill-guide.md#설치와-클라이언트별-호출)을
+설치·갱신하고 **선택한 모든 호스트**에서 읽기 전용 요약을 확인합니다.
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# 사용자가 동의한 경우에만, 실제로 쓰는 클라이언트(omp 또는 claude)에 설치합니다.
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+플러그인과 스킬 설치만으로 네이티브 수신 준비가 완료됐다고 판단하지 마세요.
+누락된 런타임은 명시적 동의를 받아 설치합니다. 대화형 설치기의 기본 선택은
+**Not now(나중에)**이며, `agent_skill_installer.py install all --runtime omp|claude|all`은
+명시적 동의입니다. 관련 없는 파일이나 수정된 파일을 덮어쓰지 마세요.
+다시 시작해야 할 세션을 알리고 사용자가 선택한 세션만 다시 시작합니다.
+이후 `extension_present=1`을 확인하거나 **설치됨, 활성화 대기**로 보고합니다.
+플러그인 로드는 클라이언트 설정을 쓰지 않으며 새 저장소의 기본 `auto` 모드도
+유지됩니다. 자세한 내용은 [수신 설정 가이드](skill-guide.md#수신-의존성)를 참고하세요.
+
 ## Workspace 역할 마이그레이션(스키마 v7)
 
 이전 원장을 쓰기 가능한 방식으로 열면 기존 데이터를 보존하며 스키마 v7로

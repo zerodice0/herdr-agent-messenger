@@ -1,6 +1,6 @@
 ---
 name: herdr-agent-messenger
-description: Use HAM (Herdr Agent Messenger) to start/open new labeled Herdr sessions, message or delegate to existing agents, check progress, and collect replies. Trigger on HAM, new Herdr session requests, or host/label addresses such as local/white-bison and macbook-pro/purple-koala.
+description: Use HAM (Herdr Agent Messenger) to install or update HAM, start/open new labeled Herdr sessions, message or delegate to existing agents, check progress, and collect replies. Trigger on HAM, HAM installation/update requests, new Herdr session requests, or host/label addresses such as local/white-bison and macbook-pro/purple-koala.
 ---
 
 # HAM — Herdr Agent Messenger

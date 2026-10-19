@@ -59,6 +59,15 @@ python3 scripts/herdr_agent_messenger.py repo show
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
 
+Successful `mail send` may include
+`warnings:[{"code":"recipient_no_receiver","message":"...","client":"omp"}]`
+(or `claude`) when the resolved recipient explicitly has `extension_present=0`.
+The send still succeeds and remains queued; do not resend it. Remote absence
+is advisory only when the exported row says absent; unknown receiver state and
+Codex pull-only recipients do not produce this warning. Run `runtime status`
+on the recipient host, request consent before installing a missing runtime,
+then restart only the selected sessions if registration is pending.
+
 `mail threads` and `mail direct-list` default to the verified caller's repository.
 Explicit `--repo REPO_ID` avoids fetching Herdr caller identity. Both enumerate
 all participants' records for that repo on this local ledger, not only the
@@ -224,6 +233,14 @@ A bell write can fail **after** a successful DB commit. Such a command still
 succeeds, with `warnings:[{code:"notification_failed",committed:true,...}]`;
 `doctor.notification_failures` retains the diagnosis. Do not resend with a new
 message ID. Events/safety sweeps recover notification loss.
+
+After startup/event registry refresh, HAM shows one best-effort Herdr notification
+when an active local OMP/Claude client's runtime is missing or has an ownership
+error. The last notified `(client,state)` set is stored in `ledger_meta`, so
+unchanged refreshes do not repeat the notice; a changed or resolved-then-missing
+set can notify again. Notification failure is recorded in the same diagnostics
+without failing reconciliation. Installed-but-unregistered sessions and Codex
+do not trigger this startup notice.
 
 #### Wire and settings service
 
@@ -472,6 +489,10 @@ navigate; `s` opens Settings, `?` help, `e` diagnostics and `r` refresh.
 Agents groups single-line table rows under host headers, showing turn, alias,
 mail, receiver, role, devices/servers and phase/summary as space allows.
 Disconnected peers retain stale snapshots with unread `?`, not closed agents.
+When any shown auto/manual repository has active local OMP/Claude sessions
+without registered receivers, the existing notice row persistently shows their
+count and `runtime status` remedy (also available in Detail/help). All-repository
+scope checks each local repository's mode; remote rows and Codex are excluded.
 Detail previews the last-focused list. Agent Detail is single-column, grouped
 as Work (turn, phase, bold summary), Identity & role, Devices & servers, Mail,
 then dim Receiver/technical with full fields and separate status-update and
@@ -559,9 +580,17 @@ returned success. See the [UI reference](../../../docs/ui-reference.md).
 
 ### Receiving runtimes
 
-On **each selected host**, install/check/remove only the chosen client:
+The plugin provides the ledger, mailbox, UI and transport; the skill provides
+instructions and the launcher. Neither alone supplies native receiving. Runtime
+installation is a separate, consented, ownership-checked per-host opt-in.
+Plugin loading never modifies OMP or Claude configuration, and runtime setup
+does not change the new-repository `auto` default.
+
+On **each selected host**, inspect the read-only health summary first, then
+install/check/remove only the client the user selects:
 
 ```bash
+python3 scripts/herdr_agent_messenger.py runtime status
 python3 scripts/herdr_agent_messenger.py runtime install omp
 python3 scripts/herdr_agent_messenger.py runtime status omp
 python3 scripts/herdr_agent_messenger.py runtime uninstall omp
@@ -570,8 +599,28 @@ python3 scripts/herdr_agent_messenger.py runtime status claude --destination /AB
 python3 scripts/herdr_agent_messenger.py runtime uninstall claude --destination /ABS/CHOSEN/CLAUDE_CONFIG
 ```
 
-`install|status|uninstall` takes positional `omp|claude` and optional
-`--destination DIR`. OMP defaults to `~/.omp/agent/extensions`; Claude defaults
+With no client, `runtime status` prints one health-summary JSON object:
+
+- `clients`: OMP/Claude installation records, each with `client`, `destination`,
+  `installed`, `owner` (or `null`), and `error` (`null` or `{code,message}`).
+  A foreign/modified runtime is reported in that client's error; it does not
+  suppress the other client's result.
+- `sessions`: active **local** agent counts, keyed by `omp`, `claude`, and
+  `codex`. Each has `receiver_registered` (`extension_present=1`) and
+  `receiver_absent` counts. Counts are `null` when ledger data is unavailable,
+  not an invented zero. Codex's absence is normal: it pulls with the skill and
+  has no receiving adapter; never report that as broken.
+- `ledger`: `{available:bool,error:null|{code,message}}`. A missing/uninitialised
+  ledger or one requiring an upgrade is reported without creating, migrating,
+  refreshing or otherwise writing it; installation results remain available.
+- `next_steps`: human-readable remedies for missing runtimes, conflicts,
+  unregistered sessions or unavailable ledger data. Ask the user before
+  `runtime install <client>`, then restart only the selected sessions.
+
+`runtime status omp|claude` retains its existing client-specific output shape.
+`install|uninstall` requires positional `omp|claude`; all three client-specific
+operations accept `--destination DIR`. A no-client summary cannot use
+`--destination`. OMP defaults to `~/.omp/agent/extensions`; Claude defaults
 to `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`. OMP owns only
 `ham-mailbox.ts` and `ham-mailbox.install.json`, not Herdr's own extension.
 Claude owns `hooks/ham-mailbox.py`, its manifest and exact `SessionStart` /
@@ -579,7 +628,9 @@ Claude owns `hooks/ham-mailbox.py`, its manifest and exact `SessionStart` /
 survive install/uninstall. Ownership/checksum checks refuse foreign, modified
 or symlinked targets rather than replacing them. Restart/reload only sessions
 the user selects; neither installer silently enables all running sessions.
-Runtime status reports owned installation, not proof of context admission.
+Installed files are not proof of activation or context admission. After the
+selected sessions restart, confirm their receiver registration
+(`extension_present=1`); otherwise report **installed, activation pending**.
 
 **OMP:** only a supported root Herdr session registers. The adapter discovers
 the current structured plugin root (or explicitly configured absolute
@@ -1009,9 +1060,33 @@ python3 agent_skill_installer.py install all
 python3 agent_skill_installer.py install codex
 python3 agent_skill_installer.py install claude
 python3 agent_skill_installer.py install omp
+python3 agent_skill_installer.py install omp --runtime omp
+python3 agent_skill_installer.py install all --runtime all
 ```
 
 `all` installs all three user-scope targets. The popup also offers project-scope installs when a project workspace is available. Canonical `SKILL.md`, this `reference.md`, scripts, and agent metadata belong together; do not copy only SKILL.md. The checkout's Claude skill is a pointer to the canonical `.agents` skill; read canonical SKILL.md fully, this reference only on demand. Installed client copies contain the complete canonical bundle.
+
+After a successful interactive skill install, the installer shows OMP/Claude
+runtime installation states and offers an explicit missing-runtime choice with
+**Not now** selected by default. Before consent, it shows the destination and
+the files it will write: OMP's extension and manifest, or Claude's hook,
+manifest and merged `settings.json` entries described above. Consent uses the
+same runtime installer and ownership checks; conflicts are shown verbatim,
+never replaced or bypassed. Only the sessions the user chooses to restart
+pick up the receiver; installing does not activate every running session.
+
+Noninteractive `install <codex|claude|omp|all>` writes its final runtime summary
+to **stderr**, preserving the existing stdout result. The summary names missing
+runtimes and their exact install commands. `--runtime omp|claude|all` explicitly
+consents to installing those runtimes, independently of the selected skill
+target (`all` here means both receiving runtimes, not a Codex adapter).
+Without that flag, no runtime is installed implicitly. On each selected host,
+run the no-client `runtime status`, explain any missing runtime needed by a used
+client and request consent, report ownership conflicts without replacing
+foreign/modified files, and identify the sessions that need restarting.
+After restart, inspect receiver registration (`extension_present=1`) or report
+**installed, activation pending**. Never call native receiving ready based only
+on plugin/skill installation or owned runtime files.
 
 | Client | User scope | Project scope | Invocation |
 | --- | --- | --- | --- |

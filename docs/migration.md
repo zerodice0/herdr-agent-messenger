@@ -19,6 +19,32 @@ herdr plugin link "$PWD" --enabled
 Existing unnamed agents can be labeled with **Assign Agent Label**. Agents
 detected after installation are labeled automatically.
 
+### Receiving dependency
+
+- **Plugin:** ledger, mailbox, UI, and transport.
+- **Skill:** agent instructions and CLI launcher, not a receiver.
+- **OMP adapter:** native receiving and eligible automatic action wake.
+- **Claude hooks:** native receiving at turn boundaries, with no idle wake.
+- **Codex:** skill-guided inbox pull, with no adapter required.
+
+For new installs and upgrades, install/update the [client skill](skill-guide.md#install-with-the-plugin),
+then run the read-only summary on **every selected host**:
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# Only with user consent, for each used client (omp or claude):
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+Plugin and skill installation alone are not proof of native receiving readiness.
+Missing runtimes require explicit consent: the interactive installer defaults to
+**Not now**, and `agent_skill_installer.py install all --runtime omp|claude|all`
+opts in explicitly. Never replace foreign or modified files. Tell the user which
+sessions need restarting; restart only the sessions they select. After restart,
+confirm `extension_present=1`, or report **installed, activation pending**.
+Plugin loading never writes client configuration; the new-repository `auto`
+default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
+
 ## Workspace role migration (schema v7)
 
 A writable ledger open upgrades older ledgers additively to schema v7.

@@ -34,6 +34,50 @@ python3 agent_messenger.py skill-path
 
 The last command prints the packaged canonical skill path. Project installs are selected in the interactive installer and use the active Herdr workspace root.
 
+### Receiving dependency
+
+- **Plugin:** ledger, mailbox, UI, and transport.
+- **Skill:** agent instructions and CLI launcher, not a receiver.
+- **OMP adapter:** native receiving and eligible automatic action wake.
+- **Claude hooks:** native receiving at turn boundaries, with no idle wake.
+- **Codex:** skill-guided inbox pull; no adapter is needed.
+
+On **every selected host**, run the read-only health summary after installing or
+updating the plugin and skill:
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# Only after user consent, for each client actually used (omp or claude):
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+The summary reports runtime ownership/conflicts in `clients`, active local
+receiver counts in `sessions`, ledger availability/errors in `ledger`, and
+suggested `next_steps`. Missing or old ledgers are reported, never created or
+upgraded by this read. `runtime status omp|claude` retains its client-specific
+output. Codex's pull workflow is intentional, not a missing-receiver failure.
+
+After a successful skill install, the interactive installer shows both runtime
+states and offers missing runtimes with **Not now** selected by default. Review
+the destination and files before consenting. Noninteractive installs report a
+final runtime summary to **stderr**, including missing runtimes and the exact
+install command, without contaminating stdout. The optional flag is explicit
+consent to install the selected runtime(s), independently of the skill target:
+
+```bash
+python3 agent_skill_installer.py install omp --runtime omp
+python3 agent_skill_installer.py install all --runtime all
+```
+
+`--runtime` accepts `omp`, `claude`, or `all`; omitting it never installs a
+runtime implicitly. Conflicts are reported without replacing foreign or modified
+files. Explain which sessions must restart and restart only those the user
+selects. Then confirm receiver registration (`extension_present=1`); otherwise
+report **installed, activation pending**. Plugin and skill installation alone
+never prove receiving readiness, and owned files do not prove activation or
+context admission. Plugin loading never writes client configuration. The new
+repository `auto` default is unchanged; runtime consent does not change mode.
+
 ## Invoke HAM
 
 - **Codex CLI/IDE:** type `$ham`, then select **HAM — Herdr Agent Messenger** from the skill picker. `$ham` is a search term, not a different canonical skill name.
@@ -600,11 +644,14 @@ receiver/wake adapter, and a pull read must never be reported as native delivery
 
 ### Opt-in runtime installation and deployment order
 
-Installing the **skill** copies client instructions. It does **not** install the
-receiving runtime, enable coordination, or change global bindings. On each host,
-use the supported commands separately for the clients you actually select:
+Installing the **skill** copies client instructions. Receiving runtimes require
+separate explicit consent, either in the interactive installer, through
+`--runtime omp|claude|all`, or through the commands below. Skill installation
+does not change coordination mode or global bindings. On each host, select only
+the clients you actually use, after checking the read-only summary:
 
 ```bash
+python3 "$HAM_CLI" runtime status
 python3 "$HAM_CLI" runtime install omp
 python3 "$HAM_CLI" runtime status omp
 python3 "$HAM_CLI" runtime install claude
@@ -614,7 +661,8 @@ python3 "$HAM_CLI" runtime uninstall omp
 python3 "$HAM_CLI" runtime uninstall claude
 ```
 
-All three operations accept `--destination DIR`. OMP defaults to
+All three client-specific operations accept `--destination DIR`; the no-client
+summary does not. OMP defaults to
 `~/.omp/agent/extensions` and owns only `ham-mailbox.ts` and
 `ham-mailbox.install.json`; it leaves Herdr's extension alone. Claude defaults
 to `CLAUDE_CONFIG_DIR`, or `~/.claude`, and owns `hooks/ham-mailbox.py`, its

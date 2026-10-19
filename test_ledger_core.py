@@ -365,6 +365,26 @@ class LedgerCoreTest(unittest.TestCase):
         bells = {p.name: (p.stat().st_mtime_ns, p.read_bytes()) for p in self.store.bell_directory.iterdir()}
         return hashlib.sha256(data.encode()).hexdigest(), bells
 
+    def test_missing_local_receiver_is_advisory_and_preserves_queue(self):
+        for client in ("omp", "claude"):
+            with self.subTest(client=client):
+                recipient = {**self.recipient, "client": client, "extension_present": 0}
+                sent = self.mail.send(self.sender, recipient, body="Receiver dependency notice")
+                self.assertEqual(sent["state"], "queued")
+                warning = next(item for item in sent.get("warnings", [])
+                               if item["code"] == "recipient_no_receiver")
+                self.assertEqual(warning["client"], client)
+                self.assertIn("runtime status", warning["message"])
+                self.assertIn(sent["message_id"], [item["message_id"] for item in
+                              self.mail.read(self.recipient)["messages"]])
+
+    def test_registered_and_codex_recipients_have_no_receiver_advisory(self):
+        for client, present in (("omp", 1), ("claude", 1), ("codex", 0)):
+            with self.subTest(client=client):
+                sent = self.mail.send(self.sender, {**self.recipient, "client": client,
+                                                   "extension_present": present}, body="No warning")
+                self.assertNotIn("recipient_no_receiver", [item["code"] for item in sent.get("warnings", [])])
+
     def test_host_persistence_permissions_and_wrong_reopen(self):
         other = LedgerStore(self.store.directory)
         self.assertEqual(other.host_uuid, self.store.host_uuid)

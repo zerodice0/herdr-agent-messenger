@@ -139,6 +139,28 @@ class RemoteLedgerTest(unittest.TestCase):
     def send(self, source='alpha', target='beta', **options):
         return Mailbox(self.stores[source]).send(self.agents[source], self.agents[target], body='Immutable remote body 한글', **options)
 
+    def test_exported_remote_receiver_absence_warns_but_unknown_does_not(self):
+        beta = self.stores["beta"]
+        with beta.transaction() as connection:
+            connection.execute("UPDATE agents SET client='omp',extension_present=0 WHERE active=1")
+        recipient = self.services["alpha"].query_status("beta", self.repo_id, refresh=False)["agents"][0]
+        sent = Mailbox(self.stores["alpha"], self.environment).send(
+            self.agents["alpha"], recipient, body="Remote receiver absent")
+        self.assertEqual(sent["state"], "pending")
+        self.assertEqual(sent["warnings"][0]["code"], "recipient_no_receiver")
+        self.assertEqual(sent["warnings"][0]["client"], "omp")
+        self.assertIn("beta", sent["warnings"][0]["message"])
+        for client, present in (("omp", None), ("omp", 1), ("claude", None), ("codex", 0)):
+            with self.subTest(client=client, present=present):
+                exported = {**recipient, "client": client}
+                if present is None:
+                    exported.pop("extension_present", None)
+                else:
+                    exported["extension_present"] = present
+                result = Mailbox(self.stores["alpha"], self.environment).send(
+                    self.agents["alpha"], exported, body="No absence evidence")
+                self.assertNotIn("warnings", result)
+
     def current(self, host, message_id):
         with self.stores[host].read() as connection:
             return receipt(connection, message_id)

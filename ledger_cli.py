@@ -33,9 +33,11 @@ def add_parsers(subparsers: Any) -> None:
     installer = subparsers.add_parser("runtime", help="Explicit ownership-checked opt-in runtime installation.")
     install_commands = installer.add_subparsers(dest="runtime_operation", required=True)
     for operation in ("install", "uninstall", "status"):
-        install = install_commands.add_parser(operation, help=f"{operation.title()} a HAM-owned client runtime.")
-        install.add_argument("client", choices=("omp", "claude"))
-        install.add_argument("--destination", help="Explicit client directory: omp defaults to ~/.omp/agent/extensions; claude to ~/.claude (settings.json).")
+        description = ("Read installation health and active local receiver counts (no client), or one runtime."
+                       if operation == "status" else f"{operation.title()} a HAM-owned client runtime.")
+        install = install_commands.add_parser(operation, help=description, description=description)
+        install.add_argument("client", choices=("omp", "claude"), **({"nargs": "?"} if operation == "status" else {}))
+        install.add_argument("--destination", help="Requires a client. Explicit directory: omp defaults to ~/.omp/agent/extensions; claude to $CLAUDE_CONFIG_DIR or ~/.claude.")
     mail = subparsers.add_parser("mail", help="Leave immutable messages without interrupting an agent.")
     mail_commands = mail.add_subparsers(dest="mail_command", required=True)
     send = mail_commands.add_parser("send", help="Queue a local/remote same-repository message without interrupting work.")
@@ -157,8 +159,15 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
         from ledger_devices import device_operation
         return device_operation(arguments, environment)
     if arguments.command == "runtime":
-        from runtime_installer import manage
-        return manage(arguments.runtime_operation, arguments.destination, client=arguments.client)
+        from runtime_installer import destinations, health_summary, manage
+        if arguments.runtime_operation == "status" and arguments.client is None:
+            if arguments.destination is not None:
+                raise LedgerError("invalid_destination", "--destination requires an explicit runtime client.")
+            return health_summary(environment)
+        destination = arguments.destination
+        if destination is None:
+            destination = destinations(environment)[arguments.client]
+        return manage(arguments.runtime_operation, destination, client=arguments.client)
     name = arguments.name if arguments.command == "ledger" and arguments.ledger_command == "setup" else None
     read_only_export = False
     if (arguments.command == "ledger" and arguments.ledger_command == "status-export"
@@ -255,7 +264,10 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         if command == "retention":
             return store.retention()
         if command in {"reconcile", "event"}:
-            return registry.refresh(environment)[1]
+            result = registry.refresh(environment)[1]
+            from receiver_notifications import notify_missing_runtime
+            notify_missing_runtime(store, environment)
+            return store.annotate(result)
         if command in {"accept", "receipt", "setting", "withdraw"} or (command == "status-export" and arguments.wire):
             envelope = getattr(arguments, "wire_envelope", None)
             if envelope is None:

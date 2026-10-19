@@ -52,6 +52,33 @@ herdr plugin link "$PWD" --enabled
 합니다. 구 플러그인을 제거하기 전에 [마이그레이션 가이드](docs/ko/migration.md)를
 따르세요.
 
+### 수신 의존성
+
+- **플러그인:** 원장, 메일함, UI와 전송을 담당합니다.
+- **스킬:** 에이전트 지침과 CLI 실행기를 제공하며 수신기는 아닙니다.
+- **OMP 어댑터:** 네이티브 수신과 조건을 충족하는 action의 자동 깨우기를 제공합니다.
+- **Claude 훅:** 턴 경계에서 네이티브 수신을 제공하며 유휴 깨우기는 없습니다.
+- **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
+
+플러그인과 스킬만 설치해서는 네이티브 수신 준비가 끝나지 않습니다.
+[클라이언트 스킬](#클라이언트-스킬-설치)을 설치한 뒤 **선택한 각 호스트**의
+플러그인 또는 체크아웃 루트에서 읽기 전용 상태 요약을 확인하세요.
+
+```bash
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+# 사용자가 동의한 경우에만, 이 호스트에서 실제로 쓰는 클라이언트에 설치합니다.
+python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+```
+
+Claude 훅은 `omp` 대신 `claude`를 지정합니다. 스킬 설치기는 누락된 런타임의
+설치를 제안하며 기본 선택은 **Not now(나중에)**입니다. 비대화형 명령의
+`install all --runtime omp|claude|all`은 명시적 동의이며, 의존성을 자동으로
+설치하지는 않습니다. 소유권 충돌이 있는 파일은 덮어쓰지 마세요. 사용자가 선택한
+세션만 다시 시작하고 `extension_present=1`을 확인하세요. 확인하지 못하면
+**설치됨, 활성화 대기**로 보고합니다. 파일 설치는 활성화의 증거가 아닙니다.
+플러그인 로드는 클라이언트 설정을 바꾸지 않으며 새 저장소의 기본 `auto` 모드도
+유지됩니다. 자세한 내용은 [스킬 가이드](docs/ko/skill-guide.md#수신-의존성)를 참고하세요.
+
 ## 사용
 
 같은 저장소의 참여 에이전트끼리는 [영속 메일함](#영속-메일함)으로 협업합니다.
@@ -318,8 +345,9 @@ flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. �
 이전 peer가 보내는 `main`·`members`·`computed_main` 설정은 적용하지 않고
 성공으로 응답합니다. [마이그레이션 안내](docs/ko/migration.md#workspace-역할-마이그레이션스키마-v7)를 참고하세요.
 
-스킬 설치는 수신 런타임을 설치하지 **않습니다**. 각 호스트에서 별도로
-`runtime install omp` 또는 `runtime install claude`를 선택해 실행합니다.
+스킬 설치는 수신 런타임을 **자동으로 설치하지 않습니다**. 설치기의 명시적 선택이나
+플래그로 동의하거나, 각 호스트에서 `runtime install omp` 또는
+`runtime install claude`를 별도로 실행합니다.
 같은 대상의 `runtime status`로 상태를 확인하고 `runtime uninstall`로 제거합니다.
 선택한 세션만 다시 시작하세요. 설치기는 HAM 확장이나 훅 항목만 관리하며,
 관련 없는 Herdr·클라이언트 설정은 보존합니다.

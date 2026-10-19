@@ -7,15 +7,90 @@ import json
 import os
 from pathlib import Path
 import shlex
+import sqlite3
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
-from ledger_store import LedgerError
+from ledger_store import LedgerError, LedgerStore
 
 OWNER = 'herdr.agent-messenger'
 MANIFEST = 'ham-mailbox.install.json'
 RUNTIME = 'ham-mailbox.ts'
 _UNCHECKED = object()
+
+
+def destinations(environment: Mapping[str, str] | None = None) -> dict[str, Path]:
+    values = os.environ if environment is None else environment
+    home = Path(values.get('HOME') or str(Path.home())).expanduser()
+    return {
+        'omp': home / '.omp' / 'agent' / 'extensions',
+        'claude': Path(values.get('CLAUDE_CONFIG_DIR') or home / '.claude').expanduser(),
+    }
+
+
+def summary(environment: Mapping[str, str] | None = None, *,
+            clients: tuple[str, ...] = ('omp', 'claude')) -> dict[str, Any]:
+    """Inspect each selected default runtime independently, without installing it."""
+    directories = destinations(environment)
+    results = []
+    for client in clients:
+        destination = directories.get(client)
+        result = {'client': client, 'destination': str(destination.absolute()) if destination else None,
+                  'installed': False, 'owner': None, 'error': None}
+        try:
+            status = manage('status', destination, client=client)
+            result.update(status)
+        except LedgerError as error:
+            result['error'] = {'code': error.code, 'message': error.message}
+        except OSError as error:
+            result['error'] = {'code': 'runtime_unavailable', 'message': str(error)}
+        results.append(result)
+    return {'clients': results}
+
+
+def health_summary(environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Combine installation ownership with read-only, local registration counts."""
+    result = summary(environment)
+    sessions = {client: {'receiver_registered': None, 'receiver_absent': None}
+                for client in ('omp', 'claude', 'codex')}
+    ledger: dict[str, Any] = {'available': False, 'error': None}
+    try:
+        store = LedgerStore.open_readonly(environment)
+        if store is None:
+            raise LedgerError('ledger_not_initialized', 'No existing HAM ledger is available to read.')
+        with store.read() as connection:
+            rows = connection.execute(
+                "SELECT client,extension_present,COUNT(*) AS count FROM agents "
+                "WHERE active=1 AND host=? AND client IN ('omp','claude','codex') "
+                "GROUP BY client,extension_present", (store.host,)).fetchall()
+        sessions = {client: {'receiver_registered': 0, 'receiver_absent': 0}
+                    for client in sessions}
+        for row in rows:
+            field = 'receiver_registered' if row['extension_present'] else 'receiver_absent'
+            sessions[row['client']][field] += row['count']
+        ledger['available'] = True
+    except LedgerError as error:
+        ledger['error'] = {'code': error.code, 'message': error.message}
+    except (OSError, sqlite3.Error, ValueError) as error:
+        ledger['error'] = {'code': 'ledger_unavailable', 'message': str(error)}
+    next_steps = []
+    if ledger['error']:
+        next_steps.append('Ledger: ' + ledger['error']['message'] +
+                          ' Run `ledger reconcile` to initialize or upgrade it before checking session registration.')
+    for runtime in result['clients']:
+        client = runtime['client']
+        absent = sessions[client]['receiver_absent']
+        prefix = f'{client}: {absent} sessions without receiver; ' if absent else f'{client}: '
+        if runtime['error']:
+            next_steps.append(prefix + runtime['error']['code'] + ': ' +
+                              runtime['error']['message'] + ' Resolve the conflict; never replace foreign or modified files.')
+        elif not runtime['installed']:
+            next_steps.append(prefix + 'runtime not installed → ask the user, then `runtime install ' +
+                              client + '`, then restart only selected sessions and confirm extension_present=1.')
+        elif absent:
+            next_steps.append(prefix + 'runtime installed, activation pending → restart only selected sessions; '
+                              'confirm extension_present=1 before reporting receiving ready.')
+    return {**result, 'sessions': sessions, 'ledger': ledger, 'next_steps': next_steps}
 
 
 def _digest(path: Path) -> str:
@@ -86,7 +161,8 @@ def manage(operation: str, destination: str | Path | None = None, *, client: str
         raise LedgerError('invalid_operation','Unsupported runtime operation.')
     if not directory.exists() and operation != 'install':
         return {'client':'omp','destination':str(directory),'installed':False}
-    directory.mkdir(parents=True,exist_ok=True)
+    if operation == 'install':
+        directory.mkdir(parents=True,exist_ok=True)
     # Lock the directory itself; no extra installer-owned lock file is left in a
     # user's extension directory, and concurrent first installs cannot race.
     descriptor = os.open(directory,os.O_RDONLY)
@@ -147,7 +223,8 @@ def _manage_claude(operation: str, destination: str | Path | None) -> dict[str, 
     result = {'client':'claude','destination':str(directory)}
     if not directory.exists() and operation!='install':
         return {**result,'installed':False}
-    directory.mkdir(parents=True,exist_ok=True)
+    if operation == 'install':
+        directory.mkdir(parents=True,exist_ok=True)
     descriptor = os.open(directory,os.O_RDONLY)
     try:
         fcntl.flock(descriptor,fcntl.LOCK_EX)

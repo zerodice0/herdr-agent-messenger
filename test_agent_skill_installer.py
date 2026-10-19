@@ -1,8 +1,9 @@
 import ham_test_support  # Protect the live ledger before product imports.
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import curses
 import io
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -430,7 +431,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
     def test_popup_arrow_selection_installs_the_highlighted_target(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (22, 60)
-        screen.get_wch.side_effect = [curses.KEY_DOWN] * 5 + ["\n", "\x1b"]
+        screen.get_wch.side_effect = [curses.KEY_DOWN] * 5 + ["\n", "\x1b", "\x1b"]
 
         def run_wrapper(callback):
             return callback(screen)
@@ -487,6 +488,139 @@ class AgentSkillInstallerTest(unittest.TestCase):
         self.assertIn("omp: ask in natural language", rendered_text)
         self.assertIn("skill://herdr-agent-messenger.", rendered_text)
         self.assertIn("Example target: local/yellow-falcon", rendered)
+
+
+class ReceivingRuntimeConsentTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.environment = {"HOME": str(self.root / "home"),
+                            "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+                            "LANG": "en_US.UTF-8"}
+
+    def run_install(self, arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(stdout), redirect_stderr(stderr):
+            result = agent_skill_installer.main(arguments)
+        self.assertEqual(stdout.getvalue(), "")
+        return result, stderr.getvalue()
+
+    def screen(self, keys, size=(22, 60)):
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = size
+        screen.get_wch.side_effect = keys
+        return screen
+
+    @staticmethod
+    def rendered(screen):
+        return "".join(call.args[2] for call in screen.addnstr.call_args_list)
+
+    def test_noninteractive_skill_install_discloses_missing_runtimes_without_installing(self):
+        result, report = self.run_install(["install", "omp"])
+        self.assertEqual(result, 0)
+        self.assertIn("Receiving runtimes", report)
+        self.assertIn("runtime install omp", report)
+        self.assertIn("runtime install claude", report)
+        self.assertIn("Only sessions you choose to restart", report)
+        self.assertTrue((self.root / "home/.omp/agent/skills/herdr-agent-messenger/SKILL.md").is_file())
+        self.assertFalse((self.root / "home/.omp/agent/extensions").exists())
+        self.assertFalse((self.root / "claude").exists())
+
+    def test_runtime_flag_is_explicit_per_client_or_all_consent(self):
+        for selection in ("omp", "claude", "all"):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                self.environment = {"HOME": str(Path(directory) / "home"),
+                                    "CLAUDE_CONFIG_DIR": str(Path(directory) / "claude"),
+                                    "LANG": "en_US.UTF-8"}
+                result, report = self.run_install(["install", "codex", "--runtime", selection])
+                self.assertEqual(result, 0)
+                runtimes = agent_skill_installer.runtime_installer.summary(self.environment)["clients"]
+                for runtime in runtimes:
+                    self.assertEqual(runtime["installed"], selection in (runtime["client"], "all"))
+                    self.assertIsNone(runtime["error"])
+                self.assertIn("activation pending", report)
+                self.assertFalse((Path(directory) / "home/.omp/agent/skills").exists())
+
+    def test_runtime_flag_reports_conflict_verbatim_and_preserves_foreign_file(self):
+        destination = agent_skill_installer.runtime_installer.destinations(self.environment)["omp"]
+        destination.mkdir(parents=True)
+        target = destination / "ham-mailbox.ts"
+        target.write_text("foreign runtime", encoding="utf-8")
+        error = agent_skill_installer.runtime_installer.summary(self.environment)["clients"][0]["error"]
+        result, report = self.run_install(["install", "all", "--runtime", "all"])
+        self.assertEqual(result, 1)
+        self.assertIn(error["code"] + ": " + error["message"], report)
+        self.assertEqual(target.read_text(encoding="utf-8"), "foreign runtime")
+        self.assertTrue(agent_skill_installer.runtime_installer.summary(self.environment)["clients"][1]["installed"])
+
+    def test_runtime_offer_defaults_to_not_now_and_shows_both_clients(self):
+        screen = self.screen(["\n"])
+        with mock.patch.object(agent_skill_installer.runtime_installer, "manage",
+                               wraps=agent_skill_installer.runtime_installer.manage) as manage:
+            result = agent_skill_installer.offer_runtime_install(screen, self.environment, agent_skill_installer.COPY["en"])
+        self.assertFalse(any(call.args[0] == "install" for call in manage.call_args_list))
+        rendered = self.rendered(screen)
+        for expected in ("Receiving dependency", "omp: Not installed", "claude: Not installed",
+                         "› Not now (default)", "Codex uses skill-guided pull"):
+            self.assertIn(expected, rendered)
+        self.assertIn("Only sessions you choose to restart", result)
+        self.assertFalse((self.root / "home").exists())
+        self.assertFalse((self.root / "claude").exists())
+
+    def test_runtime_offer_shows_writes_before_install_and_only_installs_selected_client(self):
+        for client, down in (("omp", 1), ("claude", 2)):
+            with self.subTest(client=client), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                environment = {"HOME": str(Path(directory) / "home"), "CLAUDE_CONFIG_DIR": str(Path(directory) / "claude")}
+                screen = self.screen([curses.KEY_DOWN] * down + ["\n", "\n"])
+                original = agent_skill_installer.runtime_installer.manage
+
+                def manage(operation, destination=None, *, client="omp"):
+                    if operation == "install":
+                        rendered = self.rendered(screen)
+                        self.assertIn("Writes:", rendered)
+                        self.assertIn("ham-mailbox.install.json", rendered)
+                        self.assertIn(str(destination), rendered)
+                        self.assertIn("ham-mailbox.ts" if client == "omp" else "hooks/ham-mailbox.py", rendered)
+                        if client == "claude":
+                            self.assertIn("settings.json", rendered)
+                    return original(operation, destination, client=client)
+
+                with mock.patch.object(agent_skill_installer.runtime_installer, "manage", side_effect=manage):
+                    result = agent_skill_installer.offer_runtime_install(screen, environment, agent_skill_installer.COPY["en"])
+                self.assertIn("Only sessions you choose to restart", result)
+                runtimes = agent_skill_installer.runtime_installer.summary(environment)["clients"]
+                self.assertEqual([runtime["client"] for runtime in runtimes if runtime["installed"]], [client])
+
+    def test_runtime_offer_displays_existing_conflict_without_offering_replacement(self):
+        destination = agent_skill_installer.runtime_installer.destinations(self.environment)["omp"]
+        destination.mkdir(parents=True)
+        (destination / "ham-mailbox.ts").write_text("foreign", encoding="utf-8")
+        screen = self.screen([curses.KEY_NPAGE, "\n"], size=(10, 60))
+        agent_skill_installer.offer_runtime_install(screen, self.environment, agent_skill_installer.COPY["en"])
+        rendered = self.rendered(screen)
+        self.assertIn("foreign_runtime", rendered)
+        self.assertNotIn("Install omp receiver", rendered)
+        self.assertEqual((destination / "ham-mailbox.ts").read_text(encoding="utf-8"), "foreign")
+
+    def test_runtime_offer_install_conflict_is_not_suppressed(self):
+        screen = self.screen([curses.KEY_DOWN, "\n", "\n"])
+        original = agent_skill_installer.runtime_installer.manage
+
+        def manage(operation, destination=None, *, client="omp"):
+            if operation == "install":
+                raise agent_skill_installer.LedgerError("modified_runtime", "Conflict verbatim.")
+            return original(operation, destination, client=client)
+
+        with mock.patch.object(agent_skill_installer.runtime_installer, "manage", side_effect=manage):
+            result = agent_skill_installer.offer_runtime_install(screen, self.environment, agent_skill_installer.COPY["ko"])
+        self.assertEqual(result, "modified_runtime: Conflict verbatim.")
+        self.assertIn("modified_runtime: Conflict verbatim.", self.rendered(screen))
+
+    def test_runtime_flag_rejects_codex_adapter(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            agent_skill_installer.parse_cli_arguments(["install", "codex", "--runtime", "codex"])
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":
