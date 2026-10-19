@@ -196,7 +196,7 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
   --message MESSAGE_UUID
 ```
 
-`fyi`는 참고 정보이며, `action`은 조건에 맞으면 omp의 유휴 세션에서 턴을
+`fyi`는 참고 정보이며, `action`은 조건에 맞으면 Herdr의 `turn_state`가 `idle` 또는 `done`인 omp 세션에서 턴을
 시작할 수 있습니다. FYI만으로는 턴을 시작하지 않습니다. 같은 pane을 쓰는
 서브에이전트가 읽어도 조회는 전달·처리 상태를 바꾸지 않습니다. 명시적 처리는
 대기 중인 메일을 네이티브 전달 시각 없이 처리 완료로 바꿀 수 있습니다.
@@ -365,7 +365,7 @@ OMP 시작 중 `native_session_pending`은 Herdr가 아직 native 세션 경로�
 
 - **omp:** Herdr의 루트 세션은 일반 턴 경계에서 메일을 받을 수 있습니다.
   action으로 자동 턴을 시작하려면 역할, 지원되는 빈 입력창, 입력 유휴 시간,
-  세션 유휴 상태, 설정된 묶음 처리·빈도 제한 조건을 모두 충족해야 합니다.
+  OMP 런타임 유휴 상태, Herdr의 `idle` 또는 `done` 상태, 설정된 묶음 처리·빈도 제한 조건을 모두 충족해야 합니다.
   포커스만으로 메일을 보류하지는 않습니다. ACK는 같은 세션의 활성 분기
   저널에서 정확한 메일 묶음을 관찰했다는 뜻이지, 제공자의 수락이나 모델의
   이해를 뜻하지 않습니다.

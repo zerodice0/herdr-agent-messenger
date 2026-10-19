@@ -18,6 +18,7 @@ from ledger_store import LedgerError, LedgerStore
 MESSAGE_BYTES = 2048
 BUNDLE_BYTES = 8192
 BUNDLE_MESSAGES = 8
+WAKE_READY_STATES = frozenset({'idle', 'done'})
 
 
 def truncate_utf8(value: str, maximum: int) -> str:
@@ -151,7 +152,7 @@ class NativeReceiver:
             if wake:
                 if state['role'] is None:
                     reason = 'not_participating'
-                elif state['turn_state']!='idle':
+                elif state['turn_state'] not in WAKE_READY_STATES:
                     reason = 'not_idle'
                 elif state['wake_count']>=state['thresholds']['wakes_per_hour']:
                     reason = 'hourly_limit'

@@ -285,6 +285,30 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(self.claim(wake=True)['reason'],'no_action')
         self.assertIsNotNone(self.claim()['claim_id'])
 
+    def test_done_accepts_action_wake_before_user_focus(self):
+        live = snapshot(self.repo,recipient_session=self.session)
+        live['agents'][1]['agent_status']='done'
+        self.registry.reconcile(live, refresh_display=False)
+        self.assertEqual(self.receiver.inspect(**self.identity)['turn_state'],'done')
+        sent = self.send(kind='action')
+        claim = self.claim(wake=True)
+        self.assertIsNotNone(claim['claim_id'])
+        self.assertEqual([message['message_id'] for message in claim['messages']],[sent['message_id']])
+        self.assertEqual(self.states()[sent['message_id']],'delivering')
+
+    def test_nonready_turn_states_still_reject_wake_as_not_idle(self):
+        sent = self.send(kind='action')
+        for turn_state in ('working','blocked','unknown'):
+            with self.subTest(turn_state=turn_state):
+                live = snapshot(self.repo,recipient_session=self.session)
+                live['agents'][1]['agent_status']=turn_state
+                self.registry.reconcile(live, refresh_display=False)
+                self.assertEqual(self.receiver.inspect(**self.identity)['turn_state'],turn_state)
+                claim = self.claim(wake=True)
+                self.assertIsNone(claim['claim_id'])
+                self.assertEqual(claim['reason'],'not_idle')
+                self.assertEqual(self.states()[sent['message_id']],'queued')
+
     def test_coalesce_hourly_reservations_and_native_working_are_admission_gates(self):
         self.settings.mutate(self.recipient['repo_id'],'thresholds',{**self.thresholds,'coalesce_seconds':30,'wakes_per_hour':1})
         self.send(kind='action')

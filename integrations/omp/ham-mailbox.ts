@@ -31,6 +31,7 @@ type Operation = keyof ReceiverReplies;
 type Call = <O extends Operation>(operation: O, data: Request) => Promise<ReceiverReplies[O]>;
 type Pending = NativeClaim & { phase: "prepared" | "sent" | "unknown"; preparation?: string; message?: NativeMessage };
 interface EndEvent { willContinue?: boolean; messages?: readonly { role: string; stopReason?: string }[] }
+const WAKE_READY_STATES: Record<string, true> = { idle: true, done: true };
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const identity = (agent: NativeAgent) => ({ terminal_id: agent.terminal_id, agent_id: agent.agent_id, generation: agent.generation });
 
@@ -394,7 +395,7 @@ export class MailboxAdapter {
       if (ctx.mode === "tui") this.schedule(ctx, Math.max(1000, this.lastKey + state.thresholds.idle_minutes * 60000 - Date.now()));
       return;
     }
-    if (state.turn_state !== "idle") { this.refreshNeeded = true; this.schedule(ctx, 1000); return; }
+    if (!Object.hasOwn(WAKE_READY_STATES, state.turn_state)) { this.refreshNeeded = true; this.schedule(ctx, 1000); return; }
     if (state.wake_count >= state.thresholds.wakes_per_hour) { this.schedule(ctx, 300000); return; }
     if (state.coalesce_until * 1000 > Date.now()) { this.schedule(ctx, state.coalesce_until * 1000 - Date.now()); return; }
     const serial = this.inputSerial;

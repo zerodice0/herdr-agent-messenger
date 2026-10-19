@@ -194,7 +194,7 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
   --message MESSAGE_UUID
 ```
 
-`fyi` is informational; `action` can qualify for an omp idle wake. FYI alone does
+`fyi` is informational; `action` can qualify for an omp wake when Herdr `turn_state` is `idle` or `done`. FYI alone does
 not start a turn. Reads are view-only, including reads by subagents sharing a
 pane. Explicit handling can mark queued mail handled without inventing a
 delivered timestamp. Replies to mail addressed to the current recipient
@@ -364,7 +364,7 @@ reported path is still rejected as `stale_session`.
 
 - **omp:** The root Herdr session can receive at a natural turn boundary.
   Automatic action wakes additionally require an eligible role, supported empty
-  editor, quiet input, idle session, and the configured coalescing/rate limits.
+  editor, quiet input, idle OMP runtime with Herdr `turn_state` of `idle` or `done`, and the configured coalescing/rate limits.
   Focus alone does not hold mail. ACK means the exact bundle was observed in the
   same session's active-branch journal, not provider acceptance or understanding.
 - **Claude Code:** Bounded `SessionStart` and `UserPromptSubmit` hooks receive

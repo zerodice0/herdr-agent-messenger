@@ -52,10 +52,13 @@ if op=='setup':
  settings=RepoSettings(store); rid=registry.list()[0]['repo_id']
  settings.mutate(rid,'mode','auto')
  settings.mutate(rid,'thresholds',{**DEFAULT_THRESHOLDS,'idle_minutes':data.get('idle_minutes',0),'coalesce_seconds':0})
-if op=='session': registry.reconcile(snapshot(repo,recipient_session=data['session_ref']))
+if op in ('session','turn_state'):
+ live=snapshot(repo,recipient_session=data['session_ref'])
+ if op=='turn_state': live['agents'][1]['agent_status']=data['turn_state']
+ registry.reconcile(live)
 agents=registry.list(); sender=next(a for a in agents if a['terminal_id']=='term-a'); recipient=next(a for a in agents if a['terminal_id']=='term-b')
 mail=Mailbox(store)
-if op in ('setup','session'): result={'agent':recipient}
+if op in ('setup','session','turn_state'): result={'agent':recipient}
 elif op=='register': result=NativeReceiver(store).register(recipient,**data)
 elif op=='send': result=mail.send(sender,recipient,**data)
 elif op=='view':
@@ -296,6 +299,29 @@ test("idle action atomically bundles FYI and nextTurn trigger; no premature deli
   let view = await f.view(); expect(view.messages.map(m => m.state)).toEqual(["delivering", "delivering"]); expect(view.wakes).toBe(0);
   f.accept(f.sent[0].message); await f.adapter.confirm(f.context); await f.adapter.confirm(f.context);
   view = await f.view(); expect(view.messages.map(m => m.state)).toEqual(["delivered", "delivered"]); expect(view.wakes).toBe(1);
+});
+
+test("done action claims a wake with quiet empty editor before user focus", async () => {
+  const f = new Fixture(); await f.setup(); await f.send("action");
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "done" });
+  expect(f.context.isIdle()).toBe(true); expect(f.context.ui.getEditorText()).toBe("");
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+  const view = await f.view();
+  expect(view.messages[0].state).toBe("delivering"); expect(view.messages[0].claim_id).not.toBeNull();
+  expect(view.wakes).toBe(0);
+});
+
+test("working Herdr state never claims a wake despite quiet empty editor", async () => {
+  const f = new Fixture(); await f.setup(); await f.send("action");
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "working" });
+  expect(f.context.isIdle()).toBe(true); expect(f.context.ui.getEditorText()).toBe("");
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0); expect(f.operations).not.toContain("claim");
+  const view = await f.view();
+  expect(view.messages[0].state).toBe("queued"); expect(view.messages[0].claim_id).toBeNull();
+  expect(view.wakes).toBe(0);
 });
 
 test("FYI alone cannot create a turn; task agents never register or consume", async () => {

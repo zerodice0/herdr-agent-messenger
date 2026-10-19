@@ -560,7 +560,7 @@ replay an unknown claim or send a replacement while application is uncertain.
 **OMP:** opt-in receiving is limited to the root Herdr session and a supported
 native session file; the extension delegates ledger work to Python. In a
 supported TUI, automatic wake needs an empty editor, quiet input for
-`idle_minutes`, an idle agent with no pending message, `willContinue`, or retry
+`idle_minutes`, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime with no pending message, `willContinue`, or retry
 hold, an eligible action and participating role, plus coalescing/hourly/hop
 limits. Eligibility is rechecked in the same tick immediately before enqueue.
 It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself

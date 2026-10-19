@@ -664,7 +664,7 @@ the current structured plugin root (or explicitly configured absolute
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
 nonmembers. FYI alone does not start a turn. Automatic action wake requires a
 participating role, same repo/generation, TUI mode with supported empty-editor
-evidence, configured input quiet time, idle/no pending work, no continuation or
+evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.
 Final conditions and agent-attributed
 `sendMessage(...,{deliverAs:"nextTurn",triggerTurn:true})` occur in the same
@@ -1023,7 +1023,7 @@ Creates a labeled interactive session. Optional initial messaging is a single pe
 
 ### Focus-held delivery
 
-Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM popup sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead uses idle/editor/quiet-time admission and ignores pane focus.
+Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM popup sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead requires Herdr `turn_state` of `idle` or `done` plus runtime idle/editor/quiet-time admission and ignores pane focus.
 
 Self-send fails immediately with `recipient_is_sender`, before any focus check; the sender's focused pane never causes a self-addressed message to be deferred.
 

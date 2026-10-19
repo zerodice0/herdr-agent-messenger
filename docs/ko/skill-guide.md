@@ -588,7 +588,7 @@ request/journal 증거, 모델의 이해나 작업 처리 완료가 아닙니다
 **OMP:** 선택적으로 설치하는 수신 확장은 Herdr의 root 세션과 지원되는 native
 session 파일에서만 동작하며 원장 작업은 Python에 맡깁니다. 지원되는 TUI에서
 자동 깨우기를 하려면 편집기가 비어 있고 `idle_minutes` 동안 입력이 없어야 합니다.
-에이전트가 idle이며 pending 메시지, `willContinue`, retry hold가 없고, 참여 역할과
+Herdr의 `turn_state`가 `idle` 또는 `done`이고 OMP 런타임이 유휴 상태이며 pending 메시지, `willContinue`, retry hold가 없고, 참여 역할과
 적격 action이 있으며 병합·시간당 횟수·hop 제한도 만족해야 합니다. enqueue 직전
 같은 tick에서 조건을 다시 확인합니다. 에이전트 발신의 `nextTurn` + `triggerTurn`을
 사용하며 steer하지 않습니다. 포커스 자체는 이 깨우기를 막지 않으므로 기존
