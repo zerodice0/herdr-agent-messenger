@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ham_test_support  # Protect the live ledger before product imports.
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -18,7 +19,7 @@ agent_labels = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agent_labels)
 
 
-class AgentLabelsTest(unittest.TestCase):
+class AgentLabelsTest(ham_test_support.IsolatedLedgerTest):
     def test_run_herdr_uses_injected_binary(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:

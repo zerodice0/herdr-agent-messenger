@@ -1,4 +1,5 @@
 """Exercise legacy CLI policy against private real registries and request stores."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 from copy import deepcopy
 from io import StringIO

@@ -1,3 +1,4 @@
+import ham_test_support  # Protect the live ledger before product imports.
 import importlib.util
 import json
 import os
@@ -61,22 +62,13 @@ def batch_route_resolution(route, environment=None):
     )
 
 
-class IsolatedLegacyCliTest(unittest.TestCase):
+class IsolatedLegacyCliTest(ham_test_support.IsolatedLedgerTest):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(prefix="ham-legacy-cli-")
-        self.addCleanup(directory.cleanup)
-        root = Path(directory.name)
-        home = root / "home"
-        self.environment = {
-            "HOME": str(home),
-            "XDG_CONFIG_HOME": str(home / ".config"),
-            "XDG_STATE_HOME": str(home / ".local/state"),
-            "HERDR_AGENT_LEDGER_DIR": str(home / ".local/state/herdr-agent-messenger/ledger"),
-            "HERDR_AGENT_REQUEST_STATE_DIR": str(root / "requests"),
-            "HERDR_AGENT_LEDGER_AUTOSTART": "0",
+        super().setUp()
+        self.environment.update({
             "HERDR_PANE_ID": "w1:p1",
             "HERDR_TERMINAL_ID": "terminal-w1:p1",
-        }
+        })
         # Even environment={} falls back to Path.home(). Never read the user's
         # live coordination settings or request records from transport fixtures.
         environment_patch = mock.patch.dict(os.environ, self.environment)

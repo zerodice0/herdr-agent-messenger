@@ -1,4 +1,5 @@
 """Shared user/recovery/spawn services exercised with private real SQLite state."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 from concurrent.futures import ThreadPoolExecutor
 import json

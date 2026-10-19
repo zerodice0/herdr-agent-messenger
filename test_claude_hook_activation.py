@@ -1,4 +1,5 @@
 """Global Claude hooks activate from Herdr hints, never use them as identity."""
+import ham_test_support  # Protect the live ledger before product imports.
 import importlib.util
 import io
 import json

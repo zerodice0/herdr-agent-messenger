@@ -1,3 +1,4 @@
+import ham_test_support  # Protect the live ledger before product imports.
 import json
 import os
 from pathlib import Path

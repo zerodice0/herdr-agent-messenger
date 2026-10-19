@@ -1,4 +1,5 @@
 """Device ownership, refusal boundaries and read-only resource exports."""
+import ham_test_support  # Protect the live ledger before product imports.
 import contextlib
 import copy
 import io

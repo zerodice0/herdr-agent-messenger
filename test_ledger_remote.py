@@ -1,4 +1,5 @@
 """Real two/three-store CLI wire tests with transport fault injection, not DB replication."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 import json
 import os

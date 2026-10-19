@@ -1,4 +1,5 @@
 """Consumer-visible quick-send behavior and preserved isolated mailbox services."""
+import ham_test_support  # Protect the live ledger before product imports.
 import curses
 import json
 import os

@@ -1,4 +1,5 @@
 """Read-only resource discovery fixtures and host/session ownership boundaries."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 from datetime import datetime
 import json

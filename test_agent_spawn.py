@@ -1,3 +1,4 @@
+import ham_test_support  # Protect the live ledger before product imports.
 import argparse
 import json
 import os
@@ -355,6 +356,8 @@ class AgentSpawnTest(unittest.TestCase):
                 backend, "--host", "test-remote", "--cwd", "/remote/project",
                 "--from-pane", "remote-pane", "--verbose",
                 environment={
+                    "HOME": str(Path(directory) / "home"),
+                    "HERDR_AGENT_LEDGER_DIR": str(Path(directory) / "ledger"),
                     SSH_CONFIG_ENV: str(config),
                     SSH_HOSTS_FILE_ENV: str(Path(directory) / "ssh-hosts"),
                 },

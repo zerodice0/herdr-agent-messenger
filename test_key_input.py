@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
+import ham_test_support  # Protect the live ledger before product imports.
 
 from collections import deque
 import curses

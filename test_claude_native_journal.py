@@ -1,4 +1,5 @@
 """Claude 2.1.301 interactive journal evidence over an isolated real ledger."""
+import ham_test_support  # Protect the live ledger before product imports.
 from copy import deepcopy
 import hashlib
 import json

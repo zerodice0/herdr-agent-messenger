@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ham_test_support  # Protect the live ledger before product imports.
 from contextlib import ExitStack, contextmanager, nullcontext
 import importlib
 import json

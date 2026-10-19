@@ -1,4 +1,5 @@
 """Behavioral read-only board coverage using private SQLite peer services."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 import copy
 import json

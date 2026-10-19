@@ -1,4 +1,5 @@
 """Claude root-hook admission and actual-request evidence over private SQLite."""
+import ham_test_support  # Protect the live ledger before product imports.
 from concurrent.futures import ThreadPoolExecutor
 import argparse
 import hashlib

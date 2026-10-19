@@ -1,4 +1,5 @@
 """Display ownership tests with a private real ledger and injected Herdr only."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 import copy
 import io

@@ -1,4 +1,5 @@
 """Deterministic real-mail consumer interleavings at the worker exit handoff."""
+import ham_test_support  # Protect the live ledger before product imports.
 import os
 from pathlib import Path
 import tempfile

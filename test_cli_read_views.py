@@ -1,4 +1,5 @@
 """Public read commands against private SQLite and a model-free peer endpoint."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 import argparse
 import hashlib

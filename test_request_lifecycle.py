@@ -1,3 +1,4 @@
+import ham_test_support  # Protect the live ledger before product imports.
 from contextlib import nullcontext
 from copy import deepcopy
 import fcntl
@@ -1065,7 +1066,7 @@ class RequestStateStoreTest(unittest.TestCase):
                 self.assertEqual(request_state_directory(environment), current)
 
 
-class AgentRequestCliIntegrationTest(unittest.TestCase):
+class AgentRequestCliIntegrationTest(ham_test_support.IsolatedLedgerTest):
     def test_request_and_status_arguments_are_available(self):
         request = agent_skill_cli.parse_cli_arguments(
             [
@@ -1133,7 +1134,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 timeout_ms=3_000,
                 output_lines=10,
                 output_chars=500,
-                environment={},
+                environment=self.environment,
                 resolver=lambda: next(recipients),
                 state_store=store,
                 command_runner=runner,
@@ -1227,7 +1228,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 timeout_ms=3_000,
                 output_lines=10,
                 output_chars=500,
-                environment={},
+                environment=self.environment,
                 state_store=store,
                 command_runner=runner,
                 request_id="e" * 32,
@@ -1261,7 +1262,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
         transport = agent_skill_cli.AgentRequestTransport(
             resolver=lambda: target,
             sender_identity=sender.identity,
-            environment={},
+            environment=self.environment,
             command_runner=mock.Mock(return_value=result),
         )
 
@@ -1319,7 +1320,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
                 timeout_ms=3_000,
                 output_lines=10,
                 output_chars=500,
-                environment={},
+                environment=self.environment,
                 resolver=lambda: next(recipients),
                 state_store=store,
                 command_runner=request_runner,
@@ -1353,7 +1354,7 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
         ) as resolve:
             settled = agent_skill_cli.request_status_command(
                 request_id="c" * 32,
-                environment={},
+                environment=self.environment,
                 state_store=store,
                 command_runner=status_runner,
             )
@@ -1366,11 +1367,11 @@ class AgentRequestCliIntegrationTest(unittest.TestCase):
             host="local",
             label=None,
             route=stored["_context"]["route"],
-            environment={},
+            environment=self.environment,
         )
 
 
-class RequestBoundaryIntegrationTest(unittest.TestCase):
+class RequestBoundaryIntegrationTest(ham_test_support.IsolatedLedgerTest):
     @staticmethod
     def target():
         return agent_skill_cli.AgentRecord(
@@ -1392,7 +1393,7 @@ class RequestBoundaryIntegrationTest(unittest.TestCase):
                 with mock.patch.object(agent_skill_cli, "current_sender", return_value=sender):
                     result = agent_skill_cli.request_command(
                         host="local", label="worker", message="work", timeout_ms=1000,
-                        output_lines=10, output_chars=500, environment={},
+                        output_lines=10, output_chars=500, environment=self.environment,
                         resolver=mock.Mock(side_effect=observations), state_store=store,
                         command_runner=runner, request_id="a" * 32,
                         monotonic=clock.monotonic, sleep=clock.sleep,
@@ -1401,7 +1402,7 @@ class RequestBoundaryIntegrationTest(unittest.TestCase):
                 if not replace_during_wait:
                     runner.reset_mock()
                     result = agent_skill_cli.request_status_command(
-                        request_id="a" * 32, environment={}, state_store=store,
+                        request_id="a" * 32, environment=self.environment, state_store=store,
                         resolver=lambda: replacement, command_runner=runner,
                         verbose=True,
                     )
@@ -1420,7 +1421,7 @@ class RequestBoundaryIntegrationTest(unittest.TestCase):
             with self.subTest(local=local, returncode=returncode):
                 target = replace(self.target(), local=local, host="remote" if not local else "local")
                 transport = agent_skill_cli.AgentRequestTransport(
-                    resolver=lambda: target, sender_identity="sender", environment={},
+                    resolver=lambda: target, sender_identity="sender", environment=self.environment,
                     command_runner=mock.Mock(return_value=subprocess.CompletedProcess(
                         ["herdr"], returncode, "", "Connection lost",
                     )),

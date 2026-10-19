@@ -1,4 +1,5 @@
 """Registry mutations project committed rows through the shared display boundary."""
+import ham_test_support  # Protect the live ledger before product imports.
 
 import copy
 from pathlib import Path

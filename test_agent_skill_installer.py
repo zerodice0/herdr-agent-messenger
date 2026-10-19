@@ -1,3 +1,4 @@
+import ham_test_support  # Protect the live ledger before product imports.
 from contextlib import redirect_stderr
 from pathlib import Path
 import curses

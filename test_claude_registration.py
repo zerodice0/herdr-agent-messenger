@@ -1,4 +1,5 @@
 """Cold Claude root registration and foreground identity over private real ledgers."""
+import ham_test_support  # Protect the live ledger before product imports.
 from copy import deepcopy
 import json
 import os
@@ -25,10 +26,17 @@ class PrivateClaudeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.work = Path(subprocess.check_output([
-            str(Path.home() / '.config/herdr/scripts/agent_work.py'), 'path',
-            '--checkout', str(ROOT), '--name', 'claude-registration-tests',
-        ], text=True).strip())
+        helper = Path.home() / '.config/herdr/scripts/agent_work.py'
+        if helper.is_file():
+            cls.work = Path(subprocess.check_output([
+                str(helper), 'path', '--checkout', str(ROOT),
+                '--name', 'claude-registration-tests',
+            ], text=True).strip())
+        else:
+            # Like the other private-ledger fixtures, also work on machines
+            # without Herdr installed (including an empty sandbox HOME).
+            cls.work = Path(os.environ.get('AGENT_WORK_ROOT', Path.home() / '.cache/agent-work')) / 'claude-registration-tests'
+            cls.work.mkdir(parents=True, exist_ok=True)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(dir=self.work)

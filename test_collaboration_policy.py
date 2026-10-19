@@ -1,4 +1,5 @@
 """Policy behavior against private real ledgers and legacy submission stores."""
+import ham_test_support  # Protect the live ledger before product imports.
 from dataclasses import replace
 import uuid
 from pathlib import Path

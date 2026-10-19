@@ -375,3 +375,12 @@ claim that hosts or sessions have already been upgraded. See the
 ```bash
 python3 -m unittest -v
 ```
+
+Each Python test module imports `ham_test_support` before product modules. Its
+test-only tripwire rejects attempts to bootstrap the runner's default ledger
+(including HOME, XDG state, an inherited ledger override, and the account's real
+home), before any directory or schema is created. Even a caught tripwire fails
+the responsible test. Fixtures must supply a private ledger directory or private
+HOME/XDG environment to every code path they exercise; an explicit private
+`LedgerStore` alone does not isolate incidental stores opened by other helpers.
+The guard is not imported by production commands.
