@@ -71,7 +71,7 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 | `↑` / `↓`, `j` / `k` | Move the list selection; arrows scroll when Detail is focused. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
-| `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; restart reading at the top. Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
+| `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
 | `s` | Open Settings. |
 | `?` | Open help, with contextual keys followed by the full keymap. |
 | `e` | Show diagnostics (connection errors and pending operations) in Detail. |
@@ -179,9 +179,20 @@ in local time with relative age. **Detail is read-only: viewing never ACKs,
 delivers, handles or resolves mail.** Threads includes message histories, direct
 submissions and pending/failed OUTBOX entries; `delivering` is **UNCERTAIN**.
 
+To read sent or received mail, press `Tab` to focus **Threads**, select a thread,
+then focus **Detail** to scroll its messages. Selecting an agent shows its status
+and resources, not message bodies. After Unread, Agent Detail has a **Mail**
+section with counts of loaded active/handled threads involving that agent and a
+dim reading hint; if none are loaded, it says `No threads with this agent yet`.
+Devices and Servers remain available below.
+
 Message Detail starts with a bounded **message i/N, local timestamp/age and
 recorded sender → recipient** header, then a compact kind/state summary and the
-body in normal brightness. Native histories keep their chronological order.
+body in normal brightness. Native histories keep their chronological order and
+numbering (oldest → newest), but a newly selected thread opens at its **latest
+message header**. Short latest messages use the clamped final page. Use PgUp or
+Home in Detail to read earlier messages; the Threads title previews the latest
+message's subject or first body line.
 Long participant labels are shortened only in these reading headers. On narrow
 panels, participants and direction get their own header row rather than being
 displaced by the message number/timestamp row; that metadata row may be shortened.
@@ -199,9 +210,13 @@ agent/generation, routing, confirmation source, evidence and errors in dim text.
 The compact state still shows unresolved `delivering` as UNCERTAIN, operator
 confirmation as **NOT native ACK**, and DIRECT acceptance as **not native
 delivery/handled**, even while technical information is hidden.
-Both toggling directions restart at the top. Selecting a different item starts
-collapsed at the top; refreshing the same item preserves its toggle and reading
-offset, clamping when content or wrapping changes.
+Both toggling directions return to the latest native message header. Selecting a
+different item starts collapsed at that header; single-message threads, DIRECT
+and OUTBOX start at the top as before. Refreshing the same item preserves its
+toggle and reading offset, clamping when content or wrapping changes. A new
+message moves the viewport to its header only if you were still at the previous
+latest header's position (or its clamped final page); scrolling elsewhere keeps
+your reading position.
 
 The existing read-only notice also shows the current visible line range/total,
 `↑more`/`↓more` when content remains above/below, and the technical toggle state.

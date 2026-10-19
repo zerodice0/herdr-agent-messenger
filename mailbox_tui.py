@@ -480,6 +480,8 @@ class MailboxApp:
         self.detail_identity: Any = None
         self.detail_technical = False
         self.detail_available, self.detail_total = 0, 0
+        self.detail_anchor_pending = False
+        self.detail_latest: tuple[Any, int] | None = None
         self.diagnostics = False
         self.status, self.input_error = "", ""
         self.status_level, self.last_error = "info", ""
@@ -625,6 +627,8 @@ class MailboxApp:
                 self.detail_technical = False
                 self.scrolls["detail"] = 0
                 self.detail_total = 0
+                self.detail_anchor_pending = True
+                self.detail_latest = None
             self.detail = self.selected(self.preview)
 
     def tick(self) -> None:
@@ -1259,6 +1263,7 @@ class MailboxApp:
         elif key == "t" and self.focus == "detail" and self.technical_supported():
             self.detail_technical = not self.detail_technical
             self.scrolls["detail"] = 0
+            self.detail_anchor_pending = True
         elif self.focus == "threads" and key in ("w", "t", "a", "n"):
             self.thread_action(key)
 
@@ -1770,7 +1775,8 @@ class MailboxApp:
     def clamp_detail(self, offset: int) -> int:
         return min(max(0, offset), max(0, self.detail_total - self.detail_available))
 
-    def thread_detail(self, width: int = 100) -> list[tuple[str, int]]:
+    def thread_detail(self, width: int = 100, *,
+                      message_starts: list[int] | None = None) -> list[tuple[str, int]]:
         item = self.detail or {}
         result: list[tuple[str, int]] = []
 
@@ -1806,6 +1812,8 @@ class MailboxApp:
                     summary += " · HOLD"
                 if index > 1:
                     result.append(("", 0))
+                if message_starts is not None:
+                    message_starts.append(len(result))
                 result.extend([
                     (header(message, index, len(messages), str(message.get("sender_label") or "—"),
                             str(message.get("recipient_address") or "—")), curses.A_BOLD),
@@ -1874,6 +1882,22 @@ class MailboxApp:
                          ["  URL: ?" if urls is None else "  URL: none"])
         return lines
 
+    def agent_mail_lines(self, item: Mapping[str, Any]) -> list[str]:
+        address = self.address(item)
+        threads = [thread for thread in self.items("threads") if thread.get("type") == "thread"
+                   and any(message.get("recipient_address") == address or
+                           (message.get("recipient_host"), message.get("recipient_terminal_id")) ==
+                           (item["host"], item["terminal_id"]) or
+                           (item.get("agent_id") and message.get("sender") == item["agent_id"]) or
+                           (message.get("sender") != "user" and
+                            f"{message.get('origin_host')}/{message.get('sender_label')}" == address)
+                           for message in thread.get("messages", []))]
+        handled = sum(self.thread_handled(thread) for thread in threads)
+        summary = (f"Threads: {len(threads) - handled} active · {handled} handled with this agent"
+                   if threads else "No threads with this agent yet")
+        return ["Mail", summary,
+                "Read: Tab → Threads, select a thread; its messages appear here"]
+
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
             return ["Diagnostics", json.dumps({"connection_errors": self.remote_errors,
@@ -1890,6 +1914,7 @@ class MailboxApp:
                 f"Role: {item.get('role') or '—'}", f"Client: {item.get('client') or '—'}",
                 f"Turn state: {item.get('turn_state') or 'unknown'}", f"Phase: {item.get('phase') or '—'}",
                 f"Summary: {item.get('summary') or '—'}", f"Unread: {item.get('unread', '?')}",
+            ] + self.agent_mail_lines(item) + [
                 f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
                 f"Extension present: {yes_no(item.get('extension_present'))}",
                 f"Repo ID: {item.get('repo_id') or '—'}",
@@ -1914,12 +1939,33 @@ class MailboxApp:
             return
         agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
         wrap = wrap_summary if agent and not self.diagnostics else wrap_display_text
-        entries = (self.thread_detail(width) if not self.diagnostics and (self.detail or {}).get("type")
-                   else [(line, 0) for line in self.detail_lines()])
-        lines = [(part, attribute) for line, attribute in entries for logical in line.split("\n")
-                 for part in wrap(logical, max(1, width))]
+        message_starts: list[int] = []
+        entries = (self.thread_detail(width, message_starts=message_starts)
+                   if not self.diagnostics and (self.detail or {}).get("type") else
+                   [(line, curses.A_DIM if agent and line.startswith("Read: Tab → Threads,") else 0)
+                    for line in self.detail_lines()])
+        lines = []
+        latest_row = 0
+        for index, (line, attribute) in enumerate(entries):
+            if message_starts and index == message_starts[-1]:
+                latest_row = len(lines)
+            lines.extend((part, attribute) for logical in line.split("\n")
+                         for part in wrap(logical, max(1, width)))
         self.detail_total = len(lines)
+        latest = None
+        if message_starts:
+            latest = (self.detail["messages"][-1]["message_id"], self.clamp_detail(latest_row))
+        # Follow arrivals only at the previous latest header (or its clamped
+        # end-page position). Other same-thread refreshes preserve numeric position.
+        follow_latest = (latest is not None and self.detail_latest is not None and
+                         latest[0] != self.detail_latest[0] and
+                         self.scrolls["detail"] == self.detail_latest[1])
+        if self.detail_anchor_pending or follow_latest:
+            self.scrolls["detail"] = latest[1] if latest else 0
         self.scrolls["detail"] = self.clamp_detail(self.scrolls["detail"])
+        if not self.diagnostics:
+            self.detail_anchor_pending = False
+            self.detail_latest = latest
         first = self.scrolls["detail"]
         last = min(len(lines), first + self.detail_available)
         position = f"{first + 1}-{last}/{len(lines)}" if last > first else f"0-0/{len(lines)}"
@@ -2029,7 +2075,7 @@ class MailboxApp:
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
-                    "Detail: t toggles technical source (messages only); toggle restarts at top.",
+                    "Detail: t toggles technical source; threads reopen latest, single items reopen top.",
                     "Detail PgUp/PgDn: viewport page with one row overlap; range + ↑/↓ show more.",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
@@ -2149,7 +2195,7 @@ class MailboxApp:
         if self.focus == "threads":
             return ["Threads: Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (
-            ["t technical details (restart at top)"] if self.technical_supported() else [])
+            ["t technical details (opens latest message)"] if self.technical_supported() else [])
 
     def run(self) -> int:
         curses.nonl()
