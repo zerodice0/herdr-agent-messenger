@@ -90,9 +90,12 @@ class CollaborationPolicyTest(unittest.TestCase):
     def mode(self, store, value):
         self.settings(store).mutate(self.repo_id, "mode", value)
 
-    def members(self, store, *terminals):
+    def members(self, store, *terminals, workspace_id=None):
+        agents = AgentRegistry(store).list()
+        workspace_id = workspace_id or agents[0]["workspace_id"]
         self.settings(store).mutate(self.repo_id, "members", [
-            {"host": store.host, "terminal_id": terminal} for terminal in terminals])
+            {"host": store.host, "terminal_id": terminal} for terminal in terminals],
+            host=store.host, workspace_id=workspace_id)
 
     def policy(self):
         return CollaborationPolicy(self.local, self.sender, remote=self.endpoint)
@@ -133,7 +136,9 @@ class CollaborationPolicyTest(unittest.TestCase):
 
     def test_manual_main_is_participant_without_members_entry(self):
         self.mode(self.local, "manual")
-        self.settings(self.local).mutate(self.repo_id, "main", {"host": "alpha", "terminal_id": "a-0"})
+        self.settings(self.local).mutate(
+            self.repo_id, "main", {"host": "alpha", "terminal_id": "a-0"},
+            host="alpha", workspace_id=self.sender["workspace_id"])
         self.members(self.local, "a-1")
         with self.assertRaises(LedgerError) as caught:
             self.policy().check(self.local_targets[1])
@@ -167,6 +172,37 @@ class CollaborationPolicyTest(unittest.TestCase):
                 self.assertIn("mail send --to remote-alias/bird-0", caught.exception.message)
                 self.assertEqual(self.database(), before)
                 self.assertEqual(self.requests.list_request_ids(), [])
+
+    def test_manual_roles_use_each_local_endpoints_own_workspace(self):
+        for section in ("panes", "agents"):
+            self.local_snapshot[section][1]["workspace_id"] = "other-workspace"
+        AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
+        self.local_targets = parse_agent_payload(
+            {"result": self.local_snapshot}, host="local", local=True)
+        self.mode(self.local, "manual")
+        self.members(self.local, "a-0", workspace_id="a")
+        self.policy().check(self.local_targets[1])
+        self.members(self.local, "a-1", workspace_id="other-workspace")
+        with self.assertRaises(LedgerError) as caught:
+            self.policy().check(self.local_targets[1])
+        self.assertEqual(caught.exception.code, "use_mailbox")
+        self.assertEqual(self.endpoint.calls, [])
+
+    def test_matching_workspace_ids_on_different_hosts_do_not_share_members(self):
+        for section in ("panes", "agents"):
+            for row in self.remote_snapshot[section]:
+                row["workspace_id"] = "a"
+        AgentRegistry(self.remote).reconcile(self.remote_snapshot, refresh_display=False)
+        self.targets = parse_agent_payload(
+            {"result": self.remote_snapshot}, host="remote-alias", local=False)
+        self.mode(self.local, "manual")
+        self.mode(self.remote, "manual")
+        self.members(self.local, "a-0", workspace_id="a")
+        self.policy().check(self.targets[0])
+        self.members(self.remote, "b-0", workspace_id="a")
+        with self.assertRaises(LedgerError) as caught:
+            self.policy().check(self.targets[0])
+        self.assertEqual(caught.exception.code, "use_mailbox")
 
     def test_authoritative_different_repo_allows_identical_looking_remote_cwd(self):
         self.mode(self.local, "auto")

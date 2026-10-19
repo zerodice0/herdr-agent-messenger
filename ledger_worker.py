@@ -39,14 +39,15 @@ def maintenance_pending(store: LedgerStore) -> bool:
             return True
         if connection.execute("SELECT 1 FROM deliveries WHERE authoritative=1 AND state IN ('queued','delivering') LIMIT 1").fetchone():
             return True
-        if connection.execute("SELECT 1 FROM agents a JOIN repo_settings r USING(repo_id) WHERE a.active=1 AND r.field='mode' "
-                              "AND r.value IN ('\"manual\"','\"auto\"') LIMIT 1").fetchone():
+        if connection.execute("SELECT 1 FROM agents a JOIN repo_settings r USING(repo_id) WHERE a.host=? "
+                              "AND a.active=1 AND r.field='mode' "
+                              "AND r.value IN ('\"manual\"','\"auto\"') LIMIT 1", (store.host,)).fetchone():
             return True
         if connection.execute(
-                "SELECT 1 FROM repo_settings r JOIN terminal_slots t ON t.host=? "
-                "AND t.terminal_id=json_extract(r.value,'$.terminal_id') WHERE r.field='main' "
-                "AND json_extract(r.value,'$.host')=? AND t.present=1 LIMIT 1",
-                (store.host, store.host)).fetchone():
+                "SELECT 1 FROM workspace_settings w JOIN terminal_slots t ON t.host=w.host "
+                "AND t.workspace_id=w.workspace_id AND t.terminal_id=json_extract(w.value,'$.terminal_id') "
+                "WHERE w.host=? AND w.field='main' AND json_extract(w.value,'$.host')=w.host "
+                "AND t.present=1 LIMIT 1", (store.host,)).fetchone():
             return True
     return False
 

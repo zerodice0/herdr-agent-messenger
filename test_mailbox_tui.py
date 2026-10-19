@@ -25,7 +25,7 @@ from mailbox_tui import (Job, MailboxApp, OPENER_PANE, OPENER_TERMINAL, REPO_ENV
                          execute_job, launch, local_snapshot, maintain, wrap_summary)
 
 
-SCRATCH = Path('/home/zerodice0/.cache/agent-work/herdr-agent-labels-mailbox-quicksend-2708b9bca7/mailbox-quicksend')
+SCRATCH = Path('/home/zerodice0/.cache/agent-work/herdr-agent-labels-resource-presence-e726754b00/workspace-main')
 
 
 class Screen(FakeCursesWindow):
@@ -104,13 +104,15 @@ class MailboxUiTest(unittest.TestCase):
         self.recipient = next(agent for agent in self.registry.list() if agent['terminal_id'] == 'term-b')
         self.repo_id = self.recipient['repo_id']
         self.environment[REPO_ENV] = self.repo_id
+        self.environment[OPENER_PANE] = 'w1:p1'
+        self.environment[OPENER_TERMINAL] = 'term-a'
         self.mail = Mailbox(self.store, self.environment)
         self.now = 0
 
     def app(self, **options):
         app = MailboxApp(Screen(), self.environment, job_factory=PendingJob,
                          clock=lambda: self.now, **options)
-        app.local = local_snapshot(self.store, self.repo_id)
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
         return app
 
     def select_agent(self, app, terminal_id='term-b'):
@@ -309,7 +311,7 @@ class MailboxUiTest(unittest.TestCase):
                 if resources is not None:
                     exported['resources'] = resources
                 with patch('mailbox_tui.RemoteLedger.status_export', return_value=exported):
-                    snapshot = local_snapshot(self.store, self.repo_id)
+                    snapshot = local_snapshot(self.store, self.repo_id, self.environment)
                 if resources is None:
                     self.assertNotIn('resources', snapshot)
                 else:
@@ -371,7 +373,7 @@ class MailboxUiTest(unittest.TestCase):
                     app = self.app()
                     sent = [self.mail.send_user(self.repo_id, agent, body='thread-' + str(index))
                             for index, agent in enumerate(app.agents())]
-                    app.local = local_snapshot(self.store, self.repo_id)
+                    app.local = local_snapshot(self.store, self.repo_id, self.environment)
                     app.selections['threads'] = 0
                     snapshot = self.capture(app, 36, width)
                     rows = [call for call in snapshot.draw_calls
@@ -511,7 +513,7 @@ class MailboxUiTest(unittest.TestCase):
         app = self.app()
         app.key('s')
         self.capture(app, 24, 100)
-        point = self.mouse_at_text(app, 'members:')
+        point = self.mouse_at_text(app, 'Members (workspace')
         self.assertEqual(app.settings_selection, app.SETTINGS.index('members'))
         self.assertEqual(app.mode, 'settings')
         self.capture(app, 24, 100)
@@ -612,7 +614,7 @@ class MailboxUiTest(unittest.TestCase):
     def test_board_unread_and_read_only_thread_inspection(self):
         result = self.mail.send_user(self.repo_id, self.recipient, body='Read only')
         before = self.store.bell_directory.joinpath('_board').stat().st_mtime_ns
-        data = local_snapshot(self.store, self.repo_id)
+        data = local_snapshot(self.store, self.repo_id, self.environment)
         recipient = next(agent for agent in data['agents'] if agent['terminal_id'] == 'term-b')
         self.assertEqual(recipient['unread'], 1)
         self.assertEqual(data['threads'][0]['messages'][0]['state'], 'queued')
@@ -1258,7 +1260,7 @@ class MailboxUiTest(unittest.TestCase):
                     sent = self.mail.send_user(self.repo_id, self.recipient, body='Claim to inspect')
                     self.mail.claim(terminal_id='term-b', agent_id=self.recipient['agent_id'],
                                     generation=self.recipient['generation'])
-                    app.local = local_snapshot(self.store, self.repo_id)
+                    app.local = local_snapshot(self.store, self.repo_id, self.environment)
                     app.key('\t')
                     app.selections['threads'] = next(
                         index for index, item in enumerate(app.items('threads'))
@@ -1302,7 +1304,9 @@ class MailboxUiTest(unittest.TestCase):
             self.assertEqual(main(['popup']), 0)
         self.assertEqual(identity.call_args.args, (str(self.root), self.store.host))
         self.assertEqual(popup.call_args.kwargs['extra_arguments'],
-                         ['--env', f'{REPO_ENV}=opener-repo'])
+                         ['--env', f'{REPO_ENV}=opener-repo',
+                          '--env', f'{OPENER_PANE}=w1:p1',
+                          '--env', f'{OPENER_TERMINAL}=opener'])
 
     def test_open_input_refreshes_snapshot_when_repository_changes(self):
         app = self.app()
@@ -1313,8 +1317,157 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIsNot(app.jobs['snapshot'], old_snapshot)
         self.assertEqual(app.jobs['snapshot'].request['repo_id'], 'different-repo')
 
-    def test_settings_edits_wait_for_matching_repository_snapshot(self):
-        for settings in (None, {'repo_id': 'old-repo'}):
+    def move_opener(self, workspace='w2'):
+        with self.store.transaction() as connection:
+            for table in ('agents', 'terminal_slots'):
+                connection.execute(f"UPDATE {table} SET workspace_id=?,pane_id=? "
+                                   "WHERE host=? AND terminal_id='term-a'",
+                                   (workspace, workspace + ':p1', self.store.host))
+
+    def test_settings_scope_uses_opener_not_selected_agent_or_mailbox_pane(self):
+        app = self.app()
+        app.environment.pop(OPENER_TERMINAL)
+        app.environment['HERDR_PANE_ID'] = 'mailbox:p9'
+        app.environment['HERDR_WORKSPACE_ID'] = 'mailbox'
+        self.select_agent(app, 'term-b')
+        app.selected('agents')['workspace_id'] = 'elsewhere'
+        app.key('s')
+        self.assertEqual(app.current_settings_scope(),
+                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1'})
+        self.assertIn('Main (workspace w1 @ ' + self.store.host + ')', '\n'.join(app.settings_lines()))
+        self.assertIn('mode (repo-wide)', '\n'.join(app.settings_lines()))
+        for key in ('m', ' '):
+            app.key(key)
+            self.assertIsNone(app.confirm)
+            self.assertNotIn('mutation', app.jobs)
+            self.assertIn("opener's workspace", app.status)
+
+    def test_settings_workspace_move_cancels_picker_numeric_and_pending_edits(self):
+        for field in ('mode', 'main', 'members', 'idle_minutes'):
+            with self.subTest(field=field):
+                app = self.app()
+                app.key('s')
+                app.settings_selection = app.SETTINGS.index(field)
+                app.key('\r')
+                app.settings_pending['mode'] = 'manual'
+                self.move_opener()
+                app.key('\r')
+                self.assertEqual(app.settings_pending, {})
+                self.assertIsNone(app.settings_picker)
+                self.assertIsNone(app.settings_numeric)
+                self.assertNotIn('mutation', app.jobs)
+                self.assertEqual(app.jobs['snapshot'].request['scope']['workspace_id'], 'w2')
+                self.move_opener('w1')
+
+    def test_settings_confirmation_cannot_save_after_opener_workspace_move(self):
+        app = self.app()
+        app.key('s')
+        app.key('m')
+        self.assertEqual(app.confirm['values']['scope']['workspace_id'], 'w1')
+        self.move_opener()
+        self.accept(app)
+        self.assertNotIn('mutation', app.jobs)
+        self.assertIn('scope changed', app.status)
+
+    def test_settings_save_response_and_snapshot_cannot_replace_new_workspace(self):
+        app = self.app()
+        app.key('s')
+        app.key('l')
+        app.key('\r')
+        mutation = app.jobs['mutation']
+        old = json.loads(json.dumps(app.local))
+        self.move_opener()
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
+        mutation.result = old['settings']
+        app.tick()
+        self.assertEqual(app.local['settings']['workspace_id'], 'w2')
+        self.assertNotIn('mode', app.settings_results)
+        snapshot = app.jobs['snapshot']
+        snapshot.result = old
+        app.tick()
+        self.assertIsNone(app.local['settings'])
+        self.assertFalse(app.settings_ready('main'))
+
+    def test_settings_all_repositories_selects_repo_but_keeps_opener_workspace(self):
+        app = self.app()
+        app.repo_id = None
+        app.key('s')
+        self.assertEqual(app.repo_id, self.repo_id)
+        self.assertEqual(app.jobs['snapshot'].request['scope'],
+                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1'})
+        app = self.app()
+        app.repo_id = None
+        app.local['agents'] = []
+        app.key('s')
+        app.key('\r')
+        self.assertIn('choose a repository', app.status)
+        self.assertNotIn('mutation', app.jobs)
+
+    def test_settings_missing_opener_disables_edits_without_using_selected_workspace(self):
+        app = self.app()
+        app.environment.pop(OPENER_TERMINAL)
+        app.environment[OPENER_PANE] = 'missing:pane'
+        app.key('s')
+        app.key('\r')
+        self.assertIn('opener workspace is unavailable', app.status)
+        self.assertNotIn('mutation', app.jobs)
+        self.assertIsNone(app.settings_picker)
+
+    def test_settings_members_picker_excludes_known_moved_and_foreign_targets(self):
+        app = self.app()
+        moved = app.local['agents'][0]
+        target = {name: moved[name] for name in ('host', 'terminal_id')}
+        moved['workspace_id'] = 'other-workspace'
+        foreign = {'host': 'another-host', 'terminal_id': 'unknown'}
+        app.local['settings']['settings']['members'] = {'value': [target, foreign]}
+        app.key('s')
+        app.settings_selection = app.SETTINGS.index('members')
+        app.key('\r')
+        self.assertNotIn(target, [value for _label, value in app.settings_picker['entries']])
+        self.assertNotIn(foreign, [value for _label, value in app.settings_picker['entries']])
+        self.assertEqual(app.settings_picker['checked'], [])
+
+    def test_settings_member_shortcut_filters_moved_and_foreign_but_retains_unavailable(self):
+        pane = {'terminal_id': 'term-c', 'pane_id': 'w1:p3', 'workspace_id': 'w1'}
+        self.snapshot['panes'].append(pane)
+        self.snapshot['agents'].append({
+            **self.snapshot['agents'][0], **pane, 'name': 'stale-member',
+            'agent_session': {'value': 'session-c'}})
+        self.registry.reconcile(self.snapshot, refresh_display=False)
+        moved = {'host': self.store.host, 'terminal_id': 'term-b'}
+        unavailable = {'host': self.store.host, 'terminal_id': 'term-c'}
+        selected = {'host': self.store.host, 'terminal_id': 'term-a'}
+        with patch('ledger_display.LedgerDisplay.refresh', return_value={'updated': [], 'failed': []}):
+            RepoSettings(self.store).mutate(
+                self.repo_id, 'members', [moved, unavailable], host=self.store.host, workspace_id='w1')
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE host=? AND terminal_id='term-c'",
+                               (self.store.host,))
+            for table in ('agents', 'terminal_slots'):
+                connection.execute(f"UPDATE {table} SET workspace_id='w2',pane_id='w2:p2' "
+                                   "WHERE host=? AND terminal_id='term-b'", (self.store.host,))
+        for removing in (False, True):
+            with self.subTest(removing=removing):
+                app = self.app()
+                self.select_agent(app, 'term-a')
+                app.local['settings']['settings']['members']['value'].append(
+                    {'host': 'another-host', 'terminal_id': 'foreign'})
+                app.key('s')
+                app.key(' ')
+                expected = [unavailable] if removing else [unavailable, selected]
+                self.assertCountEqual(app.confirm['values']['value'], expected)
+                self.accept(app)
+                request = app.jobs['mutation'].request
+                self.assertCountEqual(request['value'], expected)
+                with patch('ledger_display.LedgerDisplay.refresh',
+                           return_value={'updated': [], 'failed': []}):
+                    result = execute_job(request, self.environment)
+                self.assertCountEqual(result['members'], expected)
+
+    def test_settings_edits_wait_for_matching_full_scope_snapshot(self):
+        for settings in (None, {'repo_id': 'old-repo'},
+                         {'repo_id': self.repo_id, 'host': 'elsewhere', 'workspace_id': 'w1'},
+                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w2'}):
             for key in ('m', ' ', '\r'):
                 with self.subTest(settings=settings, key=key):
                     app = self.app()
@@ -1337,7 +1490,7 @@ class MailboxUiTest(unittest.TestCase):
                 app.key('s')
                 if mouse:
                     self.capture(app)
-                    self.mouse_at_text(app, 'mode:')
+                    self.mouse_at_text(app, 'mode (repo-wide):')
                 else:
                     app.key('\r')
                 self.assertEqual(app.mode_word(), 'PICK')
@@ -1351,7 +1504,8 @@ class MailboxUiTest(unittest.TestCase):
                     app.key('\r')
                 job = app.jobs['mutation']
                 self.assertEqual(job.request, {'operation': 'setting', 'repo_id': self.repo_id,
-                                               'field': 'mode', 'value': 'auto'})
+                                               'field': 'mode', 'value': 'auto',
+                                               'scope': app.current_settings_scope()})
                 self.assertIsNone(app.confirm)
                 app.key('\r')
                 app.key(curses.KEY_END)
@@ -1359,14 +1513,17 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertIs(app.jobs['mutation'], job)
                 self.assertIn('pending', app.settings_results['mode'])
 
-    def test_settings_main_picker_live_repo_targets_and_none(self):
+    def test_settings_main_picker_active_opener_scope_targets_and_none(self):
         for choose_none in (False, True):
             with self.subTest(choose_none=choose_none):
                 app = self.app()
                 target = {name: app.agents()[0][name] for name in ('host', 'terminal_id')}
                 app.local['agents'] += [
                     {**app.agents()[0], 'terminal_id': 'stale', 'stale': True},
-                    {**app.agents()[0], 'terminal_id': 'elsewhere', 'repo_id': 'elsewhere'}]
+                    {**app.agents()[0], 'terminal_id': 'elsewhere', 'repo_id': 'elsewhere'},
+                    {**app.agents()[0], 'terminal_id': 'other-workspace', 'workspace_id': 'w2'},
+                    {**app.agents()[0], 'terminal_id': 'other-host', 'host': 'peer'},
+                    {**app.agents()[0], 'terminal_id': 'inactive', 'active': False}]
                 if choose_none:
                     app.local['settings']['settings']['main'] = {'value': target}
                 app.key('s')
@@ -1383,7 +1540,7 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(app.jobs['mutation'].request['value'], None if choose_none else target)
 
     def test_settings_members_checklist_retains_stale_until_unticked(self):
-        stale = {'host': 'missing-host', 'terminal_id': 'missing-terminal'}
+        stale = {'host': self.store.host, 'terminal_id': 'missing-terminal'}
         for untick in (False, True):
             with self.subTest(untick=untick):
                 app = self.app()
@@ -1528,7 +1685,7 @@ class MailboxUiTest(unittest.TestCase):
                 app.key(curses.KEY_RIGHT)
                 app.key('\r')
                 self.assertIn('Saving settings', '\n'.join(app.settings_lines()))
-                result = RepoSettings(self.store).show(self.repo_id)
+                result = RepoSettings(self.store).show(self.repo_id, self.store.host, 'w1')
                 if error:
                     result = {'error': {'code': 'denied', 'message': 'Not saved'}}
                 app.jobs['mutation'].result = result
@@ -2839,13 +2996,13 @@ class MailboxUiTest(unittest.TestCase):
         app.render_threads((0, 0, 12, 100))
         self.assertIn('? UNCERTAIN delivering', app.screen.snapshot().line(2))
         self.mail.resolve_claim(**target, disposition='applied', evidence='Inspected old context')
-        app.local = local_snapshot(self.store, self.repo_id)
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
         delivered = app.items('threads')[0]
         self.assertEqual(delivered['messages'][0]['confirmation_source'], 'operator')
         self.assertEqual(delivered['messages'][0]['state'], 'delivered')
         self.assertFalse(app.thread_handled(delivered))
         self.mail.handle(self.recipient, [sent['message_id']])
-        app.local = local_snapshot(self.store, self.repo_id)
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
         handled = app.items('threads')[0]
         self.assertEqual(handled['messages'][0]['claim_id'], claim['claim_id'])
         self.assertEqual(handled['messages'][0]['confirmation_source'], 'operator')
@@ -2900,7 +3057,7 @@ class MailboxUiTest(unittest.TestCase):
         reply = self.mail.send_user(self.repo_id, self.recipient, body='New reply',
                                     reply_to=handled['message_id'])
         app.start_job('snapshot', 'snapshot')
-        app.jobs['snapshot'].result = local_snapshot(self.store, self.repo_id)
+        app.jobs['snapshot'].result = local_snapshot(self.store, self.repo_id, self.environment)
         app.tick()
         self.assertEqual(app.selections['threads'], 0)
         self.assertEqual(app.identity(app.selected()), ('thread', handled['thread_id']))
@@ -3816,7 +3973,7 @@ class MailboxUiTest(unittest.TestCase):
                 app.recipient = self.recipient  # Deliberately different: never the settings target.
                 app.key('s')
                 snapshot = self.capture(app)
-                self.assertIn('Target: ' + app.address(selected), '\n'.join(snapshot.lines()))
+                self.assertIn('workspace w1 @ ' + self.store.host, '\n'.join(snapshot.lines()))
                 app.key(key)
                 self.assertEqual(app.mode, 'confirm')
                 self.assertEqual(app.confirm['choice'], 0)
@@ -3831,7 +3988,8 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(request['value'], target if field == 'main' else [target])
                 with patch('ledger_display.LedgerDisplay.refresh'):
                     execute_job(request, self.environment)
-                self.assertEqual(RepoSettings(self.store).show(self.repo_id)['settings'][field]['value'], request['value'])
+                self.assertEqual(RepoSettings(self.store).show(self.repo_id, self.store.host, 'w1')
+                                 ['settings'][field]['value'], request['value'])
 
     def test_settings_picker_mutates_real_internal_service_without_confirm(self):
         app = self.app()
@@ -3844,7 +4002,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIsNone(app.confirm)
         with patch('ledger_display.LedgerDisplay.refresh'), patch('ledger_worker.ensure_worker'):
             execute_job(app.jobs['mutation'].request, self.environment)
-        self.assertEqual(RepoSettings(self.store).show(self.repo_id)['mode'], 'manual')
+        self.assertEqual(RepoSettings(self.store).show(self.repo_id, self.store.host, 'w1')['mode'], 'manual')
 
     def test_setting_result_precedes_next_toggle_and_discards_stale_snapshot(self):
         app = self.app()
@@ -3858,7 +4016,8 @@ class MailboxUiTest(unittest.TestCase):
         stale = app.jobs['snapshot']
         stale.result = json.loads(json.dumps(app.local))
         with patch('ledger_display.LedgerDisplay.refresh'):
-            mutation.result = RepoSettings(self.store).mutate(self.repo_id, 'members', [target])
+            mutation.result = RepoSettings(self.store).mutate(
+                self.repo_id, 'members', [target], host=self.store.host, workspace_id='w1')
         app.tick()
         self.assertTrue(stale.closed)
         self.assertIsNot(app.jobs['snapshot'], stale)
@@ -3870,7 +4029,8 @@ class MailboxUiTest(unittest.TestCase):
             app.jobs['mutation'].result = execute_job(app.jobs['mutation'].request, self.environment)
         app.tick()
         self.assertEqual(app.local['settings']['settings']['members']['value'], [])
-        self.assertEqual(RepoSettings(self.store).show(self.repo_id)['settings']['members']['value'], [])
+        self.assertEqual(RepoSettings(self.store).show(self.repo_id, self.store.host, 'w1')
+                         ['settings']['members']['value'], [])
 
     def test_single_mutation_keeps_newer_unsubmitted_input(self):
         app = self.app()
@@ -3944,7 +4104,7 @@ class MailboxUiTest(unittest.TestCase):
         app = self.app()
         selected = self.select_agent(app)
         second = self.mail.send_user(self.repo_id, self.recipient, body='Second thread')
-        refreshed = local_snapshot(self.store, self.repo_id)
+        refreshed = local_snapshot(self.store, self.repo_id, self.environment)
         refreshed['agents'] = list(reversed(refreshed['agents']))
         app.start_job('snapshot', 'snapshot')
         app.jobs['snapshot'].result = refreshed
@@ -4004,7 +4164,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(self.mail.show_thread(sent['thread_id'])['messages'][0]['state'], 'queued')
         self.mail.withdraw(sent['message_id'])
         app.start_job('snapshot', 'snapshot')
-        app.jobs['snapshot'].result = local_snapshot(self.store, self.repo_id)
+        app.jobs['snapshot'].result = local_snapshot(self.store, self.repo_id, self.environment)
         app.tick()
         self.assertEqual(app.detail['messages'][0]['state'], 'withdrawn')
 

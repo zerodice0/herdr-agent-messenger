@@ -1,4 +1,4 @@
-"""Per-field repository settings and registration defaults, not an agent mutation CLI."""
+"""Replicated repository settings and host-local Herdr workspace coordination."""
 
 from __future__ import annotations
 
@@ -11,11 +11,10 @@ from typing import Any, Mapping
 from ledger_store import LedgerError, LedgerStore, json_text, queue_outbox
 
 DEFAULT_THRESHOLDS = {"idle_minutes": 3, "coalesce_seconds": 30, "wakes_per_hour": 6, "max_hop": 10}
-FIELDS = frozenset({"home", "mode", "main", "members", "thresholds", "computed_main"})
-
-
-def stamp(setting: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: setting[key] for key in ("version", "origin_host", "value")}
+REPO_FIELDS = frozenset({"home", "mode", "thresholds"})
+WORKSPACE_FIELDS = frozenset({"main", "members"})
+LEGACY_FIELDS = WORKSPACE_FIELDS | {"computed_main"}
+FIELDS = REPO_FIELDS | LEGACY_FIELDS
 
 
 def _target(value: Any) -> bool:
@@ -84,25 +83,31 @@ class RepoSettings:
 
     @staticmethod
     def fields(connection: Any, repo_id: str) -> dict[str, dict[str, Any]]:
-        result = {row["field"]: {**dict(row), "value": json.loads(row["value"])} for row in connection.execute(
+        return {row["field"]: {**dict(row), "value": json.loads(row["value"])} for row in connection.execute(
             "SELECT * FROM repo_settings WHERE repo_id=?", (repo_id,))}
-        for field, setting in result.items():
-            condition = connection.execute("SELECT expected_main FROM setting_conditions WHERE repo_id=? AND field=? "
-                                           "AND version=? AND origin_host=?",
-                                           (repo_id, field, setting["version"], setting["origin_host"])).fetchone()
-            if condition:
-                setting["expected_main"] = json.loads(condition[0])
-        return result
 
-    def show(self, repo_id: str) -> dict[str, Any]:
+    @staticmethod
+    def workspace_fields(connection: Any, repo_id: str, host: str,
+                         workspace_id: str) -> dict[str, dict[str, Any]]:
+        return {row["field"]: {**dict(row), "value": json.loads(row["value"])} for row in connection.execute(
+            "SELECT * FROM workspace_settings WHERE repo_id=? AND host=? AND workspace_id=?",
+            (repo_id, host, workspace_id))}
+
+    def show(self, repo_id: str, host: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
         with self.store.read() as connection:
             fields = self.fields(connection, repo_id)
+            scoped = self.workspace_fields(connection, repo_id, host, workspace_id) if host is not None and workspace_id is not None else {}
             conflicts = [dict(row) for row in connection.execute(
                 "SELECT * FROM setting_conflicts WHERE repo_id=? ORDER BY seq", (repo_id,))]
             pending = connection.execute("SELECT count(*) FROM outbox WHERE kind='setting' AND state='pending' "
                                          "AND json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0]
-        return {"repo_id": repo_id, "home_host": fields.get("home", {}).get("value"),
-                "mode": fields.get("mode", {}).get("value", "off"), "settings": fields,
+            main = self.main(connection, repo_id, host, workspace_id) if host is not None and workspace_id is not None else None
+            computed = self._computed_main(connection, repo_id, host, workspace_id) if (
+                host is not None and workspace_id is not None and fields.get("mode", {}).get("value") == "auto") else None
+        return {"repo_id": repo_id, "host": host, "workspace_id": workspace_id,
+                "home_host": fields.get("home", {}).get("value"),
+                "mode": fields.get("mode", {}).get("value", "off"), "settings": {**fields, **scoped},
+                "main": main, "members": scoped.get("members", {}).get("value", []), "computed_main": computed,
                 "conflicts": conflicts, "propagation_pending": pending}
 
     @staticmethod
@@ -110,7 +115,7 @@ class RepoSettings:
         return connection.execute("SELECT coalesce(max(version),0)+1 FROM repo_settings WHERE repo_id=?", (repo_id,)).fetchone()[0]
 
     def _publish(self, connection: Any, value: Mapping[str, Any], *, exclude: str | None = None) -> None:
-        if value["repo_id"].startswith("local:"):
+        if value["repo_id"].startswith("local:") or value["field"] not in REPO_FIELDS:
             return
         for peer in connection.execute("SELECT canonical_name FROM peers ORDER BY canonical_name").fetchall():
             if peer[0] != exclude:
@@ -119,20 +124,11 @@ class RepoSettings:
     def _apply(self, connection: Any, value: Mapping[str, Any], *, source: str | None = None) -> bool:
         incoming = validate_setting(value)
         repo_id, field = incoming["repo_id"], incoming["field"]
-        fields = self.fields(connection, repo_id)
-        home = fields.get("home")
-        if field == "computed_main":
-            if (home is None or incoming["origin_host"] != home["value"] or
-                    incoming["value"]["home_stamp"] != stamp(home)):
-                # A delayed former-home publication is inert, even at a larger version.
-                return False
-        old = fields.get(field)
-        if "expected_main" in incoming and old is not None and stamp(old) != incoming["expected_main"]:
-            # Exact duplicate clears are harmless, but a delayed close must
-            # never clear a newer user designation, irrespective of tie order.
-            if (old["version"], old["origin_host"], old["value"]) != (
-                    incoming["version"], incoming["origin_host"], incoming["value"]):
-                return False
+        # Protocol-1 peers may still publish their old repository-wide roles.
+        # Acknowledge without storing or forwarding them.
+        if field in LEGACY_FIELDS:
+            return False
+        old = self.fields(connection, repo_id).get(field)
         if old is not None:
             if (old["version"], old["origin_host"]) == (incoming["version"], incoming["origin_host"]):
                 if old["value"] != incoming["value"]:
@@ -158,15 +154,8 @@ class RepoSettings:
                            "changed_by=excluded.changed_by,changed_at=excluded.changed_at",
                            (repo_id, field, json_text(incoming["value"]), incoming["version"], incoming["origin_host"],
                             incoming["changed_by"], incoming["changed_at"]))
-        if "expected_main" in incoming:
-            connection.execute("INSERT OR IGNORE INTO setting_conditions VALUES (?,?,?,?,?)",
-                               (repo_id, field, incoming["version"], incoming["origin_host"], json_text(incoming["expected_main"])))
         if field == "home":
             connection.execute("UPDATE repos SET home_host=? WHERE repo_id=?", (incoming["value"], repo_id))
-        if field == "members":
-            connection.execute("DELETE FROM repo_members WHERE repo_id=?", (repo_id,))
-            connection.executemany("INSERT INTO repo_members VALUES (?,?,?)",
-                                   [(repo_id, item["host"], item["terminal_id"]) for item in incoming["value"]])
         self._publish(connection, incoming, exclude=source)
         return True
 
@@ -174,118 +163,92 @@ class RepoSettings:
         """Called only after registry insertion, never for already-known repositories."""
         if self.fields(connection, repo_id):
             return
-        # Protocol 1 (including 0.9.1) accepts "home" attribution and positive
-        # versions only. The reserved mode origin sorts below every canonical
-        # hostname, so any explicit host-origin setting at version >= 1 wins,
-        # even on an unchanged peer. Home keeps its existing proposal shape.
         for field, value, origin in (("home", self.store.host, self.store.host),
                                      ("mode", "auto", "!default")):
             self._apply(connection, {"repo_id": repo_id, "field": field, "value": value,
                                      "version": 1, "origin_host": origin,
                                      "changed_by": "home", "changed_at": at})
 
-    def mutate(self, repo_id: str, field: str, value: Any) -> dict[str, Any]:
+    def _mutate_workspace(self, connection: Any, repo_id: str, field: str, value: Any,
+                          host: str | None, workspace_id: str | None) -> None:
+        if host != self.store.host or not isinstance(workspace_id, str) or not workspace_id:
+            raise LedgerError("invalid_scope", "Workspace settings require a local host and workspace ID.")
+        validate_setting({"repo_id": repo_id, "field": field, "value": value, "version": 1,
+                          "origin_host": host, "changed_by": "user", "changed_at": time.time()})
+        scoped = self.workspace_fields(connection, repo_id, host, workspace_id)
+        existing = scoped.get("members", {}).get("value", [])
+        for target in ([value] if value else []) if field == "main" else value:
+            agent = connection.execute(
+                "SELECT repo_id,workspace_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                (target["host"], target["terminal_id"])).fetchone()
+            if (target["host"] != host or
+                    (agent is not None and (agent["repo_id"] != repo_id or agent["workspace_id"] != workspace_id)) or
+                    (agent is None and (field == "main" or target not in existing))):
+                raise LedgerError("target_out_of_scope", f"Target must be an active agent in workspace {workspace_id} on {host}.")
+        connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)", (repo_id, time.time()))
+        version = max((row["version"] for row in scoped.values()), default=0) + 1
+        connection.execute("INSERT INTO workspace_settings VALUES (?,?,?,?,?,?,?,?) "
+                           "ON CONFLICT(repo_id,host,workspace_id,field) DO UPDATE SET "
+                           "value=excluded.value,version=excluded.version,changed_by=excluded.changed_by,changed_at=excluded.changed_at",
+                           (repo_id, host, workspace_id, field, json_text(value), version, "user", time.time()))
+
+    def mutate(self, repo_id: str, field: str, value: Any, *, host: str | None = None,
+               workspace_id: str | None = None) -> dict[str, Any]:
         """Local user-TUI service. Intentionally not exposed by a mutation CLI."""
         if field not in {"mode", "main", "members", "thresholds"}:
             raise LedgerError("invalid_setting", "Only user settings can be changed here.")
         with self.store.transaction() as connection:
-            fields = self.fields(connection, repo_id)
-            if field == "mode" and value != "off" and "home" not in fields:
-                self._apply(connection, {"repo_id": repo_id, "field": "home", "value": self.store.host,
-                                         "version": 1, "origin_host": self.store.host, "changed_by": "user", "changed_at": time.time()})
-            setting = {"repo_id": repo_id, "field": field, "value": value,
-                       "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
-                       "changed_by": "user", "changed_at": time.time()}
-            self._apply(connection, setting)
-            self._compute(connection, repo_id)
-        return {**self.show(repo_id), **self._display_result()}
+            if field in WORKSPACE_FIELDS:
+                self._mutate_workspace(connection, repo_id, field, value, host, workspace_id)
+            else:
+                fields = self.fields(connection, repo_id)
+                if field == "mode" and value != "off" and "home" not in fields:
+                    self._apply(connection, {"repo_id": repo_id, "field": "home", "value": self.store.host,
+                                             "version": 1, "origin_host": self.store.host, "changed_by": "user", "changed_at": time.time()})
+                self._apply(connection, {"repo_id": repo_id, "field": field, "value": value,
+                                         "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
+                                         "changed_by": "user", "changed_at": time.time()})
+        return {**self.show(repo_id, host, workspace_id), **self._display_result()}
 
     def accept(self, setting: Mapping[str, Any], source: str) -> dict[str, Any]:
-        if setting.get("repo_id", "").startswith("local:"):
+        incoming = validate_setting(setting)
+        if incoming["field"] in LEGACY_FIELDS:
+            return {"applied": False, "ignored": "workspace_local", **self.show(incoming["repo_id"])}
+        if incoming["repo_id"].startswith("local:"):
             raise LedgerError("local_repo", "Host-local repositories do not propagate settings.")
         with self.store.transaction() as connection:
-            changed = self._apply(connection, setting, source=source)
-            self._compute(connection, setting["repo_id"])
-        return {"applied": changed, **self.show(setting["repo_id"]), **self._display_result()}
+            changed = self._apply(connection, incoming, source=source)
+        return {"applied": changed, **self.show(incoming["repo_id"]), **self._display_result()}
 
-    def _compute(self, connection: Any, repo_id: str) -> None:
-        fields = self.fields(connection, repo_id)
-        home = fields.get("home")
-        if not home or home["value"] != self.store.host:
-            return
-        target = None
-        if fields.get("mode", {}).get("value") == "auto":
-            agents = connection.execute("SELECT terminal_id FROM agents WHERE host=? AND repo_id=? AND active=1 AND is_main_checkout=1",
-                                        (self.store.host, repo_id)).fetchall()
-            if len(agents) == 1:
-                target = {"host": self.store.host, "terminal_id": agents[0][0]}
-        computed = {"target": target, "home_stamp": stamp(home)}
-        if fields.get("computed_main", {}).get("value") == computed:
-            return
-        self._apply(connection, {"repo_id": repo_id, "field": "computed_main", "value": computed,
-                                 "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
-                                 "changed_by": "home", "changed_at": time.time()})
+    @staticmethod
+    def _computed_main(connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
+        agents = connection.execute(
+            "SELECT terminal_id,is_main_checkout FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND active=1",
+            (repo_id, host, workspace_id)).fetchall()
+        candidates = agents if len(agents) == 1 else [agent for agent in agents if agent["is_main_checkout"]]
+        return {"host": host, "terminal_id": candidates[0]["terminal_id"]} if len(candidates) == 1 else None
 
-    def clear_closed_main(self, repo_id: str, expected: Mapping[str, Any], *,
-                          refresh_display: bool = True,
-                          environment: Mapping[str, str] | None = None) -> bool:
-        changed = False
-        with self.store.transaction() as connection:
-            fields = self.fields(connection, repo_id)
-            main = fields.get("main")
-            if main and stamp(main) == dict(expected) and main["value"] and main["value"]["host"] == self.store.host:
-                terminal = connection.execute("SELECT present FROM terminal_slots WHERE host=? AND terminal_id=?",
-                                              (self.store.host, main["value"]["terminal_id"])).fetchone()
-                if terminal is None or not terminal[0]:
-                    self._apply(connection, {"repo_id": repo_id, "field": "main", "value": None,
-                                             "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
-                                             "changed_by": "main_host", "changed_at": time.time(), "expected_main": dict(expected)})
-                    self._compute(connection, repo_id)
-                    changed = True
-        if changed and refresh_display:
-            self._display_result(environment)
-        return changed
-
-    def reconcile_local(self, *, refresh_display: bool = True,
-                        environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-        with self.store.read() as connection:
-            repos = [row[0] for row in connection.execute("SELECT repo_id FROM repos")]
-        changed = False
-        for repo_id in repos:
-            current = self.show(repo_id)["settings"].get("main")
-            if current and self.clear_closed_main(repo_id, stamp(current), refresh_display=False):
-                changed = True
-            with self.store.transaction() as connection:
-                before = self.fields(connection, repo_id)
-                self._compute(connection, repo_id)
-                after = self.fields(connection, repo_id)
-                changed = changed or before != after
-        display = self._refresh_display(environment) if changed and refresh_display else None
-        return {"changed": changed, "display": display}
-
-    def main(self, connection: Any, repo_id: str) -> dict[str, str] | None:
-        fields = self.fields(connection, repo_id)
-        mode = fields.get("mode", {}).get("value", "off")
+    def main(self, connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
+        mode = self.fields(connection, repo_id).get("mode", {}).get("value", "off")
         if mode == "off":
             return None
-        main = fields.get("main", {}).get("value")
-        if main:
-            return main
-        if mode == "auto":
-            computed, home = fields.get("computed_main"), fields.get("home")
-            if computed and home and computed["value"]["home_stamp"] == stamp(home):
-                return computed["value"]["target"]
-        return None
+        explicit = self.workspace_fields(connection, repo_id, host, workspace_id).get("main", {}).get("value")
+        if explicit and explicit["host"] == host and connection.execute(
+                "SELECT 1 FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND terminal_id=? AND active=1",
+                (repo_id, host, workspace_id, explicit["terminal_id"])).fetchone():
+            return explicit
+        return self._computed_main(connection, repo_id, host, workspace_id) if mode == "auto" else None
 
-    def role(self, agent: Mapping[str, Any]) -> str | None:
-        with self.store.read() as connection:
-            fields = self.fields(connection, agent["repo_id"])
-            mode = fields.get("mode", {}).get("value", "off")
-            if mode == "off":
-                return None
-            target = {"host": agent["host"], "terminal_id": agent["terminal_id"]}
-            if self.main(connection, agent["repo_id"]) == target:
-                return "main"
-            if mode == "auto" or target in fields.get("members", {}).get("value", []):
-                return "worker"
-        return None
+    def role(self, agent: Mapping[str, Any], connection: Any = None) -> str | None:
+        if connection is None:
+            with self.store.read() as current:
+                return self.role(agent, connection=current)
+        fields = self.fields(connection, agent["repo_id"])
+        mode = fields.get("mode", {}).get("value", "off")
+        if mode == "off" or not agent["active"]:
+            return None
+        target = {"host": agent["host"], "terminal_id": agent["terminal_id"]}
+        if self.main(connection, agent["repo_id"], agent["host"], agent["workspace_id"]) == target:
+            return "main"
+        scoped = self.workspace_fields(connection, agent["repo_id"], agent["host"], agent["workspace_id"])
+        return "worker" if mode == "auto" or target in scoped.get("members", {}).get("value", []) else None

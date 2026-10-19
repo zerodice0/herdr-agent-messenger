@@ -1,6 +1,7 @@
 """Registry mutations project committed rows through the shared display boundary."""
 import ham_test_support  # Protect the live ledger before product imports.
 
+from argparse import Namespace
 import copy
 from pathlib import Path
 import subprocess
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from ledger_cli import _dispatch
 from ledger_display import SOURCE
 from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry, repository_identity
@@ -71,15 +73,17 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         settings_seen = []
 
         def capture(command):
-            settings_seen.append(RepoSettings(self.store).show(repo_id))
+            settings_seen.append(RepoSettings(self.store).show(
+                repo_id, host=self.store.host, workspace_id="workspace"))
             return self.capture(command)
 
         AgentRegistry(self.store, display_runner=capture).reconcile(observed)
         self.assertTrue(settings_seen)
         for current in settings_seen:
             self.assertEqual(current["mode"], "auto")
-            self.assertEqual(current["settings"]["computed_main"]["value"]["target"],
-                             {"host": self.store.host, "terminal_id": "terminal"})
+            self.assertEqual(current["workspace_id"], "workspace")
+            self.assertEqual(current["main"], {"host": self.store.host, "terminal_id": "terminal"})
+            self.assertNotIn("computed_main", current["settings"])
         self.assertIn("[메인]", self.herdr.metadata["p-current"][SOURCE]["display_agent"])
 
     def test_new_snapshot_rows_are_committed_before_shared_redraw(self):
@@ -226,7 +230,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             _, result = self.registry.refresh()
         self.assertEqual(set(result), {"agents", "terminals"})
         with self.store.read() as connection:
-            self.assertIsNone(settings.main(connection, agent["repo_id"]))
+            self.assertIsNone(settings.main(connection, agent["repo_id"], self.store.host, "workspace"))
         for pane_id in ("p-current", "p-moved"):
             self.assertIn("[워커]", self.herdr.metadata[pane_id][SOURCE]["display_agent"])
             self.assertNotIn("[메인]", self.herdr.metadata[pane_id][SOURCE]["display_agent"])
@@ -237,16 +241,80 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         repo_id = agents[0]["repo_id"]
         settings = RepoSettings(self.store, display_runner=self.capture)
         settings.mutate(repo_id, "mode", "auto")
-        settings.mutate(repo_id, "main", {"host": self.store.host, "terminal_id": "terminal"})
+        settings.mutate(repo_id, "main", {"host": self.store.host, "terminal_id": "terminal"},
+                        host=self.store.host, workspace_id="workspace")
         self.assertIn("[워커]", self.herdr.metadata["p-moved"][SOURCE]["display_agent"])
         remaining = self.second_agent_snapshot()
         remaining["panes"] = remaining["panes"][1:]
         remaining["agents"] = remaining["agents"][1:]
         with mock.patch("ledger_status.live_snapshot", return_value=remaining):
             self.registry.refresh()
-        self.assertIsNone(settings.show(repo_id)["settings"]["main"]["value"])
+        scoped = settings.show(repo_id, host=self.store.host, workspace_id="workspace")
+        self.assertEqual(scoped["main"], {"host": self.store.host, "terminal_id": "second-terminal"})
+        self.assertEqual(scoped["settings"]["main"]["value"],
+                         {"host": self.store.host, "terminal_id": "terminal"})
         self.assertIn("[메인]", self.herdr.metadata["p-moved"][SOURCE]["display_agent"])
         self.assertNotIn("[워커]", self.herdr.metadata["p-moved"][SOURCE]["display_agent"])
+
+    def test_refresh_workspace_move_redraws_survivors_in_both_scopes(self):
+        initial = self.second_agent_snapshot()
+        third_pane = {"terminal_id": "third-terminal", "pane_id": "p-third", "workspace_id": "destination"}
+        initial["panes"].append(third_pane)
+        initial["agents"].append({
+            **third_pane, "agent": "omp", "name": "green-owl", "agent_status": "idle",
+            "agent_session": {"value": "third-session"}, "cwd": str(self.repo),
+        })
+        self.herdr.metadata["p-third"] = {"tokens": {"other": "keep"}}
+        self.herdr.labels["p-third"] = ""
+        self.registry.reconcile(initial, refresh_display=False)
+        settings = RepoSettings(self.store, display_runner=self.capture)
+        settings.mutate(self.registry.list()[0]["repo_id"], "mode", "auto")
+        self.assertIn("[워커]", self.herdr.metadata["p-current"][SOURCE]["display_agent"])
+        self.assertIn("[메인]", self.herdr.metadata["p-third"][SOURCE]["display_agent"])
+        self.clear_commands()
+        moved = copy.deepcopy(initial)
+        moved["panes"][1]["workspace_id"] = "destination"
+        moved["agents"][1]["workspace_id"] = "destination"
+        before = {row["terminal_id"]: (row["agent_id"], row["generation"]) for row in self.registry.list()}
+        with mock.patch("ledger_status.live_snapshot", return_value=moved):
+            self.registry.refresh()
+        after = {row["terminal_id"]: (row["agent_id"], row["generation"]) for row in self.registry.list()}
+        self.assertEqual(before, after)
+        self.assertEqual({command[2] for command in self.reports()}, {"p-current", "p-moved", "p-third"})
+        self.assertIn("[메인]", self.herdr.metadata["p-current"][SOURCE]["display_agent"])
+        for pane_id in ("p-moved", "p-third"):
+            self.assertIn("[워커]", self.herdr.metadata[pane_id][SOURCE]["display_agent"])
+
+    def test_repo_show_exposes_selected_workspace_without_mutating_settings(self):
+        observed = self.second_agent_snapshot()
+        observed["panes"][1]["workspace_id"] = "another-workspace"
+        observed["agents"][1]["workspace_id"] = "another-workspace"
+        self.registry.reconcile(observed, refresh_display=False)
+        repo_id = self.registry.list()[0]["repo_id"]
+        settings = RepoSettings(self.store, display_runner=self.capture)
+        settings.mutate(repo_id, "mode", "auto")
+        with self.store.read() as connection:
+            before = [tuple(row) for row in connection.execute("SELECT * FROM repo_settings")]
+        for workspace_id, terminal_id in (("workspace", "terminal"), ("another-workspace", "second-terminal")):
+            result = self.registry.repo_show(repo_id, self.store.host, workspace_id)
+            self.assertEqual((result["host"], result["workspace_id"]), (self.store.host, workspace_id))
+            self.assertEqual(result["mode"], "auto")
+            self.assertEqual(result["main"], {"host": self.store.host, "terminal_id": terminal_id})
+            self.assertEqual(len(result["agents"]), 2)
+        with self.store.read() as connection:
+            self.assertEqual(before, [tuple(row) for row in connection.execute("SELECT * FROM repo_settings")])
+
+    def test_repo_cli_uses_live_caller_workspace_without_registry_refresh(self):
+        self.seed()
+        with self.store.read() as connection:
+            before = list(connection.iterdump())
+        with mock.patch("ledger_cli.live_snapshot", return_value=self.moved_snapshot()), \
+                mock.patch.object(AgentRegistry, "refresh", side_effect=AssertionError("read-only repo show")):
+            result = _dispatch(Namespace(command="repo"), {"HERDR_TERMINAL_ID": "terminal"}, self.store)
+        self.assertEqual(result["workspace_id"], "moved-workspace")
+        self.assertEqual(result["host"], self.store.host)
+        with self.store.read() as connection:
+            self.assertEqual(before, list(connection.iterdump()))
 
     def test_refresh_prunes_exited_agent_claims_and_clears_shell_device_tokens(self):
         agent = self.seed()

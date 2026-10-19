@@ -268,13 +268,20 @@ repositories keep their settings; without a stored mode they remain `off` until
 changed. Host-local (`local:`) repositories follow the same default without
 propagating settings. Read-only commands never initialize participation.
 
+Mode and wake thresholds apply repository-wide. Main and worker membership are
+scoped by `(repo_id, canonical host, Herdr workspace_id)`: each worktree workspace
+gets its own main, not the main checkout workspace's coordinator. Workspace
+settings stay on their owning host and are never replicated; peers receive each
+agent's authoritative role through status export.
+
 | Mode | Roles and automatic behavior |
 | --- | --- |
 | `off` | No roles, automatic wakes, or participating legacy rejection. Explicit inbox reads and receiving at natural user-turn boundaries remain possible. |
-| `manual` | An explicitly selected main coordinates selected worker members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
-| `auto` | An explicit main wins. Otherwise, exactly one active main-checkout agent at the repository's home becomes main; zero or multiple candidates means no computed main. All other same-repository agents across hosts are workers. |
+| `manual` | An active explicit main in the workspace coordinates its selected worker members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
+| `auto` | An active explicit main in the workspace wins. Otherwise its single active agent becomes main; with several active agents, exactly one in the repository's main checkout becomes main. Otherwise there is no main. All other agents in that scope are workers, even when no main can be selected. |
 
-HAM-owned pane borders show `[메인] alias · summary` or `[워커] alias · summary`.
+Sidebar roles and HAM-owned pane borders use each agent's current host-qualified
+workspace scope. Borders show `[메인] alias · summary` or `[워커] alias · summary`.
 Missing roles or summaries are omitted; the alias stays before the summary so
 Herdr can truncate long summaries without discarding the identity first.
 `status clear` removes phase/summary but keeps the alias and any active role.
@@ -292,13 +299,21 @@ an audit decision, not native delivery proof or completion of the work.
 ### Remote transport and receiving runtimes
 
 Mailbox targets may be `local/LABEL`, `CANONICAL_HOST/LABEL`, a registered
-`SSH_ALIAS/LABEL`, or `main`. The home resolves `main` once; when the home is
-offline, mail stays pending rather than using a cached substitute. Initialize
-each host with `ledger setup --name HOST`, then register each direction with
+`SSH_ALIAS/LABEL`, or `main`. `--to main` resolves on the sender's host at send
+time to the sender's current workspace main and stores a concrete terminal
+target. A scope without a main fails visibly; it never falls back to a different
+workspace or the repository home. Explicit named mail can still cross workspaces
+within the same repository. Initialize each host with `ledger setup --name HOST`,
+then register each direction with
 `ledger peer add --ssh-alias ALIAS`. `ledger doctor` and `ledger outbox` expose
 transport state. A detached, code-only flock worker retries transient failures
 with the same message IDs; permanent failures remain visible for explicit retry.
 It does not run model polling or replicate databases.
+
+Ledger schema v7 migrates active local legacy main/member targets into their
+current workspace scopes and removes obsolete repo-level role settings.
+Protocol 1 remains unchanged: legacy `main`, `members` and `computed_main`
+setting payloads succeed as no-ops. See [migration details](docs/migration.md#workspace-role-migration-schema-v7).
 
 Skill installation does **not** install a receiving runtime. Opt in separately
 on each host with `runtime install omp` or `runtime install claude`; inspect or

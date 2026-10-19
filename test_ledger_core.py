@@ -20,7 +20,7 @@ from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_settings import RepoSettings, validate_setting
 from ledger_status import AgentRegistry, normalize_origin, repository_identity
-from ledger_store import LedgerError, LedgerStore
+from ledger_store import SCHEMA_VERSION, LedgerError, LedgerStore
 from ledger_views import status_board
 
 ROOT = Path(__file__).resolve().parent
@@ -58,28 +58,28 @@ class NewRepoDefaultsTest(unittest.TestCase):
 
     def test_new_repo_seeds_home_auto_once_and_reconciliation_keeps_versions(self):
         self.register(recipient_present=False)
-        seeded = self.settings.show(self.repo_id)
+        seeded = self.settings.show(self.repo_id, self.store.host, "w1")
         self.assertEqual(seeded["mode"], "auto")
         fields = seeded["settings"]
-        self.assertEqual(set(fields), {"home", "mode", "computed_main"})
+        self.assertEqual(set(fields), {"home", "mode"})
         self.assertEqual((fields["home"]["version"], fields["home"]["origin_host"], fields["home"]["value"]),
                          (1, "alpha", "alpha"))
         self.assertEqual((fields["mode"]["version"], fields["mode"]["origin_host"], fields["mode"]["changed_by"]),
                          (1, "!default", "home"))
-        self.assertEqual(fields["computed_main"]["value"]["target"],
-                         {"host": "alpha", "terminal_id": "term-a"})
+        self.assertEqual(seeded["main"], {"host": "alpha", "terminal_id": "term-a"})
+        self.assertEqual((seeded["host"], seeded["workspace_id"]), ("alpha", "w1"))
+        self.assertEqual(seeded["members"], [])
         self.register(recipient_present=False)
-        self.settings.reconcile_local(refresh_display=False)
-        self.assertEqual(self.settings.show(self.repo_id)["settings"], fields)
+        self.assertEqual(self.settings.show(self.repo_id, self.store.host, "w1")["settings"], fields)
 
     def test_local_repo_auto_stays_local_and_ambiguous_main_is_none(self):
         with self.store.transaction() as connection:
             connection.execute("INSERT INTO peers VALUES (?,?,?,?)", ("beta", str(uuid.uuid4()), "b", "/peer"))
         self.register()
         self.assertTrue(self.repo_id.startswith("local:"))
-        current = self.settings.show(self.repo_id)
+        current = self.settings.show(self.repo_id, self.store.host, "w1")
         self.assertEqual(current["mode"], "auto")
-        self.assertIsNone(current["settings"]["computed_main"]["value"]["target"])
+        self.assertIsNone(current["main"])
         self.assertEqual([self.settings.role(agent) for agent in self.registry.list()], ["worker", "worker"])
         with self.store.read() as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
@@ -88,11 +88,10 @@ class NewRepoDefaultsTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("INSERT INTO repos VALUES (?,NULL,?)", (self.repo_id, 1.0))
         self.register()
-        self.settings.reconcile_local(refresh_display=False)
         with self.store.read() as connection:
             before = list(connection.iterdump())
-        self.assertEqual(self.registry.repo_show(self.repo_id)["mode"], "off")
-        self.assertEqual(self.settings.show("git:not-yet-observed/repo")["mode"], "off")
+        self.assertEqual(self.registry.repo_show(self.repo_id, self.store.host, "w1")["mode"], "off")
+        self.assertEqual(self.settings.show("git:not-yet-observed/repo", self.store.host, "w1")["mode"], "off")
         self.assertTrue(all(agent["role"] is None for agent in
                             status_board(self.store, host="local", resource_scanner=lambda: {
                                 "listeners": [], "serve": [], "error": None})["agents"]))
@@ -100,12 +99,10 @@ class NewRepoDefaultsTest(unittest.TestCase):
         self.assertEqual(Mailbox(self.store).read(self.registry.list()[0])["messages"], [])
         with self.store.read() as connection:
             self.assertEqual(list(connection.iterdump()), before)
-        self.assertEqual(self.settings.show(self.repo_id)["settings"], {})
+        self.assertEqual(self.settings.show(self.repo_id, self.store.host, "w1")["settings"], {})
 
-    def test_any_existing_settings_preserve_off_manual_main_members_and_home(self):
-        cases = (("mode", "off"), ("mode", "manual"), ("mode", "auto"),
-                 ("home", "beta"), ("main", {"host": "beta", "terminal_id": "selected"}),
-                 ("members", [{"host": "beta", "terminal_id": "selected"}]))
+    def test_existing_repo_settings_preserve_off_manual_auto_and_home(self):
+        cases = (("mode", "off"), ("mode", "manual"), ("mode", "auto"), ("home", "beta"))
         for index, (field, value) in enumerate(cases):
             with self.subTest(field=field, value=value):
                 store = LedgerStore(self.root / f"existing-{index}", canonical_name="alpha")
@@ -114,16 +111,15 @@ class NewRepoDefaultsTest(unittest.TestCase):
                     settings._apply(connection, {"repo_id": self.repo_id, "field": field, "value": value,
                                                  "version": 1, "origin_host": "beta",
                                                  "changed_by": "user", "changed_at": 1.0})
-                before = settings.show(self.repo_id)["settings"]
+                before = settings.show(self.repo_id, store.host, "w1")["settings"]
                 AgentRegistry(store).reconcile(snapshot(self.repo), refresh_display=False)
-                settings.reconcile_local(refresh_display=False)
-                current = settings.show(self.repo_id)
+                current = settings.show(self.repo_id, store.host, "w1")
                 self.assertEqual(current["settings"], before)
                 self.assertEqual(current["mode"], value if field == "mode" else "off")
 
     def test_seed_uses_existing_protocol_validation_and_lowest_origin_order(self):
         self.register()
-        seed = self.settings.show(self.repo_id)["settings"]["mode"]
+        seed = self.settings.show(self.repo_id, self.store.host, "w1")["settings"]["mode"]
         self.assertEqual(validate_setting(seed), seed)
         with self.assertRaises(LedgerError):
             validate_setting({**seed, "version": 0})
@@ -146,6 +142,138 @@ class NewRepoDefaultsTest(unittest.TestCase):
         with self.store.read() as connection:
             for table in ("repos", "repo_settings", "agents", "terminal_slots", "outbox"):
                 self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
+
+
+class WorkspaceRolesTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo"
+        self.worktree = self.root / "worktree"
+        self.git("init", "-q", str(self.repo))
+        self.git("-C", str(self.repo), "-c", "user.name=Workspace Test",
+                 "-c", "user.email=workspace@example.invalid", "commit", "-q",
+                 "--allow-empty", "-m", "initial")
+        self.git("-C", str(self.repo), "config", "ham.repo-id", "git:workspace/roles")
+        self.git("-C", str(self.repo), "worktree", "add", "-q", "-b", "worker", str(self.worktree))
+        self.store = LedgerStore(self.root / "ledger", canonical_name="alpha")
+        self.registry = AgentRegistry(self.store)
+        self.settings = RepoSettings(self.store, display_runner=lambda command: subprocess.CompletedProcess(
+            command, 0, '{"result":{"pane":{"label":"manual fixture"}}}', ""))
+        self.repo_id = "git:workspace/roles"
+
+    @staticmethod
+    def git(*arguments):
+        subprocess.run(["git", *arguments], check=True, capture_output=True, text=True)
+
+    def register(self, *placements):
+        panes = [{"terminal_id": terminal, "pane_id": "pane-" + terminal, "workspace_id": workspace}
+                 for terminal, workspace, _ in placements]
+        agents = [{**pane, "agent": "omp", "agent_status": "idle", "name": pane["terminal_id"],
+                   "agent_session": {"value": "session-" + pane["terminal_id"]}, "cwd": str(directory)}
+                  for pane, (_, _, directory) in zip(panes, placements)]
+        self.registry.reconcile({"panes": panes, "agents": agents}, refresh_display=False)
+        return {agent["terminal_id"]: agent for agent in self.registry.list()}
+
+    def show(self, workspace="w1"):
+        return self.settings.show(self.repo_id, self.store.host, workspace)
+
+    def mutate(self, field, value, workspace="w1"):
+        return self.settings.mutate(self.repo_id, field, value,
+                                    host=self.store.host, workspace_id=workspace)
+
+    def test_distinct_workspaces_each_elect_their_single_active_agent(self):
+        agents = self.register(("a", "w1", self.repo), ("b", "w2", self.worktree))
+        self.assertEqual({terminal: self.settings.role(agent) for terminal, agent in agents.items()},
+                         {"a": "main", "b": "main"})
+        self.assertEqual(self.show("w1")["main"], {"host": "alpha", "terminal_id": "a"})
+        self.assertEqual(self.show("w2")["main"], {"host": "alpha", "terminal_id": "b"})
+        self.assertIsNone(self.show("unobserved")["main"])
+
+    def test_shared_scope_main_checkout_tie_rules(self):
+        cases = (
+            ((self.repo, self.worktree), {"a": "main", "b": "worker"}, "a"),
+            ((self.worktree, self.worktree), {"a": "worker", "b": "worker"}, None),
+            ((self.repo, self.repo), {"a": "worker", "b": "worker"}, None),
+        )
+        for directories, roles, main in cases:
+            with self.subTest(directories=directories):
+                agents = self.register(("a", "w1", directories[0]), ("b", "w1", directories[1]))
+                self.assertEqual({terminal: self.settings.role(agent) for terminal, agent in agents.items()}, roles)
+                self.assertEqual(self.show()["main"], {"host": "alpha", "terminal_id": main} if main else None)
+
+    def test_moved_explicit_main_is_inert_and_auto_falls_back_without_changing_settings(self):
+        self.register(("a", "w1", self.repo), ("b", "w1", self.worktree))
+        explicit = {"host": "alpha", "terminal_id": "b"}
+        self.mutate("main", explicit)
+        self.assertEqual(self.show()["main"], explicit)
+        before = self.show()["settings"]["main"]
+        agents = self.register(("a", "w1", self.repo), ("b", "w2", self.worktree))
+        with self.store.read() as connection:
+            database = tuple(connection.iterdump())
+        self.assertEqual(self.show()["main"], {"host": "alpha", "terminal_id": "a"})
+        self.assertEqual(self.show()["settings"]["main"], before)
+        self.assertEqual(self.settings.role(agents["a"]), "main")
+        self.assertEqual(self.settings.role(agents["b"]), "main")
+        self.assertEqual(self.show("w2")["main"], explicit)
+        with self.store.read() as connection:
+            self.assertEqual(tuple(connection.iterdump()), database)
+        self.settings.mutate(self.repo_id, "mode", "manual")
+        self.assertIsNone(self.show()["main"])
+        self.assertIsNone(self.show("w2")["main"])
+        self.assertTrue(all(self.settings.role(agent) is None for agent in agents.values()))
+
+    def test_inactive_explicit_main_does_not_override_surviving_auto_main(self):
+        self.register(("a", "w1", self.repo), ("b", "w1", self.worktree))
+        self.mutate("main", {"host": "alpha", "terminal_id": "b"})
+        self.register(("a", "w1", self.repo))
+        self.assertEqual(self.show()["main"], {"host": "alpha", "terminal_id": "a"})
+        self.assertEqual(self.show()["settings"]["main"]["value"], {"host": "alpha", "terminal_id": "b"})
+
+    def test_manual_main_and_members_are_scoped_and_mode_is_repo_wide(self):
+        agents = self.register(("a", "w1", self.repo), ("b", "w1", self.worktree),
+                               ("c", "w2", self.worktree), ("d", "w2", self.worktree))
+        self.settings.mutate(self.repo_id, "mode", "manual")
+        self.mutate("main", {"host": "alpha", "terminal_id": "a"})
+        self.mutate("members", [{"host": "alpha", "terminal_id": "a"}, {"host": "alpha", "terminal_id": "b"}])
+        self.mutate("members", [{"host": "alpha", "terminal_id": "c"}], "w2")
+        self.assertEqual({terminal: self.settings.role(agent) for terminal, agent in agents.items()},
+                         {"a": "main", "b": "worker", "c": "worker", "d": None})
+        self.assertIsNone(self.show("w2")["main"])
+        self.assertEqual(self.show("w2")["members"], [{"host": "alpha", "terminal_id": "c"}])
+        self.settings.mutate(self.repo_id, "mode", "off")
+        self.assertEqual(self.show()["mode"], "off")
+        self.assertEqual(self.show("w2")["mode"], "off")
+        self.assertTrue(all(self.settings.role(agent) is None for agent in agents.values()))
+
+    def test_manual_membership_does_not_follow_an_agent_to_a_new_workspace(self):
+        self.register(("a", "w1", self.repo), ("b", "w1", self.worktree))
+        self.settings.mutate(self.repo_id, "mode", "manual")
+        self.mutate("members", [{"host": "alpha", "terminal_id": "b"}])
+        agents = self.register(("a", "w1", self.repo), ("b", "w2", self.worktree))
+        self.assertIsNone(self.settings.role(agents["b"]))
+        self.assertEqual(self.show()["members"], [{"host": "alpha", "terminal_id": "b"}])
+        self.assertEqual(self.show("w2")["members"], [])
+        self.mutate("members", [{"host": "alpha", "terminal_id": "b"}], "w2")
+        self.assertEqual(self.settings.role(agents["b"]), "worker")
+
+    def test_main_and_members_require_explicit_scope_and_live_in_scope_targets(self):
+        self.register(("a", "w1", self.repo), ("b", "w2", self.worktree))
+        self.register(("a", "w1", self.repo))
+        targets = ({"host": "alpha", "terminal_id": "a"},
+                   {"host": "alpha", "terminal_id": "b"},
+                   {"host": "beta", "terminal_id": "a"},
+                   {"host": "alpha", "terminal_id": "unknown"})
+        for field in ("main", "members"):
+            value = targets[0] if field == "main" else [targets[0]]
+            for scope in ({}, {"host": "alpha"}, {"workspace_id": "w1"}):
+                with self.subTest(field=field, scope=scope), self.assertRaises(LedgerError):
+                    self.settings.mutate(self.repo_id, field, value, **scope)
+            for target in targets:
+                value = target if field == "main" else [target]
+                with self.subTest(field=field, target=target), self.assertRaises(LedgerError):
+                    self.mutate(field, value, "w2")
 
 
 class ReadonlyLedgerBootstrapTest(unittest.TestCase):
@@ -178,6 +306,7 @@ class ReadonlyLedgerBootstrapTest(unittest.TestCase):
         self.directory.mkdir()
         with sqlite3.connect(self.directory / "ledger.sqlite3") as connection:
             connection.execute("CREATE TABLE ledger_meta(key TEXT PRIMARY KEY,value TEXT)")
+            connection.execute("INSERT INTO ledger_meta VALUES (?,?)", ("schema_version", str(SCHEMA_VERSION)))
         for key, value in (("self_canonical_name", "alpha"), ("self_uuid", "fixture-uuid"),
                            ("history_cursor_key", "00" * 32)):
             with self.subTest(missing=key):

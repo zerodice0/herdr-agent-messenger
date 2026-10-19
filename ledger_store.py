@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -64,13 +64,15 @@ CREATE TABLE IF NOT EXISTS repo_settings (
  value TEXT NOT NULL, version INTEGER NOT NULL, origin_host TEXT NOT NULL,
  changed_by TEXT NOT NULL DEFAULT 'user', changed_at REAL NOT NULL,
  PRIMARY KEY(repo_id,field));
+CREATE TABLE IF NOT EXISTS workspace_settings (
+ repo_id TEXT NOT NULL REFERENCES repos(repo_id), host TEXT NOT NULL, workspace_id TEXT NOT NULL,
+ field TEXT NOT NULL CHECK(field IN ('main','members')), value TEXT NOT NULL,
+ version INTEGER NOT NULL, changed_by TEXT NOT NULL, changed_at REAL NOT NULL,
+ PRIMARY KEY(repo_id,host,workspace_id,field));
 CREATE TABLE IF NOT EXISTS setting_conflicts (
  seq INTEGER PRIMARY KEY, repo_id TEXT NOT NULL, field TEXT NOT NULL,
  version INTEGER NOT NULL, winner_host TEXT NOT NULL, loser_host TEXT NOT NULL,
  winner_value TEXT NOT NULL, loser_value TEXT NOT NULL, at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS repo_members (
- repo_id TEXT NOT NULL, host TEXT NOT NULL, terminal_id TEXT NOT NULL,
- PRIMARY KEY(repo_id,host,terminal_id));
 CREATE TABLE IF NOT EXISTS agents (
  agent_id TEXT PRIMARY KEY, host TEXT NOT NULL, terminal_id TEXT NOT NULL,
  workspace_id TEXT NOT NULL, pane_id TEXT NOT NULL, session_ref TEXT NOT NULL,
@@ -143,10 +145,6 @@ CREATE TABLE IF NOT EXISTS message_routes (
  receipt_host TEXT, forward_host TEXT);
 CREATE TABLE IF NOT EXISTS notification_failures (
  seq INTEGER PRIMARY KEY, at REAL NOT NULL, detail TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS setting_conditions (
- repo_id TEXT NOT NULL, field TEXT NOT NULL, version INTEGER NOT NULL,
- origin_host TEXT NOT NULL, expected_main TEXT NOT NULL,
- PRIMARY KEY(repo_id,field,version,origin_host));
 CREATE TABLE IF NOT EXISTS native_claims (
  claim_id TEXT PRIMARY KEY, client TEXT NOT NULL, session_ref TEXT NOT NULL,
  marker TEXT NOT NULL, content_sha256 TEXT NOT NULL, created_at REAL NOT NULL,
@@ -200,7 +198,7 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
                 if "confirmation_source" not in columns:
@@ -231,6 +229,8 @@ class LedgerStore:
                     raise LedgerError("host_identity_conflict", "An existing ledger's canonical name cannot change.")
                 self.host = metadata["self_canonical_name"]
                 self.host_uuid = metadata["self_uuid"]
+                if existing_version < 7:
+                    self._migrate_workspace_settings(connection)
                 cursor_key = metadata["history_cursor_key"]
                 if not re.fullmatch(r"[0-9a-f]{64}", cursor_key):
                     raise LedgerError("invalid_metadata", "Ledger history cursor key is malformed.")
@@ -241,6 +241,40 @@ class LedgerStore:
                 raise
             finally:
                 connection.close()
+
+    def _migrate_workspace_settings(self, connection: sqlite3.Connection) -> None:
+        """Map legacy replicated targets only where this host has authoritative agents."""
+        dropped: list[dict[str, Any]] = []
+        for row in connection.execute(
+                "SELECT * FROM repo_settings WHERE field IN ('main','members')").fetchall():
+            value = json.loads(row["value"])
+            targets = ([value] if value else []) if row["field"] == "main" else value
+            grouped: dict[str, list[dict[str, str]]] = {}
+            for target in targets:
+                if target["host"] != self.host:
+                    continue
+                agent = connection.execute(
+                    "SELECT workspace_id FROM agents WHERE repo_id=? AND host=? AND terminal_id=? AND active=1",
+                    (row["repo_id"], self.host, target["terminal_id"])).fetchone()
+                if agent is None:
+                    dropped.append({"repo_id": row["repo_id"], "field": row["field"], "target": target})
+                    continue
+                grouped.setdefault(agent["workspace_id"], []).append(target)
+            for workspace_id, members in grouped.items():
+                scoped_value = members[0] if row["field"] == "main" else members
+                connection.execute(
+                    "INSERT OR IGNORE INTO workspace_settings VALUES (?,?,?,?,?,?,?,?)",
+                    (row["repo_id"], self.host, workspace_id, row["field"], json_text(scoped_value),
+                     row["version"], row["changed_by"], row["changed_at"]))
+        if dropped:
+            connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES ('workspace_settings_migration_dropped',?)",
+                               (json_text(dropped),))
+        connection.execute("DELETE FROM repo_settings WHERE field IN ('main','members','computed_main')")
+        connection.execute("DELETE FROM setting_conflicts WHERE field IN ('main','members','computed_main')")
+        connection.execute("DELETE FROM outbox WHERE kind='setting' AND "
+                           "json_extract(payload,'$.field') IN ('main','members','computed_main')")
+        connection.execute("DROP TABLE IF EXISTS repo_members")
+        connection.execute("DROP TABLE IF EXISTS setting_conditions")
 
     @classmethod
     def open_readonly(cls, environment: Mapping[str, str] | None = None) -> LedgerStore | None:
@@ -260,6 +294,9 @@ class LedgerStore:
             store.host = metadata["self_canonical_name"]
             store.host_uuid = metadata["self_uuid"]
             store._history_cursor_key = bytes.fromhex(metadata["history_cursor_key"])
+            if metadata.get("schema_version") != str(SCHEMA_VERSION):
+                raise LedgerError("schema_upgrade_required",
+                                  "HAM ledger schema upgrade required; run ledger reconcile on this host before read-only commands.")
         except (sqlite3.Error, KeyError) as error:
             raise LedgerError("ledger_not_initialized", "No initialized HAM ledger is available to read.") from error
         return store

@@ -16,6 +16,7 @@ from ledger_runtime import NativeReceiver
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore
+from ledger_views import status_board
 from test_ledger_core import snapshot
 
 
@@ -108,6 +109,34 @@ class NativeReceiverTest(unittest.TestCase):
             claim = self.claim()
             self.assertEqual(len(claim['messages']),1)
             self.assertEqual(self.applied(claim)['receipts'][0]['state'],'delivered')
+
+    def test_runtime_and_board_roles_follow_each_agents_current_workspace(self):
+        def board_agents():
+            return status_board(self.store, repo_id=self.recipient['repo_id'], host='local',
+                                resource_scanner=lambda: {'listeners': [], 'serve': [], 'error': None})['agents']
+        live = snapshot(self.repo, recipient_session=self.session, moved=True)
+        self.registry.reconcile(live, refresh_display=False)
+        exported = board_agents()
+        self.assertEqual({row['terminal_id']: row['role'] for row in exported},
+                         {'term-a': 'main', 'term-b': 'main'})
+        self.assertEqual(self.receiver.inspect(**self.identity)['role'], 'main')
+
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'manual')
+        self.settings.mutate(self.recipient['repo_id'], 'members',
+                             [{'host': self.store.host, 'terminal_id': 'term-b'}],
+                             host=self.store.host, workspace_id='w2')
+        exported = board_agents()
+        self.assertEqual({row['terminal_id']: row['role'] for row in exported},
+                         {'term-a': None, 'term-b': 'worker'})
+        self.assertEqual(self.receiver.inspect(**self.identity)['role'], 'worker')
+
+        self.registry.reconcile(snapshot(self.repo, recipient_session=self.session), refresh_display=False)
+        exported = board_agents()
+        self.assertTrue(all(row['role'] is None for row in exported))
+        self.assertIsNone(self.receiver.inspect(**self.identity)['role'])
+        self.send(kind='action')
+        self.assertEqual(self.claim(wake=True)['reason'], 'not_participating')
+        self.assertEqual(len(self.claim()['messages']), 1)
 
     def test_wake_contains_action_and_fyi_in_one_bounded_unicode_bundle(self):
         sent = [self.send(kind='action' if index==7 else 'fyi',body='한글🙂'*1000) for index in range(10)]

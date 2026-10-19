@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from agent_directory import ssh_command, ssh_config_path, ssh_hosts, ssh_program_command
 from ledger_mail import Mailbox, payload_hash, validate_payload
-from ledger_settings import RepoSettings
+from ledger_settings import REPO_FIELDS, RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import (FINAL_STATES, STATE_RANK, LedgerError, LedgerStore, json_text,
                           public_receipt, queue_outbox, receipt, require_uuid, save_receipt)
@@ -154,8 +154,9 @@ class RemoteLedger:
             if existing is None:
                 repos = [row[0] for row in connection.execute("SELECT repo_id FROM repos WHERE repo_id NOT LIKE 'local:%'")]
                 for repo_id in repos:
-                    for setting in RepoSettings.fields(connection, repo_id).values():
-                        queue_outbox(connection, canonical_name, "setting", setting)
+                    for field, setting in RepoSettings.fields(connection, repo_id).items():
+                        if field in REPO_FIELDS:
+                            queue_outbox(connection, canonical_name, "setting", setting)
         return next(peer for peer in self.peers() if peer["canonical_name"] == canonical_name)
 
     def peer(self, address_host: str) -> dict[str, Any]:
@@ -249,11 +250,17 @@ class RemoteLedger:
     def resolve_recipient(self, address: str, sender: Mapping[str, Any]) -> dict[str, Any]:
         if address == "main":
             with self.store.read() as connection:
-                fields = RepoSettings.fields(connection, sender["repo_id"])
-                home = fields.get("home", {}).get("value")
-            if not home:
-                raise LedgerError("main_unavailable", "Enable coordination and choose a main through HAM settings.")
-            return {"host": home, "terminal_id": None, "alias": "main", "recipient_address": "main", "repo_id": sender["repo_id"]}
+                selected = RepoSettings(self.store).main(
+                    connection, sender["repo_id"], sender["host"], sender["workspace_id"])
+                agent = (connection.execute(
+                    "SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                    (selected["host"], selected["terminal_id"])).fetchone()
+                    if selected is not None else None)
+            if agent is None:
+                raise LedgerError(
+                    "main_unresolved",
+                    f"No main is available in workspace {sender['workspace_id']} on {sender['host']}.")
+            return {**dict(agent), "recipient_address": "main"}
         parts = address.split('/')
         if len(parts) != 2 or not all(parts):
             raise LedgerError("invalid_address", "Mailbox address must be main or HOST/LABEL.")
@@ -269,23 +276,31 @@ class RemoteLedger:
 
     def submit(self, connection: Any, value: Mapping[str, Any], *, upstream: str | None = None,
                resolved: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """Store once; symbolic home resolution is immutable for this message ID."""
+        """Store once; new main addresses already carry their concrete target."""
         digest = payload_hash(value)
         old = connection.execute("SELECT payload_hash FROM dedupe_receipts WHERE message_id=?", (value["message_id"],)).fetchone()
         if old:
             if old[0] != digest:
                 raise LedgerError("message_conflict", "This UUID already identifies a different immutable message.")
-            if (upstream is not None and resolved is not None and
-                    value["origin_host"] == self.store.host and value["recipient_address"] == "main" and
-                    value["recipient_host"] == upstream and resolved["recipient_host"] == self.store.host):
-                self._promote_returned_origin(connection, value, resolved, upstream)
             return public_receipt(receipt(connection, value["message_id"]))
         target = dict(resolved or {key: value[key] for key in ("recipient_host", "recipient_terminal_id", "recipient_address")})
-        if target["recipient_terminal_id"] is None and target["recipient_address"] == "main" and target["recipient_host"] == self.store.host:
-            selected = RepoSettings(self.store).main(connection, value["repo_id"])
-            if not selected:
-                raise LedgerError("main_unavailable", "The home host currently has no selected/default main; choose a recipient in HAM.")
-            target = {"recipient_host": selected["host"], "recipient_terminal_id": selected["terminal_id"], "recipient_address": "main"}
+        if target["recipient_terminal_id"] is None and target["recipient_address"] == "main":
+            # Protocol-1 ledgers may retain symbolic messages from before
+            # send-time resolution. Only the sender's recorded scope is safe:
+            # the former repo home is not a workspace-routing authority.
+            sender = connection.execute(
+                "SELECT * FROM agents WHERE agent_id=? AND host=? AND repo_id=?",
+                (value["sender"], value["origin_host"], value["repo_id"])).fetchone()
+            selected = (RepoSettings(self.store).main(
+                connection, value["repo_id"], sender["host"], sender["workspace_id"])
+                if sender is not None else None)
+            if selected is None:
+                workspace = sender["workspace_id"] if sender is not None else "(unknown sender workspace)"
+                raise LedgerError(
+                    "main_unresolved",
+                    f"Legacy main message cannot resolve workspace {workspace} on {value['origin_host']}.")
+            target = {"recipient_host": selected["host"], "recipient_terminal_id": selected["terminal_id"],
+                      "recipient_address": "main"}
         forward = target["recipient_host"] if target["recipient_host"] != self.store.host else None
         if forward:
             self.peer(forward)
@@ -293,47 +308,6 @@ class RemoteLedger:
         if forward and result["state"] not in FINAL_STATES:
             queue_outbox(connection, forward, "message", {"message": dict(value), "resolved": target}, value["message_id"])
         return public_receipt(result)
-
-    def _promote_returned_origin(self, connection: Any, value: Mapping[str, Any],
-                                 resolved: Mapping[str, Any], upstream: str) -> None:
-        """One row may be both the sender copy and the authoritative receiver.
-
-        A remote home's saved main route can return the same immutable ID to
-        another terminal on the origin. Dedupe must promote that pending copy,
-        not strand it or insert another message. Final/retained copies stay final.
-        """
-        current = receipt(connection, value["message_id"])
-        if current["state"] != "pending" or current["authoritative"]:
-            return
-        route = connection.execute("SELECT * FROM message_routes WHERE message_id=?", (value["message_id"],)).fetchone()
-        if route is None or route["forward_host"] != upstream or route["receipt_host"] is not None:
-            raise LedgerError("wrong_origin", "Returned main must follow the originating copy's saved home route.")
-        if route["resolution_terminal"] is not None and (
-                route["resolution_host"], route["resolution_terminal"], route["resolution_address"]) != (
-                resolved["recipient_host"], resolved["recipient_terminal_id"], resolved["recipient_address"]):
-            raise LedgerError("invalid_recipient", "The saved main resolution cannot change on replay.")
-        slot = connection.execute("SELECT * FROM terminal_slots WHERE host=? AND terminal_id=?",
-                                  (self.store.host, resolved["recipient_terminal_id"])).fetchone()
-        agent = connection.execute("SELECT repo_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
-                                   (self.store.host, resolved["recipient_terminal_id"])).fetchone()
-        state, hold = "queued", None
-        if slot is None or not slot["present"]:
-            state, hold = "undeliverable", "terminal_closed"
-        elif agent is None or agent["repo_id"] != value["repo_id"]:
-            hold = "recipient_absent" if agent is None else "recipient_changed"
-        at = time.time()
-        connection.execute("UPDATE message_routes SET resolution_host=?,resolution_terminal=?,resolution_address=?,"
-                           "receipt_host=? WHERE message_id=?",
-                           (self.store.host, resolved["recipient_terminal_id"], resolved["recipient_address"],
-                            upstream, value["message_id"]))
-        connection.execute("UPDATE deliveries SET authoritative=1,recipient_host=?,recipient_terminal_id=?,"
-                           "recipient_address=?,workspace_id=?,pane_id=?,state=?,hold_reason=?,updated_at=? WHERE message_id=?",
-                           (self.store.host, resolved["recipient_terminal_id"], resolved["recipient_address"],
-                            slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '',
-                            state, hold, at, value["message_id"]))
-        if state in FINAL_STATES:
-            connection.execute("UPDATE messages SET final_at=coalesce(final_at,?) WHERE message_id=?", (at, value["message_id"]))
-        save_receipt(connection, value["message_id"])
 
     def accept(self, payload: Mapping[str, Any], source: str) -> dict[str, Any]:
         if set(payload) != {"message", "resolved"} or not isinstance(payload["message"], dict):
@@ -344,13 +318,11 @@ class RemoteLedger:
             raise LedgerError("invalid_recipient", "Invalid routing resolution.")
         if resolved["recipient_host"] != self.store.host:
             raise LedgerError("wrong_host", "An accept endpoint cannot forward an arbitrary concrete host.")
-        if value["recipient_address"] != "main" and resolved != {
+        if (value["recipient_terminal_id"] is not None or value["recipient_address"] != "main") and resolved != {
                 key: value[key] for key in ("recipient_host", "recipient_terminal_id", "recipient_address")}:
             raise LedgerError("invalid_recipient", "Concrete routing cannot alter the immutable message recipient.")
         if source != value["origin_host"]:
-            # Only the registered symbolic home may relay an original sender.
-            if value["recipient_address"] != "main" or source != value["recipient_host"]:
-                raise LedgerError("wrong_origin", "Only message origin or its symbolic home can transport this message.")
+            raise LedgerError("wrong_origin", "Only the message origin can transport this message.")
         with self.store.transaction((resolved["recipient_terminal_id"],)) as connection:
             return self.submit(connection, value, upstream=source, resolved=resolved)
 
@@ -379,8 +351,7 @@ class RemoteLedger:
             raise LedgerError("invalid_receipt", "Operator confirmation requires evidence.")
         if state != "pending" and incoming.get("authoritative_host") != incoming.get("recipient_host"):
             raise LedgerError("invalid_receipt", "A public advancement requires the authoritative final host.")
-        # A returned-origin receiver owns its claim/ACK lifecycle. Even an old
-        # unresolved home response is only a copy, not a new routing decision.
+        # A local authoritative receiver owns its claim/ACK lifecycle.
         if current["authoritative"] and current["recipient_host"] == self.store.host:
             return public_receipt(current)
         if (route["resolution_terminal"] is not None and
@@ -466,9 +437,7 @@ class RemoteLedger:
                     terminals.append(result["recipient_terminal_id"])
                 return public_receipt(result)
             if source != origin:
-                # A home relay may withdraw before its final recipient sees accept.
-                if source != payload.get("relay_home") or payload.get("recipient_address") != "main":
-                    raise LedgerError("wrong_origin", "Unknown withdrawal requires origin or declared home relay.")
+                raise LedgerError("wrong_origin", "Unknown withdrawal requires the message origin.")
             compact = {key: payload.get(key) for key in ("message_id", "origin_host", "payload_hash", "recipient_address",
                        "recipient_host", "recipient_terminal_id", "via", "delivered_agent_id", "delivered_at", "handled_at")}
             compact.update(state="withdrawn", hold_reason=None, authoritative=1, authoritative_host=self.store.host,
@@ -520,8 +489,6 @@ class RemoteLedger:
                     peer = self.peer(item["target_host"])
                     command = {"message": "accept", "receipt": "receipt", "setting": "setting", "withdraw": "withdraw"}[item["kind"]]
                     payload = json.loads(item["payload"])
-                    if command == "withdraw" and payload.get("origin_host") != self.store.host:
-                        payload["relay_home"] = self.store.host
                     response = self.transport.call(peer, command, payload)
                     with self.store.transaction() as connection:
                         if item["kind"] in {"message", "withdraw"}:

@@ -159,13 +159,17 @@ class CliCollaborationPolicyTest(unittest.TestCase):
     def settings(self, store):
         return RepoSettings(store, environment=self.environment, display_runner=self.display_command)
 
-    def mode(self, store, mode, *, repo_id=None, members=(), main=None):
+    def mode(self, store, mode, *, repo_id=None, members=(), main=None, workspace_id=None):
         settings = self.settings(store)
         repo_id = repo_id or self.repo_id
         settings.mutate(repo_id, "mode", mode)
+        agents = [agent for agent in AgentRegistry(store).list() if agent["repo_id"] == repo_id]
+        workspace_id = workspace_id or agents[0]["workspace_id"]
         settings.mutate(repo_id, "members", [{"host": store.host, "terminal_id": terminal}
-                                             for terminal in members])
-        settings.mutate(repo_id, "main", {"host": store.host, "terminal_id": main} if main else None)
+                                             for terminal in members],
+                        host=store.host, workspace_id=workspace_id)
+        settings.mutate(repo_id, "main", {"host": store.host, "terminal_id": main} if main else None,
+                        host=store.host, workspace_id=workspace_id)
 
     def peers(self):
         remote = RemoteLedger(self.local, self.environment)
@@ -214,7 +218,7 @@ class CliCollaborationPolicyTest(unittest.TestCase):
             raw["cwd"] = str(self.other_project)
         AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
         repo_id = "git:cli-policy/other"
-        mode = self.settings(self.local).show(repo_id)["settings"]["mode"]
+        mode = self.settings(self.local).show(repo_id, self.local.host, "a")["settings"]["mode"]
         self.assertEqual((mode["value"], mode["changed_by"]), ("auto", "home"))
         address = "local/bird-a-1"
         for command in ("send", "request"):
@@ -255,6 +259,28 @@ class CliCollaborationPolicyTest(unittest.TestCase):
             with self.subTest(command=command):
                 address = "beta-alias/bird-b-0"
                 self.assert_mailbox_refusal(self.single_arguments(command, address), address)
+
+    def test_manual_cross_workspace_participants_still_require_mailbox(self):
+        for section in ("panes", "agents"):
+            self.local_snapshot[section][1]["workspace_id"] = "worktree"
+        AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
+        self.mode(self.local, "manual", members=("a-0",), workspace_id="a")
+        self.mode(self.local, "manual", members=("a-1",), workspace_id="worktree")
+        for command in ("send", "request"):
+            with self.subTest(command=command):
+                address = "local/bird-a-1"
+                self.assert_mailbox_refusal(self.single_arguments(command, address), address)
+        self.assertEqual(self.status_calls, [])
+
+    def test_moved_manual_member_is_not_participant_in_its_new_workspace(self):
+        self.mode(self.local, "manual", members=("a-0", "a-1"), workspace_id="a")
+        for section in ("panes", "agents"):
+            self.local_snapshot[section][1]["workspace_id"] = "worktree"
+        AgentRegistry(self.local).reconcile(self.local_snapshot, refresh_display=False)
+        for command in ("send", "request"):
+            with self.subTest(command=command):
+                self.assert_ordinary_delivery(command, "local/bird-a-1")
+        self.assertEqual(self.status_calls, [])
 
     def assert_ordinary_delivery(self, command, address):
         before = set(self.requests.list_request_ids())

@@ -227,13 +227,7 @@ class AgentRegistry:
             changed_panes: set[str] = set()
             result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment,
                                      prune_device_claims=prune_device_claims)
-            from ledger_settings import RepoSettings
-            settings = RepoSettings(self.store, environment=environment).reconcile_local(
-                refresh_display=False, environment=environment)
             if refresh_display:
-                if settings["changed"]:
-                    changed_panes.update(row["pane_id"] for row in self.list()
-                                         if row["host"] == self.store.host)
                 if changed_panes:
                     self._refresh_display(changed_panes, environment=environment)
         return snapshot, result
@@ -302,7 +296,7 @@ class AgentRegistry:
         with self.store.transaction(tuple(locations)) as connection:
             from ledger_settings import RepoSettings
             settings = RepoSettings(self.store)
-            seeded_repos: set[str] = set()
+            affected_scopes: set[tuple[str, str, str]] = set()
             old_terminals = {row[0] for row in connection.execute(
                 "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (self.store.host,))}
             for terminal, location in locations.items():
@@ -320,12 +314,16 @@ class AgentRegistry:
             for terminal, old in active.items():
                 observed_agent = observed.get(terminal)
                 if not observed_agent or any(old[key] != observed_agent[key] for key in ("session_ref", "client", "repo_id")):
+                    affected_scopes.add((old["repo_id"], old["host"], old["workspace_id"]))
                     connection.execute("UPDATE agents SET active=0,last_seen=? WHERE agent_id=?", (at, old["agent_id"]))
                     self._status(connection, old["agent_id"], "turn_state", "unknown", at)
             for terminal, value in observed.items():
                 old = active.get(terminal)
                 same = old and all(old[key] == value[key] for key in ("session_ref", "client", "repo_id"))
                 if same:
+                    if any(old[key] != value[key] for key in ("workspace_id", "is_main_checkout")):
+                        affected_scopes.add((old["repo_id"], old["host"], old["workspace_id"]))
+                        affected_scopes.add((value["repo_id"], self.store.host, value["workspace_id"]))
                     agent_id = old["agent_id"]
                     if any(old[key] != value[key] for key in
                            ("workspace_id", "pane_id", "alias", "is_main_checkout")):
@@ -337,6 +335,7 @@ class AgentRegistry:
                          value["native_session_pid"], agent_id))
                 else:
                     changed_panes.add(value["pane_id"])
+                    affected_scopes.add((value["repo_id"], self.store.host, value["workspace_id"]))
                     generation = connection.execute(
                         "SELECT coalesce(max(generation),0)+1 FROM agents WHERE host=? AND terminal_id=?",
                         (self.store.host, terminal)).fetchone()[0]
@@ -345,7 +344,6 @@ class AgentRegistry:
                                                   (value["repo_id"], at)).rowcount
                     if inserted:
                         settings._seed_new_repo(connection, value["repo_id"], at)
-                        seeded_repos.add(value["repo_id"])
                     connection.execute(
                         "INSERT INTO agents (agent_id,host,terminal_id,workspace_id,pane_id,session_ref,generation,"
                         "client,repo_id,is_main_checkout,alias,first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -355,10 +353,12 @@ class AgentRegistry:
                                        (agent_id, "unknown", at))
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
                     changed_panes.add(value["pane_id"])
-            # Compute only after all observed agents exist, in the registration
-            # transaction, so multiple main-checkout candidates stay ambiguous.
-            for repo_id in seeded_repos:
-                settings._compute(connection, repo_id)
+            # A move, arrival or departure can change the derived main for every
+            # survivor in both scopes, even when their own registry rows did not change.
+            for repo_id, host, workspace_id in affected_scopes:
+                changed_panes.update(row[0] for row in connection.execute(
+                    "SELECT pane_id FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND active=1",
+                    (repo_id, host, workspace_id)))
             changed_ids: list[str] = []
             for row in connection.execute(
                     "SELECT d.message_id,d.recipient_terminal_id,m.repo_id,d.state FROM deliveries d "
@@ -570,10 +570,11 @@ class AgentRegistry:
             ).rowcount
             return {"updated": changed == 1, "last_ham_label": desired if changed == 1 else last}
 
-    def repo_show(self, repo_id: str) -> dict[str, Any]:
+    def repo_show(self, repo_id: str, host: str, workspace_id: str) -> dict[str, Any]:
         with self.store.read() as connection:
             row = connection.execute("SELECT * FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
             if row is None:
                 raise LedgerError("repo_not_found", "No local agents have registered this repository.")
         from ledger_settings import RepoSettings
-        return {**RepoSettings(self.store).show(repo_id), "agents": self.list(repo_id)}
+        return {**RepoSettings(self.store).show(repo_id, host=host, workspace_id=workspace_id),
+                "agents": self.list(repo_id)}

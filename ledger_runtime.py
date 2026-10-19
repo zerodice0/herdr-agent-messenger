@@ -104,10 +104,7 @@ class NativeReceiver:
         fields = RepoSettings.fields(connection,agent['repo_id'])
         thresholds = fields.get('thresholds',{}).get('value',dict(DEFAULT_THRESHOLDS))
         mode = fields.get('mode',{}).get('value','off')
-        target = {'host':self.store.host,'terminal_id':agent['terminal_id']}
-        main = RepoSettings(self.store).main(connection,agent['repo_id'])
-        role = 'main' if mode!='off' and main==target else (
-                'worker' if mode=='auto' or (mode=='manual' and target in fields.get('members',{}).get('value',[])) else None)
+        role = RepoSettings(self.store).role(agent, connection=connection)
         wake_count = connection.execute('SELECT count(*) FROM wake_log WHERE agent_id=? AND at>?',
                                        (agent['agent_id'],now-3600)).fetchone()[0]
         reservations = connection.execute("SELECT count(DISTINCT claim_id) FROM deliveries WHERE claimed_agent_id=? "

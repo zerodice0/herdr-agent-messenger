@@ -19,6 +19,47 @@ herdr plugin link "$PWD" --enabled
 Existing unnamed agents can be labeled with **Assign Agent Label**. Agents
 detected after installation are labeled automatically.
 
+## Workspace role migration (schema v7)
+
+A writable ledger open upgrades older ledgers additively to schema v7.
+During rollout, run `ledger reconcile` on each host before using read commands.
+Read-only opening of a v6 ledger returns `schema_upgrade_required`, directing
+the user to run `ledger reconcile`; it never migrates or otherwise mutates the
+ledger on read.
+
+Main and worker membership now belong to `(repo_id, canonical host, Herdr workspace_id)`, so
+each worktree workspace can have its own main. Mode, home and wake thresholds
+remain repository-wide; mail history and explicit named cross-workspace mail
+remain repository-wide too.
+
+On each host, migration maps legacy repo-level `main` and `members` targets
+matching active local agents into those agents' current scopes, grouping
+members by scope. Targets on other hosts are handled by their own host's ledger
+copy. Inactive or unknown local targets cannot be mapped safely and are dropped;
+`ledger_meta.workspace_settings_migration_dropped` records JSON entries
+`{repo_id,field,target}`. Re-select any needed active replacements in Settings.
+The upgrade removes repo-level `main`, `members` and `computed_main` rows and
+their obsolete member/conditional-setting projections. The computed main is
+derived on read rather than saved or published. A stale explicit designation
+remains stored but is ignored while its target is inactive or outside the scope.
+
+Workspace role settings stay on the owning host and are never replicated.
+Peers learn each agent's role from that agent's origin-host status export.
+Protocol remains 1: incoming old-peer `main`, `members` and `computed_main`
+setting payloads return success without applying changes, preventing permanent
+old-outbox failures. Home/mode/threshold replication is unchanged. Older
+versions still compute their own old roles; upgrade each host to obtain
+workspace-scoped roles there.
+
+`--to main` now resolves on the sender's host when sending and saves a concrete
+terminal target for the sender's current workspace main. If there is no main,
+it fails visibly instead of waiting for a repo home or choosing another
+workspace. Retained unresolved symbolic messages use their recorded sender's
+local scope where available, or fail visibly with `main_unresolved`.
+Mailbox Settings labels repo-wide Mode/Thresholds separately from the
+opener's workspace Main/Members. Update copied skills along with the host
+code so agents use this routing and role contract.
+
 ## Migrate from 0.7.x
 
 HAM 0.8.0 changes the plugin ID from `herdr.agent-labels` to

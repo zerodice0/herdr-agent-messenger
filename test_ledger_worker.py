@@ -39,15 +39,44 @@ class WorkerHandoffTest(unittest.TestCase):
         repo.mkdir()
         registry = AgentRegistry(self.store)
         registry.reconcile(snapshot(repo), refresh_display=False)
-        repo_id = registry.list()[0]['repo_id']
+        agent = registry.list()[0]
+        repo_id = agent['repo_id']
         settings = RepoSettings(self.store)
-        seeded = settings.show(repo_id)['settings']['mode']
+        seeded = settings.show(repo_id, host=agent['host'], workspace_id=agent['workspace_id'])['settings']['mode']
         self.assertEqual((seeded['value'], seeded['changed_by']), ('auto', 'home'))
         self.assertTrue(ledger_worker.maintenance_pending(self.store))
         with patch.object(RepoSettings, '_display_result', return_value={}):
             settings.mutate(repo_id, 'mode', 'off')
             self.assertFalse(ledger_worker.maintenance_pending(self.store))
             settings.mutate(repo_id, 'mode', 'auto')
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+
+    def test_designated_main_shell_watch_stays_in_its_host_workspace(self):
+        settings = RepoSettings(self.store)
+        with patch.object(RepoSettings, '_display_result', return_value={}):
+            settings.mutate(self.sender['repo_id'], 'main',
+                            {'host': self.store.host, 'terminal_id': self.sender['terminal_id']},
+                            host=self.store.host, workspace_id=self.sender['workspace_id'])
+        registry = AgentRegistry(self.store)
+        shells = snapshot(self.repo)
+        shells['agents'] = []
+        registry.reconcile(shells, refresh_display=False)
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        designated = next(pane for pane in shells['panes']
+                          if pane['terminal_id'] == self.sender['terminal_id'])
+        designated['workspace_id'] = 'another-workspace'
+        registry.reconcile(shells, refresh_display=False)
+        self.assertFalse(ledger_worker.maintenance_pending(self.store))
+
+    def test_enabled_mode_keeps_worktree_workspace_maintenance_without_main(self):
+        registry = AgentRegistry(self.store)
+        registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)
+        settings = RepoSettings(self.store)
+        with patch.object(RepoSettings, '_display_result', return_value={}):
+            settings.mutate(self.sender['repo_id'], 'mode', 'manual')
+        with self.store.read() as connection:
+            self.assertIsNone(settings.main(connection, self.sender['repo_id'], self.store.host, 'w1'))
+            self.assertIsNone(settings.main(connection, self.sender['repo_id'], self.store.host, 'w2'))
         self.assertTrue(ledger_worker.maintenance_pending(self.store))
 
     def send(self):

@@ -14,6 +14,7 @@ import uuid
 
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
+from ledger_runtime import NativeReceiver
 from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore
@@ -109,11 +110,11 @@ class StatusBoardTest(unittest.TestCase):
             self.agents[name] = self.add_agent(store, name, REPO)
         self.other = self.add_agent(self.local, "other", OTHER_REPO, extension=False)
 
-    def add_agent(self, store, label, repo_id, *, extension=True):
+    def add_agent(self, store, label, repo_id, *, extension=True, workspace_id=None):
         agent_id = str(uuid.uuid4())
         terminal = "terminal-"+label
-        workspace = "workspace-"+label
-        pane = workspace+":pane-1"
+        workspace = workspace_id or "workspace-"+label
+        pane = workspace + (":pane-" + label if workspace_id else ":pane-1")
         with store.transaction() as connection:
             connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)", (repo_id, 10.0))
             connection.execute(
@@ -182,18 +183,57 @@ class StatusBoardTest(unittest.TestCase):
         self.assertEqual(all_repos["hosts"][0]["unread"], 3)
         self.assertEqual(self.board(host="local", repo_id="missing")["agents"], [])
 
-    def test_exported_roles_are_preserved_for_local_and_peer_rows(self):
+    def test_roles_are_authoritative_per_host_even_with_identical_workspace_ids(self):
         for host in ("alpha", "beta"):
             store = self.stores[host]
             with store.transaction() as connection:
-                for field, value in (("mode", "auto"), ("main", {
-                        "host": "alpha", "terminal_id": self.agents["alpha"]["terminal_id"]})):
-                    connection.execute("INSERT INTO repo_settings VALUES (?,?,?,?,?,?,?)",
-                                       (REPO, field, json.dumps(value), 1, host, "user", 10.0))
+                connection.execute("UPDATE agents SET workspace_id='shared' WHERE repo_id=?", (REPO,))
+                connection.execute("UPDATE terminal_slots SET workspace_id='shared' WHERE terminal_id=?",
+                                   (self.agents[host]["terminal_id"],))
+            settings = RepoSettings(store, display_runner=lambda command: subprocess.CompletedProcess(
+                command, 0, '{"result":{"pane":{"label":"manual fixture"}}}', ""))
+            settings.mutate(REPO, "mode", "auto")
+            self.assertEqual(settings.show(REPO, host, "shared")["main"],
+                             {"host": host, "terminal_id": self.agents[host]["terminal_id"]})
+            settings.mutate(REPO, "main", {
+                "host": host, "terminal_id": self.agents[host]["terminal_id"]},
+                host=host, workspace_id="shared")
         board = self.board(repo_id=REPO)
         roles = {row["host"]: row["role"] for row in board["agents"]}
-        self.assertEqual(roles, {"alpha": "main", "beta": "worker", "gamma": None})
-        self.assertEqual(RepoSettings(self.local).role(self.agents["alpha"]), "main")
+        self.assertEqual(roles, {"alpha": "main", "beta": "main", "gamma": None})
+        for host in ("alpha", "beta"):
+            settings = RepoSettings(self.stores[host])
+            self.assertEqual(settings.show(REPO, host, "shared")["main"],
+                             {"host": host, "terminal_id": self.agents[host]["terminal_id"]})
+
+    def test_runtime_roles_match_board_for_workspace_auto_manual_and_off(self):
+        worker = self.add_agent(self.local, "worker", REPO, workspace_id="workspace-alpha")
+        worktree = self.add_agent(self.local, "worktree", REPO, workspace_id="workspace-worktree")
+        with self.local.transaction() as connection:
+            connection.execute("UPDATE agents SET is_main_checkout=0 WHERE agent_id IN (?,?)",
+                               (worker["agent_id"], worktree["agent_id"]))
+        settings = RepoSettings(self.local, display_runner=lambda command: subprocess.CompletedProcess(
+            command, 0, '{"result":{"pane":{"label":"manual fixture"}}}', ""))
+        settings.mutate(REPO, "members", [{"host": "alpha", "terminal_id": worker["terminal_id"]}],
+                        host="alpha", workspace_id="workspace-alpha")
+        settings.mutate(REPO, "main", {"host": "alpha", "terminal_id": self.agents["alpha"]["terminal_id"]},
+                        host="alpha", workspace_id="workspace-alpha")
+        expected_roles = {
+            "auto": {"alpha": "main", "worker": "worker", "worktree": "main"},
+            "manual": {"alpha": "main", "worker": "worker", "worktree": None},
+            "off": {"alpha": None, "worker": None, "worktree": None},
+        }
+        for mode, expected in expected_roles.items():
+            with self.subTest(mode=mode):
+                settings.mutate(REPO, "mode", mode)
+                before = self.snapshot(self.local)
+                rows = self.board(host="local", repo_id=REPO)["agents"]
+                self.assertEqual({row["alias"]: row["role"] for row in rows}, expected)
+                for row in rows:
+                    inspected = NativeReceiver(self.local).inspect(
+                        terminal_id=row["terminal_id"], agent_id=row["agent_id"], generation=row["generation"])
+                    self.assertEqual(inspected["role"], row["role"])
+                self.assertEqual(self.snapshot(self.local), before)
 
     def test_default_reads_all_registered_hosts_and_verified_peer_data(self):
         self.enqueue("beta")

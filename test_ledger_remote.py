@@ -16,9 +16,9 @@ import uuid
 
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
-from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings, stamp
+from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry, repository_identity
-from ledger_store import LedgerError, LedgerStore, public_receipt, receipt
+from ledger_store import LedgerError, LedgerStore, public_receipt, queue_outbox, receipt
 from ledger_worker import maintenance_pending, worker_lock
 
 ROOT = Path(__file__).resolve().parent
@@ -41,8 +41,15 @@ class CLITransport:
             raise LedgerError('transport_unavailable', 'Injected link unavailable before send')
         if fault == 'permanent':
             raise LedgerError('invalid_message', 'Injected endpoint validation refusal')
+        if command == 'status-export':
+            # Fixtures reconcile their own snapshots; the CLI must not query a
+            # real Herdr registry while resolving an explicit remote address.
+            payload = {**payload, 'refresh': False}
         envelope = RemoteLedger(self.owner).envelope(payload)
-        result = subprocess.run([sys.executable, str(CLI), 'ledger', command],
+        arguments = [sys.executable, str(CLI), 'ledger', command]
+        if command == 'status-export':
+            arguments.append('--wire')
+        result = subprocess.run(arguments,
                                 input=json.dumps(envelope), capture_output=True, text=True, check=False,
                                 env={**self.environment, 'HERDR_AGENT_LEDGER_DIR': str(self.stores[target].directory)})
         response = json.loads(result.stdout)
@@ -103,6 +110,31 @@ class RemoteLedgerTest(unittest.TestCase):
     @staticmethod
     def display_runner(command):
         return subprocess.CompletedProcess(list(command), 1, "", "isolated fixture")
+
+    def show_settings(self, host, repo_id=None):
+        return self.settings_for(host).show(
+            repo_id or self.repo_id, host, self.agents[host]['workspace_id'])
+
+    def add_agent(self, host, terminal_id, workspace_id):
+        pane = {'terminal_id': terminal_id, 'pane_id': workspace_id+':'+terminal_id,
+                'workspace_id': workspace_id}
+        raw = {**pane, 'agent': 'codex', 'name': terminal_id, 'agent_status': 'idle',
+               'agent_session': {'value': 'session-'+terminal_id}, 'cwd': str(self.repo)}
+        snapshot = {'panes': [*self.snapshots[host]['panes'], pane],
+                    'agents': [*self.snapshots[host]['agents'], raw]}
+        self.snapshots[host] = snapshot
+        registry = AgentRegistry(self.stores[host])
+        registry.reconcile(snapshot, refresh_display=False)
+        return next(agent for agent in registry.list() if agent['terminal_id'] == terminal_id)
+
+    def legacy_message(self, recipient_host='alpha'):
+        message_id = str(uuid.uuid4())
+        sender = self.agents['alpha']
+        return {'message_id': message_id, 'thread_id': message_id, 'repo_id': self.repo_id,
+                'reply_to': None, 'origin_host': 'alpha', 'sender': sender['agent_id'],
+                'sender_label': sender['alias'], 'kind': 'fyi', 'hop': 0, 'body': 'Legacy main',
+                'subject': '', 'created_at': time.time(), 'recipient_host': recipient_host,
+                'recipient_terminal_id': None, 'recipient_address': 'main'}
 
     def send(self, source='alpha', target='beta', **options):
         return Mailbox(self.stores[source]).send(self.agents[source], self.agents[target], body='Immutable remote body 한글', **options)
@@ -349,25 +381,25 @@ class RemoteLedgerTest(unittest.TestCase):
             observed = {**original, 'agents': [{**original['agents'][0], 'cwd': str(repo)}]}
             registry = AgentRegistry(store)
             registry.reconcile(observed, refresh_display=False)
-            before = self.settings_for(host).show(repo_id)['settings']
+            before = self.show_settings(host, repo_id)['settings']
             self.assertEqual(before['mode']['value'], 'auto')
-            self.assertEqual(before['computed_main']['value']['target']['host'], host)
+            self.assertNotIn('computed_main', before)
             with store.read() as connection:
                 queued = connection.execute(
                     "SELECT count(*) FROM outbox WHERE json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0]
-            self.assertEqual(queued, 6)  # home, mode and computed main, to two peers.
+            self.assertEqual(queued, 4)  # Only repo-wide home and mode, to two peers.
             registry.reconcile(observed, refresh_display=False)
-            self.settings_for(host).reconcile_local(refresh_display=False)
-            self.assertEqual(self.settings_for(host).show(repo_id)['settings'], before)
+            self.assertEqual(self.show_settings(host, repo_id)['settings'], before)
             with store.read() as connection:
                 self.assertEqual(connection.execute(
                     "SELECT count(*) FROM outbox WHERE json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0], queued)
         self.drain()
         for host, store in self.stores.items():
-            current = self.settings_for(host).show(repo_id)
+            current = self.show_settings(host, repo_id)
             self.assertEqual((current['mode'], current['home_host']), ('auto', 'gamma'))
             with store.read() as connection:
-                self.assertEqual(self.settings_for(host).main(connection, repo_id)['host'], 'gamma')
+                self.assertEqual(self.settings_for(host).main(
+                    connection, repo_id, host, self.agents[host]['workspace_id'])['host'], host)
 
     def test_explicit_peer_version_one_mode_beats_seed_in_both_arrival_orders(self):
         for mode in ('off', 'manual', 'auto'):
@@ -383,7 +415,7 @@ class RemoteLedgerTest(unittest.TestCase):
                 original = self.snapshots['gamma']
                 observed = {**original, 'agents': [{**original['agents'][0], 'cwd': str(repo)}]}
                 AgentRegistry(self.stores['gamma']).reconcile(observed, refresh_display=False)
-                seed = self.settings_for('gamma').show(repo_id)['settings']['mode']
+                seed = self.show_settings('gamma', repo_id)['settings']['mode']
                 # The seeding host sorts AFTER the explicit writer: using its
                 # real origin would wrongly beat the existing version-1 choice.
                 result = self.wire('alpha', 'setting', self.services['gamma'].envelope(seed))
@@ -392,11 +424,11 @@ class RemoteLedgerTest(unittest.TestCase):
                 self.assertTrue(result['applied'])
                 self.drain()
                 for host in self.stores:
-                    current = self.settings_for(host).show(repo_id)
+                    current = self.show_settings(host, repo_id)
                     self.assertEqual(current['settings']['mode'], explicit)
                     self.assertEqual(current['mode'], mode)
                 if mode != 'auto':
-                    conflicts = self.settings_for('alpha').show(repo_id)['conflicts']
+                    conflicts = self.show_settings('alpha', repo_id)['conflicts']
                     self.assertTrue(any(item['field'] == 'mode' and item['winner_host'] == 'alpha'
                                         and item['loser_host'] == '!default' for item in conflicts))
 
@@ -405,147 +437,199 @@ class RemoteLedgerTest(unittest.TestCase):
         alpha.mutate(self.repo_id, 'mode', 'manual')
         beta.mutate(self.repo_id, 'thresholds', {**DEFAULT_THRESHOLDS, 'idle_minutes': 4})
         self.drain()
-        for store in self.stores.values():
-            current = RepoSettings(store).show(self.repo_id)
+        for host in self.stores:
+            current = self.show_settings(host)
             self.assertEqual(current['mode'], 'manual')
             self.assertEqual(current['settings']['thresholds']['value']['idle_minutes'], 4)
         # Both writers start from the same observed versions, then diverge.
         alpha.mutate(self.repo_id, 'mode', 'auto')
         beta.mutate(self.repo_id, 'mode', 'off')
         self.drain()
-        for store in self.stores.values():
-            current = RepoSettings(store).show(self.repo_id)
+        for host in self.stores:
+            current = self.show_settings(host)
             self.assertEqual(current['mode'], 'off')
             self.assertTrue(current['conflicts'])
 
-    def test_concurrent_initial_homes_converge_without_waiting_for_offline_peer(self):
+    def test_concurrent_initial_homes_converge_without_changing_workspace_mains(self):
         alpha, beta = self.settings_for('alpha'), self.settings_for('beta')
-        a = alpha.mutate(self.repo_id, 'mode', 'auto')
-        b = beta.mutate(self.repo_id, 'mode', 'auto')
-        self.assertEqual(a['home_host'], 'alpha')
-        self.assertEqual(b['home_host'], 'beta')
-        with self.stores['alpha'].read() as connection:
-            self.assertEqual(alpha.main(connection, self.repo_id)['host'], 'alpha')
-        old_computed = a['settings']['computed_main']
+        alpha.mutate(self.repo_id, 'mode', 'auto')
+        beta.mutate(self.repo_id, 'mode', 'auto')
+        self.assertEqual(self.show_settings('alpha')['home_host'], 'alpha')
+        self.assertEqual(self.show_settings('beta')['home_host'], 'beta')
         self.drain()
-        for store in self.stores.values():
-            self.assertEqual(RepoSettings(store).show(self.repo_id)['home_host'], 'beta')
-        stale = {**old_computed, 'version': 999}
-        result = self.wire('beta', 'setting', self.services['alpha'].envelope(stale))
-        self.assertFalse(result['applied'])
-        with self.stores['beta'].read() as connection:
-            self.assertEqual(beta.main(connection, self.repo_id)['host'], 'beta')
+        for host in self.stores:
+            current = self.show_settings(host)
+            self.assertEqual(current['home_host'], 'beta')
+            self.assertEqual(current['main'], {'host': host, 'terminal_id': 'term-'+host})
 
-    def test_stale_main_close_cannot_clear_later_designation_and_only_main_host_clears(self):
+
+    def test_stale_explicit_main_is_inert_without_rewriting_workspace_settings(self):
         settings = self.settings_for('beta')
         settings.mutate(self.repo_id, 'mode', 'manual')
-        old = settings.mutate(self.repo_id, 'main', {'host':'beta','terminal_id':'term-beta'})['settings']['main']
+        settings.mutate(self.repo_id, 'main', {'host': 'beta', 'terminal_id': 'term-beta'},
+                        host='beta', workspace_id='w2')
+        before = self.show_settings('beta')['settings']['main']
+        AgentRegistry(self.stores['beta']).reconcile({'panes': [], 'agents': []}, refresh_display=False)
+        after = self.show_settings('beta')
+        self.assertIsNone(after['main'])
+        self.assertEqual(after['settings']['main'], before)
         self.drain()
-        AgentRegistry(self.stores['beta']).reconcile({'panes':[], 'agents':[]}, refresh_display=False)
-        self.assertFalse(self.settings_for('alpha').clear_closed_main(self.repo_id, stamp(old)))
-        self.assertTrue(settings.clear_closed_main(self.repo_id, stamp(old)))
-        clear = settings.show(self.repo_id)['settings']['main']
-        alpha = self.settings_for('alpha')
-        alpha.mutate(self.repo_id, 'main', {'host':'gamma','terminal_id':'term-gamma'})
-        # Delay the close packet until after a newer user designation.
-        result = alpha.accept(clear, 'beta')
-        self.assertFalse(result['applied'])
-        self.assertEqual(result['settings']['main']['value']['host'], 'gamma')
-        self.assertFalse(settings.clear_closed_main(self.repo_id, stamp(old)))
+        self.assertNotIn('main', self.show_settings('alpha')['settings'])
 
-    def test_home_offline_stays_pending_and_no_main_is_visible_permanent_failure(self):
-        home = self.settings_for('beta')
-        home.mutate(self.repo_id, 'mode', 'manual')
+
+    def test_main_unresolved_names_sender_workspace_before_any_message_is_stored(self):
+        self.settings_for('alpha').mutate(self.repo_id, 'mode', 'manual')
+        self.settings_for('beta').mutate(self.repo_id, 'main',
+            {'host': 'beta', 'terminal_id': 'term-beta'}, host='beta', workspace_id='w2')
         self.drain()
-        symbolic = self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
-        sent = Mailbox(self.stores['alpha']).send(self.agents['alpha'], symbolic, body='Main message')
+        with self.assertRaises(LedgerError) as failure:
+            self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
+        self.assertEqual(failure.exception.code, 'main_unresolved')
+        self.assertIn('w1', failure.exception.message)
+        self.assertIn('alpha', failure.exception.message)
+        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 0)
+
+
+    def test_main_resolution_uses_sender_workspace_and_never_contacts_repo_home(self):
+        self.settings_for('beta').mutate(self.repo_id, 'mode', 'auto')
+        self.drain()
         self.links['alpha'].failures['beta'] = ['transient']
-        self.services['alpha'].pump()
-        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'pending')
+        worktree_agent = self.add_agent('alpha', 'worktree-main', 'worktree')
+        service = self.services['alpha']
+        for sender in (self.agents['alpha'], worktree_agent):
+            target = service.resolve_recipient('main', sender)
+            self.assertEqual((target['host'], target['terminal_id']),
+                             ('alpha', sender['terminal_id']))
+            sent = Mailbox(self.stores['alpha']).send(sender, target, body='Workspace main')
+            self.assertEqual(sent['state'], 'queued')
+            with self.stores['alpha'].read() as connection:
+                value = connection.execute(
+                    'SELECT original_host,original_terminal,original_address FROM message_routes WHERE message_id=?',
+                    (sent['message_id'],)).fetchone()
+            self.assertEqual(tuple(value), ('alpha', sender['terminal_id'], 'main'))
+        self.assertFalse(any(item['kind'] == 'message' for item in service.outbox()))
+        self.assertEqual(self.links['alpha'].failures['beta'], ['transient'])
+
+
+    def test_main_send_time_target_survives_later_designation(self):
+        store = self.stores['alpha']
+        other = self.add_agent('alpha', 'other-main', 'w1')
+        settings = self.settings_for('alpha')
+        settings.mutate(self.repo_id, 'mode', 'manual')
+        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': other['terminal_id']},
+                        host='alpha', workspace_id='w1')
+        target = self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
+        sent = Mailbox(store).send(self.agents['alpha'], target, body='Concrete main')
+        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': 'term-alpha'},
+                        host='alpha', workspace_id='w1')
+        self.assertEqual(self.current('alpha', sent['message_id'])['recipient_terminal_id'], other['terminal_id'])
+        claim = Mailbox(store).claim(terminal_id=other['terminal_id'], agent_id=other['agent_id'],
+                                    generation=other['generation'])
+        self.assertEqual([row['message_id'] for row in claim['messages']], [sent['message_id']])
+        self.assertEqual(store.doctor()['counts']['messages'], 1)
+
+    def test_main_same_workspace_id_on_different_hosts_stays_host_local(self):
+        self.settings_for('alpha').mutate(self.repo_id, 'mode', 'auto')
+        self.drain()
+        beta = self.add_agent('beta', 'beta-w1', 'w1')
+        for host, sender in (('alpha', self.agents['alpha']), ('beta', beta)):
+            target = self.services[host].resolve_recipient('main', sender)
+            self.assertEqual((target['host'], target['terminal_id']), (host, sender['terminal_id']))
+
+    def test_ambiguous_sender_workspace_does_not_fall_back_to_other_workspace(self):
+        self.settings_for('alpha').mutate(self.repo_id, 'mode', 'auto')
+        self.add_agent('alpha', 'second-w1-main-checkout', 'w1')
+        other = self.add_agent('alpha', 'only-w2', 'w2')
+        with self.assertRaises(LedgerError) as failure:
+            self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
+        self.assertEqual(failure.exception.code, 'main_unresolved')
+        self.assertIn('w1', failure.exception.message)
+        self.assertEqual(self.services['alpha'].resolve_recipient('main', other)['terminal_id'],
+                         other['terminal_id'])
+
+    def test_legacy_local_symbolic_resolves_recorded_sender_scope_and_replay_stays_fixed(self):
+        settings = self.settings_for('alpha')
+        settings.mutate(self.repo_id, 'mode', 'auto')
+        value = self.legacy_message()
+        with self.stores['alpha'].transaction() as connection:
+            first = self.services['alpha'].submit(connection, value)
+        self.assertEqual(first['recipient_terminal_id'], 'term-alpha')
+        self.assertEqual(first['state'], 'queued')
+        other = self.add_agent('alpha', 'new-w1-main', 'w1')
+        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': other['terminal_id']},
+                        host='alpha', workspace_id='w1')
+        with self.stores['alpha'].transaction() as connection:
+            replay = self.services['alpha'].submit(connection, value)
+        self.assertEqual(replay['recipient_terminal_id'], 'term-alpha')
+        self.assertEqual(replay['payload_hash'], first['payload_hash'])
+        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 1)
+
+    def test_legacy_symbolic_without_main_reports_recorded_workspace(self):
+        self.settings_for('alpha').mutate(self.repo_id, 'mode', 'manual')
+        with self.assertRaises(LedgerError) as failure:
+            with self.stores['alpha'].transaction() as connection:
+                self.services['alpha'].submit(connection, self.legacy_message())
+        self.assertEqual(failure.exception.code, 'main_unresolved')
+        self.assertIn('w1', failure.exception.message)
+        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 0)
+
+    def test_stored_legacy_home_route_fails_visibly_without_sender_scope(self):
+        self.settings_for('beta').mutate(self.repo_id, 'mode', 'auto')
+        self.drain()
+        value = self.legacy_message('beta')
+        resolved = {key: value[key] for key in
+                    ('recipient_host', 'recipient_terminal_id', 'recipient_address')}
+        with self.stores['alpha'].transaction() as connection:
+            Mailbox(self.stores['alpha'])._enqueue(connection, value, resolved=resolved, forward='beta')
+            queue_outbox(connection, 'beta', 'message', {'message': value, 'resolved': resolved},
+                         value['message_id'])
         self.services['alpha'].pump(now=time.time()+1000)
-        failed = next(item for item in self.services['alpha'].outbox() if item['message_id']==sent['message_id'])
+        failed = next(item for item in self.services['alpha'].outbox()
+                      if item['message_id'] == value['message_id'])
         self.assertEqual(failed['state'], 'failed')
-        self.assertEqual(json.loads(failed['last_error'])['code'], 'main_unavailable')
+        error = json.loads(failed['last_error'])
+        self.assertEqual(error['code'], 'main_unresolved')
+        self.assertIn('workspace', error['message'])
+        self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
 
-    def test_symbolic_home_relays_to_third_host_receipts_and_withdraw_follow_route(self):
-        home = self.settings_for('beta')
-        home.mutate(self.repo_id, 'mode', 'manual')
-        home.mutate(self.repo_id, 'main', {'host':'gamma','terminal_id':'term-gamma'})
-        self.drain()
-        symbolic = self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
-        sent = Mailbox(self.stores['alpha']).send(self.agents['alpha'], symbolic, body='Relayed message')
-        self.services['alpha'].pump()
-        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'pending')
-        self.drain()
-        self.assertEqual(self.current('alpha', sent['message_id'])['recipient_host'], 'gamma')
-        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'queued')
-        # A later main selection cannot move an accepted message's resolution.
-        home.mutate(self.repo_id, 'main', {'host':'beta','terminal_id':'term-beta'})
-        result = Mailbox(self.stores['alpha']).withdraw(sent['message_id'], sender=self.agents['alpha'])
-        self.assertTrue(result['withdraw_requested'])
-        self.drain()
-        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'withdrawn')
-        self.assertEqual(self.current('gamma', sent['message_id'])['state'], 'withdrawn')
+    def test_concrete_main_wire_cannot_change_target_or_use_home_relay(self):
+        sent = self.send()
+        payload = json.loads(next(item for item in self.services['alpha'].outbox()
+                                  if item['message_id'] == sent['message_id'])['payload'])
+        payload['message']['recipient_address'] = 'main'
+        payload['resolved']['recipient_address'] = 'main'
+        changed = {**payload, 'resolved': {**payload['resolved'], 'recipient_terminal_id': 'another'}}
+        result = self.wire('beta', 'accept', self.services['alpha'].envelope(changed), expected=1)
+        self.assertEqual(result['error']['code'], 'invalid_recipient')
+        result = self.wire('beta', 'accept', self.services['gamma'].envelope(payload), expected=1)
+        self.assertEqual(result['error']['code'], 'wrong_origin')
+        accepted = self.wire('beta', 'accept', self.services['alpha'].envelope(payload))
+        self.assertEqual(accepted['recipient_terminal_id'], 'term-beta')
 
-    def test_symbolic_home_can_return_to_another_terminal_on_origin_without_duplicate(self):
+    def test_explicit_address_remains_cross_workspace_and_cross_host(self):
+        other = self.add_agent('alpha', 'other-workspace', 'another')
+        for address, expected in (('local/'+other['alias'], other),
+                                  ('beta/'+self.agents['beta']['alias'], self.agents['beta'])):
+            target = self.services['alpha'].resolve_recipient(address, self.agents['alpha'])
+            self.assertEqual(target['agent_id'], expected['agent_id'])
+            sent = Mailbox(self.stores['alpha']).send(self.agents['alpha'], target, body='Explicit target')
+            self.assertEqual(sent['recipient_terminal_id'], expected['terminal_id'])
+
+
+    def test_worker_observes_enabled_repo_after_designated_agent_returns_to_shell(self):
         store = self.stores['alpha']
-        pane = {'terminal_id':'term-alpha-main','pane_id':'w1:p2','workspace_id':'w1'}
-        agent = {**pane,'agent':'omp','name':'origin-main','agent_status':'idle',
-                 'agent_session':{'value':'main-session'},'cwd':str(self.repo)}
-        AgentRegistry(store).reconcile(
-            {'panes':[*self.snapshots['alpha']['panes'],pane],
-             'agents':[*self.snapshots['alpha']['agents'],agent]}, refresh_display=False)
-        main = next(item for item in AgentRegistry(store).list() if item['terminal_id']==pane['terminal_id'])
-        home = self.settings_for('beta')
-        home.mutate(self.repo_id,'mode','manual')
-        home.mutate(self.repo_id,'main',{'host':'alpha','terminal_id':main['terminal_id']})
+        settings = self.settings_for('alpha')
+        settings.mutate(self.repo_id, 'mode', 'manual')
+        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': 'term-alpha'},
+                        host='alpha', workspace_id='w1')
         self.drain()
-        symbolic = self.services['alpha'].resolve_recipient('main',self.agents['alpha'])
-        sent = Mailbox(store).send(self.agents['alpha'],symbolic,body='Return to origin main')
-        self.drain()
-        current = self.current('alpha',sent['message_id'])
-        self.assertEqual(current['state'],'queued')
-        self.assertTrue(current['authoritative'])
-        self.assertEqual(current['recipient_terminal_id'],main['terminal_id'])
-        self.assertEqual(store.doctor()['counts']['messages'],1)
-        claim = Mailbox(store).claim(terminal_id=main['terminal_id'],agent_id=main['agent_id'],generation=main['generation'])
-        self.assertEqual([row['message_id'] for row in claim['messages']],[sent['message_id']])
-        with store.read() as connection:
-            claimed = dict(connection.execute('SELECT * FROM deliveries WHERE message_id=?',
-                                              (sent['message_id'],)).fetchone())
-        home_copy = public_receipt(self.current('beta',sent['message_id']))
-        for delayed in (sent,home_copy,{**home_copy,'updated_at':time.time()+10}):
-            result = self.wire('alpha','receipt',self.services['beta'].envelope(delayed))
-            self.assertEqual(result['state'],'queued')
-            self.assertIsNone(result['delivered_at'])
-            with store.read() as connection:
-                self.assertEqual(dict(connection.execute('SELECT * FROM deliveries WHERE message_id=?',
-                                                         (sent['message_id'],)).fetchone()),claimed)
-        Mailbox(store).started(claim_id=claim['claim_id'],agent_id=main['agent_id'],
-                              generation=main['generation'],evidence='fixture:accepted-origin-context')
-        Mailbox(store).handle(main,[sent['message_id']])
-        self.drain()
-        self.assertEqual(self.current('beta',sent['message_id'])['state'],'handled')
-        item = next(item for item in self.services['beta'].outbox() if item['kind']=='message')
-        replay = json.loads(item['payload'])
-        store.retention(now=time.time()+91*86400)
-        retained = self.wire('alpha','accept',self.services['beta'].envelope(replay))
-        self.assertEqual(retained['state'],'handled')
-        self.assertEqual(retained['payload_hash'],sent['payload_hash'])
-        self.assertEqual(store.doctor()['counts']['messages'],0)
-
-    def test_worker_observes_designated_main_terminal_even_after_agent_returns_to_shell(self):
-        store = self.stores['alpha']
-        settings = RepoSettings(store, environment=self.environment, display_runner=self.display_runner)
-        settings.mutate(self.repo_id,'mode','manual')
-        settings.mutate(self.repo_id,'main',{'host':'alpha','terminal_id':'term-alpha'})
-        self.drain()
-        AgentRegistry(store).reconcile({'panes':self.snapshots['alpha']['panes'],'agents':[]}, refresh_display=False)
+        AgentRegistry(store).reconcile({'panes': self.snapshots['alpha']['panes'], 'agents': []},
+                                       refresh_display=False)
         self.assertTrue(maintenance_pending(store))
-        AgentRegistry(store).reconcile({'panes':[],'agents':[]}, refresh_display=False)
-        self.assertTrue(settings.clear_closed_main(self.repo_id,stamp(settings.show(self.repo_id)['settings']['main'])))
-        self.drain()
+        self.assertIsNone(self.show_settings('alpha')['main'])
+        AgentRegistry(store).reconcile({'panes': [], 'agents': []}, refresh_display=False)
         self.assertFalse(maintenance_pending(store))
+
 
     def test_worker_flock_is_single_instance_and_empty_worker_exits(self):
         store = self.stores['alpha']
@@ -604,66 +688,90 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(result['display']['failed'], ['isolated-pane'])
         self.assertEqual(result['warnings'][0]['code'], 'display_refresh_failed')
 
-    def test_closed_main_projection_runs_after_settings_commit(self):
+    def test_workspace_settings_mutation_projects_after_commit(self):
         store = self.stores['beta']
         observed = []
 
         def runner(command):
             with store.read() as connection:
-                fields = RepoSettings.fields(connection, self.repo_id)
+                fields = RepoSettings.workspace_fields(connection, self.repo_id, 'beta', 'w2')
                 observed.append(fields.get('main', {}).get('value'))
             return subprocess.CompletedProcess(list(command), 1, '', 'isolated display failure')
 
-        pane = {'terminal_id': 'term-beta-secondary', 'pane_id': 'w2:p2', 'workspace_id': 'w2'}
-        raw = {**pane, 'agent': 'codex', 'name': 'beta-secondary', 'agent_status': 'idle',
-               'agent_session': {'value': 'secondary-session'}, 'cwd': str(self.repo)}
-        snapshot = {'panes': [*self.snapshots['beta']['panes'], pane],
-                    'agents': [*self.snapshots['beta']['agents'], raw]}
-        AgentRegistry(store).reconcile(snapshot, refresh_display=False)
-        self.snapshots['beta'] = snapshot
         settings = RepoSettings(store, environment=self.environment, display_runner=runner)
-        settings.mutate(self.repo_id, 'mode', 'manual')
-        designated = settings.mutate(
-            self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']}
-        )['settings']['main']
-        remaining = {'panes': [pane], 'agents': [raw]}
-        AgentRegistry(store).reconcile(remaining, refresh_display=False)
-        observed.clear()
-
-        self.assertTrue(settings.clear_closed_main(self.repo_id, stamp(designated)))
+        target = {'host': 'beta', 'terminal_id': 'term-beta'}
+        result = settings.mutate(self.repo_id, 'main', target, host='beta', workspace_id='w2')
         self.assertTrue(observed)
-        self.assertEqual(set(observed), {None})
+        self.assertTrue(all(value == target for value in observed))
+        self.assertTrue(result['display']['failed'])
 
-    def test_reconcile_local_reports_deferred_redraw_after_commit(self):
-        store = self.stores['beta']
-        settings = self.settings_for('beta')
+
+    def test_old_peer_scoped_setting_outbox_completes_instead_of_failing(self):
+        settings = [
+            ('main', {'host': 'alpha', 'terminal_id': 'term-alpha'}),
+            ('members', [{'host': 'alpha', 'terminal_id': 'term-alpha'}]),
+            ('computed_main', {'target': None, 'home_stamp':
+                              {'version': 1, 'origin_host': 'alpha', 'value': 'alpha'}}),
+        ]
+        with self.stores['alpha'].transaction() as connection:
+            for field, value in settings:
+                queue_outbox(connection, 'beta', 'setting', {
+                    'repo_id': self.repo_id, 'field': field, 'value': value,
+                    'version': 1, 'origin_host': 'alpha', 'changed_by': 'user',
+                    'changed_at': time.time()})
+        result = self.services['alpha'].pump(now=time.time()+1000)
+        self.assertEqual(result, {'sent': 3, 'failed': 0, 'deferred': 0})
+        self.assertTrue(all(item['state'] == 'sent' for item in self.services['alpha'].outbox()))
+        self.assertEqual(self.show_settings('beta')['settings'], {})
+        self.assertEqual(self.services['beta'].outbox(), [])
+
+    def test_old_peer_workspace_settings_are_successful_noops_without_forwarding(self):
+        self.settings_for('beta').mutate(self.repo_id, 'mode', 'auto')
+        self.drain()
+        before = self.show_settings('beta')
+        outbox = self.services['beta'].outbox()
+        values = {
+            'main': {'host': 'alpha', 'terminal_id': 'term-alpha'},
+            'members': [{'host': 'alpha', 'terminal_id': 'term-alpha'}],
+            'computed_main': {'target': {'host': 'alpha', 'terminal_id': 'term-alpha'},
+                              'home_stamp': {'version': 1, 'origin_host': 'alpha', 'value': 'alpha'}},
+        }
+        with mock.patch('ledger_display.refresh', side_effect=AssertionError('no-op must not redraw')):
+            for field, value in values.items():
+                with self.subTest(field=field):
+                    setting = {'repo_id': self.repo_id, 'field': field, 'value': value,
+                               'version': 999, 'origin_host': 'alpha',
+                               'changed_by': 'user', 'changed_at': time.time()}
+                    result = self.wire('beta', 'setting', self.services['alpha'].envelope(setting))
+                    self.assertEqual(result['protocol'], 1)
+                    self.assertFalse(result['applied'])
+                    local_result = self.services['beta'].receive(
+                        'setting', self.services['alpha'].envelope(setting))
+                    self.assertFalse(local_result['applied'])
+        self.assertEqual(self.show_settings('beta'), before)
+        self.assertEqual(self.services['beta'].outbox(), outbox)
+
+
+    def test_peer_bootstrap_publishes_only_repo_wide_fields(self):
+        settings = self.settings_for('alpha')
         settings.mutate(self.repo_id, 'mode', 'manual')
-        settings.mutate(self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']})
-        AgentRegistry(store).reconcile({'panes': [], 'agents': []}, refresh_display=False)
+        settings.mutate(self.repo_id, 'thresholds', DEFAULT_THRESHOLDS)
+        target = {'host': 'alpha', 'terminal_id': 'term-alpha'}
+        settings.mutate(self.repo_id, 'main', target, host='alpha', workspace_id='w1')
+        settings.mutate(self.repo_id, 'members', [target], host='alpha', workspace_id='w1')
+        self.drain()
+        store = self.stores['alpha']
+        with store.transaction() as connection:
+            connection.execute("DELETE FROM peer_options WHERE canonical_name='gamma'")
+            connection.execute("DELETE FROM peers WHERE canonical_name='gamma'")
+        before = {item['item_id'] for item in self.services['alpha'].outbox()}
+        self.services['alpha'].add_peer(canonical_name='gamma', uuid=self.stores['gamma'].host_uuid,
+            ssh_alias='c', remote_ham_root=str(ROOT), remote_ledger_dir=str(self.stores['gamma'].directory))
+        bootstrapped = [json.loads(item['payload']) for item in self.services['alpha'].outbox()
+                        if item['item_id'] not in before]
+        self.assertEqual({value['field'] for value in bootstrapped}, {'home', 'mode', 'thresholds'})
+        self.assertTrue(all(value['repo_id'] == self.repo_id for value in bootstrapped))
 
-        result = settings.reconcile_local(refresh_display=False, environment=self.environment)
-        self.assertEqual(result, {'changed': True, 'display': None})
-        self.assertIsNone(settings.show(self.repo_id)['settings']['main']['value'])
-        self.assertEqual(settings.reconcile_local(refresh_display=False),
-                         {'changed': False, 'display': None})
-
-    def test_reconcile_local_returns_postcommit_display_result(self):
-        store = self.stores['beta']
-        settings = self.settings_for('beta')
-        settings.mutate(self.repo_id, 'mode', 'manual')
-        settings.mutate(self.repo_id, 'main', {'host': 'beta', 'terminal_id': self.agents['beta']['terminal_id']})
-        AgentRegistry(store).reconcile({'panes': [], 'agents': []}, refresh_display=False)
-        observed = []
-
-        def project(ledger, environment=None, *, runner=None):
-            with ledger.read() as connection:
-                observed.append(RepoSettings.fields(connection, self.repo_id)['main']['value'])
-            return {'updated': [], 'failed': ['isolated-pane']}
-
-        with mock.patch('ledger_display.refresh', side_effect=project):
-            result = settings.reconcile_local(environment=self.environment)
-        self.assertEqual(result, {'changed': True, 'display': {'updated': [], 'failed': ['isolated-pane']}})
-        self.assertEqual(observed, [None])
 
     def test_status_export_and_recipient_resolution_do_not_scan_by_default(self):
         service = self.services["beta"]

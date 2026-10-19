@@ -325,16 +325,17 @@ state, including permanent dedupe after body retention. A bell failure after
 commit is a successful store with a `notification_failed`, `committed:true`
 warning, not permission to resend.
 
-`--to main` is a symbolic address resolved once by the repository home on
-acceptance. An offline home leaves pending mail; an online home without a main
-returns a visible `main_unavailable` item for explicit retry. Resolved receipts
-and withdrawals follow the saved route, including a main on a third host.
+`--to main` is resolved on the sender's host at send time against the sender's
+current `(repo_id, canonical host, workspace_id)` scope. The immutable message
+stores a concrete terminal target. If the scope has no main, sending fails
+visibly and names the workspace; it never uses another workspace's main or the
+repository home. Explicit `HOST/LABEL` mail remains repository-wide, including
+cross-workspace collaborators. Receipts and withdrawals follow the saved target.
 The home is the first enabled canonical host and is deliberately read-only in
-the user UI. Mode/main/member/threshold mutations belong to the user UI service,
-not the agent CLI; there is no `repo set` or home-changing command. Local auto
-bootstrap does not wait for all peers. Observed concurrent initial home proposals
-converge deterministically; stale former-home computations cannot overwrite the
-winning home stamp.
+the user UI; it does not elect or relay workspace mains. Mode/main/member/threshold
+mutations belong to the user UI service, not the agent CLI; there is no `repo set`
+or home-changing command. Local auto bootstrap does not wait for all peers.
+Observed concurrent initial home proposals converge deterministically.
 
 Isolated verification can pin `peer add --remote-root /ABS/WORK_COPY
 --remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`.
@@ -356,12 +357,27 @@ propagation. Reads never seed defaults. Off creates no main/worker roles, automa
 wake, or participating-traffic legacy restriction; explicit reads and natural
 user-boundary receiving remain available.
 
-- **manual:** the explicitly designated main is main; chosen members are workers,
-  excluding main. Nonmembers may receive naturally but cannot be auto-woken.
-- **auto:** an explicit main wins. Otherwise exactly one active main-checkout
-  agent at the home becomes main; zero or two-or-more candidates produce no
-  computed main. All other same-repository agents across hosts are workers.
-  A worktree is not a main checkout.
+Mode and wake thresholds remain repository-wide. Main and members are local to
+`(repo_id, canonical host, Herdr workspace_id)`, so worktree workspaces elect
+their own main. Workspace IDs are never compared across hosts.
+
+- **manual:** an explicit active main in the scope is main; chosen members in
+  that scope are workers, excluding main. Nonmembers may receive naturally but
+  cannot be auto-woken.
+- **auto:** an explicit active main in the scope wins. Otherwise the scope's
+  single active agent becomes main. With several agents, exactly one active
+  main-checkout agent becomes main; if there is not exactly one, no main is
+  computed. All other agents in the scope are workers, even without a main.
+  A linked worktree is not a main checkout, but its single agent can be main.
+
+A designation that becomes inactive or moves out of the scope is ignored on
+read without rewriting the setting; auto falls back to the election above.
+Workspace main/member settings are never replicated. Peers read the role
+computed by each agent's own host through status export. Schema v7 migrates
+active local legacy targets into their current workspace scopes and removes
+repo-level main/members/computed-main settings. Protocol-1 legacy role-setting
+payloads succeed without applying changes; home/mode/threshold replication is
+unchanged. See [migration](migration.md#workspace-role-migration-schema-v7).
 
 Public status is independent of coordination mode:
 
@@ -373,6 +389,9 @@ python3 "$HAM_CLI" status clear
 python3 "$HAM_CLI" repo show
 ```
 
+`repo show` exposes the caller's host and `workspace_id`, scope main and members,
+and repository-wide mode. `status board`, sidebar roles and borders use each
+agent's own host-qualified workspace role.
 `status set PHASE --summary TEXT` updates the caller's phase/summary; it does not
 change Herdr's `turn_state`. Phase is projected to `$recap`. HAM-owned pane
 borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting
@@ -428,24 +447,35 @@ The Settings overlay has exactly **seven mutable rows**:
 | `wakes_per_hour` | `6` wakes per hour |
 | `max_hop` | `10` hops |
 
+Mode and the four thresholds apply to the repository. Main and Members rows
+identify the Mailbox opener's host-qualified workspace (`Main (workspace …)` /
+`Members (workspace …)`), resolved from `HERDR_HAM_OPENER_PANE_ID`; they do not
+follow an arbitrarily selected remote agent. In all-repositories view the
+existing repository selection still applies; without one repo the editor is
+disabled with an explanation.
+
 ↑/↓ selects a row, Enter edits, and Esc closes. `Target: host/alias` is the
-selected Agents row: `m` sets it as main, Space toggles manual membership.
-Every mutation requires confirmation with Cancel selected by default.
+selected Agents row: `m` sets it as main, Space toggles manual membership, only
+when it is active and in the opener's settings scope. Out-of-scope targets are
+rejected by the service. Every mutation requires confirmation with Cancel
+selected by default.
 
 Each threshold is an integer from 0 to 10000. The four threshold rows are saved
-as one versioned `thresholds` field. Home, computed main, version/origin stamps,
-conflicts and propagation pending are **read-only**, not hidden extra editors.
-Each independently versioned field chooses the greatest `(version, canonical
-origin)` pair; equal-version competing origins use the lexically greater
-canonical origin. A new edit allocates a newer observed version. Conflict
-details wrap without dropping their contents.
+as one versioned, repo-wide `thresholds` field. Home, computed main,
+version/origin stamps, conflicts and propagation pending are **read-only**, not
+hidden extra editors. Replicated repo-wide fields choose the greatest
+`(version, canonical origin)` pair; equal-version competing origins use the
+lexically greater canonical origin. Workspace main/member edits stay local.
+A new edit allocates a newer observed version. Conflict details wrap without
+dropping their contents.
 
 Saving is single-flight and visibly pending. You may open a text editor while
 a save is pending, but a second save submission or member/main toggle is
 rejected, not silently queued; the edit buffer is retained. Navigation and
-closing remain responsive. The authoritative result is applied immediately,
-and an older snapshot cannot overwrite it. Remote propagation can remain
-pending while a peer is offline; local saving does not require all peers online.
+closing remain responsive. The authoritative result is matched to the full
+repo/host/workspace scope and applied immediately; an older snapshot cannot
+overwrite it. Repo-wide propagation can remain pending while a peer is offline;
+workspace edits do not propagate. Local saving does not require all peers online.
 
 Agents Enter opens inline FYI input; Threads Enter opens a reply to the latest
 message with a live, non-stale agent resolved by host/terminal identity.

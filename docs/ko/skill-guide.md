@@ -351,15 +351,17 @@ terminal 종료로 취급하지 않습니다. 영구 실패 항목은 오류를 
 저장은 성공하며 `notification_failed`, `committed:true` 경고가 나옵니다.
 새 메시지로 다시 보내지 마세요.
 
-`--to main`은 저장소 home 호스트가 접수할 때 한 번만 해석합니다. home이
-오프라인이면 pending을 유지하고, 접속 가능하지만 main이 없으면
-`main_unavailable` 실패 항목으로 보여 명시적으로 재시도할 수 있습니다.
-다른 호스트의 main으로 중계해도 수신 확인과 철회는 저장된 경로를 따릅니다.
-home은 처음 활성화한 canonical 호스트이며 사용자 UI에서 의도적으로 읽기 전용입니다.
-mode/main/members/thresholds 변경은 사용자 UI 서비스 전용입니다. agent CLI에는
-`repo set`이나 home 변경 명령이 없습니다. 로컬 auto 초기화는 모든 peer의 접속을
-기다리지 않습니다. 동시에 생긴 home 제안은 관찰된 뒤 결정적인 규칙으로 수렴하며,
-이전 home의 오래된 계산은 승리한 home stamp를 덮어쓰지 못합니다.
+`--to main`은 보낼 때 송신 호스트에서 송신자의 현재
+`(repo_id, 정규 호스트, workspace_id)` 범위를 기준으로 해석합니다. 변경 불가능한
+메시지에는 구체적인 terminal 대상을 저장합니다. 해당 범위에 main이 없으면
+workspace를 명시하는 오류로 실패하며, 다른 workspace의 main이나 저장소
+home으로 대체하지 않습니다. `HOST/LABEL`을 명시한 메일은 같은 저장소의 다른
+workspace에도 보낼 수 있습니다. 수신 확인과 철회는 저장된 대상을 따릅니다.
+home은 처음 활성화한 canonical 호스트이며 사용자 UI에서 읽기 전용입니다.
+workspace main을 선출하거나 중계하지는 않습니다. mode/main/members/thresholds
+변경은 사용자 UI 서비스 전용이며 agent CLI에는 `repo set`이나 home 변경 명령이
+없습니다. 로컬 auto 초기화는 모든 peer의 접속을 기다리지 않습니다. 동시에 생긴
+home 제안은 관찰된 뒤 결정적인 규칙으로 수렴합니다.
 
 격리 검증에는 `peer add --remote-root /ABS/WORK_COPY
 --remote-ledger-dir /ABS/PRIVATE/ledger --remote-socket /SHORT/PRIVATE.sock`을
@@ -380,13 +382,27 @@ mode/main/members/thresholds 변경은 사용자 UI 서비스 전용입니다. a
 off에서는 main/worker 역할, 자동 깨우기, 참여 트래픽의 기존 전송 제한이 없습니다.
 명시적 조회와 자연스러운 사용자 입력 경계의 수신은 허용합니다.
 
-- **manual:** 명시적으로 지정한 에이전트가 main이며, 선택한 members 중 main을
-  제외한 에이전트가 worker입니다. 비회원도 자연스러운 경계에서 수신할 수 있지만
-  자동으로 깨우지는 않습니다.
-- **auto:** 명시적인 main 지정이 우선합니다. 지정이 없으면 home의 활성 main
-  checkout 에이전트가 정확히 하나일 때만 main을 계산합니다. 후보가 없거나 둘
-  이상이면 계산된 main도 없습니다. 나머지 모든 호스트의 같은 저장소 에이전트는
-  worker입니다. worktree는 main checkout이 아닙니다.
+모드와 깨우기 임곗값은 저장소 전체에 적용합니다. main과 members는
+`(repo_id, 정규 호스트, Herdr workspace_id)`별로 정하므로 worktree workspace도
+자체 main을 선출합니다. 서로 다른 호스트의 workspace ID를 같은 범위로 보지 않습니다.
+
+- **manual:** 해당 범위 안의 활성 에이전트를 명시적 main으로 지정하며, 선택한
+  members 중 main을 제외한 에이전트가 worker입니다. 비회원도 자연스러운 경계에서
+  수신할 수 있지만 자동으로 깨우지는 않습니다.
+- **auto:** 해당 범위의 유효한 명시적 main이 우선합니다. 그렇지 않으면 활성
+  에이전트가 하나일 때 그 에이전트가 main이 됩니다. 여럿이면 메인 체크아웃의
+  활성 에이전트가 정확히 하나일 때만 main이 됩니다. 그 외에는 main이 없습니다.
+  main 유무와 관계없이 해당 범위의 나머지 에이전트는 worker입니다. 연결된 worktree는
+  메인 체크아웃이 아니지만, workspace의 유일한 활성 에이전트는 main이 될 수 있습니다.
+
+지정한 에이전트가 비활성화되거나 범위 밖으로 이동하면 설정을 다시 쓰지 않고
+조회 시 그 지정을 무시합니다. auto에서는 위의 자동 선출 규칙을 적용합니다.
+workspace main·members 설정은 복제하지 않습니다. peer는 상태 내보내기를 통해
+각 에이전트의 호스트가 계산한 역할을 받아 봅니다. 스키마 v7은 기존 역할 설정의
+활성 로컬 대상을 현재 workspace 범위로 옮기고 저장소 단위의
+main·members·computed-main 설정을 제거합니다. 이전 peer의 프로토콜 1 역할 설정은
+적용하지 않고 성공으로 응답하며, home·mode·thresholds 복제는 바뀌지 않습니다.
+[마이그레이션 안내](migration.md#workspace-역할-마이그레이션스키마-v7)를 참고하세요.
 
 공개 상태는 조정 모드와 별개로 사용할 수 있습니다.
 
@@ -397,6 +413,10 @@ python3 "$HAM_CLI" status list --repo 'git:host/stable/repo'
 python3 "$HAM_CLI" status clear
 python3 "$HAM_CLI" repo show
 ```
+
+`repo show`는 호출자의 호스트와 `workspace_id`, 해당 범위의 main·members와
+저장소 전체의 모드를 보여 줍니다. `status board`와 사이드바·테두리는 각
+에이전트의 호스트·workspace 범위에 따른 역할을 표시합니다.
 
 `status set PHASE --summary TEXT`는 호출자의 phase와 summary를 갱신하며 Herdr의
 `turn_state`는 바꾸지 않습니다. phase는 `$recap`에 표시합니다. HAM 소유 pane
@@ -454,23 +474,32 @@ Settings에서 **수정할 수 있는 행은 일곱 개**입니다.
 | `wakes_per_hour` | 기본값은 시간당 6회입니다. |
 | `max_hop` | 기본값은 10 hop입니다. |
 
-↑·↓로 행을 고르고 Enter로 편집하며 Esc로 닫습니다. `Target: host/alias`는
-선택한 Agents 행을 가리킵니다. `m`으로 main을 지정하고 Space로 manual 구성원에
-넣거나 뺍니다. 모든 변경은 기본 선택이 Cancel인 확인창을 거칩니다.
+Mode와 네 임곗값은 저장소 전체에 적용합니다. Main·Members 행에는 Mailbox를
+연 pane의 호스트·workspace 범위가 표시됩니다(`Main (workspace …)` /
+`Members (workspace …)`). 이 범위는 `HERDR_HAM_OPENER_PANE_ID`로 찾으며,
+선택한 원격 에이전트를 따라 바뀌지 않습니다. 모든 저장소 보기에서도 기존
+저장소 선택 방식을 유지하며, 저장소를 하나로 정할 수 없으면 설명과 함께 편집을 비활성화합니다.
 
-네 임계값은 각각 0~10000의 정수이며 하나의 version을 가진 `thresholds` 필드로
-저장합니다. home, computed main, version/origin stamp, 충돌과 전파 대기는 모두
-**읽기 전용**이며 추가 편집 항목이 아닙니다. 독립적인 각 설정 필드는
-`(version, canonical origin)`이 큰 값을 채택합니다. version이 같은 서로 다른
-origin은 canonical 이름의 사전식 순서가 큰 쪽이 이깁니다. 새 편집에는 관찰된
-값보다 새 version을 부여합니다. 충돌 내용은 줄바꿈하여 빠짐없이 표시합니다.
+↑·↓로 행을 고르고 Enter로 편집하며 Esc로 닫습니다. `Target: host/alias`는
+선택한 Agents 행을 가리킵니다. 해당 에이전트가 활성 상태이며 설정 범위 안에
+있을 때만 `m`으로 main을 지정하고 Space로 manual 구성원에 넣거나 뺄 수 있습니다.
+서비스도 범위 밖의 대상을 거절합니다. 모든 변경은 기본 선택이 Cancel인 확인창을 거칩니다.
+
+네 임곗값은 각각 0~10000의 정수이며 저장소 전체에 적용하는 하나의 version을
+가진 `thresholds` 필드로 저장합니다. home, computed main, version/origin stamp,
+충돌과 전파 대기는 모두 **읽기 전용**이며 추가 편집 항목이 아닙니다.
+복제하는 저장소 단위 설정은 `(version, canonical origin)`이 큰 값을 채택하며,
+version이 같으면 canonical 이름의 사전식 순서가 큰 쪽이 이깁니다.
+workspace main·members 변경은 로컬에만 저장합니다. 새 편집에는 관찰된 값보다
+새 version을 부여합니다. 충돌 내용은 줄바꿈하여 빠짐없이 표시합니다.
 
 저장은 한 번에 하나만 진행하며 pending 상태를 보여 줍니다. 저장 중에도 텍스트
 편집기는 열 수 있지만, 다음 저장 제출이나 main/member 토글은 대기열에 넣지 않고
-거절하며 편집 버퍼는 보존합니다. 화면 이동과 닫기는 계속 가능합니다. 권위 있는
-결과를 즉시 적용하고 오래된 snapshot이 덮어쓰지 못하게 합니다. peer가
-오프라인이면 원격 전파는 pending으로 남을 수 있으며 로컬 저장은 모든 peer의
-접속을 기다리지 않습니다.
+거절하며 편집 버퍼는 보존합니다. 화면 이동과 닫기는 계속 가능합니다. 결과를
+저장소·호스트·workspace 전체 범위와 대조해 즉시 적용하고 오래된 snapshot이
+덮어쓰지 못하게 합니다. peer가 오프라인이면 저장소 단위 설정의 원격 전파는
+pending으로 남을 수 있지만 workspace 설정은 전파하지 않습니다. 로컬 저장은
+모든 peer의 접속을 기다리지 않습니다.
 
 Agents에서 Enter를 누르면 인라인 FYI 입력창을 엽니다. Threads의 Enter는 최신
 메시지에 답장하며, 호스트·terminal ID로 현재의 stale이 아닌 에이전트를 찾습니다.

@@ -295,15 +295,25 @@ Press `s` in NAV. `↑`/`↓` or `j`/`k` selects a row. Click a row to select it
 clicking the selected row acts like `Enter`. `Esc` closes the overlay and
 discards unsaved inline changes.
 
-- **Mode:** `Enter` opens a **PICK** list with a short explanation of each option.
+Mode and Thresholds are repository-wide. Main and Members show the Mailbox
+opener's workspace (`Main (workspace …)` / `Members (workspace …)`), resolved
+from `HERDR_HAM_OPENER_PANE_ID`, on the canonical local host. Their scope is
+`(repo_id, host, workspace_id)`, not the selected agent's workspace. The
+all-repositories view keeps its existing repository selection; without one
+repository, settings stays disabled with an explanation. Workspace role
+settings stay host-local and are not replicated.
+
+- **Mode (repo-wide):** `Enter` opens a **PICK** list with a short explanation of each option.
   `↑`/`↓` selects; `Enter` or clicking an option saves immediately.
   On the mode row, `←`/`→` or `h`/`l` cycles an unsaved choice; `Enter` saves it.
-- **Main:** `Enter` opens a **PICK** list of live, non-stale repository agents plus
-  `(none)`. The current choice has a `●` marker. `Enter` or clicking a choice saves.
-- **Members:** `Enter` opens a **CHECK** list. `Space` or clicking an entry toggles
-  its checkbox; `Enter` saves the checked set. Existing unavailable members carry
-  a `stale` tag and remain checked unless explicitly unticked.
-- **Thresholds:** `←`/`→`, `-`/`+`, or clicking `◀`/`▶` adjusts the inline value.
+- **Main (workspace …):** `Enter` opens a **PICK** list of active agents in the
+  same repository, canonical host and workspace, plus `(none)`. The current
+  choice has a `●` marker. `Enter` or clicking a choice saves.
+- **Members (workspace …):** `Enter` opens a **CHECK** list for that scope.
+  `Space` or clicking an entry toggles its checkbox; `Enter` saves the checked
+  set. Inactive or out-of-scope targets cannot be newly assigned; the service
+  rejects invalid targets. A configured agent outside the scope has no role there.
+- **Thresholds (repo-wide):** `←`/`→`, `-`/`+`, or clicking `◀`/`▶` adjusts the inline value.
   Steps are 1 for `idle_minutes`, 5 for `coalesce_seconds`, and 1 each for
   `wakes_per_hour` and `max_hop`; values stay within 0–10000. An `unsaved` marker
   remains until `Enter` saves. With no pending changes, `Enter` opens an optional
@@ -311,10 +321,14 @@ discards unsaved inline changes.
 
 The mouse wheel scrolls picker/checklist entries or overlay metadata.
 The overlay shows `Target: host/alias` for the selected Agents row:
-`m` sets that agent as main; `Space` toggles its manual membership.
-These two shortcuts still require confirmation, with Cancel selected by default.
-Home, `computed_main`, version/origin stamps, propagation pending and conflicts
-are read-only. Settings uses the internal service; agent `repo show` remains read-only.
+`m` sets that agent as main; `Space` toggles its manual membership, only for
+active targets in the opener's settings scope. These two shortcuts still
+require confirmation, with Cancel selected by default.
+Home, computed main, version/origin stamps, propagation pending and conflicts
+are read-only. Only repo-wide settings propagate. Requests, snapshots and save
+results are associated with the full repo/host/workspace scope, so a result from
+another scope cannot overwrite the current settings. Settings uses the internal
+service; agent `repo show` remains read-only and reports the caller's scope.
 
 Only one settings save can be in flight. The affected row shows **Saving settings**,
 then its save result or error. Further saves are rejected, not queued, and rejected
@@ -395,6 +409,14 @@ JSON. `heavy_slot.py` remains separate and unchanged; its slots are not displaye
 
 ### Role, phase and border ownership
 
+Main/workers are decided per `(repository, canonical host, Herdr workspace)`;
+worktree workspaces have their own main. Repository mode/thresholds remain
+shared. In auto mode, a valid active explicit main wins, otherwise a single
+active agent wins; with several agents, exactly one in the main checkout wins.
+Otherwise there is no main, and the other auto agents remain workers. In manual
+mode only the active explicit main and configured in-scope members get roles.
+All displays use the role computed by each agent's own host.
+
 HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
 the alias remains addressable. A shared projection reports alias, color,
 display name, phase (`recap`) and ledger-backed device tokens under metadata
@@ -425,9 +447,9 @@ an error notification instead of opening the popup.
 Local agents appear immediately, sorted by Herdr workspace label. Unicode labels
 are preserved and worktree-backed workspaces use a `WT:` prefix. Remote agents
 are grouped under their SSH host alias. Within each host, agents are grouped
-again under their workspace. Workspace identity uses Herdr's `workspace_id`, so
-different workspaces with the same visible label are kept separate and display
-their IDs for disambiguation.
+again under their workspace. Workspace identity uses the canonical host plus
+Herdr's `workspace_id`, never a bare ID across hosts. Different workspaces with
+the same visible label stay separate and display their IDs for disambiguation.
 
 ## Recipient rows
 

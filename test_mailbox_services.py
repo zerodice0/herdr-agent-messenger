@@ -12,8 +12,10 @@ from unittest import mock
 
 from agent_directory import user_prompt_text
 from ledger_mail import Mailbox
+from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore, receipt
+from mailbox_tui import OPENER_PANE, OPENER_TERMINAL, REPO_ENV, execute_job, local_snapshot
 from test_ledger_core import snapshot
 
 
@@ -47,6 +49,101 @@ class MailboxServicesTest(unittest.TestCase):
     def state(self, message_id):
         with self.store.read() as connection:
             return receipt(connection, message_id)
+
+    def settings_environment(self):
+        return {"HERDR_AGENT_LEDGER_DIR": str(self.store.directory),
+                "HERDR_AGENT_LEDGER_AUTOSTART": "0",
+                OPENER_PANE: self.sender["pane_id"], OPENER_TERMINAL: self.sender["terminal_id"],
+                REPO_ENV: self.repo_id}
+
+    def save_settings(self, field, value, *, scope=None, environment=None):
+        request = {"operation": "setting", "repo_id": self.repo_id, "field": field, "value": value,
+                   "scope": scope or {"repo_id": self.repo_id, "host": self.store.host,
+                                      "workspace_id": self.sender["workspace_id"]}}
+        with mock.patch("ledger_display.LedgerDisplay.refresh", return_value={"updated": [], "failed": []}), \
+             mock.patch("mailbox_tui.herdr", side_effect=LedgerError("isolated", "No live Herdr")):
+            return execute_job(request, environment or self.settings_environment())
+
+    def test_settings_save_targets_opener_scope_not_selected_agent_workspace(self):
+        self.registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)
+        target = {"host": self.store.host, "terminal_id": self.sender["terminal_id"]}
+        for field, value in (("main", target), ("members", [target])):
+            result = self.save_settings(field, value)
+            self.assertEqual((result["repo_id"], result["host"], result["workspace_id"]),
+                             (self.repo_id, self.store.host, "w1"))
+            self.assertEqual(result["settings"][field]["value"], value)
+            other = RepoSettings(self.store).show(self.repo_id, self.store.host, "w2")
+            self.assertNotIn(field, other["settings"])
+        with mock.patch("mailbox_tui.herdr", side_effect=LedgerError("isolated", "No live Herdr")), \
+             mock.patch("resource_scan.scan_host_resources",
+                        return_value={"listeners": [], "serve": [], "error": None}):
+            result = local_snapshot(self.store, self.repo_id, self.settings_environment())
+        self.assertEqual(result["scope"],
+                         {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1"})
+        self.assertEqual(result["settings"]["settings"]["main"]["value"], target)
+
+    def test_settings_reject_out_of_scope_main_and_members(self):
+        self.registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)
+        targets = [{"host": self.store.host, "terminal_id": self.recipient["terminal_id"]},
+                   {"host": "another-host", "terminal_id": self.sender["terminal_id"]},
+                   {"host": self.store.host, "terminal_id": "inactive-or-unknown"}]
+        for target in targets:
+            for field, value in (("main", target), ("members", [target])):
+                with self.subTest(field=field, target=target), self.assertRaises(LedgerError) as raised:
+                    self.save_settings(field, value)
+                self.assertEqual(raised.exception.code, "target_out_of_scope")
+
+    def test_settings_mutations_require_complete_current_opener_scope(self):
+        expected = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1"}
+        for scope in ({"repo_id": self.repo_id}, {**expected, "host": "another-host"},
+                      {**expected, "workspace_id": "w2"}, {**expected, "repo_id": "another-repo"}):
+            with self.subTest(scope=scope), self.assertRaises(LedgerError) as raised:
+                self.save_settings("mode", "manual", scope=scope)
+            self.assertEqual(raised.exception.code, "invalid_settings_scope")
+        environment = self.settings_environment()
+        environment.pop(OPENER_TERMINAL)
+        environment[OPENER_PANE] = "missing:pane"
+        with self.assertRaises(LedgerError) as raised:
+            self.save_settings("main", None, environment=environment)
+        self.assertEqual(raised.exception.code, "invalid_settings_scope")
+
+    def test_settings_opener_terminal_tracks_workspace_move(self):
+        environment = self.settings_environment()
+        with self.store.transaction() as connection:
+            for table in ("agents", "terminal_slots"):
+                connection.execute(f"UPDATE {table} SET workspace_id='w2',pane_id='w2:p7' "
+                                   "WHERE host=? AND terminal_id=?", (self.store.host, self.sender["terminal_id"]))
+        with self.assertRaises(LedgerError) as raised:
+            self.save_settings("main", None, environment=environment)
+        self.assertEqual(raised.exception.code, "invalid_settings_scope")
+        scope = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w2"}
+        result = self.save_settings("main", None, scope=scope, environment=environment)
+        self.assertEqual(result["workspace_id"], "w2")
+
+    def test_settings_mode_and_thresholds_remain_repository_wide(self):
+        self.registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)
+        thresholds = {**DEFAULT_THRESHOLDS, "idle_minutes": 42}
+        self.save_settings("mode", "manual")
+        self.save_settings("thresholds", thresholds)
+        other = RepoSettings(self.store).show(self.repo_id, self.store.host, "w2")
+        self.assertEqual(other["mode"], "manual")
+        self.assertEqual(other["settings"]["thresholds"]["value"], thresholds)
+        self.assertNotIn("main", other["settings"])
+        self.assertNotIn("members", other["settings"])
+
+    def test_settings_retains_existing_unavailable_member_but_rejects_moved_member(self):
+        target = {"host": self.store.host, "terminal_id": self.recipient["terminal_id"]}
+        self.save_settings("members", [target])
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE host=? AND terminal_id=?",
+                               (self.store.host, self.recipient["terminal_id"]))
+        result = self.save_settings("members", [target])
+        self.assertEqual(result["members"], [target])
+        self.registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)
+        with self.assertRaises(LedgerError) as raised:
+            self.save_settings("members", [target])
+        self.assertEqual(raised.exception.code, "target_out_of_scope")
+        self.assertEqual(self.save_settings("members", [])["members"], [])
 
     def target(self):
         return {"host": None, "transport_host": "ssh-selected", "local": False,

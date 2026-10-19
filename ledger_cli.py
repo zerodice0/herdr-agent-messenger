@@ -144,7 +144,12 @@ def _live_context(registry: AgentRegistry, snapshot: Mapping[str, Any],
         matching_session = claude_foreground_pid(agent, environment) == agent["native_session_pid"]
     if not matching_session or live["agent"] != agent["client"] or identity["repo_id"] != agent["repo_id"]:
         raise LedgerError("stale_session", "Run ledger reconcile for the current Herdr session before receiving mail.")
-    return agent
+    location = next((pane for pane in snapshot["panes"]
+                     if pane.get("terminal_id") == agent["terminal_id"]), None)
+    if location is None:
+        raise LedgerError("recipient_absent", "The calling terminal no longer has a live pane.")
+    return {**agent, "pane_id": str(location.get("pane_id") or ""),
+            "workspace_id": str(location.get("workspace_id") or "")}
 
 
 def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -318,7 +323,7 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
     snapshot = registry.refresh(environment)[0] if mutating else live_snapshot(environment)
     sender = _live_context(registry, snapshot, environment)
     if arguments.command == "repo":
-        return registry.repo_show(sender["repo_id"])
+        return registry.repo_show(sender["repo_id"], sender["host"], sender["workspace_id"])
     if arguments.command == "inbox":
         if arguments.inbox_command == "read":
             return mailbox.read(sender, message_id=arguments.message, all_states=arguments.all, limit=arguments.limit)

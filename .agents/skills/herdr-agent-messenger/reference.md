@@ -20,10 +20,12 @@ The legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`,
 Only literal `local` means local transport. Even a hostname matching this machine means SSH. Labels can repeat across hosts and do not guarantee the same occupant after restart. Missing/ambiguous hosts or labels must be reported, not guessed. Never substitute a pane ID or create a missing agent unless asked.
 
 These selector rules describe legacy routing. Durable mail separately accepts
-`local/LABEL`, registered canonical names or SSH aliases, and symbolic `main`.
+`local/LABEL`, registered canonical names or SSH aliases, and `main`, resolved
+to the sender's workspace main at send time.
 Before using legacy `send`, `request` or `batch`, inspect repository participation:
 manual/auto same-repository traffic between participating agents is refused with
-`use_mailbox`. Use `mail send`, not another transport. All batch targets are
+`use_mailbox`, with each endpoint's role evaluated in its own host-qualified
+workspace. Use `mail send`, not another transport. All batch targets are
 resolved and policy-checked before any dispatch; a refusal or discovery/policy
 failure aborts the coordinated batch without partial submission. Off-mode,
 nonparticipating and other-repository legacy traffic retains its previous
@@ -238,37 +240,64 @@ label. Success is one JSON object with `protocol:1`; errors retain
 
 | Command | `payload` / result |
 | --- | --- |
-| `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. A concrete target must equal the immutable target; only the symbolic home may relay `main`. |
+| `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. New sends always carry a concrete terminal target matching the immutable target, including sends addressed to `main`. Persisted legacy symbolic messages use sender-scope compatibility handling or fail visibly; they never select another workspace's main. |
 | `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
-| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target; a home relay adds `relay_home` → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
-| `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` (conditional close also has `expected_main`) → `{applied,...repo_settings}`. |
+| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target → withdrawn/current receipt. Retained legacy relay routes may include `relay_home`. Unknown IDs create a permanent hash-bound tombstone before late acceptance. |
+| `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` → `{applied,...repo_settings}` for repo-wide `home`, `mode`, `thresholds`. Protocol-1 legacy `main`, `members`, `computed_main` payloads (including an old conditional `expected_main`) succeed as no-ops. Workspace settings never use this endpoint for replication. |
 | `status-export --wire` | Optional `{repo_id,refresh,resources}` → `{host:{canonical_name,uuid},agents:[...],resources?:{...}}` with roles and optional resource fields. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation. Only `resources:true` opts into server discovery and adds agent `servers` plus host `resources`; `status board` sends both flags. Missing/false `resources` avoids scans for send/policy/recipient lookup and leaves those fields unknown. Plain `status-export [--repo ID]` remains a fresh local export without server discovery. Remote rows are never inserted into local AGENTS. |
 
-The Python settings service is `RepoSettings(store).mutate(repo_id,field,value)`;
-it is reserved for the user settings UI, with **no agent mutation CLI**.
-Fields are `mode` (`off|manual|auto`), `main` (`null` or
-`{host,terminal_id}`), `members` (unique such targets), and `thresholds`
-(`idle_minutes:3,coalesce_seconds:30,wakes_per_hour:6,max_hop:10` defaults).
-Each field independently wins by `(version,origin_host)`; same-version
-different values record the deterministic canonical-name winner and conflict.
-Different fields' concurrent edits survive. `repo show` includes these stamps,
-conflicts and propagation-pending count.
+The Python settings service is
+`RepoSettings(store).show(repo_id,host,workspace_id)` and
+`mutate(repo_id,field,value,*,host=None,workspace_id=None)`, reserved for the user
+Settings UI, with **no agent mutation CLI**. `main` and `members` mutations
+require an explicit local host/workspace scope and reject inactive or
+out-of-scope targets. `main` is `null` or `{host,terminal_id}`; `members` is a
+unique list of those targets. `mode` (`off|manual|auto`) and `thresholds`
+(`idle_minutes:3,coalesce_seconds:30,wakes_per_hour:6,max_hop:10` defaults)
+remain repo-wide, as does read-only `home`.
 
-First enabling a repository creates a version-1 home proposal and immediately
-computes the local auto main; **offline peers do not prevent local use**.
-Only observed concurrent home proposals converge by canonical-name tie order.
-Computed-main publications carry their exact home stamp; stale former-home
-updates are ignored even at a higher version. No global replica/consensus is
-required. Auto default main is exactly one active main-checkout agent on the
-home host; zero/multiple means no main. An explicit main can be on another
-host. Only its own host can publish an exact-stamp conditional close clear;
-stale closes cannot erase a later designation, and SSH failure is not closure.
+`fields(connection,repo_id)` contains only repo-wide fields;
+`workspace_fields(connection,repo_id,host,workspace_id)` reads the local scope.
+`main(connection,repo_id,host,workspace_id)` selects that scope's main;
+`role(agent,connection=None)` is the shared role calculation for runtime,
+status export, sidebar and borders. Replicated fields independently win by
+`(version,origin_host)`; same-version different values record the deterministic
+canonical-name winner and conflict. Different fields' concurrent edits survive.
+Workspace main/member settings stay on their owning host and never enter peer
+publication or repo-wide conflict/member projections. Peers receive each
+agent's authoritative role through origin-host status export.
 
-`--to main` stores the symbolic home route without querying an offline home.
-The home resolves it once on acceptance and retains that resolution, including
-a relay to another host. Responses/receipts/withdrawal follow the saved route.
-Offline home leaves pending mail; an online home with no eligible main returns
-visible `main_unavailable` (failed item, explicit retry after configuration).
+First enabling a repository creates a version-1 home proposal; **offline peers
+do not prevent local use**. Observed concurrent home proposals converge by
+canonical-name tie order. Home is not the authority for workspace roles.
+Main election is derived on read, not stored or published as `computed_main`.
+A valid explicit main must be active in the exact `(repo_id, host, workspace_id)`
+scope. A target that becomes inactive or moves out is ignored without rewriting
+the setting. In auto mode, the sole active agent becomes main; with several,
+exactly one active main-checkout agent becomes main. Otherwise there is none.
+A single agent in a worktree workspace therefore gets its own main role.
+
+`--to main` resolves on the sender's host at send time against the sender's
+current scope and stores the concrete terminal target in the immutable message.
+Missing main produces `main_unresolved` naming the workspace; there is no
+fallback to a repo-global main, another workspace, or an offline home route.
+Receipts and withdrawals follow the saved target. Explicit named mail still
+crosses workspaces within a repository. An already-stored unresolved symbolic
+message uses its recorded sender agent ID, origin host and repo to find the
+sender's local workspace. If that scope cannot be found or has no main, it fails
+visibly with `main_unresolved`, never by silently routing to another scope.
+
+Schema v7 creates local workspace settings. During v6→v7 migration, legacy
+repo-level main/member targets matching active local agents are mapped to each
+agent's current scope; members are grouped by scope. Other hosts migrate their
+own targets independently. Unmappable inactive/unknown local targets are dropped;
+`ledger_meta.workspace_settings_migration_dropped` records JSON
+`[{repo_id,field,target},...]`. Obsolete repo-level `main`, `members`,
+`computed_main` rows and the old `repo_members` / `setting_conditions` tables
+are removed. Protocol remains 1:
+incoming legacy role fields succeed without applying changes, so older peer
+outboxes do not fail permanently. New code publishes only repo-wide settings.
+See [migration guidance](../../../docs/migration.md#workspace-role-migration-schema-v7).
 
 ### Modes, roles, settings and status
 
@@ -295,11 +324,12 @@ hosts may temporarily disagree until settings propagate; there is no home failov
 | Mode | Main | Workers / receiving |
 | --- | --- | --- |
 | `off` | None | No roles or automatic wakes, and no participation-based legacy rejection. Explicit inbox reads and natural user-turn receiving remain allowed. |
-| `manual` | Explicit user-designated terminal, otherwise none | Explicit members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
-| `auto` | Explicit designation first; otherwise exactly one active main-checkout agent at home | All other agents with the same repo ID across registered hosts. Zero/multiple home candidates means no default main. A remote main-checkout agent is not an additional default main. |
+| `manual` | Active explicit user-designated terminal in the same repo/host/workspace, otherwise none | Explicit in-scope members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
+| `auto` | Active in-scope explicit designation first; otherwise the sole active agent; with several, exactly one active main-checkout agent in the scope | All other agents in that scope, even when no main can be selected. Worktree workspaces elect independently; identical workspace IDs on different hosts do not collide. |
 
-The stable terminal slot survives a pane move; a new native session/client/repo
-changes generation. Agents keeps role before the addressable alias. HAM-owned
+The stable terminal slot survives a pane move; roles follow its current scope,
+and displays in both the old and new scopes are refreshed. A new native
+session/client/repo changes generation. Agents keeps role before the addressable alias. HAM-owned
 borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting
 missing parts and preserving manual user renames. Alias precedes summary so
 Herdr's width truncation clips the summary first. `status clear` removes
@@ -467,23 +497,32 @@ Settings (`s`) has exactly seven editable rows:
 | `wakes_per_hour` | Integer 0–10000, default 6 per agent/hour. |
 | `max_hop` | Integer 0–10000, default 10; action above the cap cannot wake. |
 
+Mode and thresholds apply repository-wide. Main/Members rows identify the
+Mailbox opener's workspace on its canonical host, resolved from
+`HERDR_HAM_OPENER_PANE_ID`, rather than the selected agent's workspace. Their
+scope is the full `(repo_id,host,workspace_id)`. All-repositories view retains
+repository selection; without one repo, settings is disabled with an
+explanation. The Main picker includes only active in-scope agents and `(none)`.
+
 ↑/↓ selects a row and Enter edits its value; all mutations require confirmation.
 The overlay's `Target: host/alias` is the selected Agents row: `m` designates it
-main and Space toggles manual membership. Esc closes Settings.
-The four threshold rows edit one
-versioned `thresholds` field, preserving its other values. Home,
-`computed_main`, version/origin stamps, pending propagation and conflict
-records are **intentionally read-only**. Home is the first registration/activation
-proposal, subject to deterministic concurrent proposal convergence, not an omitted
-eighth setting. Offline peers do not block initial local use.
+main and Space toggles manual membership, only if the active target belongs to
+the opener's full settings scope. The service rejects inactive/out-of-scope
+targets. Esc closes Settings. The four threshold rows edit one repo-wide
+versioned `thresholds` field, preserving its other values. Home, computed main,
+version/origin stamps, pending propagation and conflict records are
+**intentionally read-only**. Home is the first registration/activation proposal,
+subject to deterministic concurrent convergence, not an omitted eighth setting.
+Workspace main/member saves do not propagate; offline peers do not block local use.
 
 Only one settings mutation is in flight. **Saving settings** is visible; a
 second save/toggle is rejected, not queued. Wait for completion and retry the
 intended submission. An open edit buffer is retained while its submit is gated.
 Navigation and `q` outside text entry remain responsive. The authoritative
-result is shown immediately and obsolete snapshots are discarded. Conflicts
-show complete wrapped winner/loser values and stamps; a user edit publishes a
-newer version to choose the intended value. PgUp/PgDn expose long metadata;
+result is matched to the full repo/host/workspace scope and shown immediately;
+obsolete or other-scope snapshots cannot overwrite it. Repo-wide conflicts show
+complete wrapped winner/loser values and stamps; a user edit publishes a newer
+version to choose the intended value. PgUp/PgDn expose long metadata;
 NAV `e` shows full diagnostics.
 
 Threads `w` withdraws eligible locally originated mail and `t` retries the selected
@@ -673,6 +712,8 @@ available with narrower semantics.
 Board agent rows preserve the registry fields and include role, turn_state,
 phase, summary, unread, extension_present, client, workspace_id, pane_id,
 generation, is_main_checkout, status_updated_at, last_seen and stale.
+Roles are computed on each agent's origin host for its own host-qualified
+workspace; all-repository/all-host boards do not imply one global main.
 `status_updated_at` is the actual agent status update timestamp, separate from
 registry observation `last_seen`. Rows are stored snapshots, not proof of current
 native activity. The board does not refresh the registry or mutate status,

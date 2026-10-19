@@ -113,6 +113,7 @@ class LedgerDisplayTest(unittest.TestCase):
             {**panes[1], "agent": "codex", "name": "review-worker", "agent_status": "working",
              "agent_session": {"value": "worker-session"}, "cwd": str(self.worktree)},
         ]}
+        self.snapshot = snapshot
         self.registry.reconcile(snapshot, refresh_display=False)
         self.repo_id = self.agent("main")["repo_id"]
         self.display = LedgerDisplay(self.store, runner=self.herdr)
@@ -319,7 +320,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["alias"], "orange-rabbit")
 
-    def test_auto_roles_use_actual_main_and_linked_worktree(self):
+    def test_auto_roles_give_main_and_worktree_workspaces_their_own_main(self):
         self.settings.mutate(self.repo_id, "mode", "auto")
         self.status()
         result = self.display.refresh()
@@ -328,14 +329,14 @@ class LedgerDisplayTest(unittest.TestCase):
         main = self.herdr.metadata["p-main"][SOURCE]
         worker = self.herdr.metadata["p-worker"][SOURCE]
         self.assertEqual(main["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(worker["display_agent"], "[워커] review-worker")
+        self.assertEqual(worker["display_agent"], "[메인] review-worker")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"],
                          {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중", "other": "keep"})
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"],
                          {"alias": "review-worker", "color": "", "recap": "", "other": "keep"})
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
-        self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
+        self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
         for metadata in self.herdr.metadata.values():
             self.assertNotIn("phone", metadata["tokens"])
             self.assertNotIn("emu", metadata["tokens"])
@@ -344,8 +345,10 @@ class LedgerDisplayTest(unittest.TestCase):
     def test_manual_roles_and_off_keep_status_without_role(self):
         self.settings.mutate(self.repo_id, "mode", "manual")
         target = {"host": self.store.host, "terminal_id": "main"}
-        self.settings.mutate(self.repo_id, "main", target)
-        self.settings.mutate(self.repo_id, "members", [{"host": self.store.host, "terminal_id": "worker"}])
+        self.settings.mutate(self.repo_id, "main", target,
+                             host=self.store.host, workspace_id="w-main")
+        self.settings.mutate(self.repo_id, "members", [{"host": self.store.host, "terminal_id": "worker"}],
+                             host=self.store.host, workspace_id="w-worker")
         self.status()
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
@@ -355,6 +358,36 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
+
+    def test_auto_roles_in_shared_workspace_prefer_the_main_checkout(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET workspace_id='w-main' WHERE terminal_id='worker'")
+            connection.execute("UPDATE terminal_slots SET workspace_id='w-main' WHERE terminal_id='worker'")
+        self.settings.mutate(self.repo_id, "mode", "auto")
+        self.display.refresh()
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
+
+    def test_registry_move_redraws_roles_in_both_old_and_new_workspaces(self):
+        snapshot = copy.deepcopy(self.snapshot)
+        for section in ("panes", "agents"):
+            snapshot[section][1]["workspace_id"] = "w-main"
+        self.registry.reconcile(snapshot, refresh_display=False)
+        self.settings.mutate(self.repo_id, "mode", "auto")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        identities = {agent["terminal_id"]: (agent["agent_id"], agent["generation"])
+                      for agent in self.registry.list()}
+        for section in ("panes", "agents"):
+            snapshot[section][0]["workspace_id"] = "w-moved"
+        with mock.patch("ledger_status.live_snapshot", return_value=snapshot):
+            self.registry.refresh()
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[메인] review-worker")
+        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit")
+        self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
+        self.assertEqual({agent["terminal_id"]: (agent["agent_id"], agent["generation"])
+                          for agent in self.registry.list()}, identities)
 
     def test_manual_border_is_not_captured_even_when_equal_to_summary(self):
         self.status()

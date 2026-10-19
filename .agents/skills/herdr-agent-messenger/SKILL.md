@@ -7,11 +7,11 @@ description: Use HAM (Herdr Agent Messenger) for durable same-repository agent m
 
 ## Choose the operation
 
-- **Existing same-repository collaborator:** inspect `repo show` and `list`, copy the exact address, then `mail send`. Mail does not steer an ongoing turn. `--to main` needs user-configured home/main.
+- **Existing same-repository collaborator:** inspect `repo show` and `list`, copy the exact address, then `mail send`. Mail does not steer an ongoing turn. `--to main` resolves the sender's current host-qualified workspace main at send time and stores a concrete target; no main means a visible failure, never a repo-home or other-workspace fallback.
 - **New session, only when asked:** one `spawn --message TEXT` or `spawn --message-file PATH` submits the first prompt after readiness; never follow with a separate legacy request. Missing labels are errors, not permission to guess/spawn. Raw `herdr agent start` bypasses HAM records.
 - **Receive or finish work:** `inbox read` is view-only. At a useful work boundary, inspect relevant messages, perform the work, then explicitly `inbox handle --message UUID`. A useful reply uses `mail send --reply-to UUID`; a receipt alone needs no reply. Do not create acknowledgement loops or token-spending polling loops.
 - **Several collaborators:** verify each recipient and assign non-overlapping work with separate tailored `mail send` operations. HAM stores messages; it does not split tasks or verify answers.
-- **Nonparticipating legacy traffic:** `request` / `send` / `batch` remain available where permitted. Manual/auto participating same-repo pairs get `use_mailbox`; never bypass it. Batch preflights all targets; any lookup/refusal prevents all submissions.
+- **Nonparticipating legacy traffic:** `request` / `send` / `batch` remain available where permitted. Manual/auto participating same-repo pairs get `use_mailbox`, with each endpoint's role determined in its own workspace; never bypass it. Batch preflights all targets; any lookup/refusal prevents all submissions.
 
 Use bundled `scripts/herdr_agent_messenger.py` relative to this skill directory, or its absolute path, not reconstructed SSH. Agent operations use verified stable terminal/session identity after pane moves, not an inherited pane ID alone. Never guess labels. Legacy transport uses literal `local` or concrete configured SSH aliases; mail also accepts registered canonical hosts.
 
@@ -108,7 +108,11 @@ No message flag means session creation only. Otherwise immutable target/body and
 
 ## Modes, receiving, and truth boundaries
 
-Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only. Repos first seen by HAM from this version default to `auto` (including host-local `local:` repos): all same-repo agents participate, eligible queued action mail may auto-start an OMP turn, and same-repo legacy `send`/`request`/`batch` must use mail. Already-known repos preserve settings; missing mode stays `off` until changed. Reads never seed defaults. `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt. `manual` uses designated main/workers; nonmembers cannot wake. `auto` prefers explicit main; otherwise exactly one active home main-checkout agent becomes main. Zero/multiple means none; other same-repo agents across registered hosts are workers. Home is fixed by registration/activation and concurrent proposal convergence, not agent-editable.
+Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only and exposes the caller's host/workspace, scoped main/members and repo-wide mode. Repos first seen by HAM from this version default to `auto` (including host-local `local:` repos): all same-repo agents participate, eligible queued action mail may auto-start an OMP turn, and same-repo legacy `send`/`request`/`batch` must use mail. Already-known repos preserve settings; missing mode stays `off` until changed. Reads never seed defaults. `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt.
+
+Mode and thresholds are repo-wide; main/workers are scoped by `(repo_id, canonical host, Herdr workspace_id)`. Worktree workspaces get their own main. `manual` uses an active in-scope explicit main and selected in-scope workers, excluding main; nonmembers cannot wake. `auto` prefers an active in-scope explicit main, otherwise the single active agent, otherwise exactly one active main-checkout agent in that scope. If none is unique, there is no main; all other in-scope auto agents are workers. Inactive or moved-out explicit targets are ignored on read, without rewriting the setting. Home remains read-only and converges by canonical-host proposal order; it does not choose workspace mains.
+
+Workspace main/member settings stay host-local, never replicated; peers receive roles through origin-host status export. Schema v7 maps active local legacy role targets to their current workspace scopes and deletes old repo-wide main/members/computed-main rows. Protocol 1 is unchanged: legacy role-setting payloads succeed as no-ops; home/mode/thresholds still replicate.
 
 - **OMP:** opt-in root receiver. Action wake needs supported TUI empty editor, quiet/idle input, no pending work, eligible membership and coalescing/hour/hop guards. Uses agent-attributed `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves exact same-session active-branch journal acceptance, not provider success.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. Native ACK needs exact SDK context + fresh request correlation (`claude:api-request:`), or typed hook bytes/hash + causal native witness (`claude:accepted-journal:`). The latter proves host-context application, not exact provider-wire bytes, attestation or understanding. Stdout alone is not delivery. Bounded live SessionStart/no-wake observations exclude provider success and cold-unreported binding CAS (unit-only); see reference for limits and safe-launcher notes.
@@ -124,8 +128,10 @@ requested kitty keyboard protocol through herdr in compatible terminals.
 Alt+Enter is the Moshi/mosh fallback; Ctrl+J is not a newline key.
 `HAM_MAILBOX_NO_KITTY=1` disables the protocol request. Esc preserves the draft;
 Ctrl+D toggles direct input with confirmation. `?` opens NAV help; F1 does so
-while typing; `e` shows diagnostics. Settings (`s`) uses the selected Agents row:
-`m` sets main, Space toggles membership, each with confirmation.
+while typing; `e` shows diagnostics. Settings (`s`) edits repo-wide Mode/Thresholds
+and the opener's host-qualified workspace Main/Members. `m` sets the selected
+Agents row as main and Space toggles membership, each with confirmation, only
+for active targets in that same scope. Out-of-scope targets are rejected.
 Threads `w`/`t`/`a`/`n` confirms exact targets; `a`/`n` first requires evidence.
 Agents groups by host, marks stale unread `?`, and shows one summary line.
 Detail auto-previews full fields and separate status/observation timestamps.

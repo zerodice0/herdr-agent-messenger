@@ -207,6 +207,25 @@ def close_owned(environment: Mapping[str, str]) -> bool:
     return True
 
 
+def settings_scope(store: LedgerStore, repo_id: str | None,
+                   environment: Mapping[str, str]) -> dict[str, Any]:
+    """Resolve the opener's current host-local workspace, never the selected agent's."""
+    pane_id = environment.get(OPENER_PANE)
+    terminal_id = environment.get(OPENER_TERMINAL)
+    workspace_id = None
+    if pane_id or terminal_id:
+        with store.read() as connection:
+            for table, condition in (("agents", "active=1"), ("terminal_slots", "present=1")):
+                row = connection.execute(
+                    f"SELECT workspace_id FROM {table} WHERE host=? AND {condition} AND "
+                    + ("terminal_id=?" if terminal_id else "pane_id=?"),
+                    (store.host, terminal_id or pane_id)).fetchone()
+                if row is not None:
+                    workspace_id = row["workspace_id"]
+                    break
+    return {"repo_id": repo_id, "host": store.host, "workspace_id": workspace_id}
+
+
 def local_snapshot(store: LedgerStore, repo_id: str | None,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     settings = RepoSettings(store)
@@ -226,8 +245,12 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
     mail = Mailbox(store)
     snapshot = {"host": store.host, "agents": agents, "threads": mail.list_threads(repo_id)["threads"],
                 "submissions": mail.list_direct(repo_id)["submissions"],
-                "settings": settings.show(repo_id) if repo_id else None,
+                "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ),
+                "settings": None,
                 "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
+    scope = snapshot["scope"]
+    if repo_id and scope["workspace_id"]:
+        snapshot["settings"] = settings.show(repo_id, scope["host"], scope["workspace_id"])
     host = next((item for item in board.get("hosts", []) if item["host"] == store.host), {})
     if "resources" in host:
         snapshot["resources"] = host["resources"]
@@ -314,7 +337,13 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
         return dispatch_direct(store, request["recipient"], request["body"], environment,
                                subject=request.get("subject") or "")
     if operation == "setting":
-        result = RepoSettings(store).mutate(repo_id, request["field"], request["value"])
+        scope = settings_scope(store, repo_id, environment)
+        if not repo_id or not scope["workspace_id"] or request.get("scope") != scope:
+            raise LedgerError("invalid_settings_scope",
+                              "Settings scope changed or the opener workspace is unavailable; reload Settings.")
+        settings = RepoSettings(store)
+        result = settings.mutate(repo_id, request["field"], request["value"],
+                                 host=scope["host"], workspace_id=scope["workspace_id"])
         from ledger_display import LedgerDisplay
         result["display"] = LedgerDisplay(store).refresh()
         return maintain(store, result, environment)
@@ -533,7 +562,8 @@ class MailboxApp:
         self.settings_picker: dict[str, Any] | None = None
         self.settings_numeric: dict[str, Any] | None = None
         self.settings_results: dict[str, str] = {}
-        self.settings_saving: str | None = None
+        self.settings_context = settings_scope(self.store, self.repo_id, self.environment)
+        self.settings_saving: dict[str, Any] | None = None
         self.help_return = "nav"
         self.overlay_scroll = 0
         self.cursor_position: tuple[int, int] | None = None
@@ -560,8 +590,10 @@ class MailboxApp:
             if key == "mutation":
                 self.set_status("An operation is pending; this input has not been submitted.", "error")
             return False
-        self.jobs[key] = self.job_factory({"operation": operation, "repo_id": self.repo_id, **values},
-                                         self.environment)
+        request = {"operation": operation, "repo_id": self.repo_id, **values}
+        if operation in {"snapshot", "setting"}:
+            request.setdefault("scope", self.current_settings_scope())
+        self.jobs[key] = self.job_factory(request, self.environment)
         return True
 
     @staticmethod
@@ -704,6 +736,8 @@ class MailboxApp:
                     self.set_status(f"Local ledger: {error.get('code')}: {error.get('message')}", "error")
                 else:
                     self.local = value
+                    if not self.matches_settings_scope(self.local.get("settings")):
+                        self.local["settings"] = None
                     peers = {peer["canonical_name"] for peer in value.get("peers", [])}
                     for cache in (self.remote, self.remote_errors, self.remote_due):
                         for host in list(cache):
@@ -713,9 +747,12 @@ class MailboxApp:
                         if pending.startswith("remote:") and pending.split(":", 1)[1] not in peers:
                             self.jobs.pop(pending).close()
             else:
-                if job.operation == "setting" and self.settings_saving:
-                    self.settings_results[self.settings_saving] = (
-                        f"✕ {error.get('code')}: {error.get('message')}" if error else "Saved.")
+                saving = self.settings_saving if job.operation == "setting" else None
+                if saving:
+                    if saving["scope"] == self.current_settings_scope():
+                        self.settings_results[saving["field"]] = (
+                            f"✕ {error.get('code')}: {error.get('message')}" if error else
+                            "Saved." if self.matches_settings_scope(value) else "Settings scope changed; reloading…")
                     self.settings_saving = None
                 if job.operation in {"send", "direct"}:
                     self.finish_send(value, error)
@@ -727,7 +764,8 @@ class MailboxApp:
                         snapshot = self.jobs.pop("snapshot", None)
                         if snapshot is not None:
                             snapshot.close()
-                        self.local["settings"] = value
+                        if self.matches_settings_scope(value):
+                            self.local["settings"] = value
                 if self.running:
                     self.start_job("snapshot", "snapshot")
             self.refresh_detail(identities)
@@ -943,8 +981,48 @@ class MailboxApp:
             else:
                 self.set_status("Select a pending or failed outbox item to retry.", "error")
 
+    def current_settings_scope(self) -> dict[str, Any]:
+        scope = settings_scope(self.store, self.repo_id, self.environment)
+        if scope != self.settings_context:
+            self.settings_context = scope
+            self.settings_pending.clear()
+            self.settings_picker = None
+            self.settings_numeric = None
+            self.settings_results.clear()
+        return scope
+
+    def matches_settings_scope(self, settings: Mapping[str, Any] | None) -> bool:
+        return bool(settings) and all(settings.get(key) == value
+                                      for key, value in self.current_settings_scope().items())
+
+    def settings_agent_in_scope(self, agent: Mapping[str, Any]) -> bool:
+        scope = self.current_settings_scope()
+        return (all(agent.get(key) == scope[key] for key in ("repo_id", "host", "workspace_id"))
+                and not agent.get("stale") and agent.get("active", True))
+
+    def configured_members_in_scope(self) -> list[dict[str, Any]]:
+        scope = self.current_settings_scope()
+        known = {self.identity(agent): agent for agent in self.agents()}
+        members = []
+        for target in self.setting_value("members") or []:
+            agent = known.get((target["host"], target["terminal_id"]))
+            if (target["host"] == scope["host"] and
+                    (agent is None or all(agent.get(key) == scope[key]
+                                          for key in ("repo_id", "host", "workspace_id")))):
+                members.append(target)
+        return members
+
+    def setting_label(self, field: str) -> str:
+        scope = self.current_settings_scope()
+        if field in {"main", "members"}:
+            return f"{field.title()} (workspace {scope['workspace_id'] or 'unavailable'} @ {scope['host']})"
+        return f"{field} (repo-wide)" if field == "mode" else field
+
     def setting_value(self, field: str) -> Any:
+        self.current_settings_scope()
         settings = self.local.get("settings") or {}
+        if not self.matches_settings_scope(settings):
+            settings = {}
         fields = settings.get("settings", {})
         if field == "mode":
             return settings.get("mode", "off")
@@ -955,7 +1033,9 @@ class MailboxApp:
     def settings_ready(self, field: str) -> bool:
         if not self.repo_id:
             message = "Select an agent to choose a repository first."
-        elif (self.local.get("settings") or {}).get("repo_id") != self.repo_id:
+        elif not self.current_settings_scope()["workspace_id"]:
+            message = "The opener workspace is unavailable. Reopen Mailbox from a live workspace pane."
+        elif not self.matches_settings_scope(self.local.get("settings")):
             message = "Loading settings…"
             self.start_job("snapshot", "snapshot")
         else:
@@ -964,7 +1044,10 @@ class MailboxApp:
         self.set_status(message, "error" if not self.repo_id else "info")
         return False
 
-    def save_setting(self, field: str, value: Any) -> bool:
+    def save_setting(self, field: str, value: Any, scope: Mapping[str, Any] | None = None) -> bool:
+        if scope is not None and dict(scope) != self.current_settings_scope():
+            self.set_status("Settings scope changed; reopen the picker or confirmation.", "error")
+            return False
         if not self.settings_ready(field):
             return False
         if "mutation" in self.jobs:
@@ -979,21 +1062,21 @@ class MailboxApp:
             save_value[field] = value
         if not self.start_job("mutation", "setting", field=save_field, value=save_value):
             return False
-        self.settings_saving = field
+        self.settings_saving = {"field": field, "scope": dict(self.current_settings_scope())}
         self.settings_results[field] = "Saving settings…"
         self.settings_pending.pop(field, None)
         return True
 
     def open_settings_picker(self, field: str) -> None:
-        current = self.setting_value(field)
+        current = self.configured_members_in_scope() if field == "members" else self.setting_value(field)
         if field == "mode":
             entries = [
                 ("off · No main or worker roles.", "off"),
                 ("manual · Explicit main and checked members only.", "manual"),
-                ("auto · Other agents are workers; infer the sole home main-checkout agent unless set.", "auto"),
+                ("auto · Infer this workspace's sole agent or unique main-checkout agent; others are workers.", "auto"),
             ]
         else:
-            agents = self.agents()
+            agents = [agent for agent in self.agents() if self.settings_agent_in_scope(agent)]
             entries = [("(none)", None)] if field == "main" else []
             for agent in agents:
                 if not agent.get("stale"):
@@ -1001,18 +1084,24 @@ class MailboxApp:
                                     {name: agent[name] for name in ("host", "terminal_id")}))
             if field == "members":
                 live = [value for _label, value in entries]
+                known = self.agents()
                 for target in current or []:
+                    agent = next((agent for agent in known
+                                  if self.identity(agent) == (target["host"], target["terminal_id"])), None)
                     if target not in live:
-                        agent = next((agent for agent in agents
-                                      if self.identity(agent) == (target["host"], target["terminal_id"])), target)
-                        entries.append((f"{self.address(agent)} · stale", target))
+                        entries.append((f"{self.address(agent or target)} · stale", target))
         selection = next((index for index, (_label, value) in enumerate(entries)
                           if value == current), 0)
         self.settings_picker = {"field": field, "entries": entries, "selection": selection,
-                                "checked": list(current or []) if field == "members" else []}
+                                "scope": dict(self.current_settings_scope()),
+                                "checked": [value for _label, value in entries if value in (current or [])]
+                                if field == "members" else []}
         self.overlay_scroll = 0
 
     def settings_picker_key(self, key: Any) -> None:
+        self.current_settings_scope()
+        if self.settings_picker is None:
+            return
         picker = self.settings_picker
         assert picker is not None
         entries = picker["entries"]
@@ -1038,7 +1127,7 @@ class MailboxApp:
             checked.remove(target) if target in checked else checked.append(target)
         elif key == "\r":
             value = picker["checked"] if picker["field"] == "members" else entries[picker["selection"]][1]
-            if self.save_setting(picker["field"], value):
+            if self.save_setting(picker["field"], value, picker["scope"]):
                 self.settings_picker = None
                 self.overlay_scroll = 0
 
@@ -1059,10 +1148,11 @@ class MailboxApp:
             self.settings_pending.pop(field, None)
         else:
             self.settings_pending[field] = value
-        if self.settings_saving != field:
+        if not self.settings_saving or self.settings_saving["field"] != field:
             self.settings_results.pop(field, None)
 
     def settings_key(self, key: Any) -> None:
+        self.current_settings_scope()
         if self.settings_picker is not None:
             self.settings_picker_key(key)
             return
@@ -1075,7 +1165,7 @@ class MailboxApp:
                 text = numeric["text"]
                 if not text or len(text) > 5 or not 0 <= int(text) <= 10000:
                     self.settings_results[field] = "Enter a number from 0 to 10000."
-                elif self.save_setting(field, int(text)):
+                elif self.save_setting(field, int(text), numeric["scope"]):
                     self.settings_numeric = None
             elif isinstance(key, str) and len(key) == 1 and "0" <= key <= "9":
                 numeric["text"], numeric["cursor"], _ = edit_buffer(
@@ -1105,28 +1195,30 @@ class MailboxApp:
             return
         if key in ("m", " "):
             agent = self.selected("agents")
-            if not agent or agent["repo_id"] != self.repo_id or agent.get("stale"):
-                self.set_status("Choose a live, non-stale agent in this repository first.", "error")
+            if not agent or not self.settings_agent_in_scope(agent):
+                self.set_status("Choose a live agent in the opener's workspace on this host first.", "error")
                 return
             target = {name: agent[name] for name in ("host", "terminal_id")}
             field, value = "main", target
             if key == " ":
-                field, value = "members", list(self.setting_value("members") or [])
+                field, value = "members", self.configured_members_in_scope()
                 value.remove(target) if target in value else value.append(target)
             if "mutation" in self.jobs:
                 self.settings_results[field] = "An operation is pending; this setting has not been submitted."
                 self.set_status(self.settings_results[field], "error")
                 return
-            self.open_confirm(f"Change {field}?", [f"Target: {self.address(agent)}",
+            self.open_confirm(f"Change {self.setting_label(field)}?", [f"Target: {self.address(agent)}",
                               json.dumps(value, ensure_ascii=False)], "setting",
-                              {"field": field, "value": value}, return_mode="settings")
+                              {"field": field, "value": value, "scope": dict(self.current_settings_scope())},
+                              return_mode="settings")
         elif field in self.settings_pending:
             self.save_setting(field, self.settings_pending[field])
         elif field in {"mode", "main", "members"}:
             self.open_settings_picker(field)
         elif not self.settings_pending:
             text = str(self.setting_value(field))
-            self.settings_numeric = {"field": field, "text": text, "cursor": len(text)}
+            self.settings_numeric = {"field": field, "text": text, "cursor": len(text),
+                                     "scope": dict(self.current_settings_scope())}
 
     def settings_mouse(self, event: key_input.MouseEvent, hits: list[Any]) -> None:
         if event.action in {"wheel_up", "wheel_down"}:
@@ -2191,12 +2283,15 @@ class MailboxApp:
             self.cursor_position = y + row - first, x + min(width - 1, column)
 
     def settings_lines(self) -> list[str]:
+        self.current_settings_scope()
         settings = self.local.get("settings") or {}
+        if not self.matches_settings_scope(settings):
+            settings = {}
         fields = settings.get("settings", {})
         picker = self.settings_picker
         if picker is not None:
             field = picker["field"]
-            result = [field + " · " + ("Space/click toggles; Enter saves" if field == "members" else
+            result = [self.setting_label(field) + " · " + ("Space/click toggles; Enter saves" if field == "members" else
                                       "Enter/click saves") +
                       (" · " + self.settings_results[field] if field in self.settings_results else "")]
             for index, (label, value) in enumerate(picker["entries"]):
@@ -2204,7 +2299,9 @@ class MailboxApp:
                     "●" if value == self.setting_value(field) else "○")
                 result.append(("▌ " if index == picker["selection"] else "  ") + marker + " " + label)
             return result
-        result = [f"Target: {self.address(self.selected('agents'))}"]
+        scope = self.current_settings_scope()
+        result = [f"Target: repository {self.repo_id or '(select an agent first)'} · "
+                  f"workspace {scope['workspace_id'] or 'unavailable'} @ {scope['host']}"]
         for index, field in enumerate(self.SETTINGS):
             value = self.settings_pending.get(field, self.setting_value(field))
             if field in DEFAULT_THRESHOLDS:
@@ -2219,13 +2316,14 @@ class MailboxApp:
             if numeric is not None and numeric["field"] == field:
                 shown = "> " + numeric["text"] + "  (digits only)"
             feedback = self.settings_results.get(field, "")
-            if self.settings_saving == field and not feedback.startswith("Saving settings"):
+            if (self.settings_saving and self.settings_saving["field"] == field
+                    and self.settings_saving["scope"] == scope and not feedback.startswith("Saving settings")):
                 feedback = "Saving settings… · " + feedback
-            result.append(("▌ " if index == self.settings_selection else "  ") + f"{field}: {shown}" +
+            result.append(("▌ " if index == self.settings_selection else "  ") + f"{self.setting_label(field)}: {shown}" +
                           (" · unsaved" if field in self.settings_pending else "") +
                           (" · " + feedback if feedback else ""))
         result.extend([f"home: {settings.get('home_host') or 'unset'}",
-                       f"computed main: {json.dumps(fields.get('computed_main', {}).get('value'), ensure_ascii=False)}",
+                       f"computed main: {json.dumps(settings.get('computed_main'), ensure_ascii=False)}",
                        f"propagation pending: {settings.get('propagation_pending', 0)}"])
         for field, data in fields.items():
             result.append(f"{field} v{data.get('version', '—')} @ {data.get('origin_host', '—')}")
@@ -2427,7 +2525,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_id = repository_identity(cwd, store.host)["repo_id"]
             return 0 if agent_messenger.launch_plugin_popup(
                 "mailbox-popup", width=120, height=36, environment=values,
-                extra_arguments=["--env", f"{REPO_ENV}={repo_id}"]) else 1
+                extra_arguments=["--env", f"{REPO_ENV}={repo_id}",
+                                 "--env", f"{OPENER_PANE}={opener_id}",
+                                 "--env", f"{OPENER_TERMINAL}={opener['terminal_id']}"]) else 1
         if arguments.command == "job":
             result = execute_job(json.load(sys.stdin), values)
             print(json.dumps(result, ensure_ascii=False))

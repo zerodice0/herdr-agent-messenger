@@ -271,13 +271,20 @@ stale 점유 정리, 토큰 쓰기를 하지 않습니다. 에이전트 JSON에�
 적용하지만 설정을 다른 호스트로 전파하지 않습니다. 읽기 전용 명령은 참여 설정을
 초기화하지 않습니다.
 
+모드와 깨우기 임곗값은 저장소 전체에 적용합니다. main과 worker 구성원은
+`(repo_id, 정규 호스트, Herdr workspace_id)`별로 정합니다. worktree workspace도
+메인 체크아웃 workspace의 조정자를 따르지 않고 자체 main을 가집니다.
+workspace 설정은 해당 호스트에만 저장하며 복제하지 않습니다. peer는 상태
+내보내기를 통해 각 에이전트의 역할을 해당 호스트에서 받아 봅니다.
+
 | 모드 | 역할과 자동 동작 |
 | --- | --- |
 | `off` | 역할, 자동 턴 시작, 참여 정책에 따른 기존 전송 거부가 없습니다. 명시적 받은 메일 조회와 일반 사용자 턴 경계에서의 수신은 가능합니다. |
-| `manual` | 명시적으로 선택한 main이 협업을 조율하고, 선택한 멤버는 main을 제외하고 worker가 됩니다. 비멤버도 일반 턴 경계에서 수신할 수 있지만 자동으로 턴을 시작하지 않습니다. |
-| `auto` | 명시적 main 지정이 우선합니다. 지정이 없으면 저장소 home의 메인 체크아웃에서 활성 에이전트가 정확히 하나일 때만 main이 됩니다. 후보가 없거나 여럿이면 자동 main은 없습니다. 그 밖의 모든 호스트에 있는 같은 저장소의 에이전트는 worker가 됩니다. |
+| `manual` | 해당 workspace 안의 활성 에이전트를 명시적 main으로 지정하며, 선택한 구성원 중 main을 제외한 에이전트가 worker가 됩니다. 비멤버도 일반 턴 경계에서 수신할 수 있지만 자동으로 턴을 시작하지 않습니다. |
+| `auto` | 해당 workspace 안의 활성 에이전트를 지정한 명시적 main이 우선합니다. 지정이 유효하지 않으면 활성 에이전트가 하나일 때 그 에이전트가 main이 됩니다. 여럿이면 저장소의 메인 체크아웃에 있는 에이전트가 정확히 하나일 때만 main이 됩니다. 그 외에는 main이 없으며, main 유무와 관계없이 같은 범위의 나머지 에이전트는 worker가 됩니다. |
 
-HAM 소유 pane 테두리는 `[메인] alias · summary` 또는 `[워커] alias · summary`로
+사이드바와 HAM 소유 pane 테두리는 각 에이전트의 현재 호스트·workspace 범위에
+따른 역할을 표시합니다. 테두리는 `[메인] alias · summary` 또는 `[워커] alias · summary`로
 표시합니다. 역할이나 요약이 없으면 해당 부분을 생략합니다. 별칭을 요약 앞에 두므로
 Herdr가 긴 내용을 잘라도 별칭보다 요약이 먼저 잘립니다. `status clear`는 phase와
 summary만 지우고 별칭과 현재 역할은 유지합니다. 사용자가 직접 지정한 테두리는
@@ -295,14 +302,21 @@ pane을 옮겨도 슬롯은 유지됩니다. 이전 세대의 불확실한 claim
 ### 원격 전송과 수신 런타임
 
 수신자는 `local/LABEL`, `CANONICAL_HOST/LABEL`, 등록된 `SSH_ALIAS/LABEL`,
-또는 `main`으로 지정합니다. home은 `main`을 한 번만 해석합니다. home이
-오프라인이면 저장된 대체 대상을 쓰지 않고 메일을 pending 상태로 유지합니다.
-각 호스트에서 `ledger setup --name HOST`로 정체성을 고정한 뒤 양쪽에서
+또는 `main`으로 지정합니다. `--to main`은 보낼 때 송신 호스트에서 송신자의
+현재 workspace main을 찾아 구체적인 terminal 대상을 저장합니다. 해당 범위에
+main이 없으면 명확한 오류로 실패하며 다른 workspace나 저장소 home으로
+대체하지 않습니다. 주소를 명시한 메일은 같은 저장소의 다른 workspace에도
+보낼 수 있습니다. 각 호스트에서 `ledger setup --name HOST`로 정체성을 고정한 뒤 양쪽에서
 `ledger peer add --ssh-alias ALIAS`로 연결을 등록합니다. 전송 상태는
 `ledger doctor`와 `ledger outbox`로 확인합니다. 모델을 호출하지 않는 독립
 flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. 영구 오류는
 명시적으로 재시도할 수 있도록 표시됩니다. 모델 폴링이나 데이터베이스 복제는
 하지 않습니다.
+
+원장 스키마 v7은 기존 main·members의 활성 로컬 대상을 현재 workspace 범위로
+옮기고 저장소 단위의 옛 역할 설정을 제거합니다. 프로토콜은 1을 유지하며,
+이전 peer가 보내는 `main`·`members`·`computed_main` 설정은 적용하지 않고
+성공으로 응답합니다. [마이그레이션 안내](docs/ko/migration.md#workspace-역할-마이그레이션스키마-v7)를 참고하세요.
 
 스킬 설치는 수신 런타임을 설치하지 **않습니다**. 각 호스트에서 별도로
 `runtime install omp` 또는 `runtime install claude`를 선택해 실행합니다.
