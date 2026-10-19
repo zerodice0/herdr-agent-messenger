@@ -384,11 +384,13 @@ peer omitting any one field reports unknown (`?`) only for that field, not empty
 or zero. The strict wire envelope is unchanged; resources live inside payload.
 
 Board/TUI resource reads never refresh registry/status/display/claims or prune
-stale claims. Agents shows compact counts (`📱1 🤖1 🌐2`, ASCII `P1 E1 S2`
-without color), dropping the column at narrow widths. Detail has Devices and
-Servers sections; host headers summarize dead/unowned/stale-device counts.
-Missing fields show `?`, known-empty lists show none, and resource errors remain
-visible. This listing does not claim servers or change device ownership.
+stale claims. Agents shows right-aligned PHN/EMU/SRV columns for phone, emulator,
+and server counts at 70 inner columns or wider, before the flexible summary.
+Zeros show a dim `·`; missing fields independently show `?`. Host group labels
+retain the agent count and show nonzero or unknown dead/unowned/stale-device
+findings, truncating findings first. Detail has unchanged Devices and Servers
+sections; known-empty lists show none and resource errors remain visible.
+This listing does not claim servers or change device ownership.
 
 ### Mailbox TUI and operator recovery
 

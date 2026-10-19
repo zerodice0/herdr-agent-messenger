@@ -560,21 +560,23 @@ class MailboxApp:
                          if item["host"] == host and item["uuid"] == peer["uuid"]), None)
         return None
 
-    def resource_cue(self, agent: Mapping[str, Any]) -> str:
+    @staticmethod
+    def resource_counts(agent: Mapping[str, Any]) -> dict[str, str]:
         devices, servers = agent.get("devices"), agent.get("servers")
-        counts = ["?" if devices is None else str(sum(row.get("kind") == kind for row in devices))
-                  for kind in ("phone", "emu")]
-        counts.append("?" if servers is None else str(len(servers)))
-        glyphs = ("📱", "🤖", "🌐") if self.colors_enabled and "NO_COLOR" not in self.environment else ("P", "E", "S")
-        return " ".join(glyph + count for glyph, count in zip(glyphs, counts))
+        counts = {name: "?" if devices is None else str(sum(row.get("kind") == kind for row in devices))
+                  for name, kind in (("phone", "phone"), ("emu", "emu"))}
+        counts["server"] = "?" if servers is None else str(len(servers))
+        return {name: "·" if count == "0" else count for name, count in counts.items()}
 
-    def host_resource_cue(self, host: str, *, compact: bool = False) -> str:
+    def host_resource_cue(self, host: str) -> str:
         resources = self.host_resources(host) or {}
-        labels = ("D", "U", "X") if compact else ("dead", "unowned", "stale-dev")
-        counts = ["?" if resources.get(key) is None else str(len(resources[key]))
-                  for key in ("dead_serve", "servers_unowned", "stale_devices")]
-        cue = " ".join(label + ":" + count for label, count in zip(labels, counts))
-        return cue + (" !" if resources.get("error") else "")
+        findings = [label + " " + ("?" if resources.get(key) is None else str(len(resources[key])))
+                    for label, key in (("dead", "dead_serve"), ("unowned", "servers_unowned"),
+                                       ("stale-dev", "stale_devices"))
+                    if resources.get(key) is None or resources[key]]
+        if resources.get("error"):
+            findings.append("!")
+        return " · ".join(findings)
 
     @staticmethod
     def thread_handled(item: Mapping[str, Any]) -> bool:
@@ -1530,16 +1532,17 @@ class MailboxApp:
 
     @staticmethod
     def agent_columns(width: int) -> list[tuple[str, int, bool]]:
-        # The same cell widths drive the header and each row, including CJK aliases.
+        # Separators occupy one display cell; summary always gets the remainder.
         columns = [("marker", 1, False), ("turn", 10, False),
                    ("alias", max(1, width - 21), False),
                    ("mail", 4, True), ("rx", 2, False)]
         if width >= 55:
             columns[2] = ("alias", 14, False)
-            columns.extend([("role", 7, False), ("summary", width - 44, False)])
-        if width >= 78:
-            columns[-1] = ("summary", width - 59, False)
-            columns.append(("resources", 14, False))
+            columns.append(("role", 7, False))
+            if width >= 70:
+                columns.extend((name, 3, True) for name in ("phone", "emu", "server"))
+            used = sum(size for _, size, _ in columns) + len(columns)
+            columns.append(("summary", width - used, False))
         return columns
 
     def column_text(self, values: Mapping[str, str], columns: list[tuple[str, int, bool]]) -> str:
@@ -1548,7 +1551,7 @@ class MailboxApp:
             value = truncate_display_text(values.get(name, ""), width)
             parts.append((" " * max(0, width - display_width(value)) + value) if right else
                          pad_display_text(value, width))
-        return " ".join(parts)
+        return "│".join(parts)
 
     def render_table_header(self, y: int, x: int, text: str, width: int) -> None:
         text = truncate_display_text(text, width)
@@ -1586,9 +1589,23 @@ class MailboxApp:
         if height <= 0 or width <= 0:
             return
         columns = self.agent_columns(width)
-        self.render_table_header(y, x, self.column_text(
-            {"alias": "ALIAS", "turn": "TURN", "mail": "MAIL", "rx": "RX",
-             "role": "ROLE", "summary": "PHASE · SUMMARY", "resources": "RESOURCES"}, columns), width)
+        offset = 0
+        boundaries = []
+        headers = {"alias": "ALIAS", "turn": "  TURN", "mail": "MAIL", "rx": "RX",
+                   "role": "ROLE", "phone": "PHN", "emu": "EMU", "server": "SRV",
+                   "summary": "PHASE · SUMMARY"}
+        for name, size, right in columns:
+            label = truncate_display_text(headers.get(name, ""), size)
+            label = label.rjust(size) if right else pad_display_text(label, size)
+            self.render_table_header(y, x + offset, label, size)
+            offset += size
+            if offset < width:
+                boundaries.append(offset)
+                self.put(y, x + offset, "│", curses.A_DIM)
+                offset += 1
+        if height > 1:
+            rule = "┼".join("─" * size for _, size, _ in columns)
+            self.put(y + 1, x, truncate_display_text(rule, width), curses.A_DIM)
         agents = self.agents()
         lines: list[tuple[str, int, int, bool]] = []
         hosts = list(dict.fromkeys([agent["host"] for agent in agents] +
@@ -1601,13 +1618,15 @@ class MailboxApp:
         for host in hosts:
             group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
             stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
-            label = f"─ {host} · {len(group)} agents · {self.host_resource_cue(host)}"
-            if display_width(label) + 1 > width:
-                label = f"─ {host} · {self.host_resource_cue(host, compact=True)}"
-            label += " · ⚠ stale" if stale else ""
-            label = truncate_display_text(label + " ", width)
-            lines.append((label + "─" * max(0, width - display_width(label)),
-                          -1, curses.A_BOLD, False))
+            count = f"{len(group)} {'agent' if len(group) == 1 else 'agents'}"
+            host_width = max(0, width - display_width(" · " + count))
+            label = truncate_display_text(host, host_width) + " · " + count
+            findings = self.host_resource_cue(host)
+            if stale:
+                findings = "stale" + (" · " + findings if findings else "")
+            if findings and display_width(label) + 3 < width:
+                label += " · " + truncate_display_text(findings, width - display_width(label) - 3)
+            lines.append((label, -1, curses.A_BOLD | curses.A_DIM, False))
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
             for index, agent in group:
@@ -1619,33 +1638,41 @@ class MailboxApp:
                 rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
                 values = {"marker": marker, "alias": agent.get("alias") or agent["terminal_id"],
                           "turn": glyph + " " + turn, "mail": str("?" if agent.get("stale") else agent.get("unread", "?")),
-                          "rx": rx, "role": agent.get("role") or "—", "resources": self.resource_cue(agent),
+                          "rx": rx, "role": agent.get("role") or "—", **self.resource_counts(agent),
                           "summary": " · ".join(str(agent[field]) for field in ("phase", "summary")
                                                 if agent.get(field))}
                 tag = self.result_tags.get(self.identity(agent))
-                text = self.column_text(values, columns)
                 if tag:
-                    suffix = " [" + tag[0] + "]"
-                    text = truncate_display_text(text, max(0, width - display_width(suffix))) + suffix
+                    name = "summary" if width >= 55 else "alias"
+                    size = next(size for column, size, _ in columns if column == name)
+                    suffix = "[" + tag[0] + "]"
+                    prefix = truncate_display_text(values[name], max(0, size - display_width(suffix) - 1))
+                    values[name] = (prefix + " " if prefix else "") + suffix
+                text = self.column_text(values, columns)
                 attr = self.selection_style() if chosen else 0
                 if tag and tag[0].startswith("failed"):
                     attr = self.state_style("blocked", selected=chosen)
                 lines.append((text, index, attr, True))
         if not agents:
             lines.append((" No agents. r refresh", -1, curses.A_DIM, False))
-        for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 1), y + 1):
+        for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 2), y + 2):
             self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
                 agent = agents[_index]
                 turn = agent.get("turn_state") or "unknown"
                 glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
-                tag = self.result_tags.get(self.identity(agent))
-                prefix_width = max(0, width - display_width(" [" + tag[0] + "]")) if tag else width
-                state_width = max(0, min(10, prefix_width - 2))
                 self.put(row, x + 2,
-                         pad_display_text(truncate_display_text(glyph + " " + turn, state_width), state_width),
+                         pad_display_text(truncate_display_text(glyph + " " + turn, 10), 10),
                          self.state_style(turn, stale=bool(agent.get("stale")),
                                           selected=_index == self.selections["agents"]))
+                offset = 0
+                counts = self.resource_counts(agent)
+                for name, size, _right in columns:
+                    if counts.get(name) == "·":
+                        self.put(row, x + offset + size - 1, "·", attr | curses.A_DIM)
+                    offset += size + 1
+                for boundary in boundaries:
+                    self.put(row, x + boundary, "│", attr | curses.A_DIM)
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 

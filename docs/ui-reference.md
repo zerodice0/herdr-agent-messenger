@@ -95,19 +95,24 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
   selects terminal text. Set `HAM_MAILBOX_NO_MOUSE=1` to disable mouse handling.
 
 Digits never navigate. Agents uses a **one-line, aligned table**, not a second
-metadata line per agent. The full-width column header is **bold**, with
-**underline on header words only**, not separators or spaces. Each host group
-starts with a **bold rule and agent count**, with stale/error information when
-applicable. The selected row has a **common light background across the full
-table width**, including padding, while retaining state foreground colors;
-it does not turn into a yellow reverse-video block. Without color, the selected
-row uses full-width reverse video instead.
+metadata line per agent. Header words are **bold and underlined**; dim `│`
+boundaries align with every row and the `┼` joints in the rule below the header.
+The TURN heading starts over the state word, leaving its glyph unlabeled;
+numeric headings and values are right-aligned. Each host group starts with a
+**dim, bold label and agent count**, such as `winmini · 1 agent` or
+`winmini · 2 agents`. Findings follow only when nonzero (or unknown), with
+stale/error information when applicable; findings truncate before the count.
+The selected row has a **common light background across the full table width**,
+including boundaries and padding, while retaining state foreground colors.
+Without color, the selected row uses full-width reverse video instead.
 
 Columns show **state glyph + word**, **alias**, **MAIL** (unread count), and
-**RX** (native receiver flag: `✓` ready, `⚠` absent, `?` unknown). Wider panels
-also show **role** and **phase · summary** on the same row; full summaries remain
-in Detail. MAIL is `?` for a stale host. A disconnected host keeps its last
-snapshot marked stale; it is not treated as closed.
+**RX** (native receiver flag: `✓` ready, `⚠` absent, `?` unknown). At 55 inner
+columns, **role** and a final flexible **phase · summary** column appear.
+At 70 inner columns, **PHN**, **EMU**, and **SRV** counts appear before the
+summary. Full summaries remain in Detail. Send-result labels stay inside the
+alias or summary cell and may truncate. MAIL is `?` for a stale host.
+A disconnected host keeps its last snapshot marked stale; it is not treated as closed.
 
 Threads uses the same **full-width bold column header with underlined words**
 and **full-width selected-row background** (reverse video without color).
@@ -298,13 +303,16 @@ disables colors without removing labels or other non-color state cues.
 
 ### Device and server presence
 
-The Agents **RESOURCES** column appears when the agent pane is at least 78
-columns wide and drops at narrower widths. It shows `📱1 🤖1 🌐2` for phone,
-emulator and server counts. With color disabled it uses the ASCII equivalents
-`P1 E1 S2`. Missing device data shows `P? E?`; missing server data shows `S?`,
-independently. Host headers show `dead:N unowned:N stale-dev:N`, or compact
-`D:N U:N X:N`, for dead Serve routes, unowned served backends and stale devices.
-An unavailable host resource field shows `?`; a discovery error adds `!`.
+The Agents **PHN**, **EMU**, and **SRV** columns show phone, emulator, and server
+counts, respectively, when the agent pane has at least 70 inner columns.
+Each uses three right-aligned cells with ASCII headings regardless of color
+settings; there are no resource emoji. Known-zero counts show a dim `·`;
+nonzero counts have normal brightness. Missing device data shows `?` in PHN
+and EMU; missing server data independently shows `?` in SRV.
+Host group labels show findings such as `dead 1 · unowned 1 · stale-dev 1`
+for dead Serve routes, unowned served backends, and stale devices. Zero
+findings are omitted. An unavailable field shows `?`; a discovery error adds
+`!`. At narrow widths findings truncate first, retaining the agent count.
 
 Agent Detail has **Devices** and **Servers** sections. Devices show held
 nonstale claims; Servers show port/process/PID, bind address, cwd, inherited
