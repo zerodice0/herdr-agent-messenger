@@ -186,6 +186,18 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 철회나 terminal 종료로 claim 없이 최종 상태가 될 수도 있습니다.
 어느 종류든 `mail send` 자체가 모델 턴을 시작하지는 않습니다.
 
+전송에 성공해도 참고용 경고가 나올 수 있으며, 기본 종류인 `fyi`는 바뀌지 않습니다.
+`fyi_no_wake`는 수신기가 등록된 참여 OMP 수신자가 준비된 상태이며 stale이 아니고,
+Herdr의 `turn_state`가 `idle` 또는 `done`일 때 FYI를 보냈다는 뜻입니다.
+FYI만으로는 턴을 시작하지 않습니다. action, 작업 중이거나 상태를 알 수 없거나
+stale인 수신자, 수신기 미등록, 다른 클라이언트, `off` 모드, 비회원에게는
+이 경고가 나오지 않습니다. 답장도 같은 수신자 상태 기준을 따르며 원문이 action이어도
+예외는 없습니다. 질문의 답이나 결정에 따라 수신자가 행동하거나 작업을 이어가야 하면
+`--kind action`을, 그 외에는 `fyi`를 선택하세요.
+`recipient_no_receiver`와 전체 경고 조건은
+[참고서의 경고 목록](../../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)을
+참고하세요.
+
 `inbox read`는 `--message UUID`, `--all`, `--limit N`, `--verbose`를 받습니다.
 기본 한도는 100개이며 1~1000개를 지정할 수 있습니다. 기본 출력은 ID·발신자·본문·상태·
 답장 문맥을 유지하며 `--verbose`는 전체 전달 진단 정보를 반환합니다. 조회는 상태·로그·초인종을

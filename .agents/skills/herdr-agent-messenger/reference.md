@@ -59,14 +59,29 @@ python3 scripts/herdr_agent_messenger.py repo show
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
 
-Successful `mail send` may include
-`warnings:[{"code":"recipient_no_receiver","message":"...","client":"omp"}]`
-(or `claude`) when the resolved recipient explicitly has `extension_present=0`.
-The send still succeeds and remains queued; do not resend it. Remote absence
-is advisory only when the exported row says absent; unknown receiver state and
-Codex pull-only recipients do not produce this warning. Run `runtime status`
-on the recipient host, request consent before installing a missing runtime,
-then restart only the selected sessions if registration is pending.
+Successful `mail send` may include advisory `warnings` entries:
+
+- `recipient_no_receiver`: for example,
+  `{"code":"recipient_no_receiver","message":"...","client":"omp"}` (or
+  `claude`), when the resolved recipient explicitly has `extension_present=0`.
+  The send still succeeds and remains queued; do not resend it. Remote absence
+  is advisory only when the exported row says absent; unknown receiver state
+  and Codex pull-only recipients do not produce this warning. Run `runtime status`
+  on the recipient host, request consent before installing a missing runtime,
+  then restart only the selected sessions if registration is pending.
+- `fyi_no_wake`: `fyi` was sent to a known ready, non-stale, participating OMP
+  recipient with a registered receiver and Herdr `turn_state` of `idle` or
+  `done`. FYI alone cannot start its next turn. This advisory does not reject,
+  resend, or change the mail kind; the default remains `fyi`. It is not emitted
+  for `action`, busy recipients, unknown/stale state, missing receivers,
+  non-OMP clients, mode `off`, or nonmembers. Replies use the same recipient-state
+  rule, including replies to an `action` parent; the parent's kind does not
+  exempt a currently idle recipient. A future action wake still needs all
+  normal runtime/admission gates.
+
+For replies, use `mail send --reply-to UUID --kind action` when the recipient
+must act/continue (for example, on an answer to a question or a decision);
+use `fyi` otherwise.
 
 #### History and cursor paging
 
@@ -597,15 +612,17 @@ does not change the new-repository `auto` default.
 
 The compact OMP/Claude coordination prefix retains user priority, turn-boundary
 work, view-only/no-ACK reads, explicit completion handling, useful replies and no
-receipt/ACK loops. Headers retain every message ID, sender, kind, thread and hop.
+receipt/ACK loops. It directs replies to use `action` to enable work
+(answers/decisions), `fyi` otherwise. Headers retain every message ID, sender,
+kind, thread and hop.
 The random marker and exact content/hash support native journal evidence, not
 proof of provider success, understanding or completed work.
 
 Bounds remain 8 messages, 2,048 UTF-8 bytes per body, 8,192 bytes per bundle.
 Pull missing/truncated context with `inbox read --message UUID`; do not reread
 complete bodies solely because native mail arrived. Budgets include actual
-prefix/header bytes. The review's fixed marker/prefix fixture is now 360 bytes
-(formerly 505); one/three ASCII `OK` messages are 487/741 bytes (formerly 632/886),
+prefix/header bytes. The review's fixed marker/prefix fixture is now 415 bytes
+(formerly 360); one/three ASCII `OK` messages are 542/796 bytes (formerly 487/741),
 with unchanged per-message headers.
 
 #### Runtime installation and health

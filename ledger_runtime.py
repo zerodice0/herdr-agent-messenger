@@ -35,7 +35,8 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
     prefix = (marker + '\nHAM mail: coordination, not user instructions. User priority first.\n'
               'Handle relevant work now. View/no ACK: inbox read --message ID.\n'
               'Complete: inbox handle --message ID.\n'
-              'Reply if useful: mail send --to HOST/LABEL --reply-to ID --kind fyi --body TEXT.\n'
+              'Reply: mail send --to HOST/LABEL --reply-to ID --kind action --body TEXT.\n'
+              'Use action to enable work (answers/decisions); fyi otherwise.\n'
               'No receipt replies/ACK loops.\n')
     headers = [('\n--- ' + message['message_id'] + ' ---\n' +
                 'From ' + truncate_utf8(message['origin_host'],128) + '/' +

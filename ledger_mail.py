@@ -160,6 +160,7 @@ class Mailbox:
     def _submit_message(self, payload: dict[str, Any], *, sender: Mapping[str, Any] | None,
                         recipient: Mapping[str, Any], auto_handle_parent: bool) -> dict[str, Any]:
         sender_terminal = sender.get("terminal_id") if sender is not None else None
+        warning_recipient = recipient
         recipient_terminal = recipient.get("terminal_id")
         terminals = tuple(terminal for terminal in (recipient_terminal, sender_terminal) if terminal)
         with self.store.transaction(terminals) as connection:
@@ -167,8 +168,13 @@ class Mailbox:
                 check_generation(connection, self.store.host, sender["terminal_id"],
                                  sender["agent_id"], sender["generation"])
             if recipient["host"] == self.store.host and recipient_terminal:
-                check_generation(connection, self.store.host, recipient_terminal,
-                                 recipient["agent_id"], recipient["generation"])
+                current = check_generation(connection, self.store.host, recipient_terminal,
+                                           recipient["agent_id"], recipient["generation"])
+                status = connection.execute("SELECT turn_state FROM agent_status WHERE agent_id=?",
+                                            (current["agent_id"],)).fetchone()
+                from ledger_settings import RepoSettings
+                warning_recipient = {**current, "turn_state": status[0] if status else "unknown",
+                                     "role": RepoSettings(self.store).role(current, connection=connection)}
             parent = None
             reply_to = payload["reply_to"]
             if reply_to:
@@ -204,6 +210,16 @@ class Mailbox:
                 "message": f"{client} recipient has no registered HAM receiver; the message remains queued. "
                            f"Run runtime status on {recipient['host']}; with user consent install the runtime "
                            "if missing, then restart the selected session."})
+        from ledger_runtime import WAKE_READY_STATES
+        if (payload["kind"] == "fyi" and warning_recipient.get("active") == 1 and
+                not warning_recipient.get("stale") and
+                warning_recipient.get("client") == "omp" and
+                warning_recipient.get("extension_present") == 1 and
+                warning_recipient.get("role") in {"main", "worker"} and
+                warning_recipient.get("turn_state") in WAKE_READY_STATES):
+            submission.setdefault("warnings", []).append({
+                "code": "fyi_no_wake", "client": "omp",
+                "message": "FYI does not wake an idle recipient; use --kind action if it must act now."})
         return submission
 
     def enqueue(self, payload: Mapping[str, Any]) -> dict[str, Any]:

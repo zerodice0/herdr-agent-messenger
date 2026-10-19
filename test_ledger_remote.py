@@ -197,6 +197,37 @@ class RemoteLedgerTest(unittest.TestCase):
                     self.agents["alpha"], exported, body="No absence evidence")
                 self.assertNotIn("warnings", result)
 
+    def test_fyi_remote_ready_receiver_advisory_requires_current_known_context(self):
+        self.settings_for("beta").mutate(self.repo_id, "mode", "auto")
+        with self.stores["beta"].transaction() as connection:
+            connection.execute("UPDATE agents SET client='omp',extension_present=1 WHERE active=1")
+        mailbox = Mailbox(self.stores["alpha"], self.environment)
+        for state in ("idle", "done", "working", "blocked", "unknown"):
+            with self.subTest(state=state):
+                with self.stores["beta"].transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=?", (state,))
+                recipient = self.services["alpha"].resolve_recipient("beta/beta-owl", self.agents["alpha"])
+                sent = mailbox.send(self.agents["alpha"], recipient, body="Remote decision")
+                self.assertEqual(sent["state"], "pending")
+                self.assertEqual("fyi_no_wake" in [item["code"] for item in sent.get("warnings", [])],
+                                 state in {"idle", "done"})
+        recipient = {**recipient, "turn_state": "idle"}
+        cases = ({"stale": True}, {"turn_state": None}, {"active": 0},
+                 {"extension_present": None}, {"client": "claude"}, {"role": None})
+        for fields in cases:
+            with self.subTest(fields=fields):
+                sent = mailbox.send(self.agents["alpha"], {**recipient, **fields}, body="Unknown or ineligible")
+                self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+        for state in ("idle", "done"):
+            with self.subTest(action_state=state):
+                sent = mailbox.send(self.agents["alpha"], {**recipient, "turn_state": state},
+                                    kind="action", body="Continue now")
+                self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+        unknown = dict(recipient)
+        unknown.pop("turn_state")
+        sent = mailbox.send(self.agents["alpha"], unknown, body="Status omitted by older peer")
+        self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+
     def current(self, host, message_id):
         with self.stores[host].read() as connection:
             return receipt(connection, message_id)

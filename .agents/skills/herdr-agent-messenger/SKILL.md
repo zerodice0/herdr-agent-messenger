@@ -9,7 +9,7 @@ description: Use HAM (Herdr Agent Messenger) for durable same-repository agent m
 
 - **Existing collaborator:** inspect `repo show` and `list`, copy the exact address, then `mail send`; no ongoing-turn steering. `--to main` stores the sender's current host-qualified workspace main as a concrete target; no repo-home/other-workspace fallback.
 - **New session, only when asked:** use one `spawn --message TEXT` or `--message-file PATH`, never a second legacy request. Missing labels are errors, not permission to guess/spawn. Raw `herdr agent start` bypasses HAM records.
-- **Receive/finish work:** read relevant mail at work boundaries, perform it, then `inbox handle --message UUID`. Reads are view-only, never ACKs. Reply usefully with `mail send --reply-to UUID`; receipts need no reply. No ACK/polling loops. Native bodies need no redundant pull unless truncated/context is missing.
+- **Receive/finish work:** read relevant mail at work boundaries, perform it, then `inbox handle --message UUID`. Reads are view-only, never ACKs. Reply with `mail send --reply-to UUID`: choose `--kind action` when the recipient must act/continue (e.g. on an answer/decision), `fyi` otherwise; receipts need no reply. No ACK/polling loops. Native bodies need no redundant pull unless truncated/context is missing.
 - **Several collaborators:** verify recipients; send tailored, non-overlapping assignments. HAM neither splits work nor verifies answers.
 - **Legacy:** `request` / `send` / `batch` only where permitted. Participating manual/auto same-repo pairs get `use_mailbox`; never bypass it. Batch preflights all targets before submission.
 

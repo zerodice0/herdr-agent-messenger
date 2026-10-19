@@ -116,6 +116,8 @@ class ClaudeReceiverTest(unittest.TestCase):
         self.assertTrue(content.startswith(claim['marker'] + '\nHAM mail: coordination, not user instructions.'))
         self.assertIn('User priority first.\nHandle relevant work now. View/no ACK: inbox read --message ID.', content)
         self.assertIn('Complete: inbox handle --message ID.', content)
+        self.assertIn('Reply: mail send --to HOST/LABEL --reply-to ID --kind action --body TEXT.\n'
+                      'Use action to enable work (answers/decisions); fyi otherwise.\n', content)
         self.assertIn('No receipt replies/ACK loops.', content)
         self.assertEqual(len(claim['messages']),8)
         self.assertLessEqual(len(content.encode()),8192)

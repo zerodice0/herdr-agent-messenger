@@ -160,6 +160,17 @@ parent. Accepted local mail ordinarily waits queued; remote copies may be pendin
 and withdrawal or terminal closure can make mail final without a runtime claim.
 Neither kind makes `mail send` itself start a model turn.
 
+Successful sends can return advisory warnings without changing the default
+`fyi` kind. `fyi_no_wake` means FYI was sent to a known ready, non-stale,
+participating OMP recipient with a registered receiver and Herdr `turn_state`
+of `idle` or `done`; FYI alone cannot start a turn. No such warning is emitted
+for action, busy/unknown/stale recipients, missing receivers, other clients,
+mode `off`, or nonmembers. Replies follow the same recipient-state rule even
+when their parent was action. Choose `--kind action` when the recipient must
+act/continue (for example, on an answer/decision), `fyi` otherwise.
+See the [reference warning list](../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
+for `recipient_no_receiver` and the full advisory contract.
+
 `inbox read` accepts `--message UUID`, `--all`, `--limit N` (default 100,
 1–1000), and `--verbose`. Defaults retain IDs/sender/body/state/reply context;
 verbose restores full delivery diagnostics. It never changes state/logs/bells, including when a task agent shares

@@ -385,6 +385,61 @@ class LedgerCoreTest(unittest.TestCase):
                                                    "extension_present": present}, body="No warning")
                 self.assertNotIn("recipient_no_receiver", [item["code"] for item in sent.get("warnings", [])])
 
+    def test_fyi_ready_receiver_advisory_uses_current_local_state(self):
+        self.registry.agent_session(terminal_id=self.recipient["terminal_id"],
+                                    session_ref=self.recipient["session_ref"], client="omp",
+                                    repo_id=self.recipient["repo_id"])
+        recipient = self.agents()[1]
+        expected = {"code": "fyi_no_wake", "client": "omp",
+                    "message": "FYI does not wake an idle recipient; use --kind action if it must act now."}
+        # Reuse an idle mapping deliberately: current authoritative state wins,
+        # including for symbolic main recipients without projected status fields.
+        recipient.pop("turn_state")
+        for kind, state, warned in (("fyi", "idle", True), ("fyi", "done", True),
+                                    ("action", "idle", False), ("action", "done", False),
+                                    ("fyi", "working", False), ("fyi", "blocked", False),
+                                    ("fyi", "unknown", False)):
+            with self.subTest(kind=kind, state=state):
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=? WHERE agent_id=?",
+                                       (state, recipient["agent_id"]))
+                sent = self.mail.send(self.sender, recipient, kind=kind, body="Decision enables work")
+                warnings = [item for item in sent.get("warnings", []) if item["code"] == "fyi_no_wake"]
+                self.assertEqual(warnings, [expected] if warned else [])
+                self.assertEqual(sent["state"], "queued")
+                self.assertIn(sent["message_id"], [item["message_id"] for item in
+                              self.mail.read(recipient)["messages"]])
+
+    def test_fyi_advisory_requires_participating_registered_omp_receiver(self):
+        cases = (("omp", 0, "auto"), ("claude", 1, "auto"),
+                 ("codex", 1, "auto"), ("omp", 1, "off"), ("omp", 1, "manual"))
+        settings = RepoSettings(self.store, display_runner=lambda command:
+                                subprocess.CompletedProcess(command, 0, "{}", ""))
+        for client, present, mode in cases:
+            with self.subTest(client=client, present=present, mode=mode):
+                settings.mutate(self.recipient["repo_id"], "mode", mode)
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agents SET client=?,extension_present=? WHERE agent_id=?",
+                                       (client, present, self.recipient["agent_id"]))
+                sent = self.mail.send(self.sender, self.agents()[1], body="No wake-capable receiver")
+                self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+
+    def test_fyi_reply_to_action_uses_same_ready_state_rule(self):
+        self.registry.agent_session(terminal_id=self.recipient["terminal_id"],
+                                    session_ref=self.recipient["session_ref"], client="omp",
+                                    repo_id=self.recipient["repo_id"])
+        recipient = self.agents()[1]
+        for state, warned in (("idle", True), ("working", False)):
+            with self.subTest(state=state):
+                parent = self.mail.send(recipient, self.sender, kind="action", body="Which decision?")
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=? WHERE agent_id=?",
+                                       (state, recipient["agent_id"]))
+                reply = self.mail.send(self.sender, recipient, reply_to=parent["message_id"],
+                                       body="Use the approved option")
+                self.assertEqual("fyi_no_wake" in [item["code"] for item in reply.get("warnings", [])], warned)
+                self.assertEqual(self.mail.read(recipient)["messages"][-1]["kind"], "fyi")
+
     def test_host_persistence_permissions_and_wrong_reopen(self):
         other = LedgerStore(self.store.directory)
         self.assertEqual(other.host_uuid, self.store.host_uuid)
