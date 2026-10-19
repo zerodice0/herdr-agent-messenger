@@ -93,19 +93,37 @@ class MailboxServicesTest(unittest.TestCase):
                     self.save_settings(field, value)
                 self.assertEqual(raised.exception.code, "target_out_of_scope")
 
-    def test_settings_mutations_require_complete_current_opener_scope(self):
+    def test_main_and_members_require_complete_current_opener_scope(self):
         expected = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1"}
         for scope in ({"repo_id": self.repo_id}, {**expected, "host": "another-host"},
                       {**expected, "workspace_id": "w2"}, {**expected, "repo_id": "another-repo"}):
-            with self.subTest(scope=scope), self.assertRaises(LedgerError) as raised:
-                self.save_settings("mode", "manual", scope=scope)
-            self.assertEqual(raised.exception.code, "invalid_settings_scope")
+            for field, value in (("main", None), ("members", [])):
+                with self.subTest(scope=scope, field=field), self.assertRaises(LedgerError) as raised:
+                    self.save_settings(field, value, scope=scope)
+                self.assertEqual(raised.exception.code, "invalid_settings_scope")
         environment = self.settings_environment()
         environment.pop(OPENER_TERMINAL)
         environment[OPENER_PANE] = "missing:pane"
-        with self.assertRaises(LedgerError) as raised:
-            self.save_settings("main", None, environment=environment)
-        self.assertEqual(raised.exception.code, "invalid_settings_scope")
+        for field, value in (("main", None), ("members", [])):
+            with self.subTest(field=field), self.assertRaises(LedgerError) as raised:
+                self.save_settings(field, value, environment=environment)
+            self.assertEqual(raised.exception.code, "invalid_settings_scope")
+
+    def test_mode_and_thresholds_need_only_repo_id_even_without_opener_workspace(self):
+        thresholds = {**DEFAULT_THRESHOLDS, "idle_minutes": 42}
+        for missing_opener in (False, True):
+            environment = self.settings_environment()
+            if missing_opener:
+                environment.pop(OPENER_TERMINAL)
+                environment[OPENER_PANE] = "missing:pane"
+            for field, value in (("mode", "manual"), ("thresholds", thresholds)):
+                with self.subTest(missing_opener=missing_opener, field=field), \
+                     mock.patch("ledger_display.LedgerDisplay.refresh", return_value={"updated": [], "failed": []}), \
+                     mock.patch("mailbox_tui.herdr", side_effect=LedgerError("isolated", "No live Herdr")):
+                    result = execute_job({"operation": "setting", "repo_id": self.repo_id,
+                                          "field": field, "value": value}, environment)
+                self.assertEqual(result["settings"][field]["value"], value)
+                self.assertEqual(RepoSettings(self.store).show(self.repo_id)["settings"][field]["value"], value)
 
     def test_settings_opener_terminal_tracks_workspace_move(self):
         environment = self.settings_environment()
