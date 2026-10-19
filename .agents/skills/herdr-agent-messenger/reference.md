@@ -235,12 +235,15 @@ succeeds, with `warnings:[{code:"notification_failed",committed:true,...}]`;
 message ID. Events/safety sweeps recover notification loss.
 
 After startup/event registry refresh, HAM shows one best-effort Herdr notification
-when an active local OMP/Claude client's runtime is missing or has an ownership
-error. The last notified `(client,state)` set is stored in `ledger_meta`, so
-unchanged refreshes do not repeat the notice; a changed or resolved-then-missing
-set can notify again. Notification failure is recorded in the same diagnostics
-without failing reconciliation. Installed-but-unregistered sessions and Codex
-do not trigger this startup notice.
+only when an active local OMP/Claude session has `extension_present=0` and that
+client's default runtime is missing or has an ownership error. Registered
+receivers do not trigger default-path inspection or warnings (including custom
+install/config paths). The last notified `(client,state)` set is stored in
+`ledger_meta`; unchanged refreshes use plain reads, and changed sets are checked
+again under the write transaction before claiming them. A changed or
+resolved-then-missing set can notify again. Notification failure is recorded
+without failing reconciliation and is not retried until the set changes.
+Installed-but-unregistered sessions and Codex do not trigger this startup notice.
 
 #### Wire and settings service
 
@@ -613,9 +616,11 @@ With no client, `runtime status` prints one health-summary JSON object:
 - `ledger`: `{available:bool,error:null|{code,message}}`. A missing/uninitialised
   ledger or one requiring an upgrade is reported without creating, migrating,
   refreshing or otherwise writing it; installation results remain available.
-- `next_steps`: human-readable remedies for missing runtimes, conflicts,
-  unregistered sessions or unavailable ledger data. Ask the user before
-  `runtime install <client>`, then restart only the selected sessions.
+- `next_steps`: human-readable remedies for clients with active local sessions
+  (missing runtimes, conflicts or unregistered receivers), plus unavailable
+  ledger data. Unused clients remain in `clients` but have no install suggestion.
+  Ask the user before `runtime install <client>`, then restart only the selected
+  sessions.
 
 `runtime status omp|claude` retains its existing client-specific output shape.
 `install|uninstall` requires positional `omp|claude`; all three client-specific

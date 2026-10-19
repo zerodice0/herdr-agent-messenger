@@ -1767,7 +1767,11 @@ class MailboxApp:
         if notice or status:
             bottom -= 1
             error = bool(status) and self.status_level == "error"
-            text = notice + (" · " if notice and status else "") + ("✕ " if error else "") + status
+            text = ("✕ " if error else "") + status
+            if notice and not status:
+                text = notice
+            elif notice and display_width(text + " · " + notice) <= max(0, width - 1):
+                text += " · " + notice
             self.put(bottom, 0, text,
                      self.style(4 if error else 0, curses.A_BOLD if error or notice else 0))
         if self.layout == "tiny":
@@ -2292,7 +2296,7 @@ class MailboxApp:
             f"Extension present: {yes_no(item.get('extension_present'))}",
             *([f"Remedy: runtime status on {item['host']}; ask the user before runtime install "
                f"{item['client']}, then restart only the selected sessions."]
-              if item.get("client") in {"omp", "claude"} and not item.get("extension_present") else []),
+              if item.get("client") in {"omp", "claude"} and item.get("extension_present") in (False, 0) else []),
             f"Repo ID: {item.get('repo_id') or '—'}",
             f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
             f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",

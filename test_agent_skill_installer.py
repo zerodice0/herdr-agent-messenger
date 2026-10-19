@@ -540,6 +540,9 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
                     self.assertEqual(runtime["installed"], selection in (runtime["client"], "all"))
                     self.assertIsNone(runtime["error"])
                 self.assertIn("activation pending", report)
+                for client in (("omp", "claude") if selection == "all" else (selection,)):
+                    self.assertIn(f"{client}: Installed", report)
+                    self.assertNotIn(f"{client}: Current", report)
                 self.assertFalse((Path(directory) / "home/.omp/agent/skills").exists())
 
     def test_runtime_flag_reports_conflict_verbatim_and_preserves_foreign_file(self):
@@ -564,9 +567,58 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
         for expected in ("Receiving dependency", "omp: Not installed", "claude: Not installed",
                          "› Not now (default)", "Codex uses skill-guided pull"):
             self.assertIn(expected, rendered)
-        self.assertIn("Only sessions you choose to restart", result)
+        self.assertEqual(result, "")
+        self.assertNotIn("Skill installed", rendered)
         self.assertFalse((self.root / "home").exists())
         self.assertFalse((self.root / "claude").exists())
+
+    def test_runtime_offer_preserves_skill_install_or_already_current_status(self):
+        for key in ("already_current", "installed"):
+            with self.subTest(status=key):
+                text = agent_skill_installer.COPY["en"]
+                screen = self.screen(["\n"], size=(30, 160))
+                result = agent_skill_installer.offer_runtime_install(
+                    screen, self.environment, text, text[key])
+                self.assertEqual(result, text[key])
+                self.assertIn(text[key], self.rendered(screen))
+                if key == "already_current":
+                    self.assertNotIn("Skill installed", self.rendered(screen))
+
+    def test_popup_passes_accurate_skill_result_to_runtime_offer(self):
+        for current in (True, False):
+            with self.subTest(current=current):
+                screen = self.screen(["\n", "\n", "\x1b"], size=(40, 160))
+                status = (agent_skill_installer.STATUS_CURRENT if current
+                          else agent_skill_installer.STATUS_MISSING)
+                with mock.patch.object(agent_skill_installer.curses, "wrapper",
+                                       side_effect=lambda callback: callback(screen)), \
+                        mock.patch.object(agent_skill_installer.curses, "curs_set"), \
+                        mock.patch.object(agent_skill_installer.curses, "has_colors", return_value=False), \
+                        mock.patch.object(agent_skill_installer, "installation_status", return_value=status), \
+                        mock.patch.object(agent_skill_installer, "install_target") as install:
+                    self.assertEqual(agent_skill_installer.popup(self.environment), 0)
+                rendered = self.rendered(screen)
+                if current:
+                    install.assert_not_called()
+                    self.assertIn("Already current.", rendered)
+                    self.assertNotIn("Skill installed", rendered)
+                else:
+                    install.assert_called_once()
+                    self.assertIn("Skill installed. Start a new agent session", rendered)
+
+    def test_installed_runtime_copy_is_not_a_freshness_claim_in_any_locale(self):
+        for client, destination in agent_skill_installer.runtime_installer.destinations(self.environment).items():
+            agent_skill_installer.runtime_installer.manage("install", destination, client=client)
+        for language, text in agent_skill_installer.COPY.items():
+            with self.subTest(language=language):
+                screen = self.screen(["\n"], size=(30, 160))
+                agent_skill_installer.offer_runtime_install(screen, self.environment, text)
+                report = agent_skill_installer.runtime_report(self.environment, text)
+                for client in ("omp", "claude"):
+                    label = f'{client}: {text["runtime_installed"]}'
+                    self.assertIn(label, self.rendered(screen))
+                    self.assertIn(label, report)
+                    self.assertNotIn(f'{client}: {text["current"]}', report)
 
     def test_runtime_offer_shows_writes_before_install_and_only_installs_selected_client(self):
         for client, down in (("omp", 1), ("claude", 2)):

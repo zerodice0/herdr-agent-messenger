@@ -80,6 +80,9 @@ def health_summary(environment: Mapping[str, str] | None = None) -> dict[str, An
     for runtime in result['clients']:
         client = runtime['client']
         absent = sessions[client]['receiver_absent']
+        registered = sessions[client]['receiver_registered']
+        if not absent and not registered:
+            continue
         prefix = f'{client}: {absent} sessions without receiver; ' if absent else f'{client}: '
         if runtime['error']:
             next_steps.append(prefix + runtime['error']['code'] + ': ' +

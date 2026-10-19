@@ -156,6 +156,33 @@ class MailboxUiTest(unittest.TestCase):
         app.refresh_detail()
         self.assertIn("runtime install omp", "\n".join(app.detail_lines()))
 
+    def test_receiver_notice_never_hides_status_on_narrow_terminals(self):
+        app = self.app()
+        app.local["agents"][0].update(client="omp", extension_present=0)
+        for width in (40, 60, 160):
+            for status, level in (("Saved", "info"), ("Send failed: Herdr offline", "error")):
+                with self.subTest(width=width, level=level):
+                    app.set_status(status, level)
+                    snapshot = self.capture(app, height=24, width=width)
+                    line = snapshot.lines()[-2]
+                    self.assertTrue(line.startswith(("✕ " if level == "error" else "") + status))
+                    self.assertEqual("sessions without HAM receiver" in line, width == 160)
+                    if level == "error":
+                        self.assertTrue(any(call.row == 22 and call.attribute & curses.A_BOLD
+                                            for call in app.screen.draw_calls))
+
+    def test_receiver_remedy_requires_known_absence(self):
+        app = self.app()
+        item = self.select_agent(app)
+        for client in ("omp", "claude", "codex"):
+            for present in (None, False, 0, True, 1):
+                with self.subTest(client=client, present=present):
+                    item.update(client=client, extension_present=present)
+                    app.refresh_detail()
+                    lines = "\n".join(line for line, _ in app.agent_detail())
+                    self.assertEqual("Remedy:" in lines,
+                                     client in ("omp", "claude") and present in (False, 0))
+
     def test_receiver_banner_filters_scope_modes_and_local_active_clients(self):
         app = self.app()
         base = app.local["agents"][0]

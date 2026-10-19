@@ -2,11 +2,13 @@
 import ham_test_support  # Protect the live ledger before product imports.
 
 import argparse
+import builtins
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import agent_messenger
 import ledger_cli
 from ledger_status import AgentRegistry
 from ledger_store import LedgerStore
@@ -31,7 +33,7 @@ class ReceiverNotificationTest(unittest.TestCase):
         self.summary = mock.patch.object(notifications.runtime_installer, "summary")
         self.summary_mock = self.summary.start()
         self.addCleanup(self.summary.stop)
-        self.notify = mock.patch.object(notifications.agent_messenger, "show_notification", return_value=True)
+        self.notify = mock.patch.object(agent_messenger, "show_notification", return_value=True)
         self.notify_mock = self.notify.start()
         self.addCleanup(self.notify.stop)
         self.health(omp=False, claude=True)
@@ -70,7 +72,8 @@ class ReceiverNotificationTest(unittest.TestCase):
         self.health()
         self.run_notice()
         self.notify_mock.assert_not_called()
-        self.summary_mock.assert_called_once_with(self.environment)
+        self.assertEqual(self.summary_mock.call_args_list,
+                         [mock.call(self.environment), mock.call(self.environment)])
 
     def test_inactive_local_and_codex_only_never_notify(self):
         with self.store.transaction() as connection:
@@ -79,6 +82,62 @@ class ReceiverNotificationTest(unittest.TestCase):
         self.run_notice()
         self.notify_mock.assert_not_called()
         self.summary_mock.assert_not_called()
+
+    def test_registered_receivers_skip_default_destination_inspection(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET extension_present=1")
+        self.health(omp=False, claude=False, error={"code": "foreign_runtime"})
+        self.run_notice()
+        self.summary_mock.assert_not_called()
+        self.notify_mock.assert_not_called()
+
+    def test_only_local_absent_receiver_clients_can_trigger_notification(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET extension_present=1 WHERE client='omp'")
+            connection.execute("UPDATE agents SET host='remote' WHERE client='claude'")
+        self.health(omp=False, claude=False)
+        self.run_notice()
+        self.summary_mock.assert_not_called()
+        self.notify_mock.assert_not_called()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET host=? WHERE client='claude'", (self.store.host,))
+        self.run_notice()
+        self.assertEqual(self.notify_mock.call_count, 1)
+        self.assertIn("claude (not_installed)", self.notify_mock.call_args.args[0])
+        self.assertNotIn("omp (", self.notify_mock.call_args.args[0])
+
+    def test_unchanged_state_uses_only_plain_reads_and_no_messenger_import(self):
+        for installed in (False, True):
+            with self.subTest(installed=installed):
+                self.health(omp=installed)
+                self.run_notice()
+                with mock.patch.object(self.store, "transaction",
+                                       side_effect=AssertionError("Unexpected write transaction")), \
+                        mock.patch.object(builtins, "__import__", wraps=builtins.__import__) as imports:
+                    self.run_notice()
+                self.assertFalse(any(call.args[0] == "agent_messenger" for call in imports.call_args_list))
+        self.assertEqual(self.store.notification_errors, [])
+
+    def test_compare_and_set_refreshes_active_receivers_after_an_overlapping_claim(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE client IN ('omp','claude')")
+        other = LedgerStore(environment=self.environment)
+        transaction = self.store.transaction
+
+        def overlapping_claim(*args, **kwargs):
+            with other.transaction() as connection:
+                connection.execute("UPDATE agents SET active=1 WHERE client='omp'")
+            notifications.notify_missing_runtime(other, self.environment)
+            return transaction(*args, **kwargs)
+
+        with mock.patch.object(self.store, "transaction", side_effect=overlapping_claim):
+            self.run_notice()
+        self.run_notice()
+        self.assertEqual(self.notify_mock.call_count, 1)
+        with self.store.read() as connection:
+            state = connection.execute("SELECT value FROM ledger_meta WHERE key=?",
+                                       (notifications.META_KEY,)).fetchone()[0]
+        self.assertEqual(state, '[["omp","not_installed"]]')
 
     def test_notification_failure_is_durable_and_deduplicated(self):
         self.notify_mock.return_value = False
@@ -89,6 +148,12 @@ class ReceiverNotificationTest(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("not accepted", failures[0]["detail"])
         self.assertEqual(self.store.notification_errors[0]["code"], "notification_failed")
+        self.assertEqual(self.store.notification_errors[0]["recovery"], "receiver_runtime_set_change")
+        self.health()
+        self.run_notice()
+        self.health(omp=False)
+        self.run_notice()
+        self.assertEqual(self.notify_mock.call_count, 2)
 
     def test_notification_exception_and_failed_diagnostic_are_swallowed(self):
         self.notify_mock.side_effect = OSError("Herdr offline")
@@ -107,6 +172,31 @@ class ReceiverNotificationTest(unittest.TestCase):
                                               self.environment, self.store)
             self.assertEqual(events, ["refresh", "notify"])
             self.assertEqual(result, {"refreshed": True})
+
+    def test_reconcile_and_event_survive_hook_and_import_failures(self):
+        original_import = builtins.__import__
+
+        def failed_import(name, *args, **kwargs):
+            if name == "receiver_notifications":
+                raise ImportError("Notification helper unavailable")
+            return original_import(name, *args, **kwargs)
+
+        for command in ("reconcile", "event"):
+            for failure in ("import", "hook"):
+                with self.subTest(command=command, failure=failure):
+                    self.store.notification_errors.clear()
+                    patcher = (mock.patch.object(builtins, "__import__", side_effect=failed_import)
+                               if failure == "import" else
+                               mock.patch.object(notifications, "notify_missing_runtime",
+                                                 side_effect=RuntimeError("Notification helper failed")))
+                    with mock.patch.object(AgentRegistry, "refresh", return_value=({}, {"refreshed": True})), patcher:
+                        result = ledger_cli._dispatch(argparse.Namespace(command="ledger", ledger_command=command),
+                                                      self.environment, self.store)
+                    self.assertTrue(result["refreshed"])
+                    self.assertEqual(result["warnings"][0]["code"], "notification_failed")
+                    self.assertIn("Notification helper", result["warnings"][0]["message"])
+        self.assertTrue(self.store.doctor()["notification_failures"])
+
 
 
 if __name__ == "__main__":

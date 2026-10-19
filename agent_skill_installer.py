@@ -71,7 +71,8 @@ COPY = {
         "unavailable": "Project unavailable",
         "ready": "Select a target and press Enter.",
         "already_current": "Already current.",
-        "installed": "Skill installed. Only sessions you choose to restart pick up an installed receiver.",
+        "installed": "Skill installed. Start a new agent session to discover it.",
+        "runtime_installed": "Installed",
         "runtime_title": "Receiving dependency",
         "runtime_intro": "Plugin and skill do not install a receiver. Codex uses skill-guided pull.",
         "runtime_not_now": "Not now (default)",
@@ -110,7 +111,8 @@ COPY = {
         "unavailable": "프로젝트를 확인할 수 없음",
         "ready": "대상을 선택하고 Enter를 누르세요.",
         "already_current": "이미 최신 상태입니다.",
-        "installed": "스킬을 설치했습니다. 설치된 수신기는 직접 선택해 재시작한 세션에만 적용됩니다.",
+        "installed": "스킬을 설치했습니다. 새 에이전트 세션을 시작하면 스킬을 찾을 수 있습니다.",
+        "runtime_installed": "설치됨",
         "runtime_title": "수신 의존성",
         "runtime_intro": "플러그인과 스킬은 수신기를 설치하지 않습니다. Codex는 스킬 안내에 따라 메일을 가져옵니다.",
         "runtime_not_now": "나중에 (기본값)",
@@ -149,7 +151,8 @@ COPY = {
         "unavailable": "プロジェクトを確認できません",
         "ready": "対象を選び Enter を押してください。",
         "already_current": "すでに最新です。",
-        "installed": "スキルをインストールしました。選択して再起動したセッションだけが受信機を読み込みます。",
+        "installed": "スキルをインストールしました。新しいエージェントセッションでスキルを検出できます。",
+        "runtime_installed": "インストール済み",
         "runtime_title": "受信の依存関係",
         "runtime_intro": "プラグインとスキルは受信機をインストールしません。Codex はスキルに従い取得します。",
         "runtime_not_now": "今はしない (既定)",
@@ -377,7 +380,7 @@ def runtime_report(environment: Mapping[str, str] | None, text: Mapping[str, str
         if runtime["error"]:
             state = runtime["error"]["code"] + ": " + runtime["error"]["message"]
         elif runtime["installed"]:
-            state = text["current"]
+            state = text["runtime_installed"]
         else:
             command = shlex.join((sys.executable, str(Path(__file__).resolve().with_name("agent_skill_cli.py")),
                                   "runtime", "install", client))
@@ -387,11 +390,10 @@ def runtime_report(environment: Mapping[str, str] | None, text: Mapping[str, str
 
 
 def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
-                          text: Mapping[str, str]) -> str:
+                          text: Mapping[str, str], status: str = "") -> str:
     """Display both runtimes; installing requires selecting a non-default choice."""
     cursor = 0
     scroll = 0
-    status = text["installed"]
     while True:
         runtimes = runtime_installer.summary(environment)["clients"]
         missing = [runtime for runtime in runtimes if not runtime["installed"] and not runtime["error"]]
@@ -402,7 +404,7 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
         for runtime in runtimes:
             error = runtime["error"]
             state = (error["code"] + ": " + error["message"] if error else
-                     text["current"] if runtime["installed"] else text["missing"])
+                     text["runtime_installed"] if runtime["installed"] else text["missing"])
             lines.append(f'{runtime["client"]}: {state}')
             lines.append(runtime["destination"])
         lines += ["", status, ""]
@@ -645,7 +647,7 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
                     else:
                         install_target(target)
                         status = text["installed"]
-                    status = offer_runtime_install(screen, values, text)
+                    status = offer_runtime_install(screen, values, text, status)
                 except OSError as error:
                     status = text["failed"].format(error=error)
             elif key in ("\x1b", "q", "Q"):

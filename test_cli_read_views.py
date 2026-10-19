@@ -180,11 +180,7 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(result["ledger"]["error"]["code"], "ledger_not_initialized")
         self.assertTrue(result["ledger"]["error"]["message"])
         self.assertTrue(any("ledger reconcile" in step for step in result["next_steps"]))
-        for client in ("omp", "claude"):
-            step = next(step for step in result["next_steps"] if f"runtime install {client}" in step)
-            self.assertIn("user", step.lower())
-            self.assertIn("restart", step.lower())
-        self.assertFalse(any("runtime install codex" in step for step in result["next_steps"]))
+        self.assertFalse(any("runtime install" in step for step in result["next_steps"]))
         self.assertFalse(home.exists())
         self.assertFalse(self.herdr_calls.exists())
 
@@ -267,6 +263,20 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(self.database_state(self.store), before)
         self.assertFalse(self.herdr_calls.exists())
 
+    def test_runtime_status_next_steps_skip_clients_without_active_local_sessions(self):
+        for used in ("omp", "claude", "codex"):
+            with self.subTest(used=used):
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agents SET client=?,extension_present=0", (used,))
+                completed, result = self.cli("runtime", "status")
+                self.assertEqual(completed.returncode, 0)
+                if used == "codex":
+                    self.assertEqual(result["next_steps"], [])
+                else:
+                    self.assertEqual(len(result["next_steps"]), 1)
+                    self.assertIn(f"runtime install {used}", result["next_steps"][0])
+                self.assertFalse(self.herdr_calls.exists())
+
     def test_runtime_status_reports_conflict_without_recommending_replacement_or_hiding_other_client(self):
         home = Path(self.environment["HOME"])
         omp = home / ".omp/agent/extensions"
@@ -274,6 +284,8 @@ class ReadCliTest(unittest.TestCase):
         omp.mkdir(parents=True)
         (omp / RUNTIME).write_text("Foreign receiver; preserve.")
         manage("install", claude, client="claude")
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET client='omp',extension_present=0")
         before = self.database_state(self.store)
         completed, result = self.cli("runtime", "status")
         self.assertEqual(completed.returncode, 0)

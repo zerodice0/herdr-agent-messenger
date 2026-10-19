@@ -265,8 +265,18 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
             return store.retention()
         if command in {"reconcile", "event"}:
             result = registry.refresh(environment)[1]
-            from receiver_notifications import notify_missing_runtime
-            notify_missing_runtime(store, environment)
+            try:
+                from receiver_notifications import notify_missing_runtime
+                notify_missing_runtime(store, environment)
+            except Exception as error:
+                message = "HAM receiver notification hook failed after refresh: " + str(error)
+                store.notification_errors.append({
+                    "code": "notification_failed", "message": message,
+                    "committed": True, "recovery": "receiver_runtime_set_change"})
+                try:
+                    store.note_notification_failure(message)
+                except Exception:
+                    pass
             return store.annotate(result)
         if command in {"accept", "receipt", "setting", "withdraw"} or (command == "status-export" and arguments.wire):
             envelope = getattr(arguments, "wire_envelope", None)
