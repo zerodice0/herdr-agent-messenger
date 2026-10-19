@@ -4,6 +4,7 @@ import ham_test_support  # Protect the live ledger before product imports.
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from unittest import mock
 import uuid
 
 from ledger_mail import Mailbox
-from ledger_remote import RemoteLedger
+from ledger_remote import RemoteLedger, SSHTransport
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerError, LedgerStore, public_receipt, queue_outbox, receipt
@@ -138,6 +139,41 @@ class RemoteLedgerTest(unittest.TestCase):
 
     def send(self, source='alpha', target='beta', **options):
         return Mailbox(self.stores[source]).send(self.agents[source], self.agents[target], body='Immutable remote body 한글', **options)
+
+    def test_ssh_invoke_status_export_finds_herdr_without_login_path(self):
+        home = self.root / "remote home"
+        path = self.root / "remote-path"
+        path.mkdir()
+        (path / "python3").symlink_to(sys.executable)
+        (path / "env").symlink_to("/usr/bin/env")
+        binary = home / ".local/bin/herdr"
+        binary.parent.mkdir(parents=True)
+        snapshot = json.dumps({"result": {"snapshot": {"panes": [], "agents": []}}})
+        binary.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(snapshot) + "\n")
+        binary.chmod(0o700)
+        environment = {**self.environment, "HOME": str(home), "PATH": str(path)}
+        environment.pop("HERDR_BIN_PATH", None)
+        transport = SSHTransport(self.stores["alpha"], self.environment)
+        peer = next(peer for peer in self.services["alpha"].peers()
+                    if peer["canonical_name"] == "beta")
+        run = subprocess.run
+
+        def run_remote_shell_locally(command, **kwargs):
+            # Keep the production SSH argv/remote-shell construction, replacing
+            # only the SSH connection with an isolated non-login local shell.
+            self.assertEqual(command[0], "ssh")
+            self.assertEqual(command[-2], "b")
+            shell = shlex.split(command[-1])
+            self.assertEqual(shell[:2], ["sh", "-c"])
+            return run(["/bin/sh", *shell[1:]], env=environment, **kwargs)
+
+        with mock.patch("ledger_remote.subprocess.run", side_effect=run_remote_shell_locally):
+            result = transport._invoke(peer, "status-export",
+                                       self.services["alpha"].envelope({}))
+
+        self.assertEqual(result["protocol"], 1)
+        self.assertEqual(result["host"]["canonical_name"], "beta")
+        self.assertEqual(result["agents"], [])
 
     def test_exported_remote_receiver_absence_warns_but_unknown_does_not(self):
         beta = self.stores["beta"]

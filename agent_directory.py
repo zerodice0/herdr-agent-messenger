@@ -13,6 +13,7 @@ import re
 import selectors
 import shlex
 import socket
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -110,6 +111,16 @@ def decode_json_object(value: str) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def herdr_fallback_paths(home: str) -> tuple[str, ...]:
+    """Return standard installation paths shared by Python and remote shells."""
+    return tuple(os.path.join(home, path) for path in (
+        ".local/bin/herdr",
+        "/opt/homebrew/bin/herdr",
+        "/usr/local/bin/herdr",
+        ".local/share/mise/shims/herdr",
+    ))
+
+
 def herdr_executable(environment: Mapping[str, str] | None = None) -> str:
     values = os.environ if environment is None else environment
     recorded = values.get("HERDR_BIN_PATH") or ""
@@ -118,6 +129,11 @@ def herdr_executable(environment: Mapping[str, str] | None = None) -> str:
         recorded = recorded[: -len(DELETED_BINARY_SUFFIX)]
     if recorded and os.path.isfile(recorded) and os.access(recorded, os.X_OK):
         return recorded
+    if shutil.which("herdr", path=values.get("PATH", os.defpath)):
+        return "herdr"
+    for candidate in herdr_fallback_paths(values.get("HOME") or os.path.expanduser("~")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
     return "herdr"
 
 
@@ -554,14 +570,22 @@ def _remote_herdr_command(arguments: Sequence[str], *, remote_socket: str | None
         f"export HERDR_SOCKET_PATH={shlex.quote(remote_socket)}; "
         if remote_socket else ""
     )
+    fallbacks = []
+    for candidate in herdr_fallback_paths("$HOME"):
+        path = (
+            '"$HOME"/' + shlex.quote(candidate[len("$HOME/"):])
+            if candidate.startswith("$HOME/") else shlex.quote(candidate)
+        )
+        fallbacks.append(
+            f"elif [ -f {path} ] && [ -x {path} ]; then herdr_bin={path}; "
+        )
     script = (
-        "if command -v herdr >/dev/null 2>&1; then herdr_bin=$(command -v herdr); "
-        "elif [ -x \"$HOME/.local/bin/herdr\" ]; then herdr_bin=\"$HOME/.local/bin/herdr\"; "
-        "elif [ -x /opt/homebrew/bin/herdr ]; then herdr_bin=/opt/homebrew/bin/herdr; "
-        "elif [ -x /usr/local/bin/herdr ]; then herdr_bin=/usr/local/bin/herdr; "
-        "elif [ -x \"$HOME/.local/share/mise/shims/herdr\" ]; then "
-        "herdr_bin=\"$HOME/.local/share/mise/shims/herdr\"; "
-        "else exit 127; fi; "
+        "herdr_bin=${HERDR_BIN_PATH:-}; "
+        f"herdr_bin=${{herdr_bin%{shlex.quote(DELETED_BINARY_SUFFIX)}}}; "
+        "if [ -n \"$herdr_bin\" ] && [ -f \"$herdr_bin\" ] && [ -x \"$herdr_bin\" ]; then :; "
+        "elif command -v herdr >/dev/null 2>&1; then herdr_bin=$(command -v herdr); "
+        + "".join(fallbacks)
+        + "else exit 127; fi; "
         f"{socket_override}exec \"$herdr_bin\" {quoted_arguments}"
     )
     return f"sh -c {shlex.quote(script)}"

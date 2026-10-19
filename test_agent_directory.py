@@ -804,6 +804,68 @@ class AgentDirectoryTest(unittest.TestCase):
 
             self.assertEqual(agent_directory.herdr_executable(environment), "herdr")
 
+    def test_herdr_fallback_paths_keep_the_remote_installation_order(self):
+        self.assertEqual(agent_directory.herdr_fallback_paths("/sandbox/home"), (
+            "/sandbox/home/.local/bin/herdr",
+            "/opt/homebrew/bin/herdr",
+            "/usr/local/bin/herdr",
+            "/sandbox/home/.local/share/mise/shims/herdr",
+        ))
+
+    def test_herdr_executable_and_remote_shell_share_fallback_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home with spaces 'and quotes'"
+            path = Path(directory) / "path"
+            path.mkdir()
+            environment = {**os.environ, "HOME": str(home), "PATH": str(path)}
+            environment.pop("HERDR_BIN_PATH", None)
+            binary = home / ".local/bin/herdr"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+            binary.chmod(0o700)
+
+            self.assertEqual(agent_directory.herdr_executable(environment), str(binary))
+            command = agent_directory._remote_herdr_command(["agent", "list"])
+            result = subprocess.run(["/bin/sh", *shlex.split(command)[1:]], env=environment,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "agent\nlist\n")
+
+    def test_herdr_executable_prefers_path_and_ignores_nonexecutable_fallbacks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            path = root / "path"
+            path.mkdir()
+            binary = home / ".local/bin/herdr"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            alternate = home / ".local/share/mise/shims/herdr"
+            alternate.parent.mkdir(parents=True)
+            alternate.write_text("#!/bin/sh\n", encoding="utf-8")
+            alternate.chmod(0o700)
+            environment = {"HOME": str(home), "PATH": str(path)}
+            # Isolate system-wide candidates so this assertion is host-independent.
+            with mock.patch.object(agent_directory, "herdr_fallback_paths",
+                                   return_value=(str(binary), str(alternate))):
+                self.assertEqual(agent_directory.herdr_executable(environment), str(alternate))
+                on_path = path / "herdr"
+                on_path.write_text("#!/bin/sh\n", encoding="utf-8")
+                on_path.chmod(0o700)
+                self.assertEqual(agent_directory.herdr_executable(environment), "herdr")
+
+    def test_remote_shell_honors_recorded_binary_with_deleted_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "recorded herdr"
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' recorded\n", encoding="utf-8")
+            binary.chmod(0o700)
+            environment = {**os.environ, "HERDR_BIN_PATH": str(binary) + " (deleted)"}
+            command = agent_directory._remote_herdr_command(["agent", "list"])
+            result = subprocess.run(shlex.split(command), env=environment,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "recorded\n")
+
     def test_cancelled_command_never_starts_a_process(self):
         cancelled = threading.Event()
         cancelled.set()

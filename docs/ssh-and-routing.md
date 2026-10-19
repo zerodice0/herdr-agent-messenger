@@ -14,6 +14,14 @@ authentication and disable SSH forwarding, agent forwarding, X11 forwarding,
 and local commands. Hosts without required trust, authentication, connectivity,
 or a running Herdr server are skipped.
 
+Herdr lookup is shared by remote commands and the Python ledger entrypoints
+(including mail acceptance, status export, and the worker). An executable
+`HERDR_BIN_PATH` takes precedence; a server-reported ` (deleted)` suffix is
+removed before checking it. Otherwise HAM tries `herdr` on `PATH`, then
+`~/.local/bin/herdr`, `/opt/homebrew/bin/herdr`, `/usr/local/bin/herdr`, and
+`~/.local/share/mise/shims/herdr`, in that order. These checks do not require a
+login shell or edits to the remote shell startup files.
+
 ## Restrict authorized hosts
 
 By default, HAM probes every concrete alias for backward compatibility. To limit

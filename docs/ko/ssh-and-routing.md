@@ -14,6 +14,13 @@ forwarding, agent forwarding, X11 forwarding, local command를 비활성화합�
 필요한 host key 신뢰, 인증, 연결 또는 실행 중인 Herdr 서버가 없는 호스트는
 건너뜁니다.
 
+원격 명령과 Python 장부 진입점(메일 접수, status export, worker 포함)은 같은
+규칙으로 Herdr를 찾습니다. 실행 가능한 `HERDR_BIN_PATH`가 있으면 그것을 먼저
+씁니다. 서버가 알려 준 경로 끝의 ` (deleted)`는 지운 뒤 확인합니다. 없으면
+`PATH`의 `herdr`, `~/.local/bin/herdr`, `/opt/homebrew/bin/herdr`,
+`/usr/local/bin/herdr`, `~/.local/share/mise/shims/herdr` 순서로 찾습니다. 로그인
+셸이나 원격 셸 시작 파일 수정은 필요하지 않습니다.
+
 ## 허용 호스트 제한
 
 이전 버전과의 호환을 위해 기본값은 모든 명시적 별칭을 조회합니다. 대상을
