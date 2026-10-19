@@ -1542,21 +1542,21 @@ class MailboxApp:
         role_width = min(8, max(4, max((display_width(agent.get("role") or "—")
                                       for agent in agents), default=4)))
         # Keep RX at the smallest usable width by collapsing TURN first.
-        turn_width = 11 if width >= 11 + 8 + 4 + 2 + 9 else 3
-        alias_width = min(alias_width, max(8, width - turn_width - 4 - 6))
+        turn_width = 11 if width >= 11 + 8 + 4 + 2 + 6 else 3
+        alias_width = min(alias_width, max(8, width - turn_width - 4 - 4))
         columns = [("turn", turn_width, False), ("alias", alias_width, False), ("mail", 4, True)]
         def table_width() -> int:
-            return sum(size for _, size, _ in columns) + 3 * (len(columns) - 1)
-        if table_width() + 5 - (alias_width - 8) <= width:
-            alias_width -= max(0, table_width() + 5 - width)
+            return sum(size for _, size, _ in columns) + 2 * (len(columns) - 1)
+        if table_width() + 4 - (alias_width - 8) <= width:
+            alias_width -= max(0, table_width() + 4 - width)
             columns[1] = ("alias", alias_width, False)
             columns.append(("rx", 2, True))
-        summary = width - table_width() >= 19
+        summary = width - table_width() >= 18
         if summary:
-            columns.append(("summary", width - table_width() - 3, False))
+            columns.append(("summary", width - table_width() - 2, False))
         for additions in ([("role", role_width, False)],
                           [(name, 3, True) for name in ("phone", "emu", "server")]):
-            cost = sum(size + 3 for _, size, _ in additions)
+            cost = sum(size + 2 for _, size, _ in additions)
             flexible = columns[-1][1] - 16 if summary else columns[1][1] - 8 + width - table_width()
             if cost <= flexible:
                 if summary:
@@ -1579,7 +1579,7 @@ class MailboxApp:
         return " " * left + value + " " * (spare - left)
 
     def column_text(self, values: Mapping[str, str], columns: list[tuple[str, int, bool]]) -> str:
-        return " │ ".join(self.agent_cell(values.get(name, ""), size, centered)
+        return "  ".join(self.agent_cell(values.get(name, ""), size, centered)
                           for name, size, centered in columns)
 
     def render_table_header(self, y: int, x: int, text: str, width: int) -> None:
@@ -1609,6 +1609,22 @@ class MailboxApp:
                         scroll -= 1
             elif visible_end > scroll + height:
                 scroll = max(0, visible_end - height)
+            if region == "agents":
+                section = next((index for index in range(chosen, -1, -1)
+                                if lines[index][1] == -2), chosen)
+                first_agent = section
+                while first_agent < chosen and lines[first_agent][1] < 0:
+                    first_agent += 1
+                if chosen - section < height:
+                    # Restore a section heading when its selected row fits below it.
+                    scroll = min(scroll, section)
+                elif scroll > section and height > 1:
+                    # Long sections retain context without hiding the selected row.
+                    context = lines[section:first_agent][:height - 1]
+                    body_height = height - len(context)
+                    scroll = max(first_agent, min(scroll, chosen), chosen - body_height + 1)
+                    self.scrolls[region] = scroll
+                    return context + lines[scroll:scroll + body_height]
         scroll = min(max(0, scroll), max(0, len(lines) - height))
         self.scrolls[region] = scroll
         return lines[scroll:scroll + max(0, height)]
@@ -1619,21 +1635,10 @@ class MailboxApp:
             return
         agents = self.agents()
         columns = self.agent_columns(width, agents)
-        offset = 0
-        boundaries = []
+        header_style = self.style(1, curses.A_BOLD)
         headers = {"alias": "ALIAS", "turn": "   TURN" if columns[0][1] == 11 else "",
                    "mail": "MAIL", "rx": "RX", "role": "ROLE", "phone": "PHN",
                    "emu": "EMU", "server": "SRV", "summary": "PHASE · SUMMARY"}
-        for _name, size, _centered in columns[:-1]:
-            offset += size + 1
-            boundaries.append(offset)
-            offset += 2
-        self.put(y, x, self.column_text(headers, columns), curses.A_BOLD)
-        if height > 1:
-            rule = ["─"] * width
-            for boundary in boundaries:
-                rule[boundary] = "┼"
-            self.put(y + 1, x, "".join(rule), curses.A_DIM)
         lines: list[tuple[str, int, int, bool]] = []
         hosts = list(dict.fromkeys([agent["host"] for agent in agents] +
                                   ([self.local["host"]] if self.local.get("host") else []) +
@@ -1653,7 +1658,9 @@ class MailboxApp:
                 findings = "stale" + (" · " + findings if findings else "")
             if findings and display_width(label) + 3 < width:
                 label += " · " + truncate_display_text(findings, width - display_width(label) - 3)
-            lines.append((label, -1, curses.A_BOLD, False))
+            lines.append((label, -2, curses.A_BOLD, False))
+            if group:
+                lines.append((self.column_text(headers, columns), -3, header_style, False))
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
             for index, agent in group:
@@ -1685,7 +1692,7 @@ class MailboxApp:
                 lines.append((text, index, attr, True))
         if not agents:
             lines.append((" No agents. r refresh", -1, curses.A_DIM, False))
-        for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height - 2), y + 2):
+        for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height), y):
             self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
                 agent = agents[_index]
@@ -1693,20 +1700,25 @@ class MailboxApp:
                 glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
                 chosen = _index == self.selections["agents"]
                 offset = 0
+                counts = {"mail": "?" if agent.get("stale") else str(agent.get("unread", "?")),
+                          **self.resource_counts(agent)}
+                if counts["mail"] == "0":
+                    counts["mail"] = "·"
                 for name, size, centered in columns:
                     if name == "turn":
                         value = glyph if size == 3 else glyph + " " + pad_display_text(turn, 7)
                         turn_attr = (attr | curses.A_BOLD if chosen else
                                      self.state_style(turn, stale=bool(agent.get("stale"))))
                         self.put(row, x + 1, value, turn_attr)
-                    elif name == "mail" and not chosen and not agent.get("stale"):
-                        unread = str(agent.get("unread", "?"))
-                        if unread.isdigit() and int(unread):
-                            self.put(row, x + offset, self.agent_cell(unread, size, centered),
+                    elif not chosen and name in counts:
+                        value = counts[name]
+                        if value == "·":
+                            self.put(row, x + offset, self.agent_cell(value, size, centered),
+                                     attr | curses.A_DIM)
+                        elif name == "mail" and value.isdigit() and int(value):
+                            self.put(row, x + offset, self.agent_cell(value, size, centered),
                                      attr | curses.A_BOLD)
-                    offset += size + 3
-                for boundary in boundaries:
-                    self.put(row, x + boundary, "│", attr)
+                    offset += size + 2
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
 

@@ -94,21 +94,26 @@ or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 - Mouse handling is enabled by default. While it is on, `Shift`+drag usually
   selects terminal text. Set `HAM_MAILBOX_NO_MOUSE=1` to disable mouse handling.
 
-Digits never navigate. Agents uses a **one-line, aligned table**, not a second
-metadata line per agent. Header words are **bold, without underlines**. Columns
-are joined by ` │ ` with a space on both sides of every normal-intensity bar;
-the panel border is the table edge, with no extra leading/trailing bar. Header,
-agent rows and `┼` joints share the same boundary offsets. TURN starts with
-the selection marker and state glyph; its heading aligns with the state word.
-ALIAS, ROLE and SUMMARY are left-aligned. MAIL, RX, PHN, EMU and SRV headings
-and values are centered; known-zero counts show `·` and unknown counts show `?`.
-Nonzero MAIL counts are bold in unselected rows.
-Each host group starts with a **bold section label and agent count**, such as
-`▾ winmini · 1 agent` or `▾ winmini · 2 agents`. Findings follow only when
-nonzero (or unknown), with stale/error information when applicable; findings
-truncate before the count. The selected row has a **common light background
-and high-contrast foreground across the full table width**, including bars,
-padding and the bold turn glyph/word. Unselected turn states retain semantic
+Digits never navigate. Agents uses **borderless, aligned one-line rows**, not
+a second metadata line per agent. Columns have **two-space gaps**, with no
+vertical separators or horizontal rules inside the panel. Header labels are
+**cyan and bold, without underlines**; without color they are bold only.
+Each host section starts with a **bold host label and agent count**, such as
+`▾ winmini · 1 agent` or `▾ winmini · 2 agents`, followed by its column header
+and agent rows. Empty hosts have no column header. Sections have no blank
+separator rows, preserving space on small screens. Host/header rows are inert
+to mouse selection and skipped by keyboard selection. Scrolling keeps the
+selected agent visible and retains its host/header whenever space permits.
+Findings follow only when nonzero (or unknown), with stale/error information
+when applicable; findings truncate before the count.
+
+TURN starts with the selection marker and state glyph; its heading aligns
+with the state word. ALIAS, ROLE and SUMMARY are left-aligned. MAIL, RX, PHN,
+EMU and SRV headings and values are centered; unknown counts show `?`.
+Known-zero counts show `·`, dimmed only in unselected rows. Nonzero MAIL
+counts are bold in unselected rows. The selected row has a **common light
+background and high-contrast foreground across its full width**, including
+gaps and the bold turn glyph/word. Unselected turn states retain semantic
 colors. Without color, selection uses full-width reverse video instead.
 
 Columns show **state glyph + word**, **alias**, **MAIL** (unread count),
@@ -121,9 +126,10 @@ ALIAS prefers the longest visible alias, clamped to 8–18 cells; ROLE uses the
 longest role clamped to 4–8. Without SUMMARY, ALIAS absorbs leftover width.
 At 30 inner cells TURN shows only marker + glyph and has a blank heading;
 at 38 it shows the complete state word. At 76 SUMMARY remains visible, while
-all columns fit at 100 and above. Headings are never cut mid-word. Full
-summaries remain in Detail. Send-result labels stay bounded inside ALIAS or
-SUMMARY and may truncate. MAIL is `?` for a stale host.
+all columns fit at 100 and above. Headings are never cut mid-word. SUMMARY
+grows only after ALIAS has its preferred width, and truncates only at its end.
+Full summaries remain in Detail. Send-result labels stay bounded inside ALIAS
+or SUMMARY and may truncate. MAIL is `?` for a stale host.
 A disconnected host keeps its last snapshot marked stale; it is not treated as closed.
 
 Threads retains its **full-width bold column header with underlined words**
@@ -332,9 +338,9 @@ disables colors without removing labels or other non-color state cues.
 
 The Agents **PHN**, **EMU**, and **SRV** columns show phone, emulator, and server
 counts, respectively, when space permits after RX, SUMMARY and ROLE.
-Each uses three centered content cells, with space-padded bars between
-columns and ASCII headings regardless of color settings; there are no resource
-emoji. Known-zero counts show `·`; nonzero counts have normal brightness.
+Each uses three centered content cells with two-space gaps and ASCII headings
+regardless of color settings; there are no resource emoji. Known-zero counts
+show `·`, dimmed in unselected rows; nonzero counts have normal brightness.
 Missing device data shows `?` in PHN
 and EMU; missing server data independently shows `?` in SRV.
 Host group labels show findings such as `dead 1 · unowned 1 · stale-dev 1`
