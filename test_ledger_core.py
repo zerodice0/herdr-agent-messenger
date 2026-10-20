@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-from ledger_mail import Mailbox
+from ledger_mail import Mailbox, payload_hash, validate_payload
 from ledger_remote import RemoteLedger
 from ledger_settings import RepoSettings, validate_setting
 from ledger_status import AgentRegistry, normalize_origin, repository_identity
@@ -356,6 +356,15 @@ class LedgerCoreTest(unittest.TestCase):
         return self.mail.claim(terminal_id="term-b", agent_id=self.recipient["agent_id"],
                                generation=self.recipient["generation"], **options)
 
+    def register_cross_repo(self):
+        other = self.root / "other"
+        other.mkdir()
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other,
+                                         recipient_session="cross-repo-session"))
+        self.sender, self.recipient = self.agents()
+        self.assertNotEqual(self.sender["repo_id"], self.recipient["repo_id"])
+        return other
+
     def claim_identity(self, claim):
         return {key: claim[key] for key in ("claim_id", "agent_id", "generation")}
 
@@ -473,6 +482,112 @@ class LedgerCoreTest(unittest.TestCase):
         self.assertIsNone(result["delivered_agent_id"])
         self.assertIsNotNone(result["handled_at"])
         self.assertEqual(self.mail.handle(self.recipient, [sent["message_id"]])["receipts"][0], result)
+
+    def test_cross_repo_send_read_claim_ack_and_handle_use_recipient_repo(self):
+        self.register_cross_repo()
+        sent = self.send(kind="action", subject="Cross-repository review")
+        self.assertEqual(sent["state"], "queued")
+        before = self.database_snapshot()
+        inbox = self.mail.read(self.recipient, message_id=sent["message_id"])["messages"]
+        self.assertEqual(len(inbox), 1)
+        message = inbox[0]
+        self.assertEqual((message["repo_id"], message["sender_repo_id"], message["recipient_repo_id"]),
+                         (self.sender["repo_id"], self.sender["repo_id"], self.recipient["repo_id"]))
+        self.assertIsNone(message["hold_reason"])
+        self.assertEqual(self.mail.read(self.sender, message_id=sent["message_id"])["messages"], [])
+        self.assertEqual(self.database_snapshot(), before)
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.handle(self.sender, [sent["message_id"]])
+        self.assertEqual(caught.exception.code, "message_not_found")
+        claim = self.claim(kinds=["action"])
+        self.assertEqual([item["message_id"] for item in claim["messages"]], [sent["message_id"]])
+        self.assertEqual(claim["messages"][0]["recipient_repo_id"], self.recipient["repo_id"])
+        self.assertIsNone(self.claim()["claim_id"])
+        delivered = self.mail.started(**self.claim_identity(claim),
+                                      evidence="test:cross-repo-context-applied")["receipts"][0]
+        self.assertEqual(delivered["state"], "delivered")
+        handled = self.mail.handle(self.recipient, [sent["message_id"]])["receipts"][0]
+        self.assertEqual(handled["state"], "handled")
+        self.assertEqual(handled["delivered_agent_id"], self.recipient["agent_id"])
+        self.assertEqual(self.mail.read(self.recipient)["messages"], [])
+        self.assertEqual(self.mail.read(self.recipient, all_states=True)["messages"][0]["state"], "handled")
+
+    def test_cross_repo_pull_handle_does_not_require_native_claim(self):
+        self.register_cross_repo()
+        sent = self.send()
+        handled = self.mail.handle(self.recipient, [sent["message_id"]])["receipts"][0]
+        self.assertEqual(handled["state"], "handled")
+        self.assertIsNone(handled["delivered_at"])
+        self.assertIsNone(handled["delivered_agent_id"])
+        self.assertIsNone(self.claim()["claim_id"])
+
+    def test_user_cross_repo_send_keeps_selected_sender_origin(self):
+        self.register_cross_repo()
+        mail = Mailbox(self.store, {"HERDR_AGENT_LEDGER_AUTOSTART": "0"})
+        sent = mail.send_user(self.sender["repo_id"], self.recipient, body="User cross-repo request")
+        self.assertEqual(sent["state"], "queued")
+        thread = mail.show_thread(sent["thread_id"])
+        self.assertEqual(thread["repo_id"], self.sender["repo_id"])
+        message = mail.read(self.recipient)["messages"][0]
+        self.assertEqual((message["sender"], message["sender_repo_id"], message["recipient_repo_id"]),
+                         ("user", self.sender["repo_id"], self.recipient["repo_id"]))
+        reply = mail.send(self.recipient, self.sender, body="User request reviewed",
+                          reply_to=sent["message_id"])
+        self.assertEqual(reply["thread_id"], sent["thread_id"])
+
+    def test_cross_repo_recipient_switch_holds_until_intended_repo_returns(self):
+        other = self.register_cross_repo()
+        sent = self.send()
+        intended_repo = self.recipient["repo_id"]
+        # Switching into the conversation's origin is still the wrong occupant.
+        self.registry.reconcile(snapshot(self.repo, recipient_session="wrong-origin-session"))
+        self.sender, self.recipient = self.agents()
+        self.assertEqual(self.mail.read(self.recipient, message_id=sent["message_id"])["messages"], [])
+        self.assertEqual(self.claim()["messages"], [])
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.handle(self.recipient, [sent["message_id"]])
+        self.assertEqual(caught.exception.code, "message_not_found")
+        with self.store.read() as connection:
+            row = connection.execute("SELECT recipient_repo_id,state,hold_reason FROM deliveries "
+                                     "WHERE message_id=?", (sent["message_id"],)).fetchone()
+        self.assertEqual(tuple(row), (intended_repo, "queued", "recipient_changed"))
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other,
+                                         recipient_session="intended-repo-returned"))
+        self.sender, self.recipient = self.agents()
+        self.assertEqual(self.mail.read(self.recipient)["messages"][0]["message_id"], sent["message_id"])
+        self.assertIsNone(self.mail.read(self.recipient)["messages"][0]["hold_reason"])
+        self.assertEqual([item["message_id"] for item in self.claim()["messages"]], [sent["message_id"]])
+
+    def test_cross_repo_enqueue_holds_changed_occupant_despite_matching_thread_repo(self):
+        self.register_cross_repo()
+        value = {**self.payload(), "sender_repo_id": self.sender["repo_id"],
+                 "recipient_repo_id": self.recipient["repo_id"]}
+        self.registry.reconcile(snapshot(self.repo, recipient_session="origin-repo-occupant"))
+        self.sender, self.recipient = self.agents()
+        accepted = self.mail.enqueue(value)
+        self.assertEqual((accepted["state"], accepted["hold_reason"]), ("queued", "recipient_changed"))
+        self.assertEqual(self.mail.read(self.recipient, message_id=value["message_id"])["messages"], [])
+        self.assertEqual(self.claim()["messages"], [])
+
+    def test_cross_repo_operator_not_applied_recovery_checks_recipient_repo(self):
+        other = self.register_cross_repo()
+        self.send()
+        claim = self.claim()
+        self.registry.reconcile(snapshot(self.repo, recipient_session="wrong-repo"))
+        self.sender, self.recipient = self.agents()
+        resolved = self.mail.resolve_claim(**self.claim_identity(claim), disposition="not_applied",
+                                           evidence="test:no-context-was-applied")["receipts"]
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual((resolved[0]["state"], resolved[0]["hold_reason"]),
+                         ("queued", "recipient_changed"))
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute("SELECT hold_reason FROM deliveries").fetchone()[0],
+                             "recipient_changed")
+        self.assertEqual(self.claim()["messages"], [])
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other,
+                                         recipient_session="intended-repo"))
+        self.sender, self.recipient = self.agents()
+        self.assertEqual(len(self.claim()["messages"]), 1)
 
     def test_handle_batch_is_atomic_on_wrong_recipient(self):
         first = self.send()
@@ -680,6 +795,223 @@ class LedgerCoreTest(unittest.TestCase):
         self.assertEqual(thread["messages"][0]["state"], "handled")
         self.assertEqual(thread["messages"][1]["hop"], 1)
         self.assertIsNone(thread["messages"][0]["delivered_at"])
+
+    def test_cross_repo_replies_keep_origin_and_allow_any_thread_participant(self):
+        other = self.register_cross_repo()
+        first = self.send(subject="Immutable origin subject", kind="action")
+        reply = self.mail.send(self.recipient, self.sender, body="Reviewed across repositories",
+                               reply_to=first["message_id"], subject="Must not replace subject")
+        followup = self.mail.send(self.sender, self.recipient, body="Followup",
+                                  reply_to=reply["message_id"])
+        # The original sender may reply to its own earlier message as a sender,
+        # not merely to messages addressed to it.
+        own_reply = self.mail.send(self.sender, self.recipient, body="Original sender clarification",
+                                   reply_to=first["message_id"])
+        # Recipient membership is terminal+host, so a new session may continue.
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other,
+                                         recipient_session="replacement-participant"))
+        self.sender, self.recipient = self.agents()
+        continued = self.mail.send(self.recipient, self.sender, body="Replacement session reply",
+                                   reply_to=own_reply["message_id"])
+        thread = self.mail.show_thread(first["thread_id"])
+        self.assertEqual(thread["repo_id"], self.sender["repo_id"])
+        self.assertEqual(thread["subject"], "Immutable origin subject")
+        rows = {row["message_id"]: row for row in thread["messages"]}
+        for result, hop, sender_repo, recipient_repo in (
+                (first, 0, self.sender["repo_id"], self.recipient["repo_id"]),
+                (reply, 1, self.recipient["repo_id"], self.sender["repo_id"]),
+                (followup, 2, self.sender["repo_id"], self.recipient["repo_id"]),
+                (own_reply, 1, self.sender["repo_id"], self.recipient["repo_id"]),
+                (continued, 2, self.recipient["repo_id"], self.sender["repo_id"])):
+            row = rows[result["message_id"]]
+            self.assertEqual(result["thread_id"], first["thread_id"])
+            self.assertEqual((row["repo_id"], row["hop"], row["sender_repo_id"], row["recipient_repo_id"]),
+                             (thread["repo_id"], hop, sender_repo, recipient_repo))
+        self.assertEqual(rows[first["message_id"]]["state"], "handled")
+        self.assertIsNone(rows[first["message_id"]]["delivered_at"])
+
+    def test_sender_session_restart_can_continue_thread_only_in_original_repo(self):
+        other = self.register_cross_repo()
+        first = self.send(subject="Sender identity survives a restart")
+        current = snapshot(self.repo, recipient_repo=other)
+        current["agents"][0]["agent_session"]["value"] = "sender-restarted"
+        self.registry.reconcile(current, refresh_display=False)
+        self.sender, self.recipient = self.agents()
+        reply = self.mail.send(self.sender, self.recipient, body="Same terminal and repository",
+                               reply_to=first["message_id"])
+        self.assertEqual(reply["thread_id"], first["thread_id"])
+        current["agents"][0]["cwd"] = str(other)
+        self.registry.reconcile(current, refresh_display=False)
+        self.sender, self.recipient = self.agents()
+        before = self.database_snapshot()
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.send(self.sender, self.recipient, body="Wrong project on old sender terminal",
+                           reply_to=first["message_id"])
+        self.assertEqual(caught.exception.code, "not_participant")
+        self.assertEqual(self.database_snapshot(), before)
+
+    def test_reused_recipient_terminal_cannot_reply_to_or_handle_stale_mail(self):
+        self.register_cross_repo()
+        first = self.send(subject="Intended for another repository")
+        self.registry.reconcile(snapshot(self.repo, recipient_session="other-project"),
+                                refresh_display=False)
+        self.sender, self.recipient = self.agents()
+        before = self.database_snapshot()
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.send(self.recipient, self.sender, body="Not an intended participant",
+                           reply_to=first["message_id"])
+        self.assertEqual(caught.exception.code, "not_participant")
+        self.assertEqual(self.database_snapshot(), before)
+        row = self.mail.show_thread(first["thread_id"])["messages"][0]
+        self.assertEqual((row["state"], row["hold_reason"]), ("queued", "recipient_changed"))
+
+    def test_nonparticipant_cannot_reply_even_from_thread_origin_repo(self):
+        other = self.register_cross_repo()
+        first = self.send(subject="Private participant set")
+        current = snapshot(self.repo, recipient_repo=other, recipient_session="cross-repo-session")
+        pane = {"terminal_id": "term-c", "pane_id": "w1:p3", "workspace_id": "w1"}
+        current["panes"].append(pane)
+        current["agents"].append({**current["agents"][0], **pane, "name": "green-fox",
+                                  "agent_session": {"value": "session-c"}})
+        self.registry.reconcile(current)
+        outsider = next(agent for agent in self.registry.list() if agent["terminal_id"] == "term-c")
+        self.assertEqual(outsider["repo_id"], self.sender["repo_id"])
+        before = self.database_snapshot()
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.send(outsider, self.recipient, body="Uninvited reply", reply_to=first["message_id"])
+        self.assertEqual(caught.exception.code, "not_participant")
+        self.assertEqual(self.database_snapshot(), before)
+        # Being invited in any later delivery permits replying to the root.
+        invited = self.mail.send(self.sender, outsider, body="Please join this thread",
+                                 reply_to=first["message_id"])
+        accepted = self.mail.send(outsider, self.recipient, body="Now a thread participant",
+                                  reply_to=first["message_id"])
+        self.assertEqual(invited["thread_id"], first["thread_id"])
+        self.assertEqual(accepted["thread_id"], first["thread_id"])
+
+    def test_legacy_and_v8_payload_hashes_cover_exact_accepted_fields(self):
+        legacy = self.payload()
+        expected_legacy = hashlib.sha256(json.dumps(
+            legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        self.assertEqual(validate_payload(legacy), legacy)
+        self.assertEqual(payload_hash(legacy), expected_legacy)
+        modern = {**legacy, "sender_repo_id": self.sender["repo_id"],
+                  "recipient_repo_id": self.recipient["repo_id"]}
+        self.assertEqual(validate_payload(modern), modern)
+        self.assertNotEqual(payload_hash(modern), expected_legacy)
+        self.assertEqual(payload_hash(dict(reversed(list(modern.items())))), payload_hash(modern))
+        for key in ("sender_repo_id", "recipient_repo_id"):
+            with self.subTest(key=key):
+                self.assertNotEqual(payload_hash({**modern, key: "git:changed/repository"}),
+                                    payload_hash(modern))
+                incomplete = dict(modern)
+                incomplete.pop(key)
+                with self.assertRaises(LedgerError) as caught:
+                    validate_payload(incomplete)
+                self.assertEqual(caught.exception.code, "invalid_message")
+                for invalid in (None, "", 1, "x" * 4097):
+                    with self.subTest(invalid=invalid), self.assertRaises(LedgerError) as caught:
+                        validate_payload({**modern, key: invalid})
+                    self.assertEqual(caught.exception.code, "invalid_message")
+        accepted = self.mail.enqueue(legacy)
+        self.assertEqual(accepted["payload_hash"], expected_legacy)
+        self.assertEqual(self.mail.enqueue(legacy), accepted)
+        # Migration does not reinterpret old UUIDs as extended v8 payloads.
+        with self.assertRaises(LedgerError) as caught:
+            self.mail.enqueue(modern)
+        self.assertEqual(caught.exception.code, "message_conflict")
+
+    def test_v7_migration_backfills_endpoint_repos_preserving_queues_holds_and_hashes(self):
+        held = self.payload()
+        self.mail.enqueue(held)
+        self.register_cross_repo()
+        queued = {**self.payload(), "repo_id": self.recipient["repo_id"]}
+        self.mail.enqueue(queued)
+        remote_payload = {**self.payload(), "recipient_host": "beta",
+                          "recipient_address": "beta/remote-owl"}
+        remote = RemoteLedger(self.store)
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO peers VALUES (?,?,?,?)",
+                               ("beta", str(uuid.uuid4()), "inert-beta", "/inert/ham"))
+        with self.store.transaction() as connection:
+            pending = remote.submit(connection, remote_payload)
+        self.assertEqual(pending["state"], "pending")
+        payloads = {value["message_id"]: value for value in (held, queued, remote_payload)}
+        expected_hashes = {identity: hashlib.sha256(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                           for identity, value in payloads.items()}
+        with self.store.read() as connection:
+            before_messages = [{key: row[key] for key in row.keys() if key != "sender_repo_id"}
+                               for row in connection.execute("SELECT * FROM messages ORDER BY message_id")]
+            before_deliveries = [{key: row[key] for key in row.keys() if key != "recipient_repo_id"}
+                                 for row in connection.execute("SELECT * FROM deliveries ORDER BY message_id")]
+            before_receipts = [tuple(row) for row in connection.execute(
+                "SELECT * FROM dedupe_receipts ORDER BY message_id")]
+            before_routes = [tuple(row) for row in connection.execute(
+                "SELECT * FROM message_routes ORDER BY message_id")]
+            cursor_key = connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='history_cursor_key'").fetchone()[0]
+        # Reconstruct v7's actual missing-column shape rather than merely
+        # changing the version tag on a fully migrated database.
+        with self.store.transaction() as connection:
+            connection.execute("ALTER TABLE messages DROP COLUMN sender_repo_id")
+            connection.execute("ALTER TABLE deliveries DROP COLUMN recipient_repo_id")
+            connection.execute("UPDATE ledger_meta SET value='7' WHERE key='schema_version'")
+        migrated = LedgerStore(self.store.directory, canonical_name="alpha")
+        mail = Mailbox(migrated)
+        with migrated.read() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "8")
+            self.assertEqual(connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='history_cursor_key'").fetchone()[0], cursor_key)
+            self.assertEqual(migrated.host_uuid, self.store.host_uuid)
+            messages = list(connection.execute("SELECT * FROM messages ORDER BY message_id"))
+            deliveries = list(connection.execute("SELECT * FROM deliveries ORDER BY message_id"))
+            self.assertEqual([{key: row[key] for key in row.keys() if key != "sender_repo_id"}
+                              for row in messages], before_messages)
+            self.assertEqual([{key: row[key] for key in row.keys() if key != "recipient_repo_id"}
+                              for row in deliveries], before_deliveries)
+            self.assertEqual([tuple(row) for row in connection.execute(
+                "SELECT * FROM dedupe_receipts ORDER BY message_id")], before_receipts)
+            self.assertEqual([tuple(row) for row in connection.execute(
+                "SELECT * FROM message_routes ORDER BY message_id")], before_routes)
+            for message in messages:
+                self.assertEqual(message["sender_repo_id"], message["repo_id"])
+                self.assertEqual(message["payload_hash"], expected_hashes[message["message_id"]])
+            by_id = {row["message_id"]: row for row in deliveries}
+            for identity, value in payloads.items():
+                self.assertEqual(by_id[identity]["recipient_repo_id"], value["repo_id"])
+            self.assertEqual((by_id[held["message_id"]]["state"], by_id[held["message_id"]]["hold_reason"]),
+                             ("queued", "recipient_changed"))
+            self.assertEqual((by_id[queued["message_id"]]["state"], by_id[queued["message_id"]]["hold_reason"]),
+                             ("queued", None))
+        # Exact legacy retransmissions remain idempotent after the new columns
+        # have been populated, and retain the original immutable receipt hash.
+        for value in (held, queued):
+            replay = mail.enqueue(value)
+            self.assertEqual(replay["payload_hash"], expected_hashes[value["message_id"]])
+        self.assertEqual([row["message_id"] for row in mail.read(self.recipient)["messages"]],
+                         [queued["message_id"]])
+        handled = mail.handle(self.recipient, [queued["message_id"]])["receipts"][0]
+        self.assertEqual(handled["payload_hash"], expected_hashes[queued["message_id"]])
+        self.assertEqual(handled["state"], "handled")
+        incoming = {**pending, "state": "queued", "hold_reason": None,
+                    "authoritative_host": "beta", "updated_at": pending["updated_at"] + 1}
+        remote = RemoteLedger(migrated)
+        with self.assertRaises(LedgerError) as caught:
+            with migrated.transaction() as connection:
+                remote.apply_receipt(connection, {**incoming, "payload_hash": "0" * 64}, "beta")
+        self.assertEqual(caught.exception.code, "message_conflict")
+        with migrated.transaction() as connection:
+            accepted = remote.apply_receipt(connection, incoming, "beta")
+        self.assertEqual(accepted["state"], "queued")
+        self.assertEqual(accepted["payload_hash"], expected_hashes[remote_payload["message_id"]])
+        migrated.retention(now=time.time() + 91 * 86400)
+        self.assertEqual(mail.enqueue(queued), handled)
+        with self.assertRaises(LedgerError) as caught:
+            mail.enqueue({**queued, "sender_repo_id": queued["repo_id"],
+                          "recipient_repo_id": queued["repo_id"]})
+        self.assertEqual(caught.exception.code, "message_conflict")
 
     def test_status_log_retention_preserves_current_state(self):
         self.registry.set_status(self.sender, phase="review", summary="Inspecting CAS")

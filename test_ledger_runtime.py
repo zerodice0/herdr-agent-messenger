@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from ledger_mail import Mailbox
@@ -50,6 +51,36 @@ class RenderBundleTest(unittest.TestCase):
                 self.assertEqual(content, expected)
                 self.assertEqual(len(content.encode()), size)
                 self.assertEqual(hashlib.sha256(content.encode()).hexdigest(), digest)
+
+    def test_cross_repo_header_exact_bytes_hash_and_send_time_sender_repo(self):
+        message = {**self.messages(1)[0], 'origin_host': 'macbook', 'sender_label': 'purple-deer',
+                   'repo_id': 'git:example.test/team/origin',
+                   'sender_repo_id': 'git:example.test/team/monitor_mobile',
+                   'recipient_repo_id': 'git:example.test/team/dxp-api'}
+        content = render_bundle([message], self.marker)
+        self.assertIn('From macbook/purple-deer (repo monitor_mobile) [action]\n', content)
+        self.assertEqual(len(content.encode()), 571)
+        self.assertEqual(hashlib.sha256(content.encode()).hexdigest(),
+                         '70fe42f6ea41d343ae542adc72fbbbc4ba3c4f70d5fc36f88a25504e9ee92464')
+        same_repo = {**message, 'sender_repo_id': message['recipient_repo_id']}
+        same_content = render_bundle([same_repo], self.marker)
+        self.assertNotIn('(repo ', same_content)
+        self.assertEqual(len(content.encode()) - len(same_content.encode()), 22)
+        legacy = {key: value for key, value in message.items()
+                  if key not in {'sender_repo_id', 'recipient_repo_id'}}
+        self.assertEqual(render_bundle([legacy], self.marker), same_content)
+
+    def test_cross_repo_header_short_name_is_utf8_bounded_with_body_caps_unchanged(self):
+        messages = [{**message, 'sender_repo_id': 'git:example.test/team/' + '한' * 100,
+                     'recipient_repo_id': 'git:example.test/team/target'}
+                    for message in self.messages(BUNDLE_MESSAGES, '🙂' * 3000)]
+        content = render_bundle(messages, self.marker)
+        self.assertLessEqual(len(content.encode()), BUNDLE_BYTES)
+        self.assertEqual(content.count('(repo ' + '한' * 32 + ')'), BUNDLE_MESSAGES)
+        self.assertNotIn('example.test', content)
+        for message in messages:
+            self.assertIn(message['message_id'], content)
+            self.assertIn('[truncated; inbox read --message ' + message['message_id'] + ']', content)
 
     def test_original_caps_and_truncation_budget_follow_actual_prefix_bytes(self):
         self.assertEqual((MESSAGE_BYTES, BUNDLE_BYTES, BUNDLE_MESSAGES), (2048, 8192, 8))
@@ -159,6 +190,125 @@ class NativeReceiverTest(unittest.TestCase):
             claim = self.claim()
             self.assertEqual(len(claim['messages']),1)
             self.assertEqual(self.applied(claim)['receipts'][0]['state'],'delivered')
+
+    def cross_repo_recipient(self):
+        target = self.root/'target'
+        target.mkdir()
+        self.registry.reconcile(snapshot(self.repo, recipient_session=self.session,
+                                         recipient_repo=target), refresh_display=False)
+        self.recipient = next(a for a in self.registry.list() if a['terminal_id']=='term-b')
+        self.receiver.register(self.recipient, session_ref=self.session)
+        self.identity = {key:self.recipient[key] for key in ('terminal_id','agent_id','generation')}
+        self.settings.mutate(self.recipient['repo_id'],'thresholds',self.thresholds)
+
+    def test_cross_repo_actions_use_recipient_off_manual_auto_not_sender_mode(self):
+        self.cross_repo_recipient()
+        recipient_repo = self.recipient['repo_id']
+        address = {'host':self.store.host, 'terminal_id':self.recipient['terminal_id']}
+        cases = [('off', 'auto', False, 'not_participating'),
+                 ('manual', 'auto', False, 'not_participating'),
+                 ('manual', 'off', True, None),
+                 ('auto', 'off', False, None)]
+        for mode, sender_mode, member, reason in cases:
+            with self.subTest(mode=mode, sender_mode=sender_mode, member=member):
+                self.settings.mutate(self.sender['repo_id'], 'mode', sender_mode)
+                self.settings.mutate(recipient_repo, 'mode', mode)
+                self.settings.mutate(recipient_repo, 'members', [address] if member else [],
+                                     host=self.store.host, workspace_id=self.recipient['workspace_id'])
+                sent = self.send(kind='action')
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertEqual(inspected['mode'], mode)
+                self.assertEqual(inspected['queued_count'], 1)
+                self.assertTrue(inspected['has_action'])
+                claim = self.claim(wake=True)
+                self.assertEqual(claim.get('reason'), reason)
+                if reason:
+                    self.assertIsNone(claim['claim_id'])
+                    claim = self.claim()
+                self.assertEqual([row['message_id'] for row in claim['messages']], [sent['message_id']])
+                message = claim['messages'][0]
+                self.assertEqual((message['repo_id'], message['sender_repo_id'], message['recipient_repo_id']),
+                                 (self.sender['repo_id'], self.sender['repo_id'], recipient_repo))
+                self.assertIn(' (repo repo) [action]\n', claim['message']['content'])
+                self.assertEqual(self.applied(claim)['receipts'][0]['state'], 'delivered')
+
+    def test_cross_repo_wake_still_obeys_recipient_hop_coalescing_hourly_and_turn_gates(self):
+        self.cross_repo_recipient()
+        self.settings.mutate(self.sender['repo_id'], 'mode', 'off')
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'auto')
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds',
+                             {**self.thresholds, 'max_hop':0, 'coalesce_seconds':30, 'wakes_per_hour':1})
+        first = self.send(kind='action')
+        self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
+        with mock.patch('ledger_runtime.time.time', return_value=time.time()+31):
+            claim = self.claim(wake=True)
+        self.applied(claim)
+        reply = self.send(kind='action', reply_to=first['message_id'])
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+        second = self.send(kind='action')
+        self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'max_hop':0})
+        live = snapshot(self.repo, recipient_session=self.session, recipient_repo=self.root/'target')
+        live['agents'][1]['agent_status'] = 'working'
+        self.registry.reconcile(live, refresh_display=False)
+        self.assertEqual(self.claim(wake=True)['reason'], 'not_idle')
+        natural = self.claim()
+        self.assertEqual([row['message_id'] for row in natural['messages']], [second['message_id']])
+        self.assertEqual(self.states()[reply['message_id']], 'queued')
+
+    def test_runtime_filters_delivery_repo_even_if_stale_delivery_remains_queued(self):
+        sent = self.send(kind='action')
+        self.cross_repo_recipient()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET state='queued',hold_reason=NULL WHERE message_id=?",
+                               (sent['message_id'],))
+        self.assertEqual(self.receiver.inspect(**self.identity)['queued_count'], 0)
+        self.assertEqual(self.claim()['reason'], 'empty')
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute('SELECT state FROM deliveries WHERE message_id=?',
+                                                (sent['message_id'],)).fetchone()[0], 'queued')
+
+    def test_generic_claim_selects_delivery_repo_and_preserves_repo_header_fields(self):
+        stale = self.send(kind='action')
+        self.cross_repo_recipient()
+        current = self.send(kind='action')
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET state='queued',hold_reason=NULL WHERE message_id=?",
+                               (stale['message_id'],))
+        claim = self.mail.claim(**self.identity)
+        self.assertEqual([row['message_id'] for row in claim['messages']], [current['message_id']])
+        self.assertEqual(claim['messages'][0]['recipient_repo_id'], self.recipient['repo_id'])
+        self.assertEqual(claim['messages'][0]['sender_repo_id'], self.sender['repo_id'])
+        self.assertIn(' (repo repo) [action]\n', render_bundle(claim['messages'], RenderBundleTest.marker))
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute('SELECT state FROM deliveries WHERE message_id=?',
+                                                (stale['message_id'],)).fetchone()[0], 'queued')
+
+    def test_claude_cross_repo_hook_uses_delivery_repo_and_preserves_header_and_hash(self):
+        target = self.root/'target'
+        target.mkdir()
+        session_id = str(uuid.uuid4())
+        transcript = self.root/'claude'/'projects'/'isolated-project'/(session_id+'.jsonl')
+        transcript.parent.mkdir(parents=True)
+        transcript.touch()
+        live = snapshot(self.repo, recipient_session=session_id, recipient_repo=target)
+        live['agents'][1]['agent'] = 'claude'
+        self.registry.reconcile(live, refresh_display=False)
+        agent = next(a for a in self.registry.list() if a['terminal_id']=='term-b')
+        self.settings.mutate(agent['repo_id'], 'mode', 'off')
+        sent = self.mail.send(self.sender, agent, kind='action', body='Cross-repository Claude context')
+        with mock.patch('ledger_status.claude_foreground_pid', return_value=4242):
+            result = self.receiver.claude_hook(agent, hook_event_name='UserPromptSubmit',
+                    session_id=session_id, transcript_path=str(transcript), environment=self.environment)
+        self.assertEqual([row['message_id'] for row in result['claim']['messages']], [sent['message_id']])
+        self.assertEqual(result['claim']['messages'][0]['recipient_repo_id'], agent['repo_id'])
+        content = result['additional_context']
+        self.assertIn(' (repo repo) [action]\n', content)
+        self.assertEqual(result['claim']['content_bytes'], len(content.encode()))
+        self.assertEqual(result['claim']['content_sha256'], hashlib.sha256(content.encode()).hexdigest())
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM wake_log').fetchone()[0], 0)
+
 
     def test_runtime_and_board_roles_follow_each_agents_current_workspace(self):
         def board_agents():

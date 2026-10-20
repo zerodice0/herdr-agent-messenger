@@ -103,6 +103,7 @@ class LedgerProjectionTest(unittest.TestCase):
                          ("peer/term", "w1", "?", True))
         self.assertEqual((agent["devices"], agent["servers"], agent["extension_present"]), (1, 1, 0))
         self.assertTrue({"agent_id", "generation", "repo_id"}.isdisjoint(agent))
+        self.assertEqual(agent["repo"], "repo")
         host = compact["hosts"][0]
         self.assertNotIn("agents", host)
         self.assertEqual(host["error"], error)
@@ -110,6 +111,22 @@ class LedgerProjectionTest(unittest.TestCase):
                                              "stale_devices": 1, "error": "Scan unavailable"})
         self.assertIs(payload["hosts"][0]["agents"][0], row)
         self.assertEqual(row["devices"], [{"device_id": "phone"}])
+
+    def test_board_and_status_list_show_short_repo_for_every_agent_including_one_repo(self):
+        rows = [{"host": "alpha", "alias": "owl", "terminal_id": "one", "workspace_id": "w1",
+                 "repo_id": "git:example.test/team/monitor_mobile"},
+                {"host": "beta", "alias": "deer", "terminal_id": "two", "workspace_id": "w2",
+                 "repo_id": "git:example.test/services/dxp-api"}]
+        for count in (1, 2):
+            with self.subTest(count=count):
+                selected = rows[:count]
+                payload = {"repo_id": None, "agents": selected}
+                compact = agent_output.compact_board_payload(payload)
+                self.assertEqual([row["repo"] for row in compact["agents"]],
+                                 ["monitor_mobile", "dxp-api"][:count])
+                self.assertEqual([row.get("repo_id") for row in compact["agents"]],
+                                 [row["repo_id"] if count > 1 else None for row in selected])
+                self.assertTrue(all("repo" not in row for row in selected))
 
     def test_inbox_keeps_priority_reply_and_truncation_without_delivery_internals(self):
         row = {"message_id": "message", "thread_id": "thread", "reply_to": "parent", "hop": 2,

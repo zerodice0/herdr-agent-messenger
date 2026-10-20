@@ -361,8 +361,8 @@ class AgentRegistry:
                     (repo_id, host, workspace_id)))
             changed_ids: list[str] = []
             for row in connection.execute(
-                    "SELECT d.message_id,d.recipient_terminal_id,m.repo_id,d.state FROM deliveries d "
-                    "JOIN messages m USING(message_id) WHERE d.recipient_host=? AND d.state IN ('queued','delivering')",
+                    "SELECT d.message_id,d.recipient_terminal_id,d.recipient_repo_id,d.state FROM deliveries d "
+                    "WHERE d.recipient_host=? AND d.state IN ('queued','delivering')",
                     (self.store.host,)).fetchall():
                 terminal = row["recipient_terminal_id"]
                 target = observed.get(terminal)
@@ -376,7 +376,7 @@ class AgentRegistry:
                     continue
                 elif not target:
                     reason = "recipient_absent"
-                elif target["repo_id"] != row["repo_id"]:
+                elif target["repo_id"] != row["recipient_repo_id"]:
                     reason = "recipient_changed"
                 else:
                     reason = None

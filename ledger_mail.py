@@ -22,6 +22,7 @@ MAX_BODY_BYTES = 16 * 1024
 IMMUTABLE_FIELDS = ("message_id", "thread_id", "repo_id", "reply_to", "origin_host", "sender",
                     "sender_label", "kind", "hop", "body", "subject", "created_at",
                     "recipient_host", "recipient_terminal_id", "recipient_address")
+REPO_FIELDS = ("sender_repo_id", "recipient_repo_id")
 MAX_HISTORY_CURSOR_SIZE = 32768
 
 
@@ -82,8 +83,8 @@ def _history_boundary(store: LedgerStore, kind: str, repo_id: str | None,
 
 
 def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    if set(payload) != set(IMMUTABLE_FIELDS):
-        raise LedgerError("invalid_message", "Message fields do not match protocol 1.")
+    if set(payload) not in (set(IMMUTABLE_FIELDS), set(IMMUTABLE_FIELDS + REPO_FIELDS)):
+        raise LedgerError("invalid_message", "Message fields do not match a supported protocol 1 payload.")
     value = dict(payload)
     for key in ("message_id", "thread_id"):
         require_uuid(value[key], key)
@@ -91,6 +92,9 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         require_uuid(value["reply_to"], "reply_to")
     for key in ("repo_id", "origin_host", "sender", "sender_label", "recipient_host", "recipient_address"):
         if not isinstance(value[key], str) or not value[key] or len(value[key]) > 4096:
+            raise LedgerError("invalid_message", f"{key} must be a bounded nonempty string.")
+    for key in REPO_FIELDS:
+        if key in value and (not isinstance(value[key], str) or not value[key] or len(value[key]) > 4096):
             raise LedgerError("invalid_message", f"{key} must be a bounded nonempty string.")
     if value["recipient_terminal_id"] is not None and (
             not isinstance(value["recipient_terminal_id"], str) or not value["recipient_terminal_id"]):
@@ -112,6 +116,8 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def payload_hash(payload: Mapping[str, Any]) -> str:
+    # Hash the accepted wire shape, never a normalized/backfilled database row:
+    # legacy payloads omit REPO_FIELDS and must retain their original digest.
     return hashlib.sha256(json_text(payload).encode('utf-8')).hexdigest()
 
 
@@ -122,10 +128,9 @@ class Mailbox:
 
     def send(self, sender: Mapping[str, Any], recipient: Mapping[str, Any], *, body: str,
              kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
-        if sender["repo_id"] != recipient["repo_id"]:
-            raise LedgerError("repo_mismatch", "Mailbox recipients must occupy the sender's repository identity.")
         message_id = str(uuid.uuid4())
         payload = {"message_id": message_id, "thread_id": message_id, "repo_id": sender["repo_id"],
+                   "sender_repo_id": sender["repo_id"], "recipient_repo_id": recipient["repo_id"],
                    "reply_to": reply_to, "origin_host": self.store.host, "sender": sender["agent_id"],
                    "sender_label": sender["alias"] or sender["terminal_id"], "kind": kind, "hop": 0,
                    "body": body, "subject": subject, "created_at": time.time(),
@@ -136,10 +141,16 @@ class Mailbox:
 
     def send_user(self, repo_id: str, recipient: Mapping[str, Any], *, body: str,
                   kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
-        if not repo_id or recipient.get("repo_id") != repo_id:
-            raise LedgerError("repo_mismatch", "Mailbox recipients must occupy the selected repository identity.")
+        """Send as the operator from repo_id context, including to another repo.
+
+        Replies keep the retained thread origin; repo_id still records this
+        sender's context. User replies neither impersonate nor auto-handle agents.
+        """
+        if not repo_id:
+            raise LedgerError("invalid_repo", "The sender repository context must be nonempty.")
         message_id = str(uuid.uuid4())
         payload = {"message_id": message_id, "thread_id": message_id, "repo_id": repo_id,
+                   "sender_repo_id": repo_id, "recipient_repo_id": recipient["repo_id"],
                    "reply_to": reply_to, "origin_host": self.store.host, "sender": "user",
                    "sender_label": "user", "kind": kind, "hop": 0, "body": body, "subject": subject,
                    "created_at": time.time(), "recipient_host": recipient["host"],
@@ -179,16 +190,29 @@ class Mailbox:
             reply_to = payload["reply_to"]
             if reply_to:
                 require_uuid(reply_to, "reply_to")
-                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.state "
+                parent = connection.execute("SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.recipient_repo_id,d.state "
                                             "FROM messages m JOIN deliveries d USING(message_id) "
                                             "WHERE message_id=?", (reply_to,)).fetchone()
-                if parent is None or parent["repo_id"] != payload["repo_id"]:
-                    raise LedgerError("reply_not_found", "Reply target is not a retained message in this repository.")
-                payload.update(thread_id=parent["thread_id"], hop=parent["hop"] + 1)
+                if parent is None:
+                    raise LedgerError("reply_not_found", "Reply target is not a retained message.")
+                if sender is not None:
+                    participant = connection.execute(
+                        "SELECT 1 FROM messages m JOIN deliveries d USING(message_id) "
+                        "WHERE m.thread_id=? AND ((m.origin_host=? AND m.sender_repo_id=? AND "
+                        "m.sender IN (SELECT agent_id FROM agents WHERE host=? AND terminal_id=?)) OR "
+                        "(d.recipient_host=? AND d.recipient_terminal_id=? AND d.recipient_repo_id=?)) LIMIT 1",
+                        (parent["thread_id"], self.store.host, sender["repo_id"], self.store.host,
+                         sender["terminal_id"], self.store.host, sender["terminal_id"], sender["repo_id"]),
+                    ).fetchone()
+                    if participant is None:
+                        raise LedgerError("not_participant", "Only a participant of this thread may reply.")
+                payload.update(thread_id=parent["thread_id"], repo_id=parent["repo_id"], hop=parent["hop"] + 1)
                 thread = connection.execute("SELECT subject FROM threads WHERE thread_id=?",
                                             (parent["thread_id"],)).fetchone()
                 payload["subject"] = thread[0]
                 if (sender is not None and auto_handle_parent and
+                        parent["recipient_host"] == self.store.host and
+                        parent["recipient_repo_id"] == sender["repo_id"] and
                         parent["recipient_terminal_id"] == sender["terminal_id"] and
                         parent["state"] == "delivering"):
                     raise LedgerError("delivery_in_progress",
@@ -198,6 +222,7 @@ class Mailbox:
             result = RemoteLedger(self.store, self.environment).submit(connection, value)
             if (sender is not None and auto_handle_parent and parent and
                     parent["recipient_host"] == self.store.host and
+                    parent["recipient_repo_id"] == sender["repo_id"] and
                     parent["recipient_terminal_id"] == sender["terminal_id"] and
                     parent["state"] in {"queued", "delivered"}):
                 self._handled(connection, reply_to, time.time())
@@ -244,6 +269,7 @@ class Mailbox:
             raise LedgerError("message_conflict", "Withdrawal and message disagree about their origin.")
         target = dict(resolved or {key: value[key] for key in
                                   ("recipient_host", "recipient_terminal_id", "recipient_address")})
+        target["recipient_repo_id"] = target.get("recipient_repo_id", value.get("recipient_repo_id", value["repo_id"]))
         authoritative = target["recipient_host"] == self.store.host and target["recipient_terminal_id"] is not None
         connection.execute("INSERT INTO message_routes VALUES (?,?,?,?,?,?,?,?,?)",
                            (value["message_id"], value["recipient_host"], value["recipient_terminal_id"],
@@ -254,9 +280,11 @@ class Mailbox:
             raise LedgerError("thread_conflict", "Thread repository and subject are immutable.")
         connection.execute("INSERT OR IGNORE INTO threads VALUES (?,?,?)", (value["thread_id"], value["repo_id"], value["subject"]))
         connection.execute(
-            "INSERT INTO messages(message_id,thread_id,repo_id,reply_to,origin_host,sender,sender_label,kind,hop,body,created_at,payload_hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            tuple(value[key] for key in ("message_id", "thread_id", "repo_id", "reply_to", "origin_host", "sender", "sender_label",
+            "INSERT INTO messages(message_id,thread_id,repo_id,sender_repo_id,reply_to,origin_host,sender,sender_label,kind,hop,body,created_at,payload_hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(value[key] for key in ("message_id", "thread_id", "repo_id")) +
+            (value.get("sender_repo_id", value["repo_id"]),) +
+            tuple(value[key] for key in ("reply_to", "origin_host", "sender", "sender_label",
                                         "kind", "hop", "body", "created_at")) + (digest,))
         slot = connection.execute("SELECT * FROM terminal_slots WHERE host=? AND terminal_id=?",
                                   (self.store.host, target["recipient_terminal_id"])).fetchone() if authoritative else None
@@ -268,13 +296,13 @@ class Mailbox:
         elif authoritative:
             target_agent = connection.execute("SELECT repo_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
                                              (self.store.host, target["recipient_terminal_id"])).fetchone()
-            hold = "recipient_absent" if target_agent is None else ("recipient_changed" if target_agent[0] != value["repo_id"] else None)
+            hold = "recipient_absent" if target_agent is None else ("recipient_changed" if target_agent[0] != target["recipient_repo_id"] else None)
         at = time.time()
         connection.execute(
-            "INSERT INTO deliveries(message_id,recipient_address,recipient_host,recipient_terminal_id,workspace_id,pane_id,"
-            "state,hold_reason,authoritative,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO deliveries(message_id,recipient_address,recipient_host,recipient_terminal_id,recipient_repo_id,workspace_id,pane_id,"
+            "state,hold_reason,authoritative,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (value["message_id"], target["recipient_address"], target["recipient_host"], target["recipient_terminal_id"],
-             slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '', state, hold, authoritative, at))
+             target["recipient_repo_id"], slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '', state, hold, authoritative, at))
         if state in FINAL_STATES:
             connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, value["message_id"]))
         return save_receipt(connection, value["message_id"])
@@ -288,7 +316,7 @@ class Mailbox:
         with self.store.read() as connection:
             check_generation(connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
             query = ("SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) "
-                     "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND m.repo_id=?")
+                     "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.recipient_repo_id=?")
             parameters: list[Any] = [self.store.host, agent["terminal_id"], agent["repo_id"]]
             if message_id:
                 query += " AND m.message_id=?"
@@ -327,8 +355,10 @@ class Mailbox:
                      "JOIN deliveries d USING(message_id)")
             parameters: list[Any] = []
             if repo_id is not None:
-                query += " WHERE t.repo_id=?"
-                parameters.append(repo_id)
+                query += (" WHERE (t.repo_id=? OR EXISTS (SELECT 1 FROM messages pm "
+                          "JOIN deliveries pd USING(message_id) WHERE pm.thread_id=t.thread_id "
+                          "AND (pm.sender_repo_id=? OR pd.recipient_repo_id=?)))")
+                parameters.extend((repo_id, repo_id, repo_id))
             query += " GROUP BY t.thread_id,t.repo_id,t.subject"
             if boundary is not None:
                 query += " HAVING (max(d.updated_at)<? OR (max(d.updated_at)=? AND t.thread_id>?))"
@@ -544,9 +574,8 @@ class Mailbox:
             check_generation(connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
             rows = []
             for message_id in dict.fromkeys(message_ids):
-                row = connection.execute("SELECT d.*,m.repo_id FROM deliveries d JOIN messages m USING(message_id) "
-                                         "WHERE message_id=?", (message_id,)).fetchone()
-                if row is None or row["recipient_host"] != self.store.host or row["recipient_terminal_id"] != agent["terminal_id"] or row["repo_id"] != agent["repo_id"]:
+                row = connection.execute("SELECT * FROM deliveries WHERE message_id=?", (message_id,)).fetchone()
+                if row is None or row["recipient_host"] != self.store.host or row["recipient_terminal_id"] != agent["terminal_id"] or row["recipient_repo_id"] != agent["repo_id"]:
                     raise LedgerError("message_not_found", "Message is not in this recipient's repository inbox.")
                 if row["state"] not in {"queued", "delivered", "handled"}:
                     raise LedgerError("delivery_in_progress" if row["state"] == "delivering" else "message_final", "This delivery cannot be marked handled.")
@@ -626,8 +655,8 @@ class Mailbox:
             agent = check_generation(connection, self.store.host, terminal_id, agent_id, generation)
             placeholders = ','.join('?' for _ in kinds)
             rows = connection.execute(
-                "SELECT m.*,d.recipient_address FROM messages m JOIN deliveries d USING(message_id) WHERE "
-                "d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' AND m.repo_id=? "
+                "SELECT m.*,d.recipient_address,d.recipient_repo_id FROM messages m JOIN deliveries d USING(message_id) WHERE "
+                "d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' AND d.recipient_repo_id=? "
                 f"AND m.kind IN ({placeholders}) ORDER BY m.created_at,m.message_id LIMIT 100",
                 (self.store.host, terminal_id, agent["repo_id"], *kinds)).fetchall()
             result = self._claim_messages(connection, rows, agent_id, generation, via)
@@ -707,8 +736,7 @@ class Mailbox:
                     raise LedgerError("claim_resolution_conflict", "This claim already has a different operator resolution.")
                 return {"receipts": [receipt(connection, row["message_id"]) for row in prior]}
             rows = connection.execute(
-                "SELECT d.*,m.repo_id FROM deliveries d JOIN messages m USING(message_id) "
-                "WHERE d.claim_id=? ORDER BY d.message_id", (claim_id,),
+                "SELECT d.* FROM deliveries d WHERE d.claim_id=? ORDER BY d.message_id", (claim_id,),
             ).fetchall()
             if not rows:
                 raise LedgerError("claim_not_found", "Claim is absent or was already released.")
@@ -745,7 +773,7 @@ class Mailbox:
                         ).fetchone()
                         state = "queued"
                         hold = ("recipient_absent" if occupant is None else
-                                "recipient_changed" if occupant["repo_id"] != row["repo_id"] else None)
+                                "recipient_changed" if occupant["repo_id"] != row["recipient_repo_id"] else None)
                     connection.execute(
                         "UPDATE deliveries SET state=?,claim_id=NULL,claimed_agent_id=NULL,claimed_generation=NULL,"
                         "via=NULL,hold_reason=?,workspace_id=?,pane_id=?,evidence=?,"

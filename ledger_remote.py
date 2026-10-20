@@ -213,12 +213,11 @@ class RemoteLedger:
                 listener_endpoints=scanned.get("listener_endpoints"))
         with self.store.read() as connection:
             claims = device_rows(connection)
-            counts = {(row["recipient_host"], row["recipient_terminal_id"], row["repo_id"]): row["unread"]
+            counts = {(row["recipient_host"], row["recipient_terminal_id"], row["recipient_repo_id"]): row["unread"]
                       for row in connection.execute(
-                          "SELECT d.recipient_host,d.recipient_terminal_id,m.repo_id,count(*) AS unread "
-                          "FROM deliveries d JOIN messages m USING(message_id) "
-                          "WHERE d.state IN ('queued','delivering') GROUP BY d.recipient_host,"
-                          "d.recipient_terminal_id,m.repo_id")}
+                          "SELECT recipient_host,recipient_terminal_id,recipient_repo_id,count(*) AS unread "
+                          "FROM deliveries WHERE state IN ('queued','delivering') "
+                          "GROUP BY recipient_host,recipient_terminal_id,recipient_repo_id")}
         exported = [{**agent, "role": settings.role(agent),
                      "unread": counts.get((agent["host"], agent["terminal_id"], agent["repo_id"]), 0),
                      "devices": [row for row in claims if not row["stale"]
@@ -261,17 +260,44 @@ class RemoteLedger:
                     "main_unresolved",
                     f"No main is available in workspace {sender['workspace_id']} on {sender['host']}.")
             return {**dict(agent), "recipient_address": "main"}
-        parts = address.split('/')
-        if len(parts) != 2 or not all(parts):
-            raise LedgerError("invalid_address", "Mailbox address must be main or HOST/LABEL.")
-        host, label = parts
-        if host in {"local", self.store.host}:
-            agents = AgentRegistry(self.store).list()
+        if address.startswith("main@"):
+            host, selector = self.store.host, address[len("main@"):]
         else:
-            agents = self.query_status(host, sender["repo_id"])["agents"]
+            host, separator, label = address.partition("/")
+            if not separator or not host or not label:
+                raise LedgerError("invalid_address", "Mailbox address must be main, [HOST/]main@REPO or HOST/LABEL.")
+            selector = label[len("main@"):] if label.startswith("main@") else None
+            if selector is None and "/" in label:
+                raise LedgerError("invalid_address", "Mailbox address must be main, [HOST/]main@REPO or HOST/LABEL.")
+        if selector is not None and (not selector or any(not part for part in selector.split("/"))):
+            raise LedgerError("invalid_address", "Repository main addresses require a nonempty repository identity.")
+        if host in {"local", self.store.host}:
+            agents = self.status_export()["agents"] if selector is not None else AgentRegistry(self.store).list()
+        else:
+            agents = self.query_status(host, None)["agents"]
+        if selector is not None:
+            repos = sorted({agent["repo_id"] for agent in agents})
+            matches = [repo for repo in repos if repo == selector]
+            if not matches:
+                matches = [repo for repo in repos if repo.endswith("/" + selector)]
+            if len(matches) > 1:
+                raise LedgerError("repo_ambiguous", f"Repository {selector!r} matches: {', '.join(matches)}.")
+            mains = [agent for agent in agents if matches and agent["repo_id"] == matches[0]
+                     and agent.get("role") == "main"]
+            if not mains:
+                raise LedgerError("main_unresolved", f"No main is available for repository {selector!r} on {host}.")
+            if len(mains) > 1:
+                workspaces = ", ".join(sorted({agent["workspace_id"] for agent in mains}))
+                raise LedgerError("main_ambiguous",
+                                  f"Repository {matches[0]!r} has mains in workspaces {workspaces} on {host}.")
+            return {**mains[0], "recipient_address": address}
         matches = [agent for agent in agents if agent["alias"] == label]
-        if len(matches) != 1:
-            raise LedgerError("agent_not_found" if not matches else "agent_ambiguous", "Recipient label must identify one live agent.")
+        if not matches:
+            raise LedgerError("agent_not_found", "Recipient label must identify one live agent.")
+        if len(matches) > 1:
+            candidates = ", ".join(sorted(
+                f"{agent['host']}/{agent['alias']} (repo {agent['repo_id']})" for agent in matches))
+            raise LedgerError("agent_ambiguous", f"Recipient label matches multiple live agents: {candidates}.")
         return matches[0]
 
     def submit(self, connection: Any, value: Mapping[str, Any], *, upstream: str | None = None,
@@ -287,6 +313,8 @@ class RemoteLedger:
             raise LedgerError("legacy_symbolic_main",
                               "Legacy symbolic --to main is unsupported; upgrade every host before using --to main across hosts.")
         target = dict(resolved or {key: value[key] for key in ("recipient_host", "recipient_terminal_id", "recipient_address")})
+        if "recipient_repo_id" in value:
+            target["recipient_repo_id"] = value["recipient_repo_id"]
         forward = target["recipient_host"] if target["recipient_host"] != self.store.host else None
         if forward:
             self.peer(forward)
@@ -303,12 +331,14 @@ class RemoteLedger:
             raise LedgerError("legacy_symbolic_main",
                               "Legacy symbolic --to main is unsupported; upgrade every host before using --to main across hosts.")
         resolved = payload["resolved"]
-        if not isinstance(resolved, dict) or set(resolved) != {"recipient_host", "recipient_terminal_id", "recipient_address"}:
+        route_fields = ("recipient_host", "recipient_terminal_id", "recipient_address")
+        if "recipient_repo_id" in value:
+            route_fields += ("recipient_repo_id",)
+        if not isinstance(resolved, dict) or set(resolved) != set(route_fields):
             raise LedgerError("invalid_recipient", "Invalid routing resolution.")
         if resolved["recipient_host"] != self.store.host:
             raise LedgerError("wrong_host", "An accept endpoint cannot forward an arbitrary concrete host.")
-        if (value["recipient_terminal_id"] is not None or value["recipient_address"] != "main") and resolved != {
-                key: value[key] for key in ("recipient_host", "recipient_terminal_id", "recipient_address")}:
+        if resolved != {key: value[key] for key in route_fields}:
             raise LedgerError("invalid_recipient", "Concrete routing cannot alter the immutable message recipient.")
         if source != value["origin_host"]:
             raise LedgerError("wrong_origin", "Only the message origin can transport this message.")

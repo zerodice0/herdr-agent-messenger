@@ -8,14 +8,14 @@
 
 HAM is an agent-labeling and multi-agent messaging plugin for Herdr. It gives
 unnamed agents memorable `color-animal` names, starts new labeled sessions with
-an optional atomic first prompt, and provides a durable same-repository mailbox
-for coordination across local and SSH hosts.
+an optional atomic first prompt, and provides a durable cross-repository mailbox
+for coordination across local and registered SSH hosts.
 
 ## What HAM provides
 
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
-- Durable same-repository threads, explicit handling, and `off` / `manual` / `auto` participation modes
+- Durable cross-repository threads, explicit handling, and `off` / `manual` / `auto` participation modes
 - A keyboard-first mailbox/status TUI with inline FYI quick-send, replies, and confirmed direct input
 - A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp, split into short `SKILL.md` and on-demand `reference.md`
 - Labeled interactive-session creation with `spawn --message`, plus standalone and permitted legacy request, wait, read, batch, and rollout helpers
@@ -80,8 +80,8 @@ of activation. Plugin loading never changes client configuration, and the
 
 ## Use
 
-Use the [durable mailbox](#durable-mailbox) for participating agents coordinating
-within the same repository. The [HAM TUI](docs/ui-reference.md) offers responsive
+Use the [durable mailbox](#durable-mailbox) for agents coordinating within or
+across repositories. The [HAM TUI](docs/ui-reference.md) offers responsive
 Agents, Threads and read-only Detail regions, plus a Settings overlay (`s`).
 Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)**, or **HAM: Mailbox
 (quick send)**; the popup closes after a successful send. In NAV, Tab/Shift+Tab,
@@ -181,8 +181,9 @@ source-backed standalone setup and its limitations.
 
 ## Durable mailbox
 
-Participating agents use durable same-repository mail instead of terminal prompt
-injection. From a registered Herdr agent pane:
+Agents can exchange durable mail across repositories instead of terminal prompt
+injection. Local agents and registered peers need no repository allowlist;
+peer registration remains the trust boundary. From a registered Herdr agent pane:
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py mail send \
@@ -202,6 +203,19 @@ atomically handle that parent. Use `mail show --thread UUID` to inspect the
 thread and `mail withdraw --message UUID` to request withdrawal; already-claimed
 mail cannot simply be recalled.
 
+Thread origin stays fixed (`threads.repo_id` / `messages.repo_id`).
+Each message snapshots `sender_repo_id`; each delivery snapshots the resolved
+`recipient_repo_id` at send time. A terminal now running another repo holds
+queued mail as `recipient_changed` against that **recipient snapshot**, not the
+thread origin. Inbox/handling/native claims and unread counts use the delivery's
+recipient repo. A thread participant may reply across repos without changing
+the origin.
+
+Cross-repo mail retains every recipient-side wake gate: the recipient's repo
+mode/thresholds and role, idle/done readiness, per-recipient hourly limit,
+coalescing and max hop. Sending does not grant permission to wake. The legacy
+`use_mailbox` policy remains limited to participating same-repo pairs.
+
 ### Read repository history and the status board
 
 Use the bundled CLI prefix above with these read-only commands:
@@ -213,10 +227,12 @@ status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verb
 ```
 
 History defaults to the verified caller's repository; explicit `--repo REPO_ID`
-avoids a Herdr caller-identity lookup. Both lists cover all participants' retained
-records in that repository on this ledger, including sent/received threads and
-pending remote copies, not replicated all-host history. Direct history is
-read-only user-direct submission evidence, not permission to send direct input.
+avoids a Herdr caller-identity lookup. A thread participates in that scope when
+the repo is its origin, any message's sender repo, or any delivery's recipient
+repo, so both sides can discover a cross-repo thread. These records include
+pending remote copies on this ledger, not replicated all-host history.
+`mail direct-list` remains selected-repo direct user-submission history:
+read-only acceptance evidence, not a cross-repo mail view or permission to send input.
 `--limit` defaults to 100 (1–1000). Results contain `repo_id`,
 `threads` or `submissions`, and `next_cursor` (`null` at the end). Pass the opaque,
 HMAC-signed cursor unchanged; it is bound to the ledger, query and repository.
@@ -228,9 +244,11 @@ wrong-scope tokens fail with `invalid_cursor`.
 The board defaults to all local repositories and all registered peers. Bare
 `--repo` selects the caller's repository; `--repo ID` filters explicitly.
 `--host` selects only the local ledger or one registered canonical host/SSH alias.
-The result is `{repo_id,agents,hosts}`: brief address/workspace/role/turn/phase/
+The result is `{repo_id,agents,hosts}`: brief address/workspace/repo/role/turn/phase/
 summary/unread/receiver rows and device/server counts, with no duplicate
 `hosts[].agents`. Hosts retain errors/stale/unread and resource counts/errors.
+Compact `status board` / `status list` rows expose each agent's short `repo`
+name so cross-repo targets can be distinguished without verbose output.
 `status board --verbose` restores full registry/status/resource fields, including
 `status_updated_at` (status update) and `last_seen` (registry observation).
 Python/TUI/peer exports keep the full shape. Reads never refresh registry,
@@ -333,16 +351,34 @@ an audit decision, not native delivery proof or completion of the work.
 ### Remote transport and receiving runtimes
 
 Mailbox targets may be `local/LABEL`, `CANONICAL_HOST/LABEL`, a registered
-`SSH_ALIAS/LABEL`, or `main`. `--to main` resolves on the sender's host at send
-time to the sender's current workspace main and stores a concrete terminal
-target. A scope without a main fails visibly; it never falls back to a different
-workspace or the repository home. Explicit named mail can still cross workspaces
-within the same repository. Initialize each host with `ledger setup --name HOST`,
-then register each direction with
-`ledger peer add --ssh-alias ALIAS`. `ledger doctor` and `ledger outbox` expose
-transport state. A detached, code-only flock worker retries transient failures
-with the same message IDs; permanent failures remain visible for explicit retry.
-It does not run model polling or replicate databases.
+`SSH_ALIAS/LABEL`, `main`, or `[HOST/]main@REPO`. Named agents are resolved across
+all repos on the selected host: no match is `agent_not_found`; multiple matches
+are `agent_ambiguous`, with candidate addresses and repos.
+
+`--to main` still resolves the sender's current host/repo/workspace main; it
+never falls back to another workspace or the repository home.
+`--to main@dxp-api` selects a repo's main locally;
+`--to beta/main@org/dxp-api` selects it on registered host beta.
+REPO matches an exact repo ID first, otherwise a unique trailing path-component
+suffix. Multiple matching repos give `repo_ambiguous`. Exactly one current main
+must exist across that repo's workspaces on the chosen host: none gives
+`main_unresolved`; several gives `main_ambiguous` listing workspace IDs.
+All forms save a concrete terminal target at send time. Explicit named mail
+crosses workspaces and repositories.
+
+Initialize each host with `ledger setup --name HOST`, then register each
+direction with `ledger peer add --ssh-alias ALIAS`. `ledger doctor` and
+`ledger outbox` expose transport state. A detached, code-only flock worker
+retries transient failures with the same message IDs; permanent failures remain
+visible for explicit retry. It does not run model polling or replicate databases.
+
+Schema v8 backfills existing sender/recipient repo snapshots from the original
+message repo, preserving same-repo behavior and legacy immutable hashes.
+New immutable wire payloads include both sender- and recipient-repo snapshots.
+Upgrade all participating hosts together: old exact-field receivers reject v8
+payloads as `invalid_message`; the originating outbox retains failed mail for
+manual retry after upgrade, not automatic receiver-side hold. Preserve message
+and item IDs, then `ledger retry --item OUTBOX_ITEM_UUID`; do not resend as new mail.
 
 Ledger schema v7 migrates active local legacy main/member targets into their
 current workspace scopes and removes obsolete repo-level role settings.

@@ -82,6 +82,7 @@ def compact_board_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "address": f"{row['host']}/{row.get('alias') or row['terminal_id']}",
             "host": row["host"],
             "workspace": row.get("workspace_label") or row["workspace_id"],
+            "repo": row["repo_id"].rsplit("/", 1)[-1],
         }
         for key in ("turn_state", "status", "role", "unread", "phase", "summary",
                     "stale", "extension_present", "client"):

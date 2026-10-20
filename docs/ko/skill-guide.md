@@ -2,10 +2,10 @@
 
 한국어 · [English](../skill-guide.md) · [README](../../README.ko.md)
 
-HAM은 저장소별 영구 메일과 조정 상태를 관리하고, `spawn`으로 새 Herdr 에이전트
-세션을 시작합니다. 조정에 참여하지 않는 기존 에이전트에는 프롬프트 전송과 응답
-수집도 사용할 수 있습니다. Codex, Claude Code, omp에서 사용하는 번들 스킬의
-정식 이름은 `herdr-agent-messenger`이며, **HAM**은 짧은 사용자 표시 이름입니다.
+HAM은 저장소 간 영속 메일과 조정 상태를 관리하고, `spawn`으로 새 Herdr 에이전트
+세션을 시작합니다. 기존 정책이 허용하는 에이전트에는 프롬프트 전송과 응답 수집도
+사용할 수 있습니다. Codex, Claude Code, omp에서 사용하는 번들 스킬의 정식 이름은
+`herdr-agent-messenger`이며, **HAM**은 짧은 사용자 표시 이름입니다.
 
 번들 스킬은 일반적인 작업을 안내하는 짧은
 [SKILL.md](../../.agents/skills/herdr-agent-messenger/SKILL.md)와 필요할 때 읽는
@@ -176,7 +176,7 @@ python3 "$HAM_CLI" mail show --thread THREAD_UUID
 ```
 
 `mail send`는 `--to local/LABEL`, 등록된 canonical 호스트나 SSH 별칭의 주소,
-또는 `--to main`과 `--body TEXT` / `--body-file PATH` 중 하나를 받습니다.
+`--to main` 또는 `--to [HOST/]main@REPO`와 `--body TEXT` / `--body-file PATH` 중 하나를 받습니다.
 본문은 비어 있지 않은 UTF-8이며 최대
 16 KiB입니다. `--kind fyi|action`의 기본값은 `fyi`이고,
 `--subject TEXT`는 새 대화 제목을 정합니다(UTF-8 기준 최대 1024바이트).
@@ -185,6 +185,21 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 접수된 로컬 메일은 보통 queued로 기다리지만 원격 사본은 pending일 수 있으며,
 철회나 terminal 종료로 claim 없이 최종 상태가 될 수도 있습니다.
 어느 종류든 `mail send` 자체가 모델 턴을 시작하지는 않습니다.
+
+로컬 호스트나 등록된 peer에서는 저장소가 달라도 메일을 주고받을 수 있습니다.
+별도의 저장소 허용 목록은 없으며 peer 등록이 신뢰 경계입니다. 대화의 시작 저장소
+(`threads.repo_id` / `messages.repo_id`)는 바뀌지 않습니다. 스키마 v8의
+`messages.sender_repo_id`는 발신 시점의 저장소를,
+`deliveries.recipient_repo_id`는 주소를 해석한 수신자의 당시 저장소를 저장합니다.
+기존 행은 메시지의 저장소로 두 스냅샷을 채우며 기존 불변 해시는 바꾸지 않습니다.
+새 불변 wire payload에는 두 저장소 스냅샷이 모두 들어가고, 라우팅된 전달에도
+수신 저장소를 포함합니다. 답장자는 대화에서 메일을 보내거나 받은 참여자여야
+하며, 그렇지 않으면 `not_participant`로 실패합니다. 시작 저장소와 같을 필요는 없습니다.
+
+저장소 간 수신과 자동 턴 시작에는 **수신자 저장소**의 설정과 수신자의 역할을
+적용합니다. 모드, idle/done 상태, 수신자별 시간당 한도, coalescing, max hop 조건은
+그대로입니다. 기존 협업 정책도 바뀌지 않으므로 `use_mailbox`는 같은 저장소의
+참여 송수신자에만 적용합니다.
 
 전송에 성공해도 참고용 경고가 나올 수 있으며, 기본 종류인 `fyi`는 바뀌지 않습니다.
 `fyi_no_wake`는 수신기가 등록된 참여 OMP 수신자가 준비된 상태이며 stale이 아니고,
@@ -228,10 +243,12 @@ verbose를 포함한 CLI JSON은 불필요한 공백 없이 UTF-8로 출력합�
 `--repo REPO_ID`를 명시하면 Herdr에서 호출자 정체성을 가져오지 않습니다.
 `--limit`은 기본 100개이며 1~1000개를 받습니다. 결과는
 `{repo_id,threads,next_cursor}` 또는 `{repo_id,submissions,next_cursor}`이고,
-`next_cursor:null`이면 마지막 페이지입니다. 선택한 저장소의 모든 참여자가 이
-로컬 원장에 남긴 기록을 조회합니다. 송신·수신 대화와 원격 pending 사본,
-`via=direct` 기록을 포함하지만 `spawn_initial`이나 모든 호스트의 복제 이력은
-포함하지 않습니다. HMAC 서명된 불투명 cursor는 그대로 전달하세요. 원장·쿼리·저장소에
+`next_cursor:null`이면 마지막 페이지입니다. `mail threads`는 대화의 시작 저장소,
+메시지의 발신 저장소 또는 전달의 수신 저장소가 선택한 저장소인 대화를 포함합니다.
+양쪽에서 참여 대화를 찾을 수 있으며, 이 로컬 원장에 남아 있는 원격 pending 사본도
+포함합니다. `mail direct-list`는 기존처럼 선택한 저장소의 `via=direct` 사용자
+입력 이력이며 `spawn_initial`이나 저장소 간 메일 목록이 아닙니다. 두 목록 모두
+모든 호스트의 이력을 복제하지는 않습니다. HMAC 서명된 불투명 cursor는 그대로 전달하세요. 원장·쿼리·저장소에
 귀속되므로 변조하거나 다른 범위에서 쓰면 `invalid_cursor`로 실패합니다.
 `updated_at DESC`, UUID 오름차순의 keyset 페이지이며 OFFSET을 쓰지 않습니다.
 고정된 스냅샷이 아니므로 동시 갱신으로 아직 읽지 않은 행이 경계 앞으로 이동할 수
@@ -240,12 +257,13 @@ verbose를 포함한 CLI JSON은 불필요한 공백 없이 UTF-8로 출력합�
 `status board`는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
 값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
 `--host`는 로컬 또는 등록된 정규 호스트·SSH 별칭 하나로 범위를 좁힙니다.
-결과 `{repo_id,agents,hosts}`는 주소·호스트·workspace와 역할·턴·phase·summary·unread·
+결과 `{repo_id,agents,hosts}`는 주소·호스트·workspace·repo와 역할·턴·phase·summary·unread·
 stale·수신 상태, 기기·서버 개수를 간결하게 표시합니다. 호스트는 중복 에이전트 행 없이
 오류·unread·stale와 자원 개수·탐색 오류를 유지합니다. `--verbose`는 전체 레지스트리·
 상태·자원 필드와 시각·정체성·배치 정보, `hosts[].agents`를 복원합니다.
 `status list --verbose`도 전체 로컬 행을 복원합니다. Python·TUI·peer `status-export`의
 전체 구조는 바뀌지 않습니다. 상태 갱신 시각과 레지스트리 관찰 시각은 별개입니다.
+간결한 board/list 행의 `repo`는 짧은 저장소 이름이므로 다른 저장소의 대상을 구분할 수 있습니다.
 어느 호스트의 상태·표시·claim도 갱신하지 않으며 peer에도 `refresh=false`를 요청합니다.
 실패한 peer는
 구조화된 오류와 unread `?`를 남깁니다. 이전 행이 없는 CLI는 행을 만들어 내지
@@ -333,7 +351,8 @@ Herdr 토큰은 source별로 격리되지 않은 pane 단위의 평면 맵입니
 ### 메일함 용어
 
 - **Mailbox / inbox:** 안정적인 수신 terminal 슬롯에 남기는 영속 메일이며 터미널
-  입력이 아닙니다. `inbox read`는 현재 호스트·호출자 terminal·저장소의
+  입력이 아닙니다. `inbox read`는 현재 호스트·호출자 terminal을 확인하고 전달의
+  수신 저장소 스냅샷이 현재 저장소와 일치하는 메일을 조회합니다.
   `queued`, `delivering`, `delivered`를 기본으로 읽습니다. `--all`은 같은 수신자의
   보존된 최종 상태까지 포함하고 `--message UUID`도 최종 메시지를 선택할 수 있습니다.
   조회는 ACK가 아닙니다.
@@ -350,8 +369,9 @@ Herdr 토큰은 source별로 격리되지 않은 pane 단위의 평면 맵입니
   처리나 이해를 뜻하지 않습니다. `handled`, `withdrawn`, `undeliverable`은 최종
   상태입니다. `confirmation_source=native|operator`를 구분하세요. 직접 입력의
   `submitting/accepted/unknown/failed`는 전송 수락이며 메일함 ACK가 아닙니다.
-- **Unread:** 실제로 글을 봤는지가 아니라 `queued` + `delivering` 개수입니다.
-  delivered 상태로 미처리된 메일은 제외합니다. `fyi`/`action`은 상태가 아니라 종류입니다.
+- **Unread:** 실제로 글을 봤는지가 아니라 전달의 수신 저장소별 `queued` +
+  `delivering` 개수입니다. 대화의 시작 저장소를 기준으로 세지 않으며 delivered
+  상태로 미처리된 메일은 제외합니다. `fyi`/`action`은 상태가 아니라 종류입니다.
 
 호스트 정체성은 원장에 저장된 canonical 이름과 고정 UUID입니다. 기기 hostname,
 `local`, SSH 별칭과 구분하세요. `local`은 현재 원장을, 등록된 이름과 별칭은
@@ -361,10 +381,11 @@ native session 정체성이 generation을 정합니다. pane 이동은 위치만
 CLI는 프로세스 조상과 Herdr의 공개 `pane process-info`가 반환한 shell PID를
 대조해 이동한 terminal을 찾습니다. stdin TTY나 상속한 terminal 변수를 증거로
 삼지 않으며, 정체성을 확인할 수 없으면 옛 pane ID로 추측하지 않고 거절합니다.
-표시·상태 revision만 바뀌어서는 generation이 증가하지 않습니다. 같은 저장소의
-새 세션에는 queued 메일이 이어질 수 있지만, 다른 저장소나 shell이 terminal을
-차지하면 보류합니다. 접수 여부를 모르는 이전 generation의 claim은 자동 재전송하지
-않습니다.
+표시·상태 revision만 바뀌어서는 generation이 증가하지 않습니다. 전달에 저장된
+발신 당시 수신 저장소의 새 세션에는 queued 메일이 이어질 수 있습니다. 다른
+저장소나 shell이 terminal을 차지하면 `recipient_changed`로 보류합니다. 비교
+대상은 발신자나 대화의 시작 저장소가 아니라 수신 저장소 스냅샷입니다. 접수 여부를
+모르는 이전 generation의 claim은 자동 재전송하지 않습니다.
 
 Git HTTPS/SSH/scp origin은 host와 경로를 기준으로 정규화합니다. origin 이름을
 바꿀 때 정체성을 유지하려면 미리
@@ -402,6 +423,15 @@ python3 "$HAM_CLI" ledger retry --item OUTBOX_ITEM_UUID
 등록된 canonical 이름과 SSH 별칭 모두 같은 peer를 가리킵니다.
 원격 에이전트 상태는 실시간 조회하며 로컬 AGENTS에 복제하지 않습니다.
 
+라벨은 해당 호스트의 모든 저장소에서 찾습니다. 없으면 `agent_not_found`,
+여럿이면 후보 주소와 저장소를 포함한 `agent_ambiguous`로 실패합니다.
+v8 메일을 주고받기 전에 참여 호스트를 함께 업그레이드하세요. 정확한 옛 필드만
+받는 구버전 수신자는 새 payload를 `invalid_message`로 거부합니다. 메일은
+수신자 쪽에서 자동 보류되는 것이 아니라 발신 outbox에 실패 상태로 보존됩니다.
+메시지·항목 ID를 유지하고 업그레이드 후 `ledger retry --item OUTBOX_ITEM_UUID`로
+수동 재시도하세요. 새 메일로 다시 보내지 마세요. 기존 `recipient_changed` 보류는
+발신 저장소가 아니라 수신자의 점유 상태를 기준으로 유지됩니다.
+
 독립적인 코드 전용 worker는 원장별 flock을 잡고 peer별 FIFO 재시도(최대 5분 간격),
 수신 확인, 닫힌 terminal 확인과 보존 기간 정리를 처리합니다. 시작한 CLI가
 끝나도 유지되며 남은 유지보수 작업이 없으면 종료합니다. Herdr 조회 실패를
@@ -417,8 +447,20 @@ terminal 종료로 취급하지 않습니다. 영구 실패 항목은 오류를 
 `(repo_id, 정규 호스트, workspace_id)` 범위를 기준으로 해석합니다. 변경 불가능한
 메시지에는 구체적인 terminal 대상을 저장합니다. 해당 범위에 main이 없으면
 workspace를 명시하는 오류로 실패하며, 다른 workspace의 main이나 저장소
-home으로 대체하지 않습니다. `HOST/LABEL`을 명시한 메일은 같은 저장소의 다른
-workspace에도 보낼 수 있습니다. 수신 확인과 철회는 저장된 대상을 따릅니다.
+home으로 대체하지 않습니다. `HOST/LABEL`을 명시한 메일은 workspace와 저장소
+경계를 모두 넘을 수 있습니다. 수신 확인과 철회는 저장된 대상을 따릅니다.
+
+`--to [HOST/]main@REPO`는 지정한 호스트에서 저장소의 main을 선택합니다.
+HOST의 기본값은 로컬입니다. 예를 들어 `--to main@dxp-api` 또는
+`--to beta/main@org/dxp-api`를 사용합니다. 정확한 repo ID가 우선하며, 그 외에는
+경로의 끝 구성요소가 유일하게 일치해야 합니다. 여러 저장소가 일치하면
+`repo_ambiguous`로 실패합니다. 선택한 호스트의 해당 저장소 workspace 전체에서
+현재 main이 정확히 하나여야 합니다. 없거나 저장소를 찾지 못하면
+`main_unresolved`, 여러 workspace에 main이 있으면 workspace ID 목록과 함께
+`main_ambiguous`로 실패합니다. 원격 선택에는 내보낸 역할·workspace 정보를
+사용합니다. `main`과 마찬가지로 보낼 때 구체적인 terminal 대상을 저장하며
+main을 새로 정하거나 home으로 대체하지 않습니다. main이 여러 개이면 구체적인
+`HOST/LABEL`을 선택하세요.
 home은 처음 활성화한 canonical 호스트이며 사용자 UI에서 읽기 전용입니다.
 workspace main을 선출하거나 중계하지는 않습니다. mode/main/members/thresholds
 변경은 사용자 UI 서비스 전용이며 agent CLI에는 `repo set`이나 home 변경 명령이

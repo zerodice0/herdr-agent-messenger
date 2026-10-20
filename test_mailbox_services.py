@@ -187,6 +187,38 @@ class MailboxServicesTest(unittest.TestCase):
         self.assertEqual(self.state(parent["message_id"])["state"], "queued")
         self.assertEqual(len(self.registry.list()), 2)
 
+    def test_user_cross_repo_keeps_sender_context_and_recipient_snapshot(self):
+        other = self.root / "other-repo"
+        other.mkdir()
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other), refresh_display=False)
+        recipient = next(row for row in self.registry.list() if row["terminal_id"] == "term-b")
+        sent = self.mail.send_user(self.repo_id, recipient, body="Cross-repo user task")
+        row = self.mail.read(recipient, message_id=sent["message_id"])["messages"][0]
+        self.assertEqual((row["repo_id"], row["sender_repo_id"], row["recipient_repo_id"]),
+                         (self.repo_id, self.repo_id, recipient["repo_id"]))
+        self.assertIsNone(row["hold_reason"])
+        self.assertEqual(row["sender"], "user")
+
+    def test_cross_repo_operator_recovery_guards_recipient_snapshot(self):
+        other = self.root / "other-repo"
+        other.mkdir()
+        self.registry.reconcile(snapshot(self.repo, recipient_repo=other), refresh_display=False)
+        self.recipient = next(row for row in self.registry.list() if row["terminal_id"] == "term-b")
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                self.registry.reconcile(snapshot(self.repo, recipient_repo=other), refresh_display=False)
+                self.recipient = next(row for row in self.registry.list() if row["terminal_id"] == "term-b")
+                sent = self.message()
+                claim = self.claim()
+                self.registry.reconcile(snapshot(self.repo, recipient_repo=self.repo if moved else other,
+                                                 recipient_session=f"replacement-{moved}"),
+                                        refresh_display=False)
+                result = self.mail.resolve_claim(**claim, disposition="not_applied",
+                                                 evidence="Original journal did not admit context")["receipts"][0]
+                self.assertEqual(result["state"], "queued")
+                row = self.mail.show_thread(sent["thread_id"])["messages"][0]
+                self.assertEqual(row["hold_reason"], "recipient_changed" if moved else None)
+
     def test_worker_start_failure_preserves_committed_user_message(self):
         for error in (LedgerError("busy", "worker unavailable"), OSError("worker unavailable")):
             with self.subTest(error=type(error).__name__):

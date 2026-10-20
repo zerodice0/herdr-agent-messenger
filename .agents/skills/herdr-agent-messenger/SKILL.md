@@ -1,13 +1,13 @@
 ---
 name: herdr-agent-messenger
-description: Use HAM (Herdr Agent Messenger) for durable same-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, and omp.
+description: Use HAM (Herdr Agent Messenger) for durable cross-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, and omp.
 ---
 
 # HAM — Herdr Agent Messenger
 
 ## Choose the operation
 
-- **Existing collaborator:** inspect `repo show` and `list`, copy the exact address, then `mail send`; no ongoing-turn steering. `--to main` stores the sender's current host-qualified workspace main as a concrete target; no repo-home/other-workspace fallback.
+- **Existing collaborator:** inspect `repo show` / `status board`, copy the exact address, then `mail send`; no steering. Mail crosses repos on local/registered hosts. `main` keeps sender workspace scope; `[HOST/]main@REPO` selects a repo's unique main (default local; exact ID/unique path suffix). Do not guess on `repo_ambiguous`, `main_ambiguous`, `main_unresolved`, `agent_ambiguous`; reference **Recipient selectors**.
 - **New session, only when asked:** use one `spawn --message TEXT` or `--message-file PATH`, never a second legacy request. Missing labels are errors, not permission to guess/spawn. Raw `herdr agent start` bypasses HAM records.
 - **Receive/finish work:** read relevant mail at work boundaries, perform it, then `inbox handle --message UUID`. Reads are view-only, never ACKs. Reply with `mail send --reply-to UUID`: choose `--kind action` when the recipient must act/continue (e.g. on an answer/decision), `fyi` otherwise; receipts need no reply. No ACK/polling loops. Native bodies need no redundant pull unless truncated/context is missing.
 - **Several collaborators:** verify recipients; send tailored, non-overlapping assignments. HAM neither splits work nor verifies answers.
@@ -39,13 +39,15 @@ python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing 
 
 `status board`: all local repos + registered peers by default; bare `--repo` selects caller repo, `--repo ID` filters, `--host local|CANONICAL|REGISTERED_SSH_ALIAS` selects one host. No registry/status/claim refresh. Inspect host errors/stale/unread even on exit 0. Older-peer omissions mean unknown, not zero.
 
-History: `mail threads` / `mail direct-list` accept `--repo REPO_ID`, `--limit N`, `--cursor TOKEN`; reference **History and cursor paging**. Board fields: **Status board output and fields**. All commands accept `-h` / `--help`; domain errors exit 1, usage errors exit 2.
+History: `mail threads --repo REPO_ID` (default caller repo) includes participating threads. `mail direct-list` remains direct user-input history. Both accept `--limit N`, `--cursor TOKEN`; reference **History and cursor paging**. All commands support `-h`; domain errors exit 1, usage errors 2.
 
 ## Modes, receiving, and truth boundaries
 
 Only the **user** changes mode/main/members/thresholds in Settings. `repo show` is read-only. Newly registered repos default to `auto`; existing settings survive, missing mode stays `off`, and reads never seed defaults. `off` disables roles/wakes/participating legacy rejection, not reads or natural receipt.
 
 Mode/thresholds are repo-wide; roles are scoped by `(repo_id, canonical host, workspace_id)`, including independent worktree workspaces. `manual`: active in-scope explicit main + selected workers, excluding main; nonmembers cannot wake. `auto`: active explicit main, else sole active agent, else exactly one active main-checkout agent; otherwise no main. Others remain workers. Inactive/moved-out targets are ignored, not rewritten; home does not choose mains. Details: reference **Modes, roles, settings and status**; internals: **Workspace role migration**.
+
+Cross-repo wakes retain recipient repo settings/role and all gates. Occupancy holds compare the current recipient repo to its send-time delivery snapshot, not thread origin. Replies require participation. Upgrade hosts together: old receivers reject v8; failed outbox mail stays for manual retry after upgrade, not new sends.
 
 - **OMP:** opt-in root receiver; action wake needs Herdr `turn_state` of `idle` or `done`, empty supported TUI editor, quiet/idle input, no pending work, eligible membership and rate/hop guards. Uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves same-session active-branch journal acceptance, not provider success.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. ACK needs exact SDK context + fresh request correlation or typed hook bytes/hash + causal journal witness. The latter proves host-context application, not provider-wire bytes/understanding. Stdout alone is not delivery. Limits: reference **Receiving runtimes**.

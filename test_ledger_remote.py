@@ -1,6 +1,7 @@
 """Real two/three-store CLI wire tests with transport fault injection, not DB replication."""
 import ham_test_support  # Protect the live ledger before product imports.
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import unittest
 from unittest import mock
 import uuid
 
-from ledger_mail import Mailbox
+from ledger_mail import Mailbox, payload_hash, validate_payload
 from ledger_remote import RemoteLedger, SSHTransport
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry, repository_identity
@@ -116,11 +117,11 @@ class RemoteLedgerTest(unittest.TestCase):
         return self.settings_for(host).show(
             repo_id or self.repo_id, host, self.agents[host]['workspace_id'])
 
-    def add_agent(self, host, terminal_id, workspace_id):
+    def add_agent(self, host, terminal_id, workspace_id, *, repo=None):
         pane = {'terminal_id': terminal_id, 'pane_id': workspace_id+':'+terminal_id,
                 'workspace_id': workspace_id}
         raw = {**pane, 'agent': 'codex', 'name': terminal_id, 'agent_status': 'idle',
-               'agent_session': {'value': 'session-'+terminal_id}, 'cwd': str(self.repo)}
+               'agent_session': {'value': 'session-'+terminal_id}, 'cwd': str(repo or self.repo)}
         snapshot = {'panes': [*self.snapshots[host]['panes'], pane],
                     'agents': [*self.snapshots[host]['agents'], raw]}
         self.snapshots[host] = snapshot
@@ -139,6 +140,269 @@ class RemoteLedgerTest(unittest.TestCase):
 
     def send(self, source='alpha', target='beta', **options):
         return Mailbox(self.stores[source]).send(self.agents[source], self.agents[target], body='Immutable remote body 한글', **options)
+
+    def new_repository(self, name, repo_id):
+        repo = self.root/name
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        subprocess.run(['git', '-C', str(repo), 'config', 'ham.repo-id', repo_id], check=True)
+        return repo
+
+    def test_cross_repo_fake_peer_routes_snapshots_and_reverse_reply(self):
+        repo = self.new_repository('api', 'git:example.test/team/api')
+        recipient = self.add_agent('beta', 'api-main', 'api-workspace', repo=repo)
+        calls = []
+        services = self.services
+
+        class StoredPeerTransport:
+            def __init__(_, owner):
+                _.owner = owner
+
+            def call(_, peer, command, payload):
+                calls.append((_.owner, command, payload))
+                return services[peer['canonical_name']].receive(
+                    command, services[_.owner].envelope(payload))
+
+        for host, service in services.items():
+            service.transport = StoredPeerTransport(host)
+        sender = self.agents['alpha']
+        target = services['alpha'].resolve_recipient('b/'+recipient['alias'], sender)
+        self.assertEqual(target['repo_id'], recipient['repo_id'])
+        self.assertEqual(calls[-1][2], {'repo_id': None})
+        sent = Mailbox(self.stores['alpha']).send(sender, target, body='API integration', kind='action')
+        route = json.loads(next(item['payload'] for item in services['alpha'].outbox()
+                                if item['message_id'] == sent['message_id']))
+        self.assertEqual(route['message']['repo_id'], sender['repo_id'])
+        self.assertEqual(route['message']['sender_repo_id'], sender['repo_id'])
+        self.assertEqual(route['message']['recipient_repo_id'], recipient['repo_id'])
+        self.assertEqual(route['resolved']['recipient_repo_id'], recipient['repo_id'])
+        self.assertEqual(payload_hash(route['message']), sent['payload_hash'])
+        self.drain()
+        inbox = Mailbox(self.stores['beta']).read(recipient)
+        self.assertEqual([item['message_id'] for item in inbox['messages']], [sent['message_id']])
+        exported = services['beta'].status_export()
+        counts = {agent['agent_id']: agent['unread'] for agent in exported['agents']}
+        self.assertEqual(counts[recipient['agent_id']], 1)
+        self.assertEqual(counts[self.agents['beta']['agent_id']], 0)
+        with self.stores['beta'].read() as connection:
+            row = connection.execute(
+                'SELECT m.repo_id,m.sender_repo_id,d.recipient_repo_id,d.hold_reason '
+                'FROM messages m JOIN deliveries d USING(message_id) WHERE message_id=?',
+                (sent['message_id'],)).fetchone()
+        self.assertEqual(tuple(row), (sender['repo_id'], sender['repo_id'], recipient['repo_id'], None))
+        reply = Mailbox(self.stores['beta']).send(
+            recipient, sender, body='API ready', reply_to=sent['message_id'])
+        self.drain()
+        with self.stores['alpha'].read() as connection:
+            row = connection.execute(
+                'SELECT m.repo_id,m.sender_repo_id,d.recipient_repo_id FROM messages m '
+                'JOIN deliveries d USING(message_id) WHERE message_id=?', (reply['message_id'],)).fetchone()
+        self.assertEqual(tuple(row), (sender['repo_id'], recipient['repo_id'], sender['repo_id']))
+        self.assertEqual(reply['thread_id'], sent['thread_id'])
+        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'handled')
+        self.assertEqual(self.current('alpha', reply['message_id'])['state'], 'queued')
+
+    def test_alias_ambiguity_lists_addresses_and_repositories_locally_and_remotely(self):
+        original = self.agents['beta']
+        candidates = [{**original, 'repo_id': repo} for repo in ('git:org/one', 'git:org/two')]
+        service = self.services['alpha']
+        for address in ('beta/'+original['alias'], 'local/'+original['alias']):
+            with self.subTest(address=address):
+                with mock.patch.object(service, 'query_status', return_value={'agents': candidates}) as query, \
+                        mock.patch.object(AgentRegistry, 'list', return_value=candidates):
+                    with self.assertRaises(LedgerError) as failure:
+                        service.resolve_recipient(address, self.agents['alpha'])
+                self.assertEqual(failure.exception.code, 'agent_ambiguous')
+                for candidate in candidates:
+                    self.assertIn('beta/'+original['alias'], failure.exception.message)
+                    self.assertIn(candidate['repo_id'], failure.exception.message)
+                if address.startswith('beta/'):
+                    query.assert_called_once_with('beta', None)
+
+    def test_repository_main_exact_and_unique_suffix_use_exported_roles(self):
+        repo = self.new_repository('api', 'git:example.test/team/api')
+        local = self.add_agent('alpha', 'local-api', 'api-local', repo=repo)
+        remote = self.add_agent('beta', 'remote-api', 'api-remote', repo=repo)
+        for address, expected in (
+                ('main@api', local), ('main@team/api', local), ('local/main@team/api', local),
+                ('main@'+local['repo_id'], local), ('beta/main@api', remote),
+                ('b/main@team/api', remote), ('beta/main@'+remote['repo_id'], remote)):
+            with self.subTest(address=address):
+                selected = self.services['alpha'].resolve_recipient(address, self.agents['alpha'])
+                self.assertEqual(selected['agent_id'], expected['agent_id'])
+                self.assertEqual(selected['recipient_address'], address)
+        # Bare main still uses only the sender's workspace, not the enabled API repo.
+        with self.assertRaises(LedgerError) as failure:
+            self.services['alpha'].resolve_recipient('main', self.agents['alpha'])
+        self.assertEqual(failure.exception.code, 'main_unresolved')
+        self.assertIn(self.agents['alpha']['workspace_id'], failure.exception.message)
+        selected = self.services['alpha'].resolve_recipient('beta/main@api', self.agents['alpha'])
+        sent = Mailbox(self.stores['alpha']).send(self.agents['alpha'], selected, body='Selected API main')
+        self.settings_for('beta').mutate(remote['repo_id'], 'mode', 'off')
+        self.drain()
+        self.assertEqual(self.current('beta', sent['message_id'])['recipient_terminal_id'], remote['terminal_id'])
+        self.assertEqual(self.current('beta', sent['message_id'])['state'], 'queued')
+
+    def test_repository_main_ambiguity_and_missing_main_fail_before_submission(self):
+        first_repo = self.new_repository('one-api', 'git:example.test/one/api')
+        second_repo = self.new_repository('two-api', 'git:example.test/two/api')
+        first = self.add_agent('beta', 'one-main', 'one-workspace', repo=first_repo)
+        second = self.add_agent('beta', 'two-main', 'two-workspace', repo=second_repo)
+        service = self.services['alpha']
+        with self.assertRaises(LedgerError) as failure:
+            service.resolve_recipient('beta/main@api', self.agents['alpha'])
+        self.assertEqual(failure.exception.code, 'repo_ambiguous')
+        self.assertIn(first['repo_id'], failure.exception.message)
+        self.assertIn(second['repo_id'], failure.exception.message)
+        self.add_agent('beta', 'second-one-main', 'another-workspace', repo=first_repo)
+        with self.assertRaises(LedgerError) as failure:
+            service.resolve_recipient('beta/main@one/api', self.agents['alpha'])
+        self.assertEqual(failure.exception.code, 'main_ambiguous')
+        self.assertIn('one-workspace', failure.exception.message)
+        self.assertIn('another-workspace', failure.exception.message)
+        self.settings_for('beta').mutate(second['repo_id'], 'mode', 'off')
+        for selector in ('two/api', 'missing/api', 'pi'):
+            with self.subTest(selector=selector):
+                with self.assertRaises(LedgerError) as failure:
+                    service.resolve_recipient('beta/main@'+selector, self.agents['alpha'])
+                self.assertEqual(failure.exception.code, 'main_unresolved')
+        self.assertEqual(self.stores['alpha'].doctor()['counts']['messages'], 0)
+
+    def test_repository_main_exact_identity_precedes_suffix_matches(self):
+        service = self.services['alpha']
+        original = self.agents['beta']
+        candidates = [{**original, 'repo_id': repo, 'role': 'main'}
+                      for repo in ('team/api', 'git:example.test/team/api')]
+        with mock.patch.object(service, 'query_status', return_value={'agents': candidates}) as query:
+            selected = service.resolve_recipient('beta/main@team/api', self.agents['alpha'])
+        self.assertEqual(selected['repo_id'], 'team/api')
+        query.assert_called_once_with('beta', None)
+        for address in ('main@', 'beta/main@', 'main@team//api', 'beta/main@api/', 'beta/x/y'):
+            with self.subTest(address=address):
+                with self.assertRaises(LedgerError) as failure:
+                    service.resolve_recipient(address, self.agents['alpha'])
+                self.assertEqual(failure.exception.code, 'invalid_address')
+
+    def test_legacy_concrete_wire_retains_hash_and_backfills_repository_snapshots(self):
+        value = self.legacy_message('beta')
+        value.update(recipient_terminal_id=self.agents['beta']['terminal_id'],
+                     recipient_address='beta/'+self.agents['beta']['alias'])
+        expected_hash = hashlib.sha256(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        self.assertEqual(validate_payload(value), value)
+        self.assertEqual(payload_hash(validate_payload(value)), expected_hash)
+        with self.stores['alpha'].transaction() as connection:
+            submitted = self.services['alpha'].submit(connection, value)
+        self.assertEqual(submitted['payload_hash'], expected_hash)
+        route = json.loads(next(item['payload'] for item in self.services['alpha'].outbox()
+                                if item['message_id'] == value['message_id']))
+        self.assertNotIn('sender_repo_id', route['message'])
+        self.assertNotIn('recipient_repo_id', route['resolved'])
+        self.drain()
+        with self.stores['beta'].read() as connection:
+            row = connection.execute(
+                'SELECT m.sender_repo_id,d.recipient_repo_id FROM messages m '
+                'JOIN deliveries d USING(message_id) WHERE message_id=?', (value['message_id'],)).fetchone()
+        self.assertEqual(tuple(row), (self.repo_id, self.repo_id))
+        Mailbox(self.stores['beta']).handle(self.agents['beta'], [value['message_id']])
+        self.drain()
+        final = self.current('alpha', value['message_id'])
+        self.assertEqual(final['state'], 'handled')
+        self.assertEqual(final['payload_hash'], expected_hash)
+        self.stores['beta'].retention(now=time.time()+91*86400)
+        replay = self.services['beta'].receive('accept', self.services['alpha'].envelope(route))
+        self.assertEqual(replay['payload_hash'], expected_hash)
+        self.assertEqual(replay['state'], 'handled')
+
+    def test_old_peer_refusal_retains_cross_repo_message_for_retry_after_upgrade(self):
+        repo = self.new_repository('api', 'git:example.test/team/api')
+        recipient = self.add_agent('beta', 'api-main', 'api-workspace', repo=repo)
+        origin = self.services['alpha']
+        current_transport = origin.transport
+        legacy_fields = set(self.legacy_message())
+
+        class OldPeerTransport:
+            def call(_, peer, command, payload):
+                if command == 'accept' and set(payload['message']) != legacy_fields:
+                    raise LedgerError('invalid_message', 'Message fields do not match protocol 1.')
+                return current_transport.call(peer, command, payload)
+
+        origin.transport = OldPeerTransport()
+        sent = Mailbox(self.stores['alpha']).send(
+            self.agents['alpha'], recipient, body='Retain until peer upgrade')
+        original_item = next(item for item in origin.outbox() if item['message_id'] == sent['message_id'])
+        result = origin.pump()
+        self.assertEqual(result, {'sent': 0, 'failed': 1, 'deferred': 0})
+        failed = next(item for item in origin.outbox() if item['item_id'] == original_item['item_id'])
+        self.assertEqual(failed['state'], 'failed')
+        self.assertEqual(json.loads(failed['last_error'])['code'], 'invalid_message')
+        self.assertEqual(failed['payload'], original_item['payload'])
+        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'pending')
+        with self.stores['alpha'].read() as connection:
+            retained = connection.execute(
+                'SELECT body,payload_hash FROM messages WHERE message_id=?', (sent['message_id'],)).fetchone()
+        self.assertEqual(tuple(retained), ('Retain until peer upgrade', sent['payload_hash']))
+        self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
+
+        origin.transport = current_transport
+        self.assertEqual(origin.retry(failed['item_id'])['state'], 'pending')
+        self.drain()
+        retried = next(item for item in origin.outbox() if item['item_id'] == failed['item_id'])
+        self.assertEqual(retried['state'], 'sent')
+        self.assertEqual(retried['attempts'], 2)
+        self.assertEqual(retried['payload'], original_item['payload'])
+        self.assertEqual(self.current('alpha', sent['message_id'])['payload_hash'], sent['payload_hash'])
+        self.assertEqual(self.current('alpha', sent['message_id'])['state'], 'queued')
+        claim = Mailbox(self.stores['beta']).claim(
+            terminal_id=recipient['terminal_id'], agent_id=recipient['agent_id'],
+            generation=recipient['generation'])
+        self.assertEqual([item['message_id'] for item in claim['messages']], [sent['message_id']])
+
+    def test_wire_repository_snapshots_are_hash_bound_and_route_cannot_override_them(self):
+        sent = self.send()
+        route = json.loads(next(item['payload'] for item in self.services['alpha'].outbox()
+                                if item['message_id'] == sent['message_id']))
+        for field in ('sender_repo_id', 'recipient_repo_id'):
+            altered = {**route['message'], field: 'git:another/repo'}
+            self.assertNotEqual(payload_hash(altered), sent['payload_hash'])
+        changed = {**route, 'resolved': {**route['resolved'], 'recipient_repo_id': 'git:another/repo'}}
+        with self.assertRaises(LedgerError) as failure:
+            self.services['beta'].receive('accept', self.services['alpha'].envelope(changed))
+        self.assertEqual(failure.exception.code, 'invalid_recipient')
+        missing = {**route, 'resolved': {key: value for key, value in route['resolved'].items()
+                                       if key != 'recipient_repo_id'}}
+        with self.assertRaises(LedgerError) as failure:
+            self.services['beta'].receive('accept', self.services['alpha'].envelope(missing))
+        self.assertEqual(failure.exception.code, 'invalid_recipient')
+        accepted = self.services['beta'].receive('accept', self.services['alpha'].envelope(route))
+        self.assertEqual(accepted['payload_hash'], sent['payload_hash'])
+        changed = {**route, 'message': {**route['message'], 'sender_repo_id': 'git:another/repo'}}
+        with self.assertRaises(LedgerError) as failure:
+            self.services['beta'].receive('accept', self.services['alpha'].envelope(changed))
+        self.assertEqual(failure.exception.code, 'message_conflict')
+
+    def test_cross_repo_route_keeps_send_time_repo_when_remote_terminal_changes_project(self):
+        repo = self.new_repository('api', 'git:example.test/team/api')
+        recipient = self.add_agent('beta', 'api-main', 'api-workspace', repo=repo)
+        sent = Mailbox(self.stores['alpha']).send(
+            self.agents['alpha'], recipient, body='Only for the API project')
+        snapshot = self.snapshots['beta']
+        snapshot['agents'] = [
+            {**agent, 'cwd': str(self.repo)} if agent['terminal_id'] == recipient['terminal_id'] else agent
+            for agent in snapshot['agents']]
+        registry = AgentRegistry(self.stores['beta'])
+        registry.reconcile(snapshot, refresh_display=False)
+        current = next(agent for agent in registry.list() if agent['terminal_id'] == recipient['terminal_id'])
+        self.assertEqual(current['repo_id'], self.repo_id)
+        self.drain()
+        with self.stores['beta'].read() as connection:
+            row = connection.execute(
+                'SELECT recipient_repo_id,hold_reason FROM deliveries WHERE message_id=?',
+                (sent['message_id'],)).fetchone()
+        self.assertEqual(tuple(row), (recipient['repo_id'], 'recipient_changed'))
+        self.assertEqual(Mailbox(self.stores['beta']).read(current)['messages'], [])
+        exported = self.services['beta'].status_export()
+        current_export = next(agent for agent in exported['agents'] if agent['agent_id'] == current['agent_id'])
+        self.assertEqual(current_export['unread'], 0)
 
     def test_ssh_invoke_status_export_finds_herdr_without_login_path(self):
         home = self.root / "remote home"
@@ -880,7 +1144,7 @@ class RemoteLedgerTest(unittest.TestCase):
             self.assertEqual(reader.resolve_recipient(
                 "beta/"+self.agents["beta"]["alias"], self.agents["alpha"])["agent_id"],
                 self.agents["beta"]["agent_id"])
-        self.assertEqual(calls, [{"repo_id": self.repo_id}])
+        self.assertEqual(calls, [{"repo_id": None}])
 
     def test_status_wire_resources_are_explicitly_opted_in(self):
         service = self.services["beta"]

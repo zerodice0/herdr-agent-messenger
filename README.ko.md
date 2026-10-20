@@ -8,14 +8,14 @@
 
 HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러그인입니다.
 이름 없는 에이전트에 기억하기 쉬운 `color-animal` 이름을 붙이고, 새 세션과
-첫 프롬프트를 하나의 작업으로 생성합니다. 같은 저장소에서 작업하는 로컬·SSH
-에이전트는 영속 메일함으로 협업할 수 있습니다.
+첫 프롬프트를 하나의 작업으로 생성합니다. 로컬 에이전트와 등록된 SSH 호스트의
+에이전트는 저장소가 달라도 영속 메일함으로 협업할 수 있습니다.
 
 ## 주요 기능
 
 - `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
 - `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
-- 같은 저장소의 대화 이력과 명시적 처리 기록, `off` / `manual` / `auto` 참여 모드를 제공합니다.
+- 저장소 간 대화 이력과 명시적 처리 기록, `off` / `manual` / `auto` 참여 모드를 제공합니다.
 - 키보드 중심 메일함·상태 TUI에서 인라인 FYI 전송, 답장과 확인을 거치는 직접 입력을 제공합니다.
 - Codex, Claude Code, omp용 스킬을 짧은 `SKILL.md`와 필요할 때 읽는 `reference.md`로 제공합니다.
 - `spawn --message`로 라벨이 있는 세션과 첫 프롬프트를 생성하며, 단독 사용과 정책이 허용하는 기존 요청·대기·읽기·배치·원격 배포 도구도 지원합니다.
@@ -81,7 +81,7 @@ Claude 훅은 `omp` 대신 `claude`를 지정합니다. 스킬 설치기는 누�
 
 ## 사용
 
-같은 저장소의 참여 에이전트끼리는 [영속 메일함](#영속-메일함)으로 협업합니다.
+에이전트는 저장소가 같거나 달라도 [영속 메일함](#영속-메일함)으로 협업합니다.
 [HAM TUI](docs/ko/ui-reference.md)는 화면 크기에 맞춰 Agents, Threads, 읽기 전용
 Detail 영역을 배치하며 `s`로 Settings를 엽니다. **HAM: Mailbox (Right Split)**,
 **HAM: Mailbox (Tab)** 또는 **HAM: Mailbox (quick send)**로 열 수 있고,
@@ -183,8 +183,9 @@ HAM 플러그인을 활성화하지 않고 Herdr와 스킬만 사용할 수도 �
 
 ## 영속 메일함
 
-참여 에이전트는 터미널에 프롬프트를 직접 넣는 대신 같은 저장소의 영속 메일을
-사용합니다. 등록된 Herdr 에이전트 pane에서 다음과 같이 실행합니다.
+에이전트는 터미널에 프롬프트를 직접 넣는 대신 저장소 간 영속 메일을 사용할 수
+있습니다. 로컬 에이전트와 등록된 peer 사이에는 별도의 저장소 허용 목록이 없으며,
+peer 등록이 신뢰 경계입니다. 등록된 Herdr 에이전트 pane에서 다음과 같이 실행합니다.
 
 ```bash
 python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py mail send \
@@ -205,6 +206,19 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
 `mail withdraw --message UUID`로 철회를 요청합니다. 이미 전달 claim이
 생성된 메일을 단순히 회수할 수는 없습니다.
 
+대화의 시작 저장소(`threads.repo_id` / `messages.repo_id`)는 바뀌지 않습니다.
+각 메시지는 발신 시점의 `sender_repo_id`를, 각 전달은 해석된 수신자의
+`recipient_repo_id`를 저장합니다. terminal에서 다른 저장소를 실행하면 시작
+저장소가 아니라 이 **수신 저장소 스냅샷**과 비교해 `recipient_changed`로
+보류합니다. 받은 메일 조회·처리·네이티브 claim·unread도 전달의 수신 저장소를
+기준으로 합니다. 대화에서 메일을 보내거나 받은 참여자는 저장소가 달라도
+시작 저장소를 바꾸지 않고 답장할 수 있습니다.
+
+자동 턴 시작 조건은 그대로입니다. 수신자 저장소의 모드·임곗값과 수신자의 역할,
+idle/done 상태, 수신자별 시간당 한도, coalescing과 max hop을 모두 적용합니다.
+저장소 간 전송이 이 조건을 우회하지는 않습니다. 기존 `use_mailbox` 정책도
+같은 저장소의 참여 송수신자에만 적용합니다.
+
 ### 저장소 이력과 상태 보드 조회
 
 위의 번들 CLI 경로 뒤에 다음 읽기 전용 명령을 붙입니다.
@@ -217,10 +231,12 @@ status board [--repo [ID]] [--host local|CANONICAL|REGISTERED_SSH_ALIAS] [--verb
 
 이력 조회는 기본적으로 정체성을 검증한 호출자의 저장소를 선택합니다.
 `--repo REPO_ID`를 명시하면 Herdr에서 호출자 정체성을 조회하지 않습니다.
-선택한 저장소의 모든 참여자가 이 원장에 남긴 기록을 조회하므로 송신·수신 대화와
-원격 pending 사본도 포함하지만, 모든 호스트의 이력을 복제하지는 않습니다.
-직접 입력 이력은 사용자 직접 입력의 수락 증거를 읽는 기능이지 직접 전송 권한이
-아닙니다. `--limit`은 기본 100개이며 1~1000개를 받습니다. 결과에는 `repo_id`,
+대화의 시작 저장소, 메시지의 발신 저장소 또는 전달의 수신 저장소가 선택한
+저장소이면 대화 목록에 포함하므로 양쪽에서 저장소 간 대화를 찾을 수 있습니다.
+이 원장에 남아 있는 원격 pending 사본도 포함하지만 모든 호스트의 이력을
+복제하지는 않습니다. `mail direct-list`는 기존처럼 선택한 저장소의 사용자
+직접 입력 이력만 조회합니다. 직접 전송 권한이나 저장소 간 메일 목록이 아니라
+수락 증거를 읽는 기능입니다. `--limit`은 기본 100개이며 1~1000개를 받습니다. 결과에는 `repo_id`,
 `threads` 또는 `submissions`, 마지막 페이지에서 `null`인 `next_cursor`가 있습니다.
 HMAC 서명된 불투명 cursor는 원장·쿼리·저장소에 귀속되므로 그대로 전달하세요.
 정렬은 `updated_at DESC`, UUID 오름차순이며 OFFSET 대신 keyset 페이지를 씁니다.
@@ -231,10 +247,12 @@ HMAC 서명된 불투명 cursor는 원장·쿼리·저장소에 귀속되므로 
 보드는 기본적으로 로컬의 모든 저장소와 등록된 모든 peer를 조회합니다.
 값 없는 `--repo`는 호출자의 저장소를, `--repo ID`는 지정한 저장소를 선택합니다.
 `--host`는 로컬 원장 또는 등록된 정규 호스트·SSH 별칭 하나만 선택합니다.
-결과는 `{repo_id,agents,hosts}`이며 주소·workspace·역할·턴·phase·summary·unread·수신
+결과는 `{repo_id,agents,hosts}`이며 주소·workspace·repo·역할·턴·phase·summary·unread·수신
 상태와 기기·서버 개수를 간결하게 표시합니다. `hosts[].agents` 중복은 없으며 호스트별
 오류·stale·unread와 자원 개수·탐색 오류는 유지합니다. `--verbose`는 전체 레지스트리·상태·
 자원 필드와 `status_updated_at`(상태 갱신), `last_seen`(레지스트리 관찰)을 복원합니다.
+간결한 `status board` / `status list` 행의 `repo`는 짧은 저장소 이름이므로
+verbose 출력 없이도 다른 저장소의 대상을 구분할 수 있습니다.
 Python·TUI·peer export의 전체 구조는 바뀌지 않습니다. 조회는 레지스트리를 수집하거나
 상태·표시·claim을 바꾸지 않으며 peer에도 `refresh=false`를 전달합니다.
 peer 조회에 실패하면 `hosts`에 구조화된 오류와 `stale:true`, unread `?`를 남깁니다.
@@ -335,16 +353,35 @@ pane을 옮겨도 슬롯은 유지됩니다. 이전 세대의 불확실한 claim
 ### 원격 전송과 수신 런타임
 
 수신자는 `local/LABEL`, `CANONICAL_HOST/LABEL`, 등록된 `SSH_ALIAS/LABEL`,
-또는 `main`으로 지정합니다. `--to main`은 보낼 때 송신 호스트에서 송신자의
-현재 workspace main을 찾아 구체적인 terminal 대상을 저장합니다. 해당 범위에
-main이 없으면 명확한 오류로 실패하며 다른 workspace나 저장소 home으로
-대체하지 않습니다. 주소를 명시한 메일은 같은 저장소의 다른 workspace에도
-보낼 수 있습니다. 각 호스트에서 `ledger setup --name HOST`로 정체성을 고정한 뒤 양쪽에서
+`main` 또는 `[HOST/]main@REPO`로 지정합니다. 라벨은 선택한 호스트의 모든
+저장소에서 찾습니다. 없으면 `agent_not_found`, 여럿이면 후보 주소와 저장소를
+포함한 `agent_ambiguous`로 실패하므로 임의로 선택하지 마세요.
+
+`--to main`은 여전히 송신자의 현재 호스트·저장소·workspace main을 선택하며,
+다른 workspace나 저장소 home으로 대체하지 않습니다.
+`--to main@dxp-api`는 로컬에서, `--to beta/main@org/dxp-api`는 등록된 beta
+호스트에서 해당 저장소의 main을 선택합니다. REPO는 정확한 repo ID를 우선하며,
+그 외에는 경로의 끝 구성요소가 유일하게 일치해야 합니다. 저장소가 여러 개이면
+`repo_ambiguous`로 실패합니다. 선택한 호스트의 해당 저장소 workspace 전체에서
+현재 main이 정확히 하나여야 합니다. 없으면 `main_unresolved`, 여러 workspace에
+있으면 workspace ID 목록과 함께 `main_ambiguous`로 실패합니다.
+모든 주소 형식은 보낼 때 구체적인 terminal 대상을 저장합니다.
+주소를 명시한 메일은 workspace와 저장소 경계를 모두 넘을 수 있습니다.
+
+각 호스트에서 `ledger setup --name HOST`로 정체성을 고정한 뒤 양쪽에서
 `ledger peer add --ssh-alias ALIAS`로 연결을 등록합니다. 전송 상태는
 `ledger doctor`와 `ledger outbox`로 확인합니다. 모델을 호출하지 않는 독립
 flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. 영구 오류는
-명시적으로 재시도할 수 있도록 표시됩니다. 모델 폴링이나 데이터베이스 복제는
+명시적으로 재시도할 수 있도록 표시합니다. 모델 폴링이나 데이터베이스 복제는
 하지 않습니다.
+
+스키마 v8은 기존 메시지의 저장소로 발신·수신 저장소 스냅샷을 채워 같은 저장소의
+기존 동작과 불변 해시를 유지합니다. 새 불변 wire payload에는 발신·수신 저장소
+스냅샷이 모두 들어갑니다. 참여 호스트를 함께 업그레이드하세요. 정확한 옛 필드만
+받는 구버전 수신자는 v8 payload를 `invalid_message`로 거부합니다. 메일은 수신자
+쪽에서 자동 보류되는 것이 아니라 발신 outbox에 실패 상태로 보존됩니다.
+메시지·항목 ID를 유지하고 업그레이드 후 `ledger retry --item OUTBOX_ITEM_UUID`로
+수동 재시도하세요. 새 메일로 다시 보내지 마세요.
 
 원장 스키마 v7은 기존 main·members의 활성 로컬 대상을 현재 workspace 범위로
 옮기고 저장소 단위의 옛 역할 설정을 제거합니다. 프로토콜은 1을 유지하며,

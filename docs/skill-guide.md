@@ -2,7 +2,7 @@
 
 [한국어](ko/skill-guide.md) · English · [README](../README.md)
 
-HAM lets Codex, Claude Code, and omp exchange durable repository mail, inspect coordination status, and **start new labeled interactive Herdr sessions**. Existing-agent prompt routing remains available for nonparticipating traffic. The canonical skill name is `herdr-agent-messenger`; **HAM** is its shorter user-facing name.
+HAM lets Codex, Claude Code, and omp exchange durable mail across repositories, inspect coordination status, and **start new labeled interactive Herdr sessions**. Existing-agent prompt routing remains available where legacy policy permits. The canonical skill name is `herdr-agent-messenger`; **HAM** is its shorter user-facing name.
 
 ## Install with the plugin
 
@@ -160,6 +160,21 @@ parent. Accepted local mail ordinarily waits queued; remote copies may be pendin
 and withdrawal or terminal closure can make mail final without a runtime claim.
 Neither kind makes `mail send` itself start a model turn.
 
+Mail can cross repositories on the local host or a registered peer; there is no
+repository allowlist. Peer registration remains the trust boundary. Thread
+origin (`threads.repo_id` / `messages.repo_id`) never changes. Schema v8 adds
+`messages.sender_repo_id` (sender's repo at send time) and
+`deliveries.recipient_repo_id` (resolved recipient's repo at send time).
+Legacy rows backfill both from the message repo without changing legacy hashes;
+new immutable wire payloads include both repo snapshots, with the recipient
+snapshot also in the routed delivery. A replier must have sent or received a
+message in the thread (`not_participant` otherwise), not share its origin repo.
+
+Cross-repo receipt and wake use the **recipient's** repo settings and own scoped
+role. Modes, idle/done readiness, hourly per-recipient limit, coalescing and
+max-hop gates are unchanged. Legacy collaboration policy is also unchanged:
+`use_mailbox` still applies only to participating same-repo pairs.
+
 Successful sends can return advisory warnings without changing the default
 `fyi` kind. `fyi_no_wake` means FYI was sent to a known ready, non-stale,
 participating OMP recipient with a registered receiver and Herdr `turn_state`
@@ -201,9 +216,12 @@ History lists default to the verified caller's repository. Explicit
 `--repo REPO_ID` avoids fetching Herdr caller identity. `--limit` defaults to 100
 (1–1000). Results are `{repo_id,threads,next_cursor}` or
 `{repo_id,submissions,next_cursor}`; `next_cursor:null` ends traversal.
-Records cover all participants in the selected repository on this local ledger:
-sent and received threads, including pending remote copies, and retained
-`via=direct` submissions, not `spawn_initial` or replicated all-host history.
+`mail threads` includes a thread when the selected repo is its origin, any
+message's sender repo, or any delivery's recipient repo. Both sides therefore
+discover participating cross-repo threads, including retained pending remote
+copies on this ledger. `mail direct-list` remains selected-repo `via=direct`
+user-submission history, not `spawn_initial` or a cross-repo mail view.
+Neither list replicates all-host history.
 Pass the HMAC-signed opaque cursor unchanged. It is bound to ledger/query/repo;
 tampering or a scope mismatch produces `invalid_cursor`. Pages use
 `updated_at DESC` then UUID ascending keyset order, never OFFSET. This is live
@@ -213,12 +231,13 @@ before the boundary. Restart from the first page to see newer updates.
 `status board` defaults to all local repositories plus all registered peers.
 Bare `--repo` selects the caller's repo; explicit `--repo ID` filters it.
 `--host` restricts the board to local or one registered canonical name/SSH alias.
-The result `{repo_id,agents,hosts}` defaults to brief address/host/workspace,
+The result `{repo_id,agents,hosts}` defaults to brief address/host/workspace/repo,
 role/turn/phase/summary/unread/stale/receiver fields and device/server counts.
 Hosts retain errors/unread/stale and resource counts/errors, not duplicate
 agent rows. `--verbose` restores full registry/status/resource fields, timestamps,
 identity/placement and `hosts[].agents`. `status list --verbose` likewise restores
 full local rows. Python/TUI/peer `status-export` retain the full shape.
+Compact board/list `repo` is the short repo name for discovering cross-repo targets.
 Status-update and registry-observation timestamps differ. Reads do not refresh
 or mutate status/display/claims and request peer `refresh=false`. A failed peer has a structured
 error and unread `?`. The stateless CLI has no prior rows to invent; a TUI may
@@ -305,7 +324,7 @@ a separate, unchanged script: HAM neither reads nor displays heavy-work slots.
 ### Mailbox terminology
 
 - **Mailbox / inbox:** durable recipient-slot mail, not terminal input.
-  `inbox read` selects only this host/caller terminal/repository, normally
+  `inbox read` selects this host/caller terminal and delivery recipient-repo snapshot matching the caller's current repo, normally
   `queued`, `delivering`, `delivered`; `--all` includes its retained final states,
   and `--message UUID` can select one final message. Reading is not an ACK.
 - **Thread:** the root message UUID is its thread UUID. `--reply-to` inherits the
@@ -321,8 +340,9 @@ a separate, unchanged script: HAM neither reads nor displays heavy-work slots.
   not handling or understanding. `handled`, `withdrawn`, `undeliverable` are
   final. Keep `confirmation_source=native|operator` distinct. Direct
   `submitting/accepted/unknown/failed` is transport acceptance, not mailbox ACK.
-- **Unread:** counts `queued` + `delivering`, not whether anyone viewed the text;
-  delivered-but-unhandled mail is excluded. `fyi`/`action` are kinds, not states.
+- **Unread:** counts `queued` + `delivering` by delivery recipient repo, not
+  thread origin or whether anyone viewed the text; delivered-but-unhandled mail
+  is excluded. `fyi`/`action` are kinds, not states.
 
 Host identity is a canonical name plus a stable ledger UUID, not the machine's
 hostname, `local`, or an SSH alias. `local` maps to this ledger; a registered
@@ -334,8 +354,10 @@ The CLI resolves moved terminals through process ancestry and Herdr's public
 `pane process-info` shell PID, without requiring a TTY or trusting an inherited
 terminal variable as proof. It refuses an unprovable/stale-pane identity.
 Display/status revisions do not create a new generation. Queued mail can move
-to a new session in the same repository; other-repository or shell occupants
-hold it. Uncertain old-generation claims are never automatically replayed.
+to a new session in the delivery's send-time recipient repo. A different-repo
+or shell occupant holds it as `recipient_changed`; the comparison is against
+the recipient snapshot, not the sender or thread-origin repo. Uncertain
+old-generation claims are never automatically replayed.
 
 Git HTTPS/SSH/scp origins normalize to a host/path identity. Preserve a planned
 origin rename explicitly with `git config ham.repo-id 'git:host/stable/repo'`.
@@ -373,6 +395,15 @@ canonical UUID; do not run a new protocol against an old installed checkout.
 Canonical host names and SSH aliases both address the same registered peer.
 Remote status is queried live, not copied into local AGENTS.
 
+Named targets use all repos on that host: no match gives `agent_not_found`;
+multiple matches give `agent_ambiguous` with addresses and repos. Upgrade all
+participating hosts together before exchanging v8 mail. Older exact-field
+receivers reject new payloads as `invalid_message`; the origin retains failed
+outbox mail for manual retry after upgrade, not automatic receiver-side hold.
+Keep message/item IDs and use `ledger retry --item OUTBOX_ITEM_UUID` after
+upgrading; do not create replacement sends. Existing `recipient_changed`
+holds still depend on recipient occupancy, not sender repo.
+
 The detached code-only worker holds a per-ledger flock, retries transient
 failures FIFO per peer (up to five-minute backoff), sends receipts, sweeps closed
 terminals and expires bodies/logs. It survives the launching CLI and exits when
@@ -388,8 +419,19 @@ warning, not permission to resend.
 current `(repo_id, canonical host, workspace_id)` scope. The immutable message
 stores a concrete terminal target. If the scope has no main, sending fails
 visibly and names the workspace; it never uses another workspace's main or the
-repository home. Explicit `HOST/LABEL` mail remains repository-wide, including
-cross-workspace collaborators. Receipts and withdrawals follow the saved target.
+repository home. Explicit `HOST/LABEL` mail crosses both workspaces and
+repositories. Receipts and withdrawals follow the saved target.
+
+Use `--to [HOST/]main@REPO` to select another repo's main (HOST defaults local).
+For example, `--to main@dxp-api` or `--to beta/main@org/dxp-api`.
+An exact repo ID wins; otherwise REPO must uniquely match trailing path
+components. Multiple repos give `repo_ambiguous`. On the selected host, exactly
+one current main must exist across that repo's workspaces: none gives
+`main_unresolved`, several gives `main_ambiguous` with workspace IDs. Unknown
+repos also give `main_unresolved`. Remote selection uses exported role/workspace
+data. Like plain `main`, this saves a concrete terminal target at send time;
+it does not elect a main or fall back to home. Use a concrete `HOST/LABEL`
+when multiple workspaces have mains.
 The home is the first enabled canonical host and is deliberately read-only in
 the user UI; it does not elect or relay workspace mains. Mode/main/member/threshold
 mutations belong to the user UI service, not the agent CLI; there is no `repo set`

@@ -38,10 +38,16 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
               'Reply: mail send --to HOST/LABEL --reply-to ID --kind action --body TEXT.\n'
               'Use action to enable work (answers/decisions); fyi otherwise.\n'
               'No receipt replies/ACK loops.\n')
-    headers = [('\n--- ' + message['message_id'] + ' ---\n' +
-                'From ' + truncate_utf8(message['origin_host'],128) + '/' +
-                truncate_utf8(message['sender_label'],96) + ' [' + message['kind'] + ']\n' +
-                'Thread ' + message['thread_id'] + ' / hop ' + str(message['hop']) + '\n') for message in messages]
+    headers = []
+    for message in messages:
+        sender_repo = message.get('sender_repo_id', message.get('repo_id', ''))
+        recipient_repo = message.get('recipient_repo_id', message.get('repo_id', ''))
+        repo = (' (repo ' + truncate_utf8(sender_repo.rsplit('/', 1)[-1], 96) + ')'
+                if sender_repo and sender_repo != recipient_repo else '')
+        headers.append('\n--- ' + message['message_id'] + ' ---\n' +
+                       'From ' + truncate_utf8(message['origin_host'],128) + '/' +
+                       truncate_utf8(message['sender_label'],96) + repo + ' [' + message['kind'] + ']\n' +
+                       'Thread ' + message['thread_id'] + ' / hop ' + str(message['hop']) + '\n')
     omitted = ['[body omitted; inbox read --message ' + message['message_id'] + ']' for message in messages]
     available = BUNDLE_BYTES - len(prefix.encode('utf-8')) - sum(len(header.encode('utf-8')) for header in headers)
     if available < sum(len(text.encode('utf-8')) for text in omitted):
@@ -119,9 +125,9 @@ class NativeReceiver:
                 'wake_count':wake_count+reservations,'pending_claims':pending_claims}
 
     def _eligible(self,connection: Any,agent: Mapping[str, Any],maximum_hop: int,*,wake: bool) -> list[Any]:
-        base = ('SELECT m.*,d.recipient_address FROM messages m JOIN deliveries d USING(message_id) '
+        base = ('SELECT m.*,d.recipient_address,d.recipient_repo_id FROM messages m JOIN deliveries d USING(message_id) '
                 "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' "
-                'AND m.repo_id=? AND m.hop<=? ')
+                'AND d.recipient_repo_id=? AND m.hop<=? ')
         parameters = (self.store.host,agent['terminal_id'],agent['repo_id'],maximum_hop)
         rows = connection.execute(base+'ORDER BY m.created_at,m.message_id LIMIT ?',(*parameters,BUNDLE_MESSAGES)).fetchall()
         if wake and not any(row['kind']=='action' for row in rows):

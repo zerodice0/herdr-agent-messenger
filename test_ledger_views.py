@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 import uuid
 
+from agent_output import compact_board_payload
 from ledger_mail import Mailbox
 from ledger_remote import RemoteLedger
 from ledger_runtime import NativeReceiver
@@ -182,6 +183,28 @@ class StatusBoardTest(unittest.TestCase):
         all_repos = self.board(host="local")
         self.assertEqual(all_repos["hosts"][0]["unread"], 3)
         self.assertEqual(self.board(host="local", repo_id="missing")["agents"], [])
+
+    def test_cross_repo_unread_belongs_to_current_delivery_repo_not_thread_origin(self):
+        sent = Mailbox(self.local, self.environment).send(
+            self.other, self.agents["alpha"], kind="action", body="Cross-repository board fixture")
+        inbox = Mailbox(self.local).read(self.agents["alpha"])["messages"]
+        self.assertEqual([row["message_id"] for row in inbox], [sent["message_id"]])
+        self.assertEqual(inbox[0]["repo_id"], OTHER_REPO)
+        self.assertEqual(inbox[0]["recipient_repo_id"], REPO)
+        scoped = self.board(host="local", repo_id=REPO)
+        self.assertEqual(scoped["agents"][0]["unread"], 1)
+        self.assertEqual(scoped["hosts"][0]["unread"], 1)
+        self.assertEqual(self.board(host="local", repo_id=OTHER_REPO)["hosts"][0]["unread"], 0)
+        compact = compact_board_payload(self.board(host="local"))
+        self.assertEqual({row["address"]: row["repo"] for row in compact["agents"]},
+                         {"alpha/alpha": "board", "alpha/other": "other"})
+
+        with self.local.transaction() as connection:
+            connection.execute("UPDATE agents SET repo_id=? WHERE agent_id=?",
+                               (OTHER_REPO, self.agents["alpha"]["agent_id"]))
+        moved = self.board(host="local", repo_id=OTHER_REPO)
+        self.assertEqual({row["unread"] for row in moved["agents"]}, {0})
+        self.assertEqual(moved["hosts"][0]["unread"], 0)
 
     def test_roles_are_authoritative_per_host_even_with_identical_workspace_ids(self):
         for host in ("alpha", "beta"):

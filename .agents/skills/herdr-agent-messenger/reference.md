@@ -19,9 +19,30 @@ All commands accept `-h` / `--help`. Legacy prompt-routing commands (`list`, rec
 
 Only literal `local` means local transport. Even a hostname matching this machine means SSH. Labels can repeat across hosts and do not guarantee the same occupant after restart. Missing/ambiguous hosts or labels must be reported, not guessed. Never substitute a pane ID or create a missing agent unless asked.
 
-These selector rules describe legacy routing. Durable mail separately accepts
-`local/LABEL`, registered canonical names or SSH aliases, and `main`, resolved
-to the sender's workspace main at send time.
+These selector rules describe legacy routing. Durable mail accepts
+`local/LABEL`, registered canonical names or SSH aliases, `main`, and
+`[HOST/]main@REPO`. Named local/remote targets are resolved across all repos;
+zero label matches gives `agent_not_found`, several gives `agent_ambiguous`
+with candidate addresses and repos. Peer registration remains the trust
+boundary; cross-repo mail needs no repository allowlist.
+
+`main` still selects the sender's current repo/host/workspace main.
+`[HOST/]main@REPO` instead selects the main of REPO on HOST (default local).
+REPO is an exact repo ID or a unique trailing path-component suffix, such as
+`dxp-api` or `org/dxp-api`; quote the address when necessary. An exact ID wins.
+Among that repo's workspaces on the chosen host, exactly one current main must
+exist. Resolution stores its concrete target; replies/withdrawals do not
+re-resolve it. Remote resolution uses exported role/workspace data.
+
+| Resolution error | Meaning / action |
+| --- | --- |
+| `repo_ambiguous` | REPO matches several repo IDs; use an exact ID or longer unique suffix. |
+| `main_ambiguous` | Several workspaces have mains; inspect the listed workspace IDs and choose a concrete `HOST/LABEL`. |
+| `main_unresolved` | No current main in the selected scope/repo; inspect status, never fall back to another host/home/workspace. |
+| `agent_ambiguous` | A label matches several agents across repos; inspect candidate addresses/repos rather than guessing. |
+
+Examples: `mail send --to main@dxp-api --body 'Review the API contract.'`
+or `mail send --to beta/main@org/dxp-api --body 'Review the API contract.'`.
 Before using legacy `send`, `request` or `batch`, inspect repository participation:
 manual/auto same-repository traffic between participating agents is refused with
 `use_mailbox`, with each endpoint's role evaluated in its own host-qualified
@@ -35,8 +56,9 @@ A verified route can refresh only when continuity checks identify one safe occup
 
 ### Local mailbox
 
-Mailbox messages are durable data, not terminal prompts. Same-repository local
-and registered remote agents can exchange them without interrupting an ongoing turn:
+Mailbox messages are durable data, not terminal prompts. Local agents and
+registered remote agents can exchange them across repositories without
+interrupting an ongoing turn:
 
 ```bash
 python3 scripts/herdr_agent_messenger.py mail send \
@@ -50,11 +72,11 @@ python3 scripts/herdr_agent_messenger.py repo show
 
 | Command | Flags and semantics |
 | --- | --- |
-| `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, or symbolic `main`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh same-repository status export. |
+| `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, `main`, or `[HOST/]main@REPO`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh all-repository status export. |
 | `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000), `--verbose`. Without `--all`, shows queued, uncertain delivering, and delivered mail. Compact IDs/sender/body/state/reply context by default; verbose restores delivery diagnostics (see Compact versus verbose payloads). Reads never change delivery, logs, or bells, even from subagents. |
 | `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
 | `mail show` | Required `--thread UUID`; reads a known retained thread, including sent mail, without caller-recipient filtering. Returns retained bodies and delivery state from this ledger. |
-| `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; repository-wide retained sent/received threads, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
+| `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; retained threads originating in or involving that repo as sender/recipient, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
 | `mail direct-list` | Same `--repo REPO_ID`, `--limit N`, `--cursor TOKEN`; retained `via=direct` user-input submissions, not `spawn_initial`. Returns `{repo_id,submissions,next_cursor}`. Read-only, not a direct-send command. |
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
@@ -86,10 +108,13 @@ use `fyi` otherwise.
 #### History and cursor paging
 
 `mail threads` and `mail direct-list` default to the verified caller's repository.
-Explicit `--repo REPO_ID` avoids fetching Herdr caller identity. Both enumerate
-all participants' records for that repo on this local ledger, not only the
-caller's inbox and not replicated all-host history. They never claim, acknowledge,
-handle, refresh the registry, or change status/last_seen/display state.
+Explicit `--repo REPO_ID` avoids fetching Herdr caller identity. A thread
+participates when the selected repo is its origin, any message's `sender_repo_id`,
+or any delivery's `recipient_repo_id`; cross-repo threads are therefore visible
+to both sides. `mail direct-list` remains retained direct user-submission history
+for the selected repo, not a cross-repo mail view. These are this ledger's records,
+not only the caller's inbox and not replicated all-host history. Reads never
+claim, acknowledge, handle, refresh the registry, or change status/last_seen/display state.
 
 `next_cursor` is `null` at the end; otherwise pass it unchanged as `--cursor`.
 The opaque HMAC-signed token binds the ledger, query kind and repository; malformed,
@@ -103,9 +128,12 @@ across calls.
 All commands return one JSON object. Errors use the existing CLI convention
 `{"error":{"code":"CODE","message":"TEXT"}}`, exit 1; argparse usage errors exit 2.
 The legacy request lifecycle's `error_code` field is unchanged. Useful codes:
-`sender_unresolved`, `stale_session`, `native_session_pending`, `recipient_absent`, `repo_mismatch`,
+`sender_unresolved`, `stale_session`, `native_session_pending`, `recipient_absent`,
 `message_conflict`, `delivery_in_progress`, `body_too_large`, `invalid_limit`,
 `invalid_repo`, `invalid_cursor` (including history tampering/scope mismatch).
+Address resolution also reports `agent_not_found`, `agent_ambiguous`,
+`repo_ambiguous`, `main_ambiguous`, or `main_unresolved` as described above.
+Different sender/recipient repositories are not a `repo_mismatch` send error.
 `native_session_pending` means Herdr has not yet published the OMP native session.
 The receiver waits within its existing bounded registration retries, without
 publishing the path itself; success removes HAM's waiting/unavailable status.
@@ -122,10 +150,35 @@ identity can be proven, HAM fails closed rather than guessing from a stale pane.
 Git HTTPS/SSH/scp origins normalize to `git:host[:nondefault-port]/Path`, preserving
 path case. Set `git config ham.repo-id 'git:host/stable/repo'` before a configured
 origin rename to keep that explicit identity. Without an origin, identity is
-local to the canonical host and real repository root. A different-repository
-occupant holds queued mail; a same-repository new session can claim it. Missing
-agents hold queued mail; closed terminals make unclaimed mail undeliverable.
-Unknown claims are never automatically replayed across crashes/session changes.
+local to the canonical host and real repository root. Each delivery snapshots
+the resolved recipient's repo at send time (`deliveries.recipient_repo_id`).
+An occupant whose current repo differs from that snapshot holds queued mail as
+`recipient_changed`; a new session in the snapshot repo can claim it, even
+when the sender/thread belongs to another repo. Missing agents hold queued mail;
+closed terminals make unclaimed mail undeliverable. Unknown claims are never
+automatically replayed across crashes/session changes.
+
+Schema v8 keeps `threads.repo_id` and `messages.repo_id` as the immutable thread
+origin. `messages.sender_repo_id` snapshots each sender's send-time repo;
+`deliveries.recipient_repo_id` snapshots each resolved recipient repo. Existing
+rows backfill both snapshots from `messages.repo_id`, preserving legacy
+same-repo semantics. New immutable wire payloads carry both `sender_repo_id` and
+`recipient_repo_id` in the existing protocol envelope; the routed recipient
+snapshot becomes the delivery repo. The new fields are integrity-bound without
+invalidating legacy message hashes or receipts. Replies require the replier
+to have sent or received a message in that thread (`not_participant` otherwise),
+not repo equality.
+
+Admission uses the recipient's repo mode/thresholds and own scoped role.
+Idle/done readiness, hourly per-recipient limits, coalescing and max-hop gates
+are unchanged. Cross-repo mail does not authorize a wake that same-repo mail
+would fail. Upgrade all participating hosts together: older exact-field
+receivers reject v8 messages as `invalid_message`. The originating outbox
+retains the failed mail for manual retry after upgrade; it is not dropped or
+delivered. Do not assume an old receiver automatically holds the new payload.
+Preserve the message/item IDs and use `ledger retry --item OUTBOX_ITEM_UUID`
+after upgrading, rather than creating replacement sends. A queued delivery held
+as `recipient_changed` remains subject to the recipient-snapshot guard above.
 
 Storage is `${XDG_STATE_HOME:-~/.local/state}/herdr-agent-messenger/ledger`
 (directory 0700, database 0600, SQLite WAL). Use `HERDR_AGENT_LEDGER_DIR` for
@@ -163,13 +216,13 @@ for both OMP and Claude ownership rules, commands and acceptance limits.
 #### Mailbox terminology
 
 - **Mailbox / inbox:** durable mail for a recipient's stable terminal slot.
-  `inbox read` filters this ledger host, caller terminal and current repository:
+  `inbox read` filters this ledger host, caller terminal and delivery recipient-repo snapshot matching its current repo:
   default `queued`, `delivering`, `delivered`; `--all` includes all retained
   states for that same recipient, and `--message UUID` can read a final message.
   Viewing never acknowledges application or work.
 - **Thread:** the root message UUID is the thread UUID. `--reply-to` retains the
   parent thread/subject and increments its hop. `mail show --thread UUID` reads
-  a known thread; `mail threads` discovers repo-wide retained threads.
+  a known thread; `mail threads` discovers retained threads the repo participates in.
 - **TUI Threads:** mixed repo-filtered sent/received threads (including remote
   pending copies) and direct results, plus host-wide pending/failed OUTBOX jobs.
   It is not just an inbox, a single chat transcript, or remote history replication.
@@ -186,8 +239,8 @@ for both OMP and Claude ownership rules, commands and acceptance limits.
   withdrawal and terminal closure mean neither kind must remain queued until a
   runtime claim. Direct `submitting/accepted/unknown/failed` is distinct transport
   acceptance, never a native mailbox ACK. `fyi`/`action` are kinds, not states.
-- **Unread:** the board counts `queued` + `delivering`, not an actual-view flag;
-  delivered-but-unhandled mail is excluded.
+- **Unread:** the board counts `queued` + `delivering` by delivery recipient repo,
+  not thread origin or an actual-view flag; delivered-but-unhandled mail is excluded.
 
 #### Hosts, FIFO transport and worker
 
@@ -318,11 +371,13 @@ A single agent in a worktree workspace therefore gets its own main role.
 current scope and stores the concrete terminal target in the immutable message.
 Missing main produces `main_unresolved` naming the workspace; there is no
 fallback to a repo-global main, another workspace, or an offline home route.
-Receipts and withdrawals follow the saved target. Explicit named mail still
-crosses workspaces within a repository. Legacy unresolved symbolic messages,
-including remote-origin sends and home relays, fail with `legacy_symbolic_main`
-and an instruction to upgrade every host. Upgrade and run `ledger reconcile`
-on every host before using `--to main` across hosts.
+Receipts and withdrawals follow the saved target. Explicit named mail crosses
+both workspaces and repositories. `[HOST/]main@REPO` selects the unique main
+across that repo's workspaces on the chosen host, as described under
+**Recipient selectors**; it does not change plain `main` semantics.
+Legacy unresolved symbolic messages, including remote-origin sends and home
+relays, fail with `legacy_symbolic_main` and an instruction to upgrade every
+host. Upgrade and run `ledger reconcile` on every host before using these routes.
 
 #### Workspace role migration
 
@@ -614,7 +669,9 @@ The compact OMP/Claude coordination prefix retains user priority, turn-boundary
 work, view-only/no-ACK reads, explicit completion handling, useful replies and no
 receipt/ACK loops. It directs replies to use `action` to enable work
 (answers/decisions), `fyi` otherwise. Headers retain every message ID, sender,
-kind, thread and hop.
+kind, thread and hop. When the sender repo differs from the recipient repo,
+`From` adds its short repo name (last path component) before the kind, for example
+`From macbook/purple-deer (repo monitor_mobile) [action]`.
 The random marker and exact content/hash support native journal evidence, not
 proof of provider success, understanding or completed work.
 
@@ -623,7 +680,12 @@ Pull missing/truncated context with `inbox read --message UUID`; do not reread
 complete bodies solely because native mail arrived. Budgets include actual
 prefix/header bytes. The review's fixed marker/prefix fixture is now 415 bytes
 (formerly 360); one/three ASCII `OK` messages are 542/796 bytes (formerly 487/741),
-with unchanged per-message headers.
+for same-repo messages; the example's ` (repo monitor_mobile)` adds 22 UTF-8
+bytes within the same bundle limit.
+
+This source change does not alter the OMP extension or Claude hook; it does not
+require receiver reinstall or session restart. Upgrade the plugin/skill on all
+participating hosts together for the v8 wire support described above.
 
 #### Runtime installation and health
 
@@ -680,7 +742,7 @@ the current structured plugin root (or explicitly configured absolute
 `HERDR_AGENT_MESSENGER_ROOT`) and calls Python asynchronously; it never opens
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
 nonmembers. FYI alone does not start a turn. Automatic action wake requires a
-participating role, same repo/generation, TUI mode with supported empty-editor
+participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
 evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.
 Final conditions and agent-attributed
@@ -826,7 +888,7 @@ available with narrower semantics.
 #### Status board output and fields
 
 Compact board/list rows have `address` (`canonical-host/alias`, terminal fallback),
-`host`, `workspace` (label, ID fallback), and existing `turn_state`, `status`,
+`host`, `workspace` (label, ID fallback), `repo` (short repo name), and existing `turn_state`, `status`,
 `role`, `unread`, `phase`, `summary`, `stale`, `extension_present`, `client`.
 Row `repo_id` appears only in multi-repo results; optional devices/servers become
 counts. Omitted old-peer resources remain unknown, not zero.
@@ -1058,7 +1120,7 @@ Focus is not a draft-text detector: a person who leaves a pane containing unsent
 
 | Operation | Compact fields | Additional/full `--verbose` fields |
 | --- | --- | --- |
-| `status board`, `status list` | Brief address/host/workspace/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents` and full host metadata. See Status board output and fields. |
+| `status board`, `status list` | Brief address/host/workspace/repo/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents` and full host metadata. See Status board output and fields. |
 | `inbox read` | `{messages,...warnings}`; nonnull `message_id`, `thread_id`, `sender` (`origin_host/sender_label`), `kind`, `priority` if provided, `state`, `body`, `reply_to`, `hop`, truncation/omission flags; nonempty `hold_reason`, true `withdraw_requested` | Full original message/delivery fields including hashes, routing, claim/recipient identity and timestamps/nulls. Priority is not synthesized if absent. Python `Mailbox.read()` is unchanged. |
 | `list` | `host`, `agents` with `address`, `status`, `workspace` | Full agent records with the fields listed below. |
 | `status` | `address`, `status`; `stale: true` only if stale | `agent` full record, `route`, `route_refreshed`. |
@@ -1118,7 +1180,8 @@ Codes can occur as envelope `error.code`, lifecycle `error_code`, or per-item er
 | Occupant: `recipient_changed` | Before held delivery: terminal failure, not submitted. After submission: terminal unknown, no replacement output. Report uncertainty and reselect only for explicitly new work. |
 | State: `request_not_found`, `request_state_invalid`, `request_state_unavailable` | Verify ID, original sender host/state location, and permissions. Storage failure can occur after submission; do not resend until delivery checked. |
 | Coordination: `use_mailbox` | Same-repository participating prompt traffic is refused before legacy submission. Use durable mail; no CLI bypass. Coordinated batch lookup/preflight failure aborts all submissions. |
-| Mail/native: `sender_unresolved`, `stale_session`, `repo_mismatch`, `message_conflict`, `delivery_in_progress`, `invalid_setting` | Preserve immutable IDs and generation evidence, repair the actual identity/input/configuration problem; do not manufacture ACK or replay unknown claims. Settings are user-TUI only. |
+| Mail/native: `sender_unresolved`, `stale_session`, `message_conflict`, `delivery_in_progress`, `invalid_setting` | Preserve immutable IDs and generation evidence, repair the actual identity/input/configuration problem; do not manufacture ACK or replay unknown claims. Settings are user-TUI only. Cross-repo sends are allowed. |
+| Mail resolution: `agent_ambiguous`, `repo_ambiguous`, `main_ambiguous`, `main_unresolved` | Inspect candidates/workspaces in the error and current board; choose an exact repo/unique suffix or concrete agent address. Never pick an arbitrary main or spawn a replacement. |
 | Native startup: `native_session_pending` | Herdr has not published the OMP session yet. Wait within the receiver's bounded retry window; never publish or replace native identity through HAM. Exhaustion is unavailable; a genuine reported-path conflict remains `stale_session`. |
 | Initial spawn: `prompt_acceptance_unknown`, `spawn_state_unavailable` | Possible first-prompt acceptance; preserve operation/submission/placement and inspect. Never automatically repeat spawn or its first prompt. |
 | Spawn input: `cwd_required`, `sender_pane_unavailable`, `label_unavailable` | Supply remote cwd/source pane or an available valid label, then retry startup. |

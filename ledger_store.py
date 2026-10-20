@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -104,13 +104,13 @@ CREATE TABLE IF NOT EXISTS threads (
  thread_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, subject TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (
  message_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(thread_id),
- repo_id TEXT NOT NULL, reply_to TEXT, origin_host TEXT NOT NULL,
+ repo_id TEXT NOT NULL, sender_repo_id TEXT NOT NULL, reply_to TEXT, origin_host TEXT NOT NULL,
  sender TEXT NOT NULL, sender_label TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('fyi','action')),
  hop INTEGER NOT NULL, body TEXT NOT NULL, created_at REAL NOT NULL, final_at REAL,
  payload_hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS deliveries (
  message_id TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
- recipient_address TEXT NOT NULL, recipient_host TEXT NOT NULL,
+ recipient_address TEXT NOT NULL, recipient_host TEXT NOT NULL, recipient_repo_id TEXT NOT NULL,
  recipient_terminal_id TEXT, workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL CHECK(state IN ('pending','queued','delivering','delivered','handled','withdrawn','undeliverable')),
  hold_reason TEXT, claim_id TEXT, claimed_agent_id TEXT, claimed_generation INTEGER,
@@ -198,9 +198,18 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
+                if "recipient_repo_id" not in columns:
+                    connection.execute("ALTER TABLE deliveries ADD COLUMN recipient_repo_id TEXT NOT NULL DEFAULT ''")
+                    connection.execute(
+                        "UPDATE deliveries SET recipient_repo_id=(SELECT repo_id FROM messages m "
+                        "WHERE m.message_id=deliveries.message_id)")
+                message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
+                if "sender_repo_id" not in message_columns:
+                    connection.execute("ALTER TABLE messages ADD COLUMN sender_repo_id TEXT NOT NULL DEFAULT ''")
+                    connection.execute("UPDATE messages SET sender_repo_id=repo_id")
                 if "confirmation_source" not in columns:
                     connection.execute("ALTER TABLE deliveries ADD COLUMN confirmation_source TEXT "
                                        "CHECK(confirmation_source IN ('native','operator'))")

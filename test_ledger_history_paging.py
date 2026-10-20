@@ -63,7 +63,7 @@ class LedgerHistoryPagingTest(unittest.TestCase):
                                ("beta", str(uuid.uuid4()), "inert-beta", "/inert/ham"))
 
     def message(self, number, updated_at, *, repo_id=None, origin="alpha", recipient="alpha",
-                sender="unrelated-agent", thread_id=None):
+                sender="unrelated-agent", thread_id=None, sender_repo_id=None, recipient_repo_id=None):
         identity = str(uuid.UUID(int=number))
         value = {
             "message_id": identity, "thread_id": thread_id or identity,
@@ -74,6 +74,8 @@ class LedgerHistoryPagingTest(unittest.TestCase):
             "recipient_host": recipient, "recipient_terminal_id": "term-b",
             "recipient_address": f"{recipient}/term-b",
         }
+        value["sender_repo_id"] = value["repo_id"] if sender_repo_id is None else sender_repo_id
+        value["recipient_repo_id"] = value["repo_id"] if recipient_repo_id is None else recipient_repo_id
         with self.store.transaction() as connection:
             result = self.remote.submit(connection, value)
             connection.execute("UPDATE deliveries SET updated_at=? WHERE message_id=?",
@@ -167,6 +169,68 @@ class LedgerHistoryPagingTest(unittest.TestCase):
         self.assertEqual([row["thread_id"] for row in page["threads"]], [sent, received, pending])
         self.assertEqual(page["threads"][-1]["messages"][0]["state"], "pending")
         self.assertIn(excluded, {row["thread_id"] for row in self.mail.list_threads()["threads"]})
+
+    def test_thread_repo_scope_matches_origin_sender_or_recipient_without_duplicates(self):
+        origin_repo = "git:origin/conversation"
+        third_repo = "git:third/repository"
+        origin, _ = self.message(10, 50.0, sender_repo_id=self.other_repo,
+                                 recipient_repo_id=third_repo)
+        sender, _ = self.message(11, 40.0, repo_id=origin_repo,
+                                 sender_repo_id=self.repo_id, recipient_repo_id=self.other_repo)
+        recipient, _ = self.message(12, 30.0, repo_id=origin_repo,
+                                    sender_repo_id=self.other_repo, recipient_repo_id=self.repo_id)
+        multiple, _ = self.message(13, 20.0, sender_repo_id=self.repo_id,
+                                   recipient_repo_id=self.repo_id)
+        # Match only through a later message: return the entire conversation,
+        # and order using its latest delivery, not only the matching message.
+        later, _ = self.message(14, 100.0, repo_id=origin_repo,
+                                sender_repo_id=self.other_repo, recipient_repo_id=third_repo)
+        self.message(15, 10.0, repo_id=origin_repo, thread_id=later,
+                     sender_repo_id=self.repo_id, recipient_repo_id=third_repo)
+        excluded, _ = self.message(16, 200.0, repo_id=origin_repo,
+                                   sender_repo_id=self.other_repo, recipient_repo_id=third_repo)
+        with self.store.read() as connection:
+            before = list(connection.iterdump())
+        page = self.mail.list_threads(self.repo_id)
+        self.assertEqual([row["thread_id"] for row in page["threads"]],
+                         [later, origin, sender, recipient, multiple])
+        self.assertEqual({row["message_id"] for row in page["threads"][0]["messages"]},
+                         {later, str(uuid.UUID(int=15))})
+        self.assertNotIn(excluded, {row["thread_id"] for row in page["threads"]})
+        self.assertEqual(len(self.mail.list_threads()["threads"]), 6)
+        self.assertEqual({row["thread_id"] for row in self.mail.list_threads(origin_repo)["threads"]},
+                         {sender, recipient, later, excluded})
+        with self.store.read() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+
+    def test_cross_repo_participation_pages_keep_ties_unique_and_cursor_scope_bound(self):
+        origin_repo = "git:origin/paged-conversation"
+        included = []
+        for number, (stamp, sender_repo, recipient_repo) in enumerate((
+                (50.0, self.repo_id, self.other_repo),
+                (40.0, self.other_repo, self.repo_id),
+                (40.0, self.repo_id, self.repo_id),
+                (40.0, self.repo_id, self.other_repo),
+                (10.0, self.other_repo, self.repo_id)), start=20):
+            identity, _ = self.message(number, stamp, repo_id=origin_repo,
+                                       sender_repo_id=sender_repo, recipient_repo_id=recipient_repo)
+            included.append((identity, stamp))
+        excluded, _ = self.message(30, 45.0, repo_id=origin_repo,
+                                   sender_repo_id=self.other_repo, recipient_repo_id=self.other_repo)
+        expected = [identity for identity, _ in sorted(included, key=lambda item: (-item[1], item[0]))]
+        first = self.mail.list_threads(self.repo_id, 2)
+        self.assertEqual([row["thread_id"] for row in first["threads"]], expected[:2])
+        self.assertIsNotNone(first["next_cursor"])
+        for scope in (None, origin_repo, self.other_repo):
+            self.assert_invalid_cursor(self.mail.list_threads, first["next_cursor"], scope)
+        reopened = Mailbox(LedgerStore(self.store.directory, environment=self.environment), self.environment)
+        second = reopened.list_threads(self.repo_id, 1, cursor=first["next_cursor"])
+        final = reopened.list_threads(self.repo_id, 100, cursor=second["next_cursor"])
+        collected = [row["thread_id"] for page in (first, second, final) for row in page["threads"]]
+        self.assertEqual(collected, expected)
+        self.assertEqual(len(collected), len(set(collected)))
+        self.assertNotIn(excluded, collected)
+        self.assertIsNone(final["next_cursor"])
 
     def test_direct_only_excludes_spawn_initial_and_includes_all_acceptances(self):
         expected = {self.direct(10.0, acceptance=value)
