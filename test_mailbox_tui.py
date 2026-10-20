@@ -420,6 +420,449 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn('0 agents · dead 1 · unowned 1 · stale-dev 1 · !', text)
         self.assertIn(' No agents. r refresh', text)
 
+    def test_snapshot_cache_reuses_metadata_until_expiry_or_explicit_refresh(self):
+        from mailbox_tui import SnapshotCache
+        cache = SnapshotCache(ttl=30, clock=lambda: self.now)
+        live = {'snapshot': {**self.snapshot, 'workspaces': [
+            {'workspace_id': 'w1', 'label': 'Cached workspace'}]}}
+        with patch('mailbox_tui.herdr', return_value=live) as transport, \
+             patch('resource_scan.scan_host_resources',
+                   return_value={'listeners': [], 'serve': [], 'error': None}) as scan:
+            first = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.now = 29.99
+            cached = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(cached['workspaces'], first['workspaces'])
+            self.assertEqual((transport.call_count, scan.call_count), (1, 1))
+            self.now = 30
+            live['snapshot']['workspaces'] = [{'workspace_id': 'w1', 'label': 'Expired workspace'}]
+            expired = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(expired['workspaces'][0]['label'], 'Expired workspace')
+            self.assertEqual((transport.call_count, scan.call_count), (2, 2))
+            self.now = 31
+            live['snapshot']['workspaces'] = [{'workspace_id': 'w1', 'label': 'Forced workspace'}]
+            forced = local_snapshot(self.store, self.repo_id, self.environment, cache=cache, force=True)
+            self.assertEqual(forced['workspaces'][0]['label'], 'Forced workspace')
+            self.assertEqual((transport.call_count, scan.call_count), (3, 3))
+            local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual((transport.call_count, scan.call_count), (3, 3))
+            local_snapshot(self.store, self.repo_id, self.environment,
+                           cache=SnapshotCache(ttl=30, clock=lambda: self.now))
+            self.assertEqual((transport.call_count, scan.call_count), (4, 4))
+
+    def test_snapshot_cache_keeps_ledger_mail_status_settings_and_devices_fresh(self):
+        from ledger_devices import DeviceClaims
+        from mailbox_tui import SnapshotCache
+        cache = SnapshotCache(ttl=30, clock=lambda: self.now)
+        with patch('mailbox_tui.herdr', return_value={'snapshot': self.snapshot}) as transport, \
+             patch('resource_scan.scan_host_resources',
+                   return_value={'listeners': [], 'serve': [], 'error': None}) as scan:
+            first = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            first_recipient = next(agent for agent in first['agents']
+                                   if agent['terminal_id'] == 'term-b')
+            self.assertEqual(first_recipient['unread'], 0)
+            self.assertEqual(first_recipient['devices'], [])
+            sent = self.mail.send_user(self.repo_id, self.recipient, body='Fresh cached-worker mail')
+            with patch.object(AgentRegistry, '_refresh_display', return_value={'updated': [], 'failed': []}):
+                self.registry.set_status(self.recipient, phase='review', summary='Fresh status')
+                DeviceClaims(self.store, registry=self.registry).claim(
+                    self.recipient, 'phone', 'test-phone', label='Fixture phone')
+            RepoSettings(self.store).mutate(self.repo_id, 'mode', 'manual')
+            self.now = 1
+            refreshed = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            recipient = next(agent for agent in refreshed['agents'] if agent['terminal_id'] == 'term-b')
+            self.assertEqual(recipient['unread'], 1)
+            self.assertEqual((recipient['phase'], recipient['summary']), ('review', 'Fresh status'))
+            self.assertEqual(recipient['devices'][0]['device_id'], 'test-phone')
+            self.assertEqual(refreshed['settings']['mode'], 'manual')
+            self.assertEqual(refreshed['repo_modes'][self.repo_id], 'manual')
+            self.assertEqual(refreshed['threads'][0]['thread_id'], sent['thread_id'])
+            self.assertEqual(refreshed['threads'][0]['messages'][0]['body'], 'Fresh cached-worker mail')
+            self.assertEqual((transport.call_count, scan.call_count), (1, 1))
+            self.assertEqual(first_recipient['unread'], 0)
+            self.assertEqual(first_recipient['devices'], [])
+
+    def test_snapshot_cache_retains_herdr_failure_until_expiry_or_force(self):
+        from mailbox_tui import SnapshotCache
+        cache = SnapshotCache(ttl=30, clock=lambda: self.now)
+        live = {'snapshot': {**self.snapshot, 'workspaces': [
+            {'workspace_id': 'w1', 'label': 'Recovered workspace'}]}}
+        with patch('mailbox_tui.herdr', side_effect=[
+                LedgerError('offline', 'Herdr unavailable'), live,
+                LedgerError('offline', 'Herdr unavailable again'), live]) as transport:
+            first = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(first['panes'], [])
+            self.assertTrue(first['agents'])
+            self.now = 29.99
+            cached = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(cached['panes'], [])
+            transport.assert_called_once()
+            self.now = 30
+            recovered = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(recovered['workspaces'][0]['label'], 'Recovered workspace')
+            self.now = 60
+            failed = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual(failed['panes'], [])
+            self.now = 61
+            forced = local_snapshot(self.store, self.repo_id, self.environment, cache=cache, force=True)
+            self.assertEqual(forced['workspaces'][0]['label'], 'Recovered workspace')
+            self.assertEqual(transport.call_count, 4)
+
+    def test_fresh_ham_label_invalidates_only_cached_herdr_metadata(self):
+        from mailbox_tui import SnapshotCache
+        cache = SnapshotCache(ttl=30, clock=lambda: self.now)
+        initial_label, updated_label = 'HAM initial label', 'HAM updated label'
+        self.assertTrue(self.registry.set_display_label(
+            self.recipient['agent_id'], self.recipient.get('last_ham_label'), initial_label)['updated'])
+
+        def live(label):
+            return {'snapshot': {'panes': [
+                {**pane, 'label': label if pane['terminal_id'] == 'term-b' else ''}
+                for pane in self.snapshot['panes']], 'workspaces': []}}
+
+        with patch('mailbox_tui.herdr', side_effect=[
+                live(initial_label), live(updated_label)]) as transport, \
+             patch('resource_scan.scan_host_resources',
+                   return_value={'listeners': [], 'serve': [], 'error': None}) as scan:
+            first = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            recipient = next(agent for agent in first['agents'] if agent['terminal_id'] == 'term-b')
+            self.assertFalse(recipient['user_border'])
+            self.assertTrue(self.registry.set_display_label(
+                self.recipient['agent_id'], initial_label, updated_label)['updated'])
+            self.now = 1
+            refreshed = local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            recipient = next(agent for agent in refreshed['agents'] if agent['terminal_id'] == 'term-b')
+            self.assertEqual(recipient['last_ham_label'], updated_label)
+            self.assertFalse(recipient['user_border'])
+            self.assertEqual((transport.call_count, scan.call_count), (2, 1))
+            local_snapshot(self.store, self.repo_id, self.environment, cache=cache)
+            self.assertEqual((transport.call_count, scan.call_count), (2, 1))
+
+    def test_explicit_refresh_bypasses_snapshot_metadata_cache_in_nav_and_input(self):
+        app = self.app()
+        app.tick()
+        self.assertFalse(app.jobs['snapshot'].request.get('force', False))
+        app.jobs['snapshot'].result = app.local
+        app.tick()
+        app.key('r')
+        self.assertTrue(app.jobs['snapshot'].request['force'])
+        app.jobs['snapshot'].result = app.local
+        app.tick()
+        app.key('\r')
+        self.type_text(app, 'Keep this draft')
+        app.key('\x12')
+        self.assertTrue(app.jobs['snapshot'].request['force'])
+        self.assertEqual((app.mode, app.body), ('input', 'Keep this draft'))
+
+    def test_explicit_refresh_during_snapshot_queues_one_forced_followup_without_cancellation(self):
+        app = self.app()
+        app.tick()
+        pending = app.jobs['snapshot']
+        app.key('r')
+        app.key('\x12')
+        self.assertIs(app.jobs['snapshot'], pending)
+        self.assertFalse(pending.closed)
+        self.assertTrue(app.snapshot_force)
+        pending.result = app.local
+        app.tick()
+        forced = app.jobs['snapshot']
+        self.assertIsNot(forced, pending)
+        self.assertTrue(pending.closed)
+        self.assertTrue(forced.request['force'])
+        self.assertFalse(app.snapshot_force)
+        forced.result = app.local
+        app.tick()
+        self.assertNotIn('snapshot', app.jobs)
+
+    def snapshot_worker_process_factory(self, child_setup=''):
+        """Run the real worker protocol with no live Herdr or host-resource reads."""
+        processes = []
+        popen = subprocess.Popen
+        code = (
+            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import ham_test_support\n"
+            "import mailbox_tui as mailbox, resource_scan\n"
+            "mailbox.herdr = lambda arguments, environment: "
+            "{'snapshot': {'panes': [], 'workspaces': []}}\n"
+            "resource_scan.scan_host_resources = lambda: "
+            "{'listeners': [], 'serve': [], 'error': None}\n"
+            + child_setup +
+            "\nraise SystemExit(mailbox.main(['snapshot-worker']))\n"
+        )
+
+        def start(command, **options):
+            self.assertEqual(command[-1], 'snapshot-worker')
+            process = popen([sys.executable, '-c', code], **options)
+            processes.append(process)
+            return process
+
+        return start, processes
+
+    def snapshot_worker_result(self, job):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            done, result = job.poll()
+            if done:
+                return result
+            time.sleep(.01)
+        self.fail('Isolated snapshot worker did not return within ten seconds')
+
+    def test_snapshot_worker_reuses_process_for_fresh_snapshots_and_closes_idle_worker(self):
+        from mailbox_tui import SnapshotWorker
+        start, processes = self.snapshot_worker_process_factory()
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+            first = worker.request(request)
+            snapshot = self.snapshot_worker_result(first)
+            self.assertNotIn('error', snapshot)
+            self.assertEqual(snapshot['threads'], [])
+            self.assertEqual(len(processes), 1)
+            process = processes[0]
+            self.assertEqual(os.getpgid(process.pid), process.pid)
+            first.close()
+            self.assertIsNone(process.poll())
+            sent = self.mail.send_user(self.repo_id, self.recipient, body='Fresh persistent snapshot')
+            second = worker.request(request)
+            snapshot = self.snapshot_worker_result(second)
+            self.assertNotIn('error', snapshot)
+            self.assertEqual(snapshot['threads'][0]['thread_id'], sent['thread_id'])
+            second.close()
+            forced = worker.request({**request, 'force': True})
+            self.assertNotIn('error', self.snapshot_worker_result(forced))
+            forced.close()
+            self.assertEqual(len(processes), 1)
+            self.assertIsNone(process.poll())
+            worker.close()
+            worker.close()
+            self.assertIsNotNone(process.poll())
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    self.assertTrue(stream.closed)
+
+    def test_snapshot_worker_reports_crash_and_restarts_next_request(self):
+        from mailbox_tui import SnapshotWorker
+        marker = self.root / 'snapshot-crashed-once'
+        setup = (
+            "import os\n"
+            f"marker = mailbox.Path({str(marker)!r})\n"
+            "original_snapshot = mailbox.local_snapshot\n"
+            "def crash_once(*arguments, **options):\n"
+            "    if not marker.exists():\n"
+            "        marker.write_text('crashed')\n"
+            "        os._exit(7)\n"
+            "    return original_snapshot(*arguments, **options)\n"
+            "mailbox.local_snapshot = crash_once\n"
+        )
+        start, processes = self.snapshot_worker_process_factory(setup)
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+            crashed = worker.request(request)
+            result = self.snapshot_worker_result(crashed)
+            self.assertIn('error', result)
+            self.assertTrue(result['error']['code'])
+            self.assertIsNotNone(processes[0].poll())
+            crashed.close()
+            restarted = worker.request(request)
+            snapshot = self.snapshot_worker_result(restarted)
+            self.assertNotIn('error', snapshot)
+            self.assertEqual(len(processes), 2)
+            self.assertNotEqual(processes[0].pid, processes[1].pid)
+            restarted.close()
+            self.assertIsNone(processes[1].poll())
+
+    def test_snapshot_worker_timeout_stops_group_and_next_request_restarts(self):
+        from mailbox_tui import SnapshotWorker
+        marker = self.root / 'snapshot-timeout-once'
+        setup = (
+            "import time\n"
+            f"marker = mailbox.Path({str(marker)!r})\n"
+            "original_snapshot = mailbox.local_snapshot\n"
+            "def stall_once(*arguments, **options):\n"
+            "    if not marker.exists():\n"
+            "        marker.write_text('started')\n"
+            "        time.sleep(60)\n"
+            "    return original_snapshot(*arguments, **options)\n"
+            "mailbox.local_snapshot = stall_once\n"
+        )
+        start, processes = self.snapshot_worker_process_factory(setup)
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment, timeout=25, clock=lambda: self.now)
+            self.addCleanup(worker.close)
+            request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+            stalled = worker.request(request)
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                self.assertEqual(stalled.poll(), (False, None))
+                time.sleep(.01)
+            self.assertTrue(marker.exists(), 'Isolated worker did not reach its stall fixture')
+            self.now = 24.99
+            self.assertEqual(stalled.poll(), (False, None))
+            self.now = 25
+            done, result = stalled.poll()
+            self.assertTrue(done)
+            self.assertEqual(result['error']['code'], 'ui_timeout')
+            self.assertIn('durable state', result['error']['message'])
+            self.assertIsNone(worker.process)
+            self.assertIsNotNone(processes[0].poll())
+            self.assertTrue(processes[0].stdin.closed)
+            self.assertTrue(processes[0].stdout.closed)
+            stalled.close()
+            restarted = worker.request(request)
+            self.assertNotIn('error', self.snapshot_worker_result(restarted))
+            self.assertEqual(len(processes), 2)
+            self.assertNotEqual(processes[0].pid, processes[1].pid)
+            restarted.close()
+
+    def test_snapshot_worker_cancelled_lease_stops_process_but_owner_can_restart(self):
+        from mailbox_tui import SnapshotWorker
+        start, processes = self.snapshot_worker_process_factory()
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+            cancelled = worker.request(request)
+            cancelled.close()
+            cancelled.close()
+            self.assertIsNone(worker.process)
+            self.assertIsNotNone(processes[0].poll())
+            self.assertFalse(worker.closed)
+            restarted = worker.request(request)
+            self.assertNotIn('error', self.snapshot_worker_result(restarted))
+            self.assertEqual(len(processes), 2)
+            restarted.close()
+            self.assertIsNone(processes[1].poll())
+
+    def test_snapshot_worker_invalid_response_stops_process_and_allows_restart(self):
+        from mailbox_tui import SnapshotWorker
+        start, processes = self.snapshot_worker_process_factory()
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+            invalid = worker.request(request)
+            with patch('mailbox_tui.os.read', return_value=b'not json\n'):
+                done, result = invalid.poll()
+            self.assertTrue(done)
+            self.assertEqual(result['error']['code'], 'ui_job_failed')
+            self.assertIsNone(worker.process)
+            self.assertIsNotNone(processes[0].poll())
+            invalid.close()
+            restarted = worker.request(request)
+            self.assertNotIn('error', self.snapshot_worker_result(restarted))
+            self.assertEqual(len(processes), 2)
+            restarted.close()
+
+    def test_snapshot_worker_accepts_history_larger_than_old_32_mib_response_cap(self):
+        from mailbox_tui import SnapshotWorker
+        size = 32 * 1024 * 1024 + 1
+        setup = (
+            "mailbox.local_snapshot = lambda *arguments, **options: "
+            "{'agents': [], 'threads': [{'messages': [{'body': 'x' * "
+            f"{size}"
+            "}]}], 'submissions': []}\n"
+        )
+        start, processes = self.snapshot_worker_process_factory(setup)
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            job = worker.request({'operation': 'snapshot', 'repo_id': self.repo_id})
+            snapshot = self.snapshot_worker_result(job)
+            self.assertNotIn('error', snapshot)
+            self.assertEqual(len(snapshot['threads'][0]['messages'][0]['body']), size)
+            job.close()
+            self.assertIsNone(processes[0].poll())
+
+    def test_snapshot_worker_reads_original_error_buffered_before_child_exit(self):
+        from mailbox_tui import SnapshotWorker
+        setup = (
+            "import builtins, os\n"
+            "def unavailable_store(*arguments, **options):\n"
+            "    raise mailbox.LedgerError('fixture_ledger_unavailable', 'Original startup failure')\n"
+            "mailbox.LedgerStore = unavailable_store\n"
+            "def print_and_exit(*arguments, **options):\n"
+            "    builtins.print(*arguments, **options)\n"
+            "    os._exit(1)\n"
+            "mailbox.print = print_and_exit\n"
+        )
+        start, processes = self.snapshot_worker_process_factory(setup)
+        with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+            worker = SnapshotWorker(self.environment)
+            self.addCleanup(worker.close)
+            job = worker.request({'operation': 'snapshot', 'repo_id': self.repo_id})
+            processes[0].wait(timeout=10)
+            done, result = job.poll()
+            self.assertTrue(done)
+            self.assertEqual(result, {'error': {
+                'code': 'fixture_ledger_unavailable', 'message': 'Original startup failure'}})
+            self.assertIsNone(worker.process)
+            self.assertTrue(processes[0].stdin.closed)
+            self.assertTrue(processes[0].stdout.closed)
+            job.close()
+
+    def test_snapshot_worker_preserves_unexpected_exception_and_serves_next_request(self):
+        from mailbox_tui import SnapshotWorker
+        for operation in ('LedgerStore', 'local_snapshot'):
+            with self.subTest(operation=operation):
+                marker = self.root / ('snapshot-unexpected-' + operation)
+                setup = (
+                    f"marker = mailbox.Path({str(marker)!r})\n"
+                    f"original_operation = mailbox.{operation}\n"
+                    "def fail_once(*arguments, **options):\n"
+                    "    if not marker.exists():\n"
+                    "        marker.write_text('failed')\n"
+                    "        raise RuntimeError('Unexpected fixture failure')\n"
+                    "    return original_operation(*arguments, **options)\n"
+                    f"mailbox.{operation} = fail_once\n"
+                )
+                start, processes = self.snapshot_worker_process_factory(setup)
+                with patch('mailbox_tui.subprocess.Popen', side_effect=start):
+                    worker = SnapshotWorker(self.environment)
+                    self.addCleanup(worker.close)
+                    request = {'operation': 'snapshot', 'repo_id': self.repo_id}
+                    failed = worker.request(request)
+                    result = self.snapshot_worker_result(failed)
+                    self.assertEqual(result, {'error': {
+                        'code': 'ui_job_failed', 'message': 'RuntimeError: Unexpected fixture failure'}})
+                    failed.close()
+                    self.assertIsNone(processes[0].poll())
+                    recovered = worker.request(request)
+                    self.assertNotIn('error', self.snapshot_worker_result(recovered))
+                    recovered.close()
+                    self.assertEqual(len(processes), 1)
+                    worker.close()
+
+    def test_run_closes_idle_snapshot_owner_on_normal_exit_and_loop_error(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                app = self.app()
+                owner = Mock()
+                app.snapshot_worker = owner
+                app.environment['HAM_MAILBOX_NO_MOUSE'] = '1'
+
+                def tick():
+                    if fail:
+                        raise RuntimeError('loop failed')
+                    app.running = False
+
+                with patch.object(app, 'tick', side_effect=tick), \
+                     patch.object(app, 'initialize_colors'), \
+                     patch.object(app.screen, 'keypad', create=True), \
+                     patch.object(app.screen, 'timeout', create=True), \
+                     patch('mailbox_tui.key_input.kitty_keyboard'), \
+                     patch('mailbox_tui.curses.nonl'), \
+                     patch('mailbox_tui.curses.set_escdelay'), \
+                     patch('mailbox_tui.curses.mousemask'):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, 'loop failed'):
+                            app.run()
+                    else:
+                        self.assertEqual(app.run(), 0)
+                self.assertEqual(app.jobs, {})
+                owner.close.assert_called_once_with()
+
     def test_local_snapshot_preserves_host_resources_and_missing_fields(self):
         for resources in (None, {'dead_serve': [], 'servers_unowned': [],
                                   'stale_devices': [], 'error': None}):
@@ -4653,6 +5096,234 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.mode, 'input')
         self.assertEqual(app.body, 'different draft')
         self.assertEqual(len(app.drafts), 1)
+
+    def test_unchanged_local_bell_does_not_start_another_snapshot(self):
+        from mailbox_tui import LOCAL_INTERVAL
+        app = self.app()
+        app.tick()
+        initial = app.jobs['snapshot']
+        initial.result = app.local
+        app.tick()
+        self.assertTrue(initial.closed)
+        self.assertEqual(app.jobs, {})
+        stamp = app.bell_stamp
+        self.capture(app)
+        for interval in (1, 2, 10):
+            with self.subTest(interval=interval):
+                self.now = interval * LOCAL_INTERVAL
+                app.tick()
+                self.assertEqual(app.jobs, {})
+                self.assertEqual(app.bell_stamp, stamp)
+                self.assertFalse(app.dirty)
+
+    def test_local_bell_change_starts_snapshot_at_next_local_interval(self):
+        from mailbox_tui import LOCAL_INTERVAL
+        app = self.app()
+        app.tick()
+        app.jobs['snapshot'].result = app.local
+        app.tick()
+        self.capture(app)
+        original_stamp = app.bell_stamp
+        self.mail.send_user(self.repo_id, self.recipient, body='Changed while idle')
+        bell = self.store.bell_directory / '_board'
+        os.utime(bell, ns=(original_stamp + 1, original_stamp + 1))
+        self.now = LOCAL_INTERVAL - .01
+        app.tick()
+        self.assertEqual(app.jobs, {})
+        self.assertFalse(app.dirty)
+        self.now = LOCAL_INTERVAL
+        app.tick()
+        self.assertEqual(app.jobs['snapshot'].operation, 'snapshot')
+        self.assertEqual(app.bell_stamp, original_stamp + 1)
+        self.assertTrue(app.dirty)
+
+    def test_render_if_needed_paints_initial_app_then_skips_clean_idle_ticks(self):
+        app = self.app(wall_clock=lambda: 1_800_000_000 + self.now)
+        self.assertTrue(app.dirty)
+        self.assertEqual(app.next_age_refresh, float('inf'))
+        with patch.object(app, 'render', wraps=app.render) as render:
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 1)
+            self.assertFalse(app.dirty)
+            self.assertEqual(app.next_age_refresh, float('inf'))
+            app.key(None)
+            for tick in range(1, 11):
+                self.now = tick / 10
+                app.render_if_needed()
+            self.assertEqual(render.call_count, 1)
+            self.assertFalse(app.dirty)
+
+    def test_key_and_resize_mark_clean_app_dirty_and_trigger_real_redraw(self):
+        for key in ('j', curses.KEY_RESIZE):
+            with self.subTest(key=key):
+                app = self.app()
+                app.render_if_needed()
+                self.assertFalse(app.dirty)
+                with patch.object(app, 'render', wraps=app.render) as render:
+                    app.key(key)
+                    self.assertTrue(app.dirty)
+                    app.render_if_needed()
+                    render.assert_called_once_with()
+                    self.assertFalse(app.dirty)
+                    app.render_if_needed()
+                    render.assert_called_once_with()
+
+    def test_started_and_completed_snapshot_jobs_trigger_redraw(self):
+        for error in (False, True):
+            with self.subTest(error=error):
+                app = self.app()
+                app.next_bell = float('inf')
+                app.render_if_needed()
+                self.assertTrue(app.start_job('snapshot', 'snapshot'))
+                self.assertTrue(app.dirty)
+                job = app.jobs['snapshot']
+                app.render_if_needed()
+                app.tick()
+                self.assertFalse(app.dirty)
+                job.result = ({'error': {'code': 'offline', 'message': 'Ledger unavailable'}}
+                              if error else app.local)
+                with patch.object(app, 'render', wraps=app.render) as render:
+                    app.tick()
+                    self.assertTrue(job.closed)
+                    self.assertNotIn('snapshot', app.jobs)
+                    self.assertTrue(app.dirty)
+                    app.render_if_needed()
+                    render.assert_called_once_with()
+                    self.assertFalse(app.dirty)
+                if error:
+                    self.assertIn('Ledger unavailable', '\n'.join(app.screen.snapshot().lines()))
+
+    def test_result_tag_expiry_marks_dirty_and_removes_visible_tag(self):
+        app = self.app()
+        app.next_bell = float('inf')
+        identity = app.identity(app.selected('agents'))
+        app.result_tags[identity] = ('queued', 10)
+        app.render_if_needed()
+        self.assertIn('[queued]', '\n'.join(app.screen.snapshot().lines()))
+        self.now = 9.99
+        app.tick()
+        self.assertFalse(app.dirty)
+        self.assertIn(identity, app.result_tags)
+        self.now = 10
+        app.tick()
+        self.assertNotIn(identity, app.result_tags)
+        self.assertTrue(app.dirty)
+        app.render_if_needed()
+        self.assertNotIn('[queued]', '\n'.join(app.screen.snapshot().lines()))
+        self.assertFalse(app.dirty)
+
+    def test_format_time_preserves_age_units_and_coalesces_display_boundaries(self):
+        for fraction in (0, .25):
+            value = 1_700_000_000 + fraction
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(value))
+            for age, suffix, boundary in (
+                    (.25, '0s', 1), (12.75, '12s', 13), (59.75, '59s', 60),
+                    (60, '1m', 120), (125.5, '2m', 180), (3599.75, '59m', 3600),
+                    (3600, '1h', 7200), (9000.5, '2h', 10800),
+                    (86399.75, '23h', 86400), (86400, '1d', 172800),
+                    (200000.5, '2d', 259200)):
+                with self.subTest(fraction=fraction, age=age):
+                    app = self.app()
+                    self.assertEqual(app.format_time(value, value + age),
+                                     f'{timestamp} ({suffix} ago)')
+                    self.assertEqual(app.next_age_refresh,
+                                     1_700_000_000 + boundary + bool(fraction))
+
+    def test_format_time_none_has_no_deadline_and_keeps_earliest_registered_age(self):
+        app = self.app()
+        now = 1_800_000_000
+        self.assertEqual(app.format_time(None, now), '—')
+        self.assertEqual(app.next_age_refresh, float('inf'))
+        app.format_time(now - 125.5, now)
+        self.assertEqual(app.next_age_refresh, now + 55)
+        app.format_time(now - 12.25, now)
+        self.assertEqual(app.next_age_refresh, now + 1)
+        app.format_time(now - 9000, now)
+        self.assertEqual(app.format_time(None, now), '—')
+        self.assertEqual(app.next_age_refresh, now + 1)
+
+    def test_fractional_relative_ages_share_one_wall_second_redraw(self):
+        wall_now = [1_800_000_000]
+        app = self.app(wall_clock=lambda: wall_now[0])
+        for agent in app.local['agents']:
+            agent.update(status_updated_at=wall_now[0] - 12.25,
+                         last_seen=wall_now[0] - 11.75,
+                         first_seen=wall_now[0] - 10.5)
+        app.focus = 'detail'
+        app.screen = Screen(100, 100)
+        with patch.object(app, 'render', wraps=app.render) as render:
+            app.render_if_needed()
+            self.assertEqual(app.next_age_refresh, 1_800_000_001)
+            for fraction in (.25, .5, .75, .99):
+                wall_now[0] = 1_800_000_000 + fraction
+                app.render_if_needed()
+                self.assertEqual(render.call_count, 1)
+            wall_now[0] = 1_800_000_001
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 2)
+            self.assertEqual(app.next_age_refresh, 1_800_000_002)
+            text = '\n'.join(app.screen.snapshot().lines())
+            for suffix in ('(13s ago)', '(12s ago)', '(11s ago)'):
+                self.assertIn(suffix, text)
+
+    def test_relative_age_boundary_redraws_detail_and_resets_deadline_each_paint(self):
+        wall_now = [1_800_000_000]
+        app = self.app(wall_clock=lambda: wall_now[0])
+        for agent in app.local['agents']:
+            agent.update(status_updated_at=wall_now[0] - 125.25,
+                         last_seen=None, first_seen=None)
+        app.focus = 'detail'
+        app.screen = Screen(100, 100)
+        with patch.object(app, 'render', wraps=app.render) as render:
+            app.render_if_needed()
+            self.assertIn('(2m ago)', '\n'.join(app.screen.snapshot().lines()))
+            self.assertEqual(app.next_age_refresh, 1_800_000_055)
+            wall_now[0] = 1_800_000_054.5
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 1)
+            wall_now[0] = 1_800_000_055
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 2)
+            self.assertIn('(3m ago)', '\n'.join(app.screen.snapshot().lines()))
+            self.assertEqual(app.next_age_refresh, 1_800_000_115)
+            self.assertFalse(app.dirty)
+            app.focus = 'agents'
+            app.screen = Screen(24, 60)
+            app.key(curses.KEY_RESIZE)
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 3)
+            self.assertEqual(app.next_age_refresh, float('inf'))
+
+    def test_only_relative_ages_inside_visible_detail_viewport_schedule_redraw(self):
+        wall_now = [1_800_000_000]
+        app = self.app(wall_clock=lambda: wall_now[0])
+        for agent in app.local['agents']:
+            agent.update(status_updated_at=wall_now[0] - 12.25,
+                         last_seen=None, first_seen=None)
+        app.focus = 'detail'
+        app.screen = Screen(24, 100)
+        with patch.object(app, 'render', wraps=app.render) as render:
+            app.render_if_needed()
+            self.assertNotIn('(12s ago)', '\n'.join(app.screen.snapshot().lines()))
+            self.assertEqual(app.next_age_refresh, float('inf'))
+            wall_now[0] += 1
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 1)
+            app.key(curses.KEY_END)
+            app.render_if_needed()
+            self.assertIn('(13s ago)', '\n'.join(app.screen.snapshot().lines()))
+            self.assertEqual(app.next_age_refresh, 1_800_000_002)
+            wall_now[0] += 1
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 3)
+            self.assertIn('(14s ago)', '\n'.join(app.screen.snapshot().lines()))
+            app.key(curses.KEY_HOME)
+            app.render_if_needed()
+            self.assertNotIn('(14s ago)', '\n'.join(app.screen.snapshot().lines()))
+            self.assertEqual(app.next_age_refresh, float('inf'))
+            wall_now[0] += 10
+            app.render_if_needed()
+            self.assertEqual(render.call_count, 4)
 
     def test_local_bell_and_remote_poll_cadences_are_independent_of_input(self):
         app = self.app()

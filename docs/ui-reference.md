@@ -399,10 +399,32 @@ Applied is a **manual user confirmation** of the old claim, not native
 runtime-journal evidence, model understanding or handled work. Not-applied
 releases exactly that claim and does not itself resend anything.
 
-The TUI checks the local board bell once per second and queries peers every
-30 seconds in bounded child processes outside the keyboard loop. Closing stops
-only its own workers; these checks do not create model turns. Display-cell-aware
-text helpers support Korean input, clipping and resizing. The presence of `NO_COLOR`
+The keyboard loop retains its 100 ms input timeout, but paints are event-driven:
+keys (including resize), started or completed jobs, and expired send-result tags
+request a redraw. A clean, unchanged screen is not repainted on each input timeout.
+Displayed relative ages request the next paint only when their displayed unit
+changes: each second below one minute, each minute below one hour, each hour below
+one day, and each day thereafter. Age-only refreshes are coalesced to whole
+wall-clock seconds, so fractional timestamps do not cause multiple paints per
+second; an age label can lag its boundary by up to one second. Missing timestamps
+and relative-age labels outside the visible Detail viewport schedule no age
+refresh. Input and new-mail updates do not wait for age refreshes.
+
+The TUI still checks the local board bell once per second; an unchanged bell does
+not request another local snapshot. Local snapshots reuse a persistent child
+process rather than starting a new process for every changed bell. Each snapshot
+reads fresh ledger, mail, agent-status, settings and device-claim rows. Only raw
+host-resource scans and Herdr pane metadata are cached, for 30 seconds within that
+Mailbox instance; an explicit refresh bypasses those caches.
+A fresh ledger change to an agent's last HAM label refreshes Herdr metadata early,
+without rescanning host resources, so cached HAM labels do not look user-edited.
+If a snapshot is already in flight, explicit refresh queues one cache-bypassing
+follow-up instead of cancelling that snapshot or restarting its worker.
+
+Peers are still queried every 30 seconds in bounded child processes outside the
+keyboard loop. Closing stops only the Mailbox's own workers, including its local
+snapshot process; these checks do not create model turns. Display-cell-aware text
+helpers support Korean input, clipping and resizing. The presence of `NO_COLOR`
 disables colors without removing labels or other non-color state cues.
 
 ### Device and server presence

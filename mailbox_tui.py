@@ -6,10 +6,12 @@ Durable mutations belong to ledger services; drafts and previews stay local.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import curses
 import fcntl
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import re
@@ -43,6 +45,7 @@ REPO_ENV = "HERDR_HAM_REPO_ID"
 LOCAL_INTERVAL = 1.0
 REMOTE_INTERVAL = 30.0
 JOB_TIMEOUT = 25.0
+METADATA_TTL = 30.0
 
 
 def herdr(arguments: Sequence[str], environment: Mapping[str, str]) -> dict[str, Any]:
@@ -245,25 +248,72 @@ def settings_scope(store: LedgerStore, repo_id: str | None,
     return {"repo_id": repo_id, "host": store.host, "workspace_id": workspace_id}
 
 
+class SnapshotCache:
+    """Pane-local discovery only; ledger rows and resource attribution stay fresh."""
+    def __init__(self, *, ttl: float = METADATA_TTL, clock=time.monotonic):
+        self.ttl, self.clock = ttl, clock
+        self.herdr_due = self.resources_due = 0.0
+        self.herdr_value: dict[str, Any] | None = None
+        self.herdr_labels: dict[str, str | None] = {}
+        self.resources_value: dict[str, Any] | None = None
+
+    def invalidate(self) -> None:
+        self.herdr_due = self.resources_due = 0.0
+
+    def herdr_snapshot(self, environment: Mapping[str, str], *,
+                       agents: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any] | None:
+        labels = {agent["terminal_id"]: agent.get("last_ham_label") for agent in agents}
+        if any(terminal in self.herdr_labels and label != self.herdr_labels[terminal]
+               for terminal, label in labels.items()):
+            # A HAM label mutation makes the cached pane label incomparable with
+            # fresh ledger evidence; heartbeat/status-only changes do not.
+            self.herdr_due = 0.0
+        if self.clock() >= self.herdr_due:
+            try:
+                result = herdr(["api", "snapshot"], environment)
+                self.herdr_value = result.get("snapshot", result)
+            except LedgerError:
+                # A missing server must not become a new subprocess on every bell.
+                self.herdr_value = None
+            self.herdr_due = self.clock() + self.ttl
+            self.herdr_labels = labels
+        return self.herdr_value
+
+    def resources(self) -> dict[str, Any]:
+        if self.resources_value is None or self.clock() >= self.resources_due:
+            import resource_scan
+            self.resources_value = resource_scan.scan_host_resources()
+            self.resources_due = self.clock() + self.ttl
+        return self.resources_value
+
+
 def local_snapshot(store: LedgerStore, repo_id: str | None,
-                   environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+                   environment: Mapping[str, str] | None = None, *,
+                   cache: SnapshotCache | None = None, force: bool = False) -> dict[str, Any]:
     settings = RepoSettings(store)
+    if cache is not None and force:
+        cache.invalidate()
     # Discover every local target, while keeping history and settings scoped to
     # the opener's repository below.
-    board = status_board(store, repo_id=None, host="local", environment=environment)
+    board_options = {"resource_scanner": cache.resources} if cache is not None else {}
+    board = status_board(store, repo_id=None, host="local", environment=environment, **board_options)
     agents = board["agents"]
     panes = []
     workspaces = []
     if environment is not None:
         try:
-            result = herdr(["api", "snapshot"], environment)
-            live_snapshot = result.get("snapshot", result)
-            panes = live_snapshot.get("panes", [])
-            workspaces = live_snapshot.get("workspaces", [])
-            labels = {pane["terminal_id"]: pane.get("label") or "" for pane in panes}
-            for agent in agents:
-                current = labels.get(agent["terminal_id"], "")
-                agent["user_border"] = bool(current and current != agent.get("last_ham_label"))
+            if cache is None:
+                result = herdr(["api", "snapshot"], environment)
+                live_snapshot = result.get("snapshot", result)
+            else:
+                live_snapshot = cache.herdr_snapshot(environment, agents=agents)
+            if live_snapshot is not None:
+                panes = live_snapshot.get("panes", [])
+                workspaces = live_snapshot.get("workspaces", [])
+                labels = {pane["terminal_id"]: pane.get("label") or "" for pane in panes}
+                for agent in agents:
+                    current = labels.get(agent["terminal_id"], "")
+                    agent["user_border"] = bool(current and current != agent.get("last_ham_label"))
         except LedgerError:
             # The ledger remains inspectable while Herdr is temporarily absent.
             pass
@@ -446,6 +496,170 @@ class Job:
             stream.close()
 
 
+class SnapshotJob:
+    """One polling lease; completing it does not close the reusable owner."""
+    operation = "snapshot"
+
+    def __init__(self, owner: SnapshotWorker):
+        self.owner = owner
+        self.started = owner.clock()
+        self.closed = self.done = False
+        self.result: Any = None
+
+    def poll(self) -> tuple[bool, Any]:
+        if not self.done:
+            self.owner._poll(self)
+        return self.done, self.result
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if not self.done:
+            self.owner._finish(self, {"error": {
+                "code": "ui_job_failed", "message": "Snapshot request cancelled."}}, stop=True)
+
+
+class SnapshotWorker:
+    """Own one restartable process group, with one bounded snapshot in flight."""
+
+    def __init__(self, environment: Mapping[str, str], *, timeout: float = JOB_TIMEOUT,
+                 clock=time.monotonic):
+        self.environment, self.timeout, self.clock = dict(environment), timeout, clock
+        self.process: subprocess.Popen | None = None
+        self.active: SnapshotJob | None = None
+        self.buffer = bytearray()
+        self.closed = False
+
+    def request(self, request: Mapping[str, Any]) -> SnapshotJob:
+        if self.closed or self.active is not None:
+            raise RuntimeError("Snapshot worker is closed or already has an active request.")
+        if request.get("operation") != "snapshot":
+            raise ValueError("Snapshot worker accepts only read-only snapshots.")
+        job = SnapshotJob(self)
+        self.active = job
+        self.buffer.clear()
+        try:
+            if self.process is not None and self.process.poll() is not None:
+                self._stop()
+            if self.process is None:
+                self.process = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "snapshot-worker"],
+                    env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
+                os.set_blocking(self.process.stdin.fileno(), False)
+                os.set_blocking(self.process.stdout.fileno(), False)
+            # Stay below PIPE_BUF: one nonblocking atomic write cannot stall keys.
+            payload = (json.dumps({"operation": "snapshot", "repo_id": request.get("repo_id"),
+                                   "force": bool(request.get("force"))}) + "\n").encode("ascii")
+            if len(payload) > 4096:
+                raise ValueError("Snapshot request is too large.")
+            if os.write(self.process.stdin.fileno(), payload) != len(payload):
+                raise OSError("Incomplete snapshot request write.")
+        except (OSError, ValueError) as error:
+            self._finish(job, {"error": {"code": "ui_job_failed", "message": str(error)}}, stop=True)
+        return job
+
+    def _finish(self, job: SnapshotJob, result: Any, *, stop: bool = False) -> None:
+        job.done, job.result = True, result
+        self.active = None
+        if stop:
+            self._stop()
+        self.buffer.clear()
+
+    def _poll(self, job: SnapshotJob) -> None:
+        if self.clock() - job.started >= self.timeout:
+            self._finish(job, {"error": {"code": "ui_timeout", "message":
+                "Operation timed out; inspect durable state before resubmitting."}}, stop=True)
+            return
+        try:
+            if self.process is None:
+                raise ValueError("Snapshot worker exited before returning a result.")
+            # Bound each poll's work even for a large ledger; never wait for IO.
+            for _ in range(16):
+                try:
+                    chunk = os.read(self.process.stdout.fileno(), 65536)
+                except BlockingIOError:
+                    return
+                if not chunk:
+                    raise ValueError("Snapshot worker closed its output.")
+                self.buffer.extend(chunk)
+                if b"\n" not in chunk:
+                    continue
+                line, extra = self.buffer.split(b"\n", 1)
+                if extra:
+                    raise ValueError("Snapshot worker returned unexpected output.")
+                result = json.loads(line)
+                if not isinstance(result, dict) or not (
+                        isinstance(result.get("error"), dict) or
+                        all(isinstance(result.get(key), list) for key in ("agents", "threads", "submissions"))):
+                    raise ValueError("Snapshot worker returned an invalid snapshot.")
+                self._finish(job, result, stop=self.process.poll() is not None)
+                return
+        except (OSError, ValueError) as error:
+            self._finish(job, {"error": {"code": "ui_job_failed", "message": str(error)}}, stop=True)
+
+    def _stop(self) -> None:
+        process, self.process = self.process, None
+        if process is None:
+            return
+        # Kill the group even if the leader exited, including discovery helpers.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            # SIGKILL may await kernel IO; never pin the curses loop to that wait.
+            # Popen retains unreaped children for subsequent nonblocking cleanup.
+            pass
+        for stream in (process.stdin, process.stdout):
+            stream.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.active is not None:
+            self.active.close()
+        self._stop()
+
+
+def snapshot_worker(environment: Mapping[str, str]) -> int:
+    """Newline JSON protocol; only metadata survives between ledger reads."""
+    cache = SnapshotCache()
+    store: LedgerStore | None = None
+    while line := sys.stdin.readline(4097):
+        try:
+            if len(line) > 4096 or not line.endswith("\n"):
+                raise ValueError("Invalid snapshot request framing.")
+            request = json.loads(line)
+            if not isinstance(request, dict) or request.get("operation") != "snapshot":
+                raise ValueError("Snapshot worker accepts only read-only snapshots.")
+            with redirect_stdout(sys.stderr):
+                if store is None:
+                    store = LedgerStore(environment=environment)
+                result = local_snapshot(store, request.get("repo_id"), environment,
+                                        cache=cache, force=bool(request.get("force")))
+        except (LedgerError, OSError, ValueError) as error:
+            result = {"error": {"code": getattr(error, "code", "ui_job_failed"), "message": str(error)}}
+        except Exception as error:
+            result = {"error": {"code": "ui_job_failed",
+                                "message": f"{type(error).__name__}: {error}"}}
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
 def clip(text: str, width: int) -> str:
     value = "".join(character if character.isprintable() else " " for character in str(text))
     return value[:character_index_at_display_column(value, max(0, width))]
@@ -562,12 +776,17 @@ class MailboxApp:
         self.repo_id = self.environment.get(REPO_ENV) or None
         self.store = LedgerStore(environment=environment)
         self.job_factory, self.clock, self.wall_clock = job_factory, clock, wall_clock
+        self.snapshot_worker = SnapshotWorker(environment) if job_factory is Job else None
+        self.snapshot_force = False
         self.jobs: dict[str, Any] = {}
         self.local: dict[str, Any] = {"agents": [], "threads": [], "submissions": [], "peers": [], "outbox": []}
         self.remote: dict[str, Any] = {}
         self.remote_errors: dict[str, str] = {}
         self.remote_due: dict[str, float] = {}
         self.next_bell, self.bell_stamp = 0.0, None
+        self.dirty = True
+        self.next_age_refresh = float("inf")
+        self.detail_age_deadlines: dict[str, float] | None = None
         self.focus, self.mode, self.layout = "agents", "nav", "single"
         self.preview = "agents"
         self.selections = {"agents": 0, "threads": 0}
@@ -627,7 +846,15 @@ class MailboxApp:
         request = {"operation": operation, "repo_id": self.repo_id, **values}
         if operation in {"snapshot", "setting"}:
             request.setdefault("scope", self.current_settings_scope())
-        self.jobs[key] = self.job_factory(request, self.environment)
+        if operation == "snapshot":
+            if self.snapshot_force:
+                request["force"] = True
+            self.jobs[key] = (self.snapshot_worker.request(request) if self.snapshot_worker is not None
+                              else self.job_factory(request, self.environment))
+            self.snapshot_force = False
+        else:
+            self.jobs[key] = self.job_factory(request, self.environment)
+        self.dirty = True
         return True
 
     @staticmethod
@@ -801,6 +1028,7 @@ class MailboxApp:
                 continue
             job.close()
             del self.jobs[key]
+            self.dirty = True
             identities = {region: self.identity(self.selected(region)) for region in ("agents", "threads")}
             error = value.get("error") if isinstance(value, dict) else None
             if key.startswith("remote:"):
@@ -857,6 +1085,9 @@ class MailboxApp:
         for identity, (_tag, until) in list(self.result_tags.items()):
             if now >= until:
                 del self.result_tags[identity]
+                self.dirty = True
+        if self.snapshot_force and "snapshot" not in self.jobs:
+            self.start_job("snapshot", "snapshot")
         if now >= self.next_bell:
             self.next_bell = now + LOCAL_INTERVAL
             try:
@@ -1355,6 +1586,7 @@ class MailboxApp:
         edit["text"], edit["cursor"], _handled = edit_buffer(edit["text"], edit["cursor"], key, multiline=False)
 
     def refresh(self) -> None:
+        self.snapshot_force = True
         self.start_job("snapshot", "snapshot")
         self.remote_due.clear()
 
@@ -1433,7 +1665,10 @@ class MailboxApp:
             self.scroll_detail(key)
 
     def key(self, key: Any) -> None:
-        if key is None or key == curses.KEY_RESIZE:
+        if key is None:
+            return
+        self.dirty = True
+        if key == curses.KEY_RESIZE:
             return
         if isinstance(key, key_input.MouseEvent):
             self.mouse_key(key)
@@ -1515,7 +1750,7 @@ class MailboxApp:
         elif key == "e":
             self.diagnostics, self.focus = True, "detail"
             self.scrolls["detail"] = 0
-        elif key == "r":
+        elif key in ("r", "\x12"):
             self.refresh()
         elif key == "t" and self.focus == "detail" and self.technical_supported():
             self.toggle_detail()
@@ -1769,7 +2004,27 @@ class MailboxApp:
         if detail:
             self.put(y, column, " · Detail", self.style(1, curses.A_BOLD))
 
+    def format_time(self, value: float | None, now: float) -> str:
+        """Repaint relative ages only when their displayed unit changes."""
+        formatted = status_time(value, now)
+        if value is not None:
+            age = max(0, int(now - value))
+            unit = 1 if age < 60 else 60 if age < 3600 else 3600 if age < 86400 else 86400
+            deadline = math.ceil(value + (age // unit + 1) * unit)
+            self.next_age_refresh = min(self.next_age_refresh, deadline)
+            if self.detail_age_deadlines is not None:
+                suffix = formatted[formatted.rfind("("):]
+                self.detail_age_deadlines[suffix] = min(
+                    self.detail_age_deadlines.get(suffix, float("inf")), deadline)
+        return formatted
+
+    def render_if_needed(self) -> None:
+        if self.dirty or self.wall_clock() >= self.next_age_refresh:
+            self.render()
+
     def render(self) -> None:
+        self.dirty = False
+        self.next_age_refresh = float("inf")
         self.screen.erase()
         self.cursor_position = None
         self.hit_map.clear()
@@ -2198,7 +2453,7 @@ class MailboxApp:
 
         def header(record: Mapping[str, Any], index: int, total: int,
                    sender: str, recipient: str) -> str:
-            metadata = f"Message {index}/{total} · {status_time(record.get('created_at'), self.wall_clock())}"
+            metadata = f"Message {index}/{total} · {self.format_time(record.get('created_at'), self.wall_clock())}"
             prefix = metadata + " · "
             # On narrow panels reserve a separate participant row rather than
             # allowing the timestamp to consume both ends of the direction.
@@ -2282,7 +2537,7 @@ class MailboxApp:
             lines.extend([
                 f"  {device.get('kind', '?')}: {icon} {device.get('label') or device.get('device_id') or '?'}",
                 f"  ID: {device.get('device_id') or '?'}",
-                f"  Claimed: {status_time(device.get('claimed_at'), now)}",
+                f"  Claimed: {self.format_time(device.get('claimed_at'), now)}",
                 f"  Attached: {yes_no(device.get('attached'))}",
             ])
         lines.append("Servers" + (": ?" if servers is None else ": none" if not servers else ""))
@@ -2292,7 +2547,7 @@ class MailboxApp:
                 f"  Bind: {server.get('bind') or '?'}",
                 f"  Cwd: {server.get('cwd') or '?'}",
                 f"  Inherited: {yes_no(server.get('inherited'))}",
-                f"  Started: {status_time(server.get('started_at'), now)}",
+                f"  Started: {self.format_time(server.get('started_at'), now)}",
             ])
             urls = server.get("urls")
             lines.extend([f"  URL: {url}" for url in urls] if urls else
@@ -2373,9 +2628,9 @@ class MailboxApp:
             f"Main checkout: {yes_no(item.get('is_main_checkout'))}",
             f"Terminal ID: {item['terminal_id']}", f"Generation: {item.get('generation', '—')}",
             f"Session reference: {item.get('session_ref') or '—'}",
-            f"Last updated: {status_time(item.get('status_updated_at'), now)}",
-            f"Last seen: {status_time(item.get('last_seen'), now)}",
-            f"First seen: {status_time(item.get('first_seen'), now)}",
+            f"Last updated: {self.format_time(item.get('status_updated_at'), now)}",
+            f"Last seen: {self.format_time(item.get('last_seen'), now)}",
+            f"First seen: {self.format_time(item.get('first_seen'), now)}",
             f"User border: {yes_no(item.get('user_border'))}"], dim=True)
         return result
 
@@ -2430,10 +2685,19 @@ class MailboxApp:
             return
         agent = self.detail and not self.detail.get("type") and self.detail.get("terminal_id")
         message_starts: list[int] = []
-        entries = (self.thread_detail(width, message_starts=message_starts)
-                   if not self.diagnostics and (self.detail or {}).get("type") else
-                   self.agent_detail(width) if agent and not self.diagnostics else
-                   [(line, 0) for line in self.detail_lines()])
+        # Building offscreen entries must not schedule age-only repaints.
+        previous_deadline = self.next_age_refresh
+        previous_candidates = self.detail_age_deadlines
+        age_deadlines: dict[str, float] = {}
+        self.detail_age_deadlines = age_deadlines
+        try:
+            entries = (self.thread_detail(width, message_starts=message_starts)
+                       if not self.diagnostics and (self.detail or {}).get("type") else
+                       self.agent_detail(width) if agent and not self.diagnostics else
+                       [(line, 0) for line in self.detail_lines()])
+        finally:
+            self.next_age_refresh = previous_deadline
+            self.detail_age_deadlines = previous_candidates
         lines = []
         latest_row = 0
         for index, (line, attribute) in enumerate(entries):
@@ -2469,7 +2733,11 @@ class MailboxApp:
         notice = next((text for text in notices if display_width(text) <= width), notices[-1])
         self.put(y, x, truncate_display_text(notice, width), curses.A_DIM)
         for row, (text, attr) in enumerate(lines[first:last], y + 1):
-            self.put(row, x, truncate_display_text(text, width), attr)
+            visible = truncate_display_text(text, width)
+            self.put(row, x, visible, attr)
+            for suffix, deadline in age_deadlines.items():
+                if suffix in visible:
+                    self.next_age_refresh = min(self.next_age_refresh, deadline)
             if agent and not self.diagnostics and text.startswith("Turn state: "):
                 self.put(row, x + len("Turn state: "), clip(text[len("Turn state: "):], width - len("Turn state: ")),
                          self.state_style(self.detail.get("turn_state") or "unknown",
@@ -2724,7 +2992,7 @@ class MailboxApp:
                     self.tick()
                     if not self.running:
                         break
-                    self.render()
+                    self.render_if_needed()
                     key = decoder.next()
                     if key is not None:
                         self.key(key)
@@ -2736,15 +3004,19 @@ class MailboxApp:
             for job in self.jobs.values():
                 job.close()
             self.jobs.clear()
+            if self.snapshot_worker is not None:
+                self.snapshot_worker.close()
         return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HAM mailbox: agents, threads and quick send.")
-    parser.add_argument("command", choices=("split", "tab", "popup", "pane", "popup-pane", "job"))
+    parser.add_argument("command", choices=("split", "tab", "popup", "pane", "popup-pane", "job", "snapshot-worker"))
     arguments = parser.parse_args(argv)
     values = dict(os.environ)
     try:
+        if arguments.command == "snapshot-worker":
+            return snapshot_worker(values)
         if arguments.command in {"split", "tab"}:
             print(json.dumps(launch(arguments.command, values), ensure_ascii=False))
             return 0
