@@ -415,23 +415,23 @@ state, including permanent dedupe after body retention. A bell failure after
 commit is a successful store with a `notification_failed`, `committed:true`
 warning, not permission to resend.
 
-`--to main` is resolved on the sender's host at send time against the sender's
-current `(repo_id, canonical host, workspace_id)` scope. The immutable message
-stores a concrete terminal target. If the scope has no main, sending fails
-visibly and names the workspace; it never uses another workspace's main or the
-repository home. Explicit `HOST/LABEL` mail crosses both workspaces and
-repositories. Receipts and withdrawals follow the saved target.
+`--to main` resolves on the sender's host at send time against
+`(repo_id, canonical host, anchor_workspace_id)`, including linked workspaces
+in that role group. The immutable message stores a concrete terminal target.
+If the group has no main, sending fails visibly; it never uses another group's
+main or the repository home. Explicit `HOST/LABEL` mail crosses both workspaces
+and repositories. Receipts and withdrawals follow the saved target.
 
 Use `--to [HOST/]main@REPO` to select another repo's main (HOST defaults local).
 For example, `--to main@dxp-api` or `--to beta/main@org/dxp-api`.
 An exact repo ID wins; otherwise REPO must uniquely match trailing path
 components. Multiple repos give `repo_ambiguous`. On the selected host, exactly
-one current main must exist across that repo's workspaces: none gives
-`main_unresolved`, several gives `main_ambiguous` with workspace IDs. Unknown
-repos also give `main_unresolved`. Remote selection uses exported role/workspace
-data. Like plain `main`, this saves a concrete terminal target at send time;
-it does not elect a main or fall back to home. Use a concrete `HOST/LABEL`
-when multiple workspaces have mains.
+one current main must exist across distinct role groups: none gives
+`main_unresolved`, several gives `main_ambiguous` with anchor workspace IDs.
+Unknown repos also give `main_unresolved`. Remote selection uses exported
+computed roles and optional role-scope metadata. Like plain `main`, this saves a
+concrete terminal target; it does not elect a main or fall back to home.
+Use a concrete `HOST/LABEL` when multiple groups have mains.
 The home is the first enabled canonical host and is deliberately read-only in
 the user UI; it does not elect or relay workspace mains. Mode/main/member/threshold
 mutations belong to the user UI service, not the agent CLI; there is no `repo set`
@@ -458,27 +458,36 @@ propagation. Reads never seed defaults. Off creates no main/worker roles, automa
 wake, or participating-traffic legacy restriction; explicit reads and natural
 user-boundary receiving remain available.
 
-Mode and wake thresholds remain repository-wide. Main and members are local to
-`(repo_id, canonical host, Herdr workspace_id)`, so worktree workspaces elect
-their own main. Workspace IDs are never compared across hosts.
+Mode, home and wake thresholds remain repository-wide. Main and members use
+`(repo_id, canonical host, anchor_workspace_id)`. A linked worktree workspace
+joins a deterministically chosen open nonlinked workspace on the same host with
+matching Herdr `worktree.repo_key`. The anchor can have no agents. Missing
+metadata or no open anchor leaves the workspace in its own scope; git common
+directories do not group ordinary workspaces. Workspace IDs never cross hosts.
+Only anchor main/member settings apply while grouped. Linked settings are
+retained unchanged, not copied or deleted, and apply again if ungrouped.
 
 - **manual:** an explicit active main in the scope is main; chosen members in
   that scope are workers, excluding main. Nonmembers may receive naturally but
   cannot be auto-woken.
-- **auto:** an explicit active main in the scope wins. Otherwise the scope's
-  single active agent becomes main. With several agents, exactly one active
-  main-checkout agent becomes main; if there is not exactly one, no main is
-  computed. All other agents in the scope are workers, even without a main.
-  A linked worktree is not a main checkout, but its single agent can be main.
+- **auto:** an active explicit main from the anchor's settings wins, anywhere
+  in the group. Otherwise an active anchor agent is required: the sole group
+  agent becomes main, or, with several agents, the unique active main-checkout
+  agent. Without that unique choice there is no main. In particular an open
+  anchor without agents gives no auto main, even with one linked agent.
+  All other group agents are workers. Ungrouped workspaces elect independently.
 
 A designation that becomes inactive or moves out of the scope is ignored on
 read without rewriting the setting; auto falls back to the election above.
-Workspace main/member settings are never replicated. Peers read the role
-computed by each agent's own host through status export. Schema v7 migrates
-active local legacy targets into their current workspace scopes and removes
-repo-level main/members/computed-main settings. Protocol-1 legacy role-setting
-payloads succeed without applying changes; home/mode/threshold replication is
-unchanged. See [migration](migration.md#workspace-role-migration-schema-v7).
+Main/member settings are host-local and never replicated. Peers use the computed
+roles from the origin host; protocol 1 is unchanged and role-scope export
+metadata is optional. Schema v9 adds open-workspace metadata, including empty
+anchors, without moving existing settings. All HAM processes sharing a host
+ledger must upgrade/restart together: old code cannot open v9 storage, and
+downgrade needs a backed-up database. OMP/Claude receiving contracts are unchanged.
+See [current migration and rollout](migration.md#worktree-role-grouping-schema-v9);
+the v7 section is historical and its independent linked-workspace semantics
+are superseded.
 
 Public status is independent of coordination mode:
 
@@ -490,9 +499,10 @@ python3 "$HAM_CLI" status clear
 python3 "$HAM_CLI" repo show
 ```
 
-`repo show` exposes the caller's host and `workspace_id`, scope main and members,
+`repo show` exposes the caller's host, anchor `workspace_id`, original
+`requested_workspace_id`, scope main and members,
 and repository-wide mode. `status board`, sidebar roles and borders use each
-agent's own host-qualified workspace role.
+agent's host-local anchor role group.
 `status set PHASE --summary TEXT` updates the caller's phase/summary; it does not
 change Herdr's `turn_state`. Phase is projected to `$recap`. HAM-owned pane
 borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting

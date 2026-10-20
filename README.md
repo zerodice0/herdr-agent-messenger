@@ -320,20 +320,26 @@ repositories keep their settings; without a stored mode they remain `off` until
 changed. Host-local (`local:`) repositories follow the same default without
 propagating settings. Read-only commands never initialize participation.
 
-Mode and wake thresholds apply repository-wide. Main and worker membership are
-scoped by `(repo_id, canonical host, Herdr workspace_id)`: each worktree workspace
-gets its own main, not the main checkout workspace's coordinator. Workspace
-settings stay on their owning host and are never replicated; peers receive each
-agent's authoritative role through status export.
+Mode, home and wake thresholds apply repository-wide. Main and worker membership
+use a host-local role scope `(repo_id, canonical host, anchor_workspace_id)`.
+A linked worktree workspace joins an open nonlinked workspace on the same host
+with the same Herdr `worktree.repo_key`; if several match, the anchor is selected
+deterministically. Missing metadata or no open anchor means its own workspace
+scope. Plain workspaces are not grouped by git common directory.
+The anchor may have no agent: without an active anchor agent, linked agents do
+not become auto-main, even if only one remains. Anchor main/member settings win;
+linked-workspace settings stay unchanged but are ignored while grouped and apply
+again if ungrouped. Settings stay on their owning host and are never replicated;
+peers receive each agent's authoritative computed role through status export.
 
 | Mode | Roles and automatic behavior |
 | --- | --- |
 | `off` | No roles, automatic wakes, or participating legacy rejection. Explicit inbox reads and receiving at natural user-turn boundaries remain possible. |
-| `manual` | An active explicit main in the workspace coordinates its selected worker members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
-| `auto` | An active explicit main in the workspace wins. Otherwise its single active agent becomes main; with several active agents, exactly one in the repository's main checkout becomes main. Otherwise there is no main. All other agents in that scope are workers, even when no main can be selected. |
+| `manual` | An active explicit main anywhere in the role group coordinates its selected group members, excluding the main. Nonmembers can receive at natural boundaries but do not wake automatically. |
+| `auto` | An active explicit main from the anchor's settings wins. Otherwise, only with an active anchor agent, the sole active group agent becomes main; with several, exactly one active main-checkout agent becomes main. Otherwise there is no main. All other agents in the group are workers, even without a main. Ungrouped workspaces keep their own election. |
 
-Sidebar roles and HAM-owned pane borders use each agent's current host-qualified
-workspace scope. Borders show `[메인] alias · summary` or `[워커] alias · summary`.
+Sidebar roles and HAM-owned pane borders use each agent's current host-local
+role group. Borders show `[메인] alias · summary` or `[워커] alias · summary`.
 Missing roles or summaries are omitted; the alias stays before the summary so
 Herdr can truncate long summaries without discarding the identity first.
 `status clear` removes phase/summary but keeps the alias and any active role.
@@ -355,14 +361,14 @@ Mailbox targets may be `local/LABEL`, `CANONICAL_HOST/LABEL`, a registered
 all repos on the selected host: no match is `agent_not_found`; multiple matches
 are `agent_ambiguous`, with candidate addresses and repos.
 
-`--to main` still resolves the sender's current host/repo/workspace main; it
-never falls back to another workspace or the repository home.
+`--to main` resolves the sender's current host/repo/anchor role-group main,
+including from linked workspaces; it never falls back to another group or home.
 `--to main@dxp-api` selects a repo's main locally;
 `--to beta/main@org/dxp-api` selects it on registered host beta.
 REPO matches an exact repo ID first, otherwise a unique trailing path-component
 suffix. Multiple matching repos give `repo_ambiguous`. Exactly one current main
-must exist across that repo's workspaces on the chosen host: none gives
-`main_unresolved`; several gives `main_ambiguous` listing workspace IDs.
+must exist across distinct role groups on the chosen host: none gives
+`main_unresolved`; several gives `main_ambiguous` listing anchor workspace IDs.
 All forms save a concrete terminal target at send time. Explicit named mail
 crosses workspaces and repositories.
 
@@ -380,10 +386,16 @@ payloads as `invalid_message`; the originating outbox retains failed mail for
 manual retry after upgrade, not automatic receiver-side hold. Preserve message
 and item IDs, then `ledger retry --item OUTBOX_ITEM_UUID`; do not resend as new mail.
 
-Ledger schema v7 migrates active local legacy main/member targets into their
-current workspace scopes and removes obsolete repo-level role settings.
-Protocol 1 remains unchanged: legacy `main`, `members` and `computed_main`
-setting payloads succeed as no-ops. See [migration details](docs/migration.md#workspace-role-migration-schema-v7).
+Schema v9 adds host-local `workspaces` metadata for open Herdr workspaces,
+including anchors without agents; it does not move or delete existing workspace
+settings. `repo show` reports the anchor as `workspace_id` and the original
+workspace as `requested_workspace_id`. Protocol 1 is unchanged; exported role
+scope metadata is optional, and older peers can consume computed roles.
+Old code cannot open a schema-v9 ledger: upgrade/restart all HAM processes and
+copied skills together on each host; downgrade requires a backed-up database.
+See [schema-v9 migration and rollout](docs/migration.md#worktree-role-grouping-schema-v9).
+The earlier [schema-v7 migration](docs/migration.md#workspace-role-migration-schema-v7)
+is historical; v9 supersedes its independent-workspace role semantics.
 
 Skill installation does **not implicitly** install a receiving runtime. Opt in
 through the installer's explicit runtime choice/flag or separately

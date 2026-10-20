@@ -59,7 +59,8 @@ class MailboxServicesTest(unittest.TestCase):
     def save_settings(self, field, value, *, scope=None, environment=None):
         request = {"operation": "setting", "repo_id": self.repo_id, "field": field, "value": value,
                    "scope": scope or {"repo_id": self.repo_id, "host": self.store.host,
-                                      "workspace_id": self.sender["workspace_id"]}}
+                                      "workspace_id": self.sender["workspace_id"],
+                                      "requested_workspace_id": self.sender["workspace_id"]}}
         with mock.patch("ledger_display.LedgerDisplay.refresh", return_value={"updated": [], "failed": []}), \
              mock.patch("mailbox_tui.herdr", side_effect=LedgerError("isolated", "No live Herdr")):
             return execute_job(request, environment or self.settings_environment())
@@ -79,7 +80,8 @@ class MailboxServicesTest(unittest.TestCase):
                         return_value={"listeners": [], "serve": [], "error": None}):
             result = local_snapshot(self.store, self.repo_id, self.settings_environment())
         self.assertEqual(result["scope"],
-                         {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1"})
+                         {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1",
+                          "requested_workspace_id": "w1"})
         self.assertEqual(result["settings"]["settings"]["main"]["value"], target)
 
     def test_settings_reject_out_of_scope_main_and_members(self):
@@ -94,9 +96,12 @@ class MailboxServicesTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "target_out_of_scope")
 
     def test_main_and_members_require_complete_current_opener_scope(self):
-        expected = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1"}
+        expected = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w1",
+                    "requested_workspace_id": "w1"}
         for scope in ({"repo_id": self.repo_id}, {**expected, "host": "another-host"},
-                      {**expected, "workspace_id": "w2"}, {**expected, "repo_id": "another-repo"}):
+                      {**expected, "workspace_id": "w2"}, {**expected, "repo_id": "another-repo"},
+                      {**expected, "requested_workspace_id": "w2"},
+                      {key: value for key, value in expected.items() if key != "requested_workspace_id"}):
             for field, value in (("main", None), ("members", [])):
                 with self.subTest(scope=scope, field=field), self.assertRaises(LedgerError) as raised:
                     self.save_settings(field, value, scope=scope)
@@ -134,7 +139,8 @@ class MailboxServicesTest(unittest.TestCase):
         with self.assertRaises(LedgerError) as raised:
             self.save_settings("main", None, environment=environment)
         self.assertEqual(raised.exception.code, "invalid_settings_scope")
-        scope = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w2"}
+        scope = {"repo_id": self.repo_id, "host": self.store.host, "workspace_id": "w2",
+                 "requested_workspace_id": "w2"}
         result = self.save_settings("main", None, scope=scope, environment=environment)
         self.assertEqual(result["workspace_id"], "w2")
 

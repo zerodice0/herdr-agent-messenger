@@ -443,21 +443,21 @@ terminal 종료로 취급하지 않습니다. 영구 실패 항목은 오류를 
 저장은 성공하며 `notification_failed`, `committed:true` 경고가 나옵니다.
 새 메시지로 다시 보내지 마세요.
 
-`--to main`은 보낼 때 송신 호스트에서 송신자의 현재
-`(repo_id, 정규 호스트, workspace_id)` 범위를 기준으로 해석합니다. 변경 불가능한
-메시지에는 구체적인 terminal 대상을 저장합니다. 해당 범위에 main이 없으면
-workspace를 명시하는 오류로 실패하며, 다른 workspace의 main이나 저장소
-home으로 대체하지 않습니다. `HOST/LABEL`을 명시한 메일은 workspace와 저장소
-경계를 모두 넘을 수 있습니다. 수신 확인과 철회는 저장된 대상을 따릅니다.
+`--to main`은 보낼 때 송신 호스트에서
+`(repo_id, 정규 호스트, anchor_workspace_id)`를 기준으로 해석합니다. 연결된 workspace도
+같은 역할 그룹의 main을 사용합니다. 변경 불가능한 메시지에는 구체적인 terminal 대상을
+저장합니다. 그룹에 main이 없으면 오류로 실패하며 다른 그룹의 main이나 저장소 home으로
+대체하지 않습니다. `HOST/LABEL`을 명시한 메일은 workspace와 저장소 경계를 모두
+넘을 수 있습니다. 수신 확인과 철회는 저장된 대상을 따릅니다.
 
 `--to [HOST/]main@REPO`는 지정한 호스트에서 저장소의 main을 선택합니다.
 HOST의 기본값은 로컬입니다. 예를 들어 `--to main@dxp-api` 또는
 `--to beta/main@org/dxp-api`를 사용합니다. 정확한 repo ID가 우선하며, 그 외에는
 경로의 끝 구성요소가 유일하게 일치해야 합니다. 여러 저장소가 일치하면
-`repo_ambiguous`로 실패합니다. 선택한 호스트의 해당 저장소 workspace 전체에서
-현재 main이 정확히 하나여야 합니다. 없거나 저장소를 찾지 못하면
-`main_unresolved`, 여러 workspace에 main이 있으면 workspace ID 목록과 함께
-`main_ambiguous`로 실패합니다. 원격 선택에는 내보낸 역할·workspace 정보를
+`repo_ambiguous`로 실패합니다. 선택한 호스트에서 서로 다른 역할 그룹을 기준으로
+현재 main이 정확히 하나여야 합니다. 없거나 저장소를 찾지 못하면 `main_unresolved`,
+main이 있는 그룹이 여럿이면 기준 workspace ID 목록과 함께 `main_ambiguous`로
+실패합니다. 원격 선택에는 내보낸 계산된 역할과 선택적 역할 범위 메타데이터를
 사용합니다. `main`과 마찬가지로 보낼 때 구체적인 terminal 대상을 저장하며
 main을 새로 정하거나 home으로 대체하지 않습니다. main이 여러 개이면 구체적인
 `HOST/LABEL`을 선택하세요.
@@ -486,27 +486,37 @@ home 제안은 관찰된 뒤 결정적인 규칙으로 수렴합니다.
 off에서는 main/worker 역할, 자동 깨우기, 참여 트래픽의 기존 전송 제한이 없습니다.
 명시적 조회와 자연스러운 사용자 입력 경계의 수신은 허용합니다.
 
-모드와 깨우기 임곗값은 저장소 전체에 적용합니다. main과 members는
-`(repo_id, 정규 호스트, Herdr workspace_id)`별로 정하므로 worktree workspace도
-자체 main을 선출합니다. 서로 다른 호스트의 workspace ID를 같은 범위로 보지 않습니다.
+모드·home·깨우기 임곗값은 저장소 전체에 적용합니다. main과 members는
+`(repo_id, 정규 호스트, anchor_workspace_id)`별로 정합니다. 연결된 worktree workspace는
+같은 호스트에서 Herdr `worktree.repo_key`가 같고 현재 열려 있는 비연결 workspace를
+기준 workspace(anchor)로 삼습니다. 후보가 여럿이면 결정적인 순서로 하나를 선택합니다.
+기준 workspace에는 에이전트가 없어도 됩니다. 메타데이터나 열린 기준 workspace가
+없으면 자체 범위를 유지하며, git common directory로 일반 workspace를 묶지 않습니다.
+서로 다른 호스트의 workspace ID를 같은 범위로 보지 않습니다. 그룹에 속한 동안에는
+기준 workspace의 main·members 설정만 적용합니다. 연결된 workspace의 설정은
+이동·복사·삭제하지 않고 보존하며, 그룹에서 분리되면 다시 적용합니다.
 
 - **manual:** 해당 범위 안의 활성 에이전트를 명시적 main으로 지정하며, 선택한
   members 중 main을 제외한 에이전트가 worker입니다. 비회원도 자연스러운 경계에서
   수신할 수 있지만 자동으로 깨우지는 않습니다.
-- **auto:** 해당 범위의 유효한 명시적 main이 우선합니다. 그렇지 않으면 활성
-  에이전트가 하나일 때 그 에이전트가 main이 됩니다. 여럿이면 메인 체크아웃의
-  활성 에이전트가 정확히 하나일 때만 main이 됩니다. 그 외에는 main이 없습니다.
-  main 유무와 관계없이 해당 범위의 나머지 에이전트는 worker입니다. 연결된 worktree는
-  메인 체크아웃이 아니지만, workspace의 유일한 활성 에이전트는 main이 될 수 있습니다.
+- **auto:** 기준 workspace 설정의 활성 명시적 main이 우선하며, 그룹 안의 어느
+  workspace에 있어도 됩니다. 없으면 기준 workspace에 활성 에이전트가 있어야
+  자동으로 선출합니다. 그룹의 활성 에이전트가 하나이면 그 에이전트를, 여럿이면
+  메인 체크아웃의 활성 에이전트가 정확히 하나일 때 그 에이전트를 main으로 정합니다.
+  그 외에는 main이 없습니다. 특히 열린 기준 workspace에 에이전트가 없으면 연결된
+  에이전트가 하나뿐이어도 자동 main이 없습니다. 나머지 그룹 에이전트는 worker이며,
+  그룹에 속하지 않은 workspace는 자체 선출 규칙을 유지합니다.
 
 지정한 에이전트가 비활성화되거나 범위 밖으로 이동하면 설정을 다시 쓰지 않고
 조회 시 그 지정을 무시합니다. auto에서는 위의 자동 선출 규칙을 적용합니다.
-workspace main·members 설정은 복제하지 않습니다. peer는 상태 내보내기를 통해
-각 에이전트의 호스트가 계산한 역할을 받아 봅니다. 스키마 v7은 기존 역할 설정의
-활성 로컬 대상을 현재 workspace 범위로 옮기고 저장소 단위의
-main·members·computed-main 설정을 제거합니다. 이전 peer의 프로토콜 1 역할 설정은
-적용하지 않고 성공으로 응답하며, home·mode·thresholds 복제는 바뀌지 않습니다.
-[마이그레이션 안내](migration.md#workspace-역할-마이그레이션스키마-v7)를 참고하세요.
+main·members 설정은 해당 호스트에만 저장하며 복제하지 않습니다. peer는 원래 호스트가
+계산한 역할을 받아 봅니다. 프로토콜은 1을 유지하고 역할 범위 내보내기 메타데이터는
+선택 사항입니다. 스키마 v9는 에이전트가 없는 기준 workspace를 포함한 열린 workspace의
+메타데이터를 추가하며 기존 설정은 이동하지 않습니다. 같은 호스트 원장을 사용하는 HAM
+프로세스는 함께 업그레이드하고 다시 시작해야 합니다. 이전 코드는 v9 DB를 열 수 없으며,
+다운그레이드에는 백업한 DB가 필요합니다. OMP·Claude 수신 계약은 바뀌지 않습니다.
+[현재 마이그레이션·배포 안내](migration.md#worktree-역할-그룹스키마-v9)를 참고하세요.
+v7 절은 과거 기록이며 연결된 workspace의 독립 역할 규칙은 v9로 대체됐습니다.
 
 공개 상태는 조정 모드와 별개로 사용할 수 있습니다.
 
@@ -518,9 +528,9 @@ python3 "$HAM_CLI" status clear
 python3 "$HAM_CLI" repo show
 ```
 
-`repo show`는 호출자의 호스트와 `workspace_id`, 해당 범위의 main·members와
-저장소 전체의 모드를 보여 줍니다. `status board`와 사이드바·테두리는 각
-에이전트의 호스트·workspace 범위에 따른 역할을 표시합니다.
+`repo show`는 호출자의 호스트, 기준 workspace인 `workspace_id`, 원래 workspace인
+`requested_workspace_id`, 해당 범위의 main·members와 저장소 전체의 모드를 보여 줍니다.
+`status board`와 사이드바·테두리는 각 에이전트의 호스트별 역할 그룹에 따른 역할을 표시합니다.
 
 `status set PHASE --summary TEXT`는 호출자의 phase와 summary를 갱신하며 Herdr의
 `turn_state`는 바꾸지 않습니다. phase는 `$recap`에 표시합니다. HAM 소유 pane

@@ -125,17 +125,17 @@ vertical separators or horizontal rules inside the panel. Header labels are
 **cyan and bold, without underlines**; without color they are bold only.
 Each host section starts with a **bold host label and agent count**, such as
 `▾ winmini · 1 agent` or `▾ winmini · 2 agents`, followed by its column header
-and workspace groups. The opener's repository remains first: the local host comes
-first, with the opener's current workspace first, then other local workspaces
-by workspace ID; remote hosts follow alphabetically, grouped by workspace ID.
-Agents within each workspace sort by alias, then terminal ID. Missing workspace
-IDs sort last within their host.
-Every workspace group has an indented `workspace label · N` line, even when it
-is the host's only group; the opener's host-local group adds **`· current`**.
-Local labels come from Herdr snapshot workspace labels (or explicit
-`workspace_label` data), falling back to the workspace ID; older remote boards
-usually supply IDs only. Missing IDs display `No workspace`. Current workspace
-lines are cyan/bold (bold without color); other workspace lines are dim.
+and role-scope groups. The opener's repository remains first: the local host
+comes first, with the opener's anchor group first, then other groups by anchor
+workspace ID; remote hosts follow alphabetically. Each group shows an indented
+`anchor label · N` line for its total agent count. Linked workspaces appear
+under it as `workspace label (worktree) · N` sub-lines; agents sort by alias,
+then terminal ID. The actual opener workspace alone gets **`· current`**,
+on its worktree sub-line when linked. Local labels come from Herdr snapshot
+workspace labels (or explicit `workspace_label` data), falling back to IDs.
+Older peer data without optional role-scope metadata keeps workspace grouping;
+missing IDs display `No workspace` and sort last. Current workspace lines are
+cyan/bold (bold without color); other group/workspace lines are dim.
 Empty hosts have no column header. Host sections have no blank separator rows.
 Below them, **Other repositories** lists local and registered-peer agents grouped
 by host (local first), then repository short name (the last path component).
@@ -332,28 +332,31 @@ Press `s` in NAV. `↑`/`↓` or `j`/`k` selects a row. Click a row to select it
 clicking the selected row acts like `Enter`. `Esc` closes the overlay and
 discards unsaved inline changes.
 
-Mode and Thresholds are repository-wide. Main and Members show the Mailbox
-opener's workspace (`Main (workspace …)` / `Members (workspace …)`), resolved
-from `HERDR_HAM_OPENER_PANE_ID`, on the canonical local host. Their scope is
-`(repo_id, host, workspace_id)`, not the selected agent's workspace.
+Mode and Thresholds are repository-wide. Main and Members show the resolved
+anchor of the Mailbox opener's role group (`Main (workspace ANCHOR @ HOST) · role group`
+/ `Members (workspace ANCHOR @ HOST) · role group`). The original workspace is
+resolved from `HERDR_HAM_OPENER_PANE_ID` on the canonical local host; the role
+scope is `(repo_id, host, anchor_workspace_id)`, not the selected agent's workspace.
 The refresh reuses its live Herdr pane snapshot if the opener is not yet in the
 ledger, falling back to the Mailbox's own workspace if the opener has closed.
 If no workspace is available, only Main/Members are disabled; Mode and Thresholds
 still load and save for the selected repository.
 The all-repositories view keeps its existing repository selection; without one
-repository, settings stays disabled with an explanation. Workspace role
-settings stay host-local and are not replicated.
+repository, settings stays disabled with an explanation. Role settings remain
+host-local. Changes save at the anchor; grouped linked-workspace settings stay
+unchanged and ignored until ungrouped. `repo show` distinguishes anchor
+`workspace_id` from original `requested_workspace_id`.
 
 - **Mode (repo-wide):** `Enter` opens a **PICK** list with a short explanation of each option.
   `↑`/`↓` selects; `Enter` or clicking an option saves immediately.
   On the mode row, `←`/`→` or `h`/`l` cycles an unsaved choice; `Enter` saves it.
-- **Main (workspace …):** `Enter` opens a **PICK** list of active agents in the
-  same repository, canonical host and workspace, plus `(none)`. The current
-  choice has a `●` marker. `Enter` or clicking a choice saves.
-- **Members (workspace …):** `Enter` opens a **CHECK** list for that scope.
-  `Space` or clicking an entry toggles its checkbox; `Enter` saves the checked
-  set. Inactive or out-of-scope targets cannot be newly assigned; the service
-  rejects invalid targets. A configured agent outside the scope has no role there.
+- **Main (workspace ANCHOR @ HOST) · role group:** `Enter` opens a **PICK** list
+  of active agents across the same repo/host role group, including linked
+  workspaces, plus `(none)`. The current choice has `●`; `Enter` or clicking saves.
+- **Members (workspace ANCHOR @ HOST) · role group:** `Enter` opens a **CHECK**
+  list for the whole group. `Space` or clicking toggles an entry; `Enter` saves
+  the checked set. Inactive or out-of-group targets cannot be newly assigned;
+  the service rejects them. A configured agent outside the group has no role there.
 - **Thresholds (repo-wide):** `←`/`→`, `-`/`+`, or clicking `◀`/`▶` adjusts the inline value.
   Steps are 1 for `idle_minutes`, 5 for `coalesce_seconds`, and 1 each for
   `wakes_per_hour` and `max_hop`; values stay within 0–10000. An `unsaved` marker
@@ -361,8 +364,10 @@ settings stay host-local and are not replicated.
   digits-only input instead. `Esc` cancels an open picker, checklist, or numeric input.
 
 The mouse wheel scrolls picker/checklist entries or overlay metadata.
-The overlay shows `Target: repository REPO_ID · workspace WORKSPACE_ID @ HOST`
-for the settings scope, not the selected agent. For the selected Agents row,
+The overlay shows `Target: repository REPO_ID · workspace ANCHOR @ HOST`
+for the resolved settings scope and identifies the opener workspace separately;
+main/member changes save at the anchor, not at the selected agent's workspace.
+For the selected Agents row,
 `m` sets that agent as main; `Space` toggles its manual membership, only for
 active targets in the opener's settings scope. These two shortcuts still
 require confirmation, with Cancel selected by default.
@@ -473,13 +478,19 @@ JSON. `heavy_slot.py` remains separate and unchanged; its slots are not displaye
 
 ### Role, phase and border ownership
 
-Main/workers are decided per `(repository, canonical host, Herdr workspace)`;
-worktree workspaces have their own main. Repository mode/thresholds remain
-shared. In auto mode, a valid active explicit main wins, otherwise a single
-active agent wins; with several agents, exactly one in the main checkout wins.
-Otherwise there is no main, and the other auto agents remain workers. In manual
-mode only the active explicit main and configured in-scope members get roles.
-All displays use the role computed by each agent's own host.
+Main/workers use `(repository, canonical host, anchor_workspace_id)`. Linked
+workspaces join a deterministic open nonlinked workspace with matching Herdr
+`worktree.repo_key` on the same host. Missing metadata or no anchor keeps an
+independent scope; there is no git-common-directory fallback. Mode/home/thresholds
+remain repo-wide. Valid anchor explicit main/member settings apply to the whole
+group; linked settings remain stored unchanged and return when ungrouped.
+In auto, an active explicit main wins. Otherwise an active anchor agent is
+required: the sole group agent wins, or, with several, the unique main-checkout
+agent. An open anchor without agents has no auto main even with a sole linked
+agent. Other auto agents remain workers. Manual roles use the active explicit
+main and selected group members. All displays use origin-host computed roles.
+See [schema-v9 storage and rollout](migration.md#worktree-role-grouping-schema-v9)
+before sharing a ledger with upgraded code: old processes cannot open v9 storage.
 
 HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
 the alias remains addressable. A shared projection reports alias, color,

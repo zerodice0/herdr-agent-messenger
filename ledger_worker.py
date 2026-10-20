@@ -12,6 +12,7 @@ import time
 from typing import Any, Iterator, Mapping
 
 from ledger_remote import RemoteLedger
+from ledger_settings import RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore
 
@@ -43,12 +44,18 @@ def maintenance_pending(store: LedgerStore) -> bool:
                               "AND a.active=1 AND r.field='mode' "
                               "AND r.value IN ('\"manual\"','\"auto\"') LIMIT 1", (store.host,)).fetchone():
             return True
-        if connection.execute(
-                "SELECT 1 FROM workspace_settings w JOIN terminal_slots t ON t.host=w.host "
-                "AND t.workspace_id=w.workspace_id AND t.terminal_id=json_extract(w.value,'$.terminal_id') "
+        for row in connection.execute(
+                "SELECT w.repo_id,w.host,w.workspace_id,t.workspace_id AS target_workspace_id "
+                "FROM workspace_settings w JOIN terminal_slots t ON t.host=w.host "
+                "AND t.terminal_id=json_extract(w.value,'$.terminal_id') "
                 "WHERE w.host=? AND w.field='main' AND json_extract(w.value,'$.host')=w.host "
-                "AND t.present=1 LIMIT 1", (store.host,)).fetchone():
-            return True
+                "AND t.present=1", (store.host,)):
+            # Only effective anchor settings watch their designated shell. The
+            # target may live in any linked workspace, even with no active agents.
+            if (RepoSettings.scope_workspace(connection, row["repo_id"], row["host"], row["workspace_id"])
+                    == row["workspace_id"] == RepoSettings.scope_workspace(
+                        connection, row["repo_id"], row["host"], row["target_workspace_id"])):
+                return True
     return False
 
 

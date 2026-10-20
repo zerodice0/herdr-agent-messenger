@@ -199,7 +199,6 @@ class RemoteLedger:
 
     def status_export(self, repo_id: str | None = None, *, resources: bool = False,
                       resource_scanner: Any = None) -> dict[str, Any]:
-        settings = RepoSettings(self.store)
         all_agents = AgentRegistry(self.store).list()
         agents = [agent for agent in all_agents if repo_id is None or agent["repo_id"] == repo_id]
         from ledger_devices import device_rows
@@ -213,19 +212,21 @@ class RemoteLedger:
                 listener_endpoints=scanned.get("listener_endpoints"))
         with self.store.read() as connection:
             claims = device_rows(connection)
+            workspaces = [dict(row) for row in connection.execute(
+                "SELECT * FROM workspaces WHERE host=? ORDER BY workspace_id", (self.store.host,))]
             counts = {(row["recipient_host"], row["recipient_terminal_id"], row["recipient_repo_id"]): row["unread"]
                       for row in connection.execute(
                           "SELECT recipient_host,recipient_terminal_id,recipient_repo_id,count(*) AS unread "
                           "FROM deliveries WHERE state IN ('queued','delivering') "
                           "GROUP BY recipient_host,recipient_terminal_id,recipient_repo_id")}
-        exported = [{**agent, "role": settings.role(agent),
+        exported = [{**agent,
                      "unread": counts.get((agent["host"], agent["terminal_id"], agent["repo_id"]), 0),
                      "devices": [row for row in claims if not row["stale"]
                                  and row["holder"]["agent_id"] == agent["agent_id"]],
                      **({"servers": servers.get(agent["agent_id"], [])} if resources else {})}
                     for agent in agents]
         result = {"host": {"canonical_name": self.store.host, "uuid": self.store.host_uuid},
-                  "agents": exported}
+                  "agents": exported, "workspaces": workspaces}
         if host_resources is not None:
             result["resources"] = {"servers_unowned": host_resources["unowned_served"],
                                    "dead_serve": host_resources["dead_serve"],
@@ -286,10 +287,11 @@ class RemoteLedger:
                      and agent.get("role") == "main"]
             if not mains:
                 raise LedgerError("main_unresolved", f"No main is available for repository {selector!r} on {host}.")
-            if len(mains) > 1:
-                workspaces = ", ".join(sorted({agent["workspace_id"] for agent in mains}))
+            groups = {agent.get("role_workspace_id", agent["workspace_id"]) for agent in mains}
+            if len(groups) > 1:
+                workspaces = ", ".join(sorted(groups))
                 raise LedgerError("main_ambiguous",
-                                  f"Repository {matches[0]!r} has mains in workspaces {workspaces} on {host}.")
+                                  f"Repository {matches[0]!r} has mains in role scopes {workspaces} on {host}.")
             return {**mains[0], "recipient_address": address}
         matches = [agent for agent in agents if agent["alias"] == label]
         if not matches:

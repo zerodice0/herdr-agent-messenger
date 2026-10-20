@@ -129,9 +129,15 @@ INPUT에서 Space는 문자로 입력되고, CONFIRM·Settings 선택 목록의 
 발견 사항은 0이 아니거나 알 수 없을 때만 뒤에 표시하며, 필요한 경우 stale·오류
 정보도 표시합니다. 공간이 부족하면 개수를 유지하고 발견 사항부터 줄입니다.
 
-먼저 창을 연 저장소의 에이전트를 표시합니다. 로컬 호스트에서는 창을 연 작업 공간을
-맨 위에 두고 `· current`를 붙인 뒤, 다른 작업 공간을 ID 순서로 표시합니다.
-원격 호스트는 이름순으로, 각 호스트의 에이전트는 작업 공간별로 묶습니다.
+먼저 창을 연 저장소의 에이전트를 표시합니다. 로컬 호스트에서는 시작 workspace가 속한
+기준 workspace(anchor) 그룹을 맨 위에 두고, 다른 역할 그룹은 기준 workspace ID 순으로
+표시합니다. 원격 호스트는 이름순으로 표시합니다. 각 그룹은 `기준 workspace 라벨 · N`으로
+그룹 전체의 에이전트 수를 표시하며, 연결된 workspace는 들여쓴
+`workspace 라벨 (worktree) · N` 하위 행으로 표시합니다. 실제 시작 workspace에만
+`· current`를 붙이므로 연결된 workspace에서 열었다면 해당 하위 행에 붙습니다.
+그룹 안의 에이전트는 별칭·terminal ID 순으로 정렬합니다. 로컬 라벨은 Herdr 스냅샷에서
+가져오고 없으면 ID를 사용합니다. 역할 범위 메타데이터가 없는 이전 peer는 workspace별
+표시를 유지합니다. ID가 없으면 `No workspace`로 표시하고 마지막에 배치합니다.
 그 아래 **Other repositories** 구역에는 로컬 호스트와 등록된 피어의 다른 저장소를
 호스트 → 저장소의 짧은 이름 → 에이전트 순서로 표시합니다. 짧은 이름은 저장소 경로의
 마지막 부분이며, 길면 화면 너비에 맞게 줄입니다. 들여쓴 저장소 행에는 에이전트 수도
@@ -314,13 +320,17 @@ NAV에서 `s`를 누릅니다. `↑`·`↓` 또는 `j`·`k`로 행을 고릅니�
 행을 클릭하면 선택하고, 선택한 행을 다시 클릭하면 `Enter`처럼 동작합니다.
 `Esc`로 설정창을 닫으면 아직 저장하지 않은 변경을 버립니다.
 
-Mode와 Thresholds는 저장소 전체에 적용합니다. Main·Members에는
-`HERDR_HAM_OPENER_PANE_ID`로 찾은 Mailbox 시작 pane의 workspace를 표시합니다
-(`Main (workspace …)` / `Members (workspace …)`). 범위는
-`(repo_id, 정규 로컬 호스트, workspace_id)`이며 선택한 에이전트의 workspace를
-따라 바뀌지 않습니다. 모든 저장소 보기에서도 기존 저장소 선택 방식을 유지하며,
-저장소를 하나로 정할 수 없으면 설명과 함께 설정을 비활성화합니다.
-workspace 역할 설정은 해당 호스트에만 저장하며 복제하지 않습니다.
+Mode와 Thresholds는 저장소 전체에 적용합니다. Main·Members에는 Mailbox 시작 pane의
+역할 그룹을 해석한 기준 workspace를 표시합니다
+(`Main (workspace ANCHOR @ HOST) · role group` /
+`Members (workspace ANCHOR @ HOST) · role group`). 원래 workspace는
+`HERDR_HAM_OPENER_PANE_ID`로 찾으며, 범위는
+`(repo_id, 정규 로컬 호스트, anchor_workspace_id)`입니다. 선택한 에이전트를 따라 바뀌지
+않습니다. 모든 저장소 보기에서도 기존 저장소 선택 방식을 유지하며, 저장소를 하나로
+정할 수 없으면 설명과 함께 설정을 비활성화합니다. 역할 설정은 해당 호스트에만 저장하고
+변경은 기준 workspace에 저장합니다. 연결된 workspace의 기존 설정은 그룹에 속한 동안
+무시하지만 변경 없이 보존하며, 분리되면 다시 적용합니다. `repo show`의 `workspace_id`는
+기준 workspace, `requested_workspace_id`는 원래 workspace입니다.
 시작 pane이 아직 원장에 없으면 새로고침에서 가져온 Herdr pane 스냅샷으로
 workspace를 찾습니다. 시작 pane이 닫혔다면 Mailbox 자체의 workspace를 사용합니다.
 workspace를 찾을 수 없어도 Main·Members만 비활성화하며, 선택한 저장소의
@@ -329,13 +339,13 @@ Mode·Thresholds는 계속 조회하고 저장할 수 있습니다.
 - **Mode (repo-wide):** `Enter`로 각 선택지의 의미가 표시된 **PICK** 목록을 엽니다.
   `↑`·`↓`로 고른 뒤 `Enter`를 누르거나 항목을 클릭하면 바로 저장합니다.
   mode 행에서 `←`·`→` 또는 `h`·`l`로 값을 바꾼 뒤 `Enter`로 저장할 수도 있습니다.
-- **Main (workspace …):** `Enter`로 저장소·정규 호스트·workspace가 모두 같은
-  활성 에이전트와 `(none)`을 담은 **PICK** 목록을 엽니다. 현재 값은 `●`로
-  표시하며 `Enter`나 클릭으로 저장합니다.
-- **Members (workspace …):** `Enter`로 해당 범위의 **CHECK** 목록을 엽니다.
-  `Space`나 항목 클릭으로 체크를 바꾸고 `Enter`로 체크된 구성원을 저장합니다.
-  비활성 에이전트나 범위 밖의 대상을 새로 지정할 수 없으며 서비스도 이를
-  거절합니다. 기존 구성원이 범위 밖으로 이동하면 그 범위의 역할을 받지 않습니다.
+- **Main (workspace ANCHOR @ HOST) · role group:** `Enter`로 같은 저장소·정규 호스트의
+  역할 그룹 전체에서 활성 에이전트와 `(none)`을 담은 **PICK** 목록을 엽니다.
+  연결된 workspace의 에이전트도 포함합니다. 현재 값은 `●`로 표시하며 `Enter`나 클릭으로 저장합니다.
+- **Members (workspace ANCHOR @ HOST) · role group:** `Enter`로 그룹 전체의 **CHECK**
+  목록을 엽니다. `Space`나 항목 클릭으로 체크를 바꾸고 `Enter`로 저장합니다.
+  비활성 에이전트나 그룹 밖의 대상을 새로 지정할 수 없으며 서비스도 이를 거절합니다.
+  기존 구성원이 그룹 밖으로 이동하면 그 그룹의 역할을 받지 않습니다.
 - **임곗값(repo-wide):** `←`·`→`, `-`·`+` 또는 `◀`·`▶` 클릭으로 값을 조정합니다.
   `idle_minutes`는 1, `coalesce_seconds`는 5, `wakes_per_hour`와 `max_hop`은
   각각 1씩 바뀌며 범위는 0~10000입니다. 저장 전에는 `unsaved`로 표시하고
@@ -344,9 +354,9 @@ Mode·Thresholds는 계속 조회하고 저장할 수 있습니다.
   누르면 해당 편집을 취소합니다.
 
 마우스 휠로 목록이나 설정 메타데이터를 스크롤합니다.
-설정 범위는 `Target: repository REPO_ID · workspace WORKSPACE_ID @ HOST`로
-표시하며 선택한 에이전트의 범위와 구분합니다. 선택한 Agents 행의 대상이
-활성 상태이며 Mailbox 시작 pane의 설정 범위 안에 있을 때만 `m`으로 main을 지정하고
+설정 범위는 `Target: repository REPO_ID · workspace ANCHOR @ HOST`로 표시하며,
+시작 workspace는 별도로 표시합니다. main·members 변경은 기준 workspace에 저장합니다.
+선택한 Agents 행의 대상이 활성 상태이며 시작 pane의 역할 그룹 안에 있을 때만 `m`으로 main을 지정하고
 `Space`로 수동 구성원에 넣거나 뺄 수 있습니다. 이 두 단축키는 기본 선택이
 Cancel인 확인창을 그대로 거칩니다. Home, computed main, 버전·origin, 전파
 대기와 충돌 정보는 읽기 전용이며 저장소 단위 설정만 전파합니다. 요청·snapshot·저장
@@ -456,14 +466,20 @@ Herdr 갱신 실패를 stale의 근거로 해석하지 않습니다. `device lis
 
 ### 역할, phase와 테두리 소유권
 
-main과 worker는 `(저장소, 정규 호스트, Herdr workspace)`별로 정하므로
-worktree workspace도 자체 main을 가집니다. 모드와 임곗값은 저장소 전체에
-적용합니다. auto에서는 해당 범위의 활성 에이전트로 지정한 명시적 main이
-우선합니다. 없으면 활성 에이전트가 하나일 때 그 에이전트가 main이 되며,
-여럿이면 메인 체크아웃의 활성 에이전트가 정확히 하나일 때만 main이 됩니다.
-그 외에는 main이 없고 나머지 auto 에이전트는 worker로 남습니다. manual에서는
-활성 명시적 main과 해당 범위의 지정 구성원만 역할을 받습니다. 모든 화면은
+main과 worker는 `(저장소, 정규 호스트, anchor_workspace_id)`를 기준으로 정합니다.
+연결된 workspace는 같은 호스트에서 Herdr `worktree.repo_key`가 같고 열려 있는 비연결
+workspace를 결정적인 순서로 선택해 기준 workspace로 삼습니다. 메타데이터나 기준
+workspace가 없으면 자체 범위를 유지하며 git common directory로 대체하지 않습니다.
+모드·home·임곗값은 저장소 전체에 적용합니다. 기준 workspace의 유효한 main·members
+설정이 그룹 전체에 적용되며, 연결된 workspace의 설정은 변경 없이 보존했다가 분리되면
+다시 사용합니다. auto에서는 활성 명시적 main이 우선합니다. 없으면 기준 workspace에
+활성 에이전트가 있을 때만 그룹의 유일한 활성 에이전트, 또는 여럿 중 메인 체크아웃의
+유일한 활성 에이전트가 main이 됩니다. 열린 기준 workspace에 에이전트가 없으면
+연결된 에이전트가 하나뿐이어도 자동 main이 없습니다. 나머지 auto 에이전트는 worker입니다.
+manual에서는 활성 명시적 main과 선택한 그룹 구성원만 역할을 받습니다. 모든 화면은
 각 에이전트의 호스트가 계산한 역할을 표시합니다.
+이전 프로세스는 v9 원장을 열 수 없으므로 배포 전에
+[스키마 v9 저장소·배포 안내](migration.md#worktree-역할-그룹스키마-v9)를 참고하세요.
 
 역할은 `🟧 [메인] orange-rabbit`처럼 alias 앞에 붙여 주소 해석을 유지합니다.
 공유 표시 모듈이 alias, color, 표시 이름, phase(`recap`)와 원장 기반 기기 토큰을

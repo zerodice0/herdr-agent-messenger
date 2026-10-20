@@ -1909,7 +1909,8 @@ class MailboxUiTest(unittest.TestCase):
         self.select_agent(app, 'term-b')
         app.key('s')
         self.assertEqual(app.current_settings_scope(),
-                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1'})
+                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1',
+                          'requested_workspace_id': 'w1'})
         self.assertIn('Main (workspace w1 @ ' + self.store.host + ')', '\n'.join(app.settings_lines()))
         self.assertIn('mode (repo-wide)', '\n'.join(app.settings_lines()))
         for key in ('m', ' '):
@@ -1970,7 +1971,8 @@ class MailboxUiTest(unittest.TestCase):
         app.key('s')
         self.assertEqual(app.repo_id, self.repo_id)
         self.assertEqual(app.jobs['snapshot'].request['scope'],
-                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1'})
+                         {'repo_id': self.repo_id, 'host': self.store.host, 'workspace_id': 'w1',
+                          'requested_workspace_id': 'w1'})
         app = self.app()
         app.repo_id = None
         app.local['agents'] = []
@@ -2913,7 +2915,7 @@ class MailboxUiTest(unittest.TestCase):
         base = app.local['agents'][0]
         def agent(terminal, workspace, alias, host=None):
             return {**base, 'terminal_id': terminal, 'workspace_id': workspace,
-                    'alias': alias, 'host': host or self.store.host}
+                    'role_workspace_id': workspace, 'alias': alias, 'host': host or self.store.host}
         app.local['agents'] = [
             agent('local-other-z', 'w3', 'alpha'),
             agent('local-missing', None, 'aaa'),
@@ -2995,7 +2997,7 @@ class MailboxUiTest(unittest.TestCase):
                 updated = json.loads(json.dumps(app.local))
                 target = next(agent for agent in updated['agents']
                               if agent['terminal_id'] == 'local-other-z')
-                target.update(workspace_id='w1', alias='aaa')
+                target.update(workspace_id='w1', role_workspace_id='w1', alias='aaa')
                 app.start_job('snapshot', 'snapshot')
                 app.jobs['snapshot'].result = updated
                 app.tick()
@@ -3017,7 +3019,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.identity(app.selected('agents')), identity)
         self.assertEqual(app.agents_workspace(), 'w1')
         updated = json.loads(json.dumps(app.local))
-        updated['scope']['workspace_id'] = 'w3'
+        updated['scope'].update(workspace_id='w3', requested_workspace_id='w3')
         app.start_job('snapshot', 'snapshot')
         app.jobs['snapshot'].result = updated
         app.tick()
@@ -3052,6 +3054,143 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertIn('ALIAS', snapshot.line(1))
             if height >= 4:
                 self.assertIn('w3 · 21', snapshot.line(2))
+
+    def worktree_role_app(self, *, empty_anchor=False):
+        panes = [{'terminal_id': terminal, 'pane_id': workspace + ':p1', 'workspace_id': workspace}
+                 for terminal, workspace in [('term-a', 'w1'), ('term-b', 'w2'),
+                                              ('term-c', 'w3'), ('term-d', 'w0')]
+                 if not (empty_anchor and terminal == 'term-a')]
+        snapshot = {
+            'panes': panes,
+            'agents': [{**self.snapshot['agents'][0], **pane,
+                        'name': pane['terminal_id'], 'agent_session': {'value': pane['terminal_id']}}
+                       for pane in panes],
+            'workspaces': [
+                {'workspace_id': workspace, 'label': label,
+                 'worktree': {'repo_key': key, 'is_linked_worktree': linked}}
+                for workspace, label, key, linked in [
+                    ('w1', 'Main checkout', '/repo/.git', False),
+                    ('w2', 'Feature two', '/repo/.git', True),
+                    ('w3', 'Feature three', '/repo/.git', True),
+                    ('w0', 'Independent', '/other/.git', False)]]}
+        self.registry.reconcile(snapshot, refresh_display=False)
+        self.environment[OPENER_TERMINAL] = 'term-b'
+        self.environment[OPENER_PANE] = 'w2:p1'
+        return self.app()
+
+    def test_worktree_agents_group_under_anchor_and_mark_actual_opener_current(self):
+        app = self.worktree_role_app()
+        self.assertEqual([agent['terminal_id'] for agent in app.agents()],
+                         ['term-a', 'term-b', 'term-c', 'term-d'])
+        self.assertEqual(app.agents_workspace(), 'w2')
+        app.screen = Screen(30, 160)
+        app.render_agents((0, 0, 30, 160))
+        lines = app.screen.snapshot().lines()
+        text = '\n'.join(lines)
+        self.assertIn('Main checkout · 3', text)
+        self.assertIn('Feature two (worktree) · 1 · current', text)
+        self.assertIn('Feature three (worktree) · 1', text)
+        self.assertNotIn('Main checkout · 3 · current', text)
+        self.assertEqual(text.count('· current'), 1)
+        self.assertLess(text.index('Main checkout ·'), text.index('Independent ·'))
+        for row, line in enumerate(lines):
+            if any(label in line for label in ('Main checkout ·', '(worktree)')):
+                self.assertFalse(any(rect[0] == row for rect, kind, _ in app.hit_map
+                                     if kind == 'list-row'))
+        app.settings_pending['mode'] = 'manual'
+        app.render_agents((0, 0, 30, 160))
+        self.assertEqual(app.settings_pending, {'mode': 'manual'})
+
+    def test_worktree_agents_keep_empty_anchor_header_and_sticky_subworkspace(self):
+        app = self.worktree_role_app(empty_anchor=True)
+        base = next(agent for agent in app.local['agents'] if agent['terminal_id'] == 'term-b')
+        app.local['agents'].extend({**base, 'terminal_id': f'long-{index}', 'alias': f'long-{index:02d}'}
+                                   for index in range(20))
+        self.select_agent(app, 'long-19')
+        for height in range(1, 9):
+            app.screen = Screen(height, 160)
+            app.render_agents((0, 0, height, 160))
+            text = '\n'.join(app.screen.snapshot().lines())
+            self.assertIn('long-19', text)
+            if height >= 4:
+                self.assertIn('Main checkout · 22', text)
+            if height >= 5:
+                self.assertIn('Feature two (worktree) · 21 · current', text)
+
+    def test_worktree_settings_pickers_cover_group_and_save_at_anchor(self):
+        app = self.worktree_role_app()
+        scope = app.current_settings_scope()
+        self.assertEqual(scope, {'repo_id': self.repo_id, 'host': self.store.host,
+                                 'workspace_id': 'w1', 'requested_workspace_id': 'w2'})
+        self.assertTrue(app.matches_settings_scope(app.local['settings']))
+        for field in ('main', 'members'):
+            app.open_settings_picker(field)
+            targets = [value['terminal_id'] for _label, value in app.settings_picker['entries'] if value]
+            self.assertEqual(targets, ['term-a', 'term-b', 'term-c'])
+            self.assertIn('workspace w1 @', app.settings_lines()[0])
+            self.assertIn('role group', app.settings_lines()[0])
+        app.settings_picker = None
+        self.assertIn('opener workspace: w2', app.settings_lines()[0])
+        main = {'host': self.store.host, 'terminal_id': 'term-a'}
+        members = [{'host': self.store.host, 'terminal_id': 'term-c'}]
+        with patch('ledger_display.LedgerDisplay.refresh', return_value={'updated': [], 'failed': []}), \
+             patch('mailbox_tui.maintain', side_effect=lambda store, result, environment: result):
+            for field, value in [('main', main), ('members', members)]:
+                result = execute_job({'operation': 'setting', 'repo_id': self.repo_id,
+                                      'field': field, 'value': value, 'scope': scope}, self.environment)
+                self.assertEqual(result['workspace_id'], 'w1')
+                self.assertEqual(result['requested_workspace_id'], 'w2')
+                self.assertTrue(app.matches_settings_scope(result))
+                self.assertEqual(result['settings'][field]['value'], value)
+        with self.store.read() as connection:
+            rows = connection.execute("SELECT DISTINCT workspace_id FROM workspace_settings WHERE repo_id=?",
+                                      (self.repo_id,)).fetchall()
+        self.assertEqual([row['workspace_id'] for row in rows], ['w1'])
+
+    def test_worktree_anchor_change_invalidates_picker_even_with_same_opener(self):
+        app = self.worktree_role_app()
+        app.open_settings_picker('main')
+        scope = dict(app.settings_picker['scope'])
+        with self.store.transaction() as connection:
+            connection.execute("DELETE FROM workspaces WHERE host=? AND workspace_id='w1'", (self.store.host,))
+        self.assertFalse(app.save_setting('main', None, scope))
+        self.assertIsNone(app.settings_picker)
+        self.assertEqual(app.current_settings_scope()['workspace_id'], 'w2')
+        self.assertNotIn('mutation', app.jobs)
+
+    def test_worktree_settings_opener_move_within_group_invalidates_picker(self):
+        app = self.worktree_role_app()
+        app.open_settings_picker('members')
+        scope = dict(app.settings_picker['scope'])
+        app.environment[OPENER_TERMINAL] = 'term-c'
+        app.environment[OPENER_PANE] = 'w3:p1'
+        self.assertFalse(app.save_setting('members', [], scope))
+        self.assertIsNone(app.settings_picker)
+        self.assertEqual(app.current_settings_scope()['workspace_id'], 'w1')
+        self.assertEqual(app.current_settings_scope()['requested_workspace_id'], 'w3')
+        self.assertNotIn('mutation', app.jobs)
+
+    def test_remote_worktree_group_uses_peer_anchor_and_never_marks_local_current(self):
+        app = self.worktree_role_app()
+        host = 'peer'
+        app.local['peers'].append({'canonical_name': host, 'uuid': 'peer-uuid'})
+        base = next(agent for agent in app.local['agents'] if agent['terminal_id'] == 'term-b')
+        app.remote[host] = {
+            'hosts': [{'host': host, 'uuid': 'peer-uuid'}],
+            'agents': [{**base, 'host': host, 'terminal_id': 'peer-worktree'}],
+            'workspaces': [
+                {'host': self.store.host, 'workspace_id': 'w1', 'label': 'Wrong host label'},
+                {'host': host, 'workspace_id': 'w1', 'label': 'Peer main'},
+                {'host': host, 'workspace_id': 'w2', 'label': 'Peer feature'}]}
+        app.screen = Screen(40, 160)
+        app.render_agents((0, 0, 40, 160))
+        text = '\n'.join(app.screen.snapshot().lines())
+        self.assertIn('Peer main · 1', text)
+        self.assertIn('Peer feature (worktree) · 1', text)
+        self.assertNotIn('Wrong host label', text)
+        self.assertEqual(text.count('· current'), 1)
+        self.assertLess(text.index('Main checkout · 3'), text.index('Peer main · 1'))
+        self.assertFalse(app.settings_agent_in_scope(app.remote[host]['agents'][0]))
 
     def cross_repo_app(self):
         app = self.workspace_app()

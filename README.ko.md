@@ -322,19 +322,25 @@ stale 점유 정리, 토큰 쓰기를 하지 않습니다. verbose 보드·peer 
 적용하지만 설정을 다른 호스트로 전파하지 않습니다. 읽기 전용 명령은 참여 설정을
 초기화하지 않습니다.
 
-모드와 깨우기 임곗값은 저장소 전체에 적용합니다. main과 worker 구성원은
-`(repo_id, 정규 호스트, Herdr workspace_id)`별로 정합니다. worktree workspace도
-메인 체크아웃 workspace의 조정자를 따르지 않고 자체 main을 가집니다.
-workspace 설정은 해당 호스트에만 저장하며 복제하지 않습니다. peer는 상태
-내보내기를 통해 각 에이전트의 역할을 해당 호스트에서 받아 봅니다.
+모드·home·깨우기 임곗값은 저장소 전체에 적용합니다. main과 worker 구성원은
+호스트별 역할 범위 `(repo_id, 정규 호스트, anchor_workspace_id)`로 정합니다.
+연결된 worktree workspace는 같은 호스트에서 Herdr `worktree.repo_key`가 같고
+현재 열려 있는 비연결 workspace를 기준 workspace(anchor)로 삼습니다. 후보가
+여럿이면 결정적인 순서로 하나를 선택합니다. 메타데이터가 없거나 기준 workspace가
+열려 있지 않으면 자체 범위를 유지합니다. 일반 workspace를 git common directory로
+묶지는 않습니다. 기준 workspace에 활성 에이전트가 없으면 연결된 에이전트가 하나만
+남아도 자동 main이 되지 않습니다. 기준 workspace의 main·members 설정을 사용하며,
+연결된 workspace의 기존 설정은 변경하지 않고 그룹에 속한 동안만 무시합니다.
+그룹에서 분리되면 기존 설정이 다시 적용됩니다. 역할 설정은 해당 호스트에만
+저장하며 복제하지 않습니다. peer는 상태 내보내기로 각 호스트가 계산한 역할을 받습니다.
 
 | 모드 | 역할과 자동 동작 |
 | --- | --- |
 | `off` | 역할, 자동 턴 시작, 참여 정책에 따른 기존 전송 거부가 없습니다. 명시적 받은 메일 조회와 일반 사용자 턴 경계에서의 수신은 가능합니다. |
-| `manual` | 해당 workspace 안의 활성 에이전트를 명시적 main으로 지정하며, 선택한 구성원 중 main을 제외한 에이전트가 worker가 됩니다. 비멤버도 일반 턴 경계에서 수신할 수 있지만 자동으로 턴을 시작하지 않습니다. |
-| `auto` | 해당 workspace 안의 활성 에이전트를 지정한 명시적 main이 우선합니다. 지정이 유효하지 않으면 활성 에이전트가 하나일 때 그 에이전트가 main이 됩니다. 여럿이면 저장소의 메인 체크아웃에 있는 에이전트가 정확히 하나일 때만 main이 됩니다. 그 외에는 main이 없으며, main 유무와 관계없이 같은 범위의 나머지 에이전트는 worker가 됩니다. |
+| `manual` | 역할 그룹 안의 활성 에이전트를 명시적 main으로 지정하며, 선택한 그룹 구성원 중 main을 제외한 에이전트가 worker가 됩니다. 비멤버도 일반 턴 경계에서 수신할 수 있지만 자동으로 턴을 시작하지 않습니다. |
+| `auto` | 기준 workspace 설정의 유효한 명시적 main이 우선합니다. 없으면 기준 workspace에 활성 에이전트가 있을 때만 자동으로 선출합니다. 그룹의 활성 에이전트가 하나이면 그 에이전트가, 여럿이면 메인 체크아웃의 활성 에이전트가 정확히 하나일 때 그 에이전트가 main이 됩니다. 그 외에는 main이 없습니다. 나머지 그룹 에이전트는 main 유무와 관계없이 worker가 됩니다. 그룹에 속하지 않은 workspace는 자체 선출 규칙을 유지합니다. |
 
-사이드바와 HAM 소유 pane 테두리는 각 에이전트의 현재 호스트·workspace 범위에
+사이드바와 HAM 소유 pane 테두리는 각 에이전트의 현재 호스트별 역할 그룹에
 따른 역할을 표시합니다. 테두리는 `[메인] alias · summary` 또는 `[워커] alias · summary`로
 표시합니다. 역할이나 요약이 없으면 해당 부분을 생략합니다. 별칭을 요약 앞에 두므로
 Herdr가 긴 내용을 잘라도 별칭보다 요약이 먼저 잘립니다. `status clear`는 phase와
@@ -357,14 +363,14 @@ pane을 옮겨도 슬롯은 유지됩니다. 이전 세대의 불확실한 claim
 저장소에서 찾습니다. 없으면 `agent_not_found`, 여럿이면 후보 주소와 저장소를
 포함한 `agent_ambiguous`로 실패하므로 임의로 선택하지 마세요.
 
-`--to main`은 여전히 송신자의 현재 호스트·저장소·workspace main을 선택하며,
-다른 workspace나 저장소 home으로 대체하지 않습니다.
+`--to main`은 송신자의 현재 호스트·저장소·기준 workspace 역할 그룹의 main을
+선택합니다. 연결된 workspace에서도 같은 main을 사용하며 다른 그룹이나 home으로 대체하지 않습니다.
 `--to main@dxp-api`는 로컬에서, `--to beta/main@org/dxp-api`는 등록된 beta
 호스트에서 해당 저장소의 main을 선택합니다. REPO는 정확한 repo ID를 우선하며,
 그 외에는 경로의 끝 구성요소가 유일하게 일치해야 합니다. 저장소가 여러 개이면
-`repo_ambiguous`로 실패합니다. 선택한 호스트의 해당 저장소 workspace 전체에서
-현재 main이 정확히 하나여야 합니다. 없으면 `main_unresolved`, 여러 workspace에
-있으면 workspace ID 목록과 함께 `main_ambiguous`로 실패합니다.
+`repo_ambiguous`로 실패합니다. 선택한 호스트에서 서로 다른 역할 그룹을 기준으로
+현재 main이 정확히 하나여야 합니다. 없으면 `main_unresolved`, 여러 그룹에 있으면
+기준 workspace ID 목록과 함께 `main_ambiguous`로 실패합니다.
 모든 주소 형식은 보낼 때 구체적인 terminal 대상을 저장합니다.
 주소를 명시한 메일은 workspace와 저장소 경계를 모두 넘을 수 있습니다.
 
@@ -383,10 +389,16 @@ flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. �
 메시지·항목 ID를 유지하고 업그레이드 후 `ledger retry --item OUTBOX_ITEM_UUID`로
 수동 재시도하세요. 새 메일로 다시 보내지 마세요.
 
-원장 스키마 v7은 기존 main·members의 활성 로컬 대상을 현재 workspace 범위로
-옮기고 저장소 단위의 옛 역할 설정을 제거합니다. 프로토콜은 1을 유지하며,
-이전 peer가 보내는 `main`·`members`·`computed_main` 설정은 적용하지 않고
-성공으로 응답합니다. [마이그레이션 안내](docs/ko/migration.md#workspace-역할-마이그레이션스키마-v7)를 참고하세요.
+스키마 v9는 에이전트가 없는 기준 workspace를 포함해 현재 열린 Herdr workspace의
+메타데이터를 호스트별 `workspaces` 테이블에 추가합니다. 기존 workspace 설정은
+이동하거나 삭제하지 않습니다. `repo show`의 `workspace_id`는 기준 workspace이며,
+`requested_workspace_id`는 원래 workspace입니다. 프로토콜은 1을 유지하며 역할 범위
+내보내기 메타데이터는 선택 사항입니다. 이전 peer도 계산된 역할을 받아 볼 수 있습니다.
+이전 코드는 스키마 v9 원장을 열 수 없으므로 각 호스트의 HAM 프로세스와 복사한
+스킬을 함께 갱신하고 다시 시작해야 합니다. 다운그레이드에는 백업한 DB가 필요합니다.
+[스키마 v9 마이그레이션·배포 안내](docs/ko/migration.md#worktree-역할-그룹스키마-v9)를 참고하세요.
+기존 [스키마 v7 안내](docs/ko/migration.md#workspace-역할-마이그레이션스키마-v7)는
+과거 기록이며, workspace별 독립 역할 규칙은 v9의 그룹 규칙으로 대체됐습니다.
 
 스킬 설치는 수신 런타임을 **자동으로 설치하지 않습니다**. 설치기의 명시적 선택이나
 플래그로 동의하거나, 각 호스트에서 `runtime install omp` 또는

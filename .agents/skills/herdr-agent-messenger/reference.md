@@ -26,27 +26,29 @@ zero label matches gives `agent_not_found`, several gives `agent_ambiguous`
 with candidate addresses and repos. Peer registration remains the trust
 boundary; cross-repo mail needs no repository allowlist.
 
-`main` still selects the sender's current repo/host/workspace main.
+`main` selects the sender's current repo/host/anchor role-group main, shared by
+linked workspaces while their anchor is open.
 `[HOST/]main@REPO` instead selects the main of REPO on HOST (default local).
 REPO is an exact repo ID or a unique trailing path-component suffix, such as
 `dxp-api` or `org/dxp-api`; quote the address when necessary. An exact ID wins.
-Among that repo's workspaces on the chosen host, exactly one current main must
-exist. Resolution stores its concrete target; replies/withdrawals do not
-re-resolve it. Remote resolution uses exported role/workspace data.
+Exactly one current main must exist across distinct role groups in that repo on
+the chosen host; linked workspaces in one group do not add candidates.
+Resolution stores its concrete target; replies/withdrawals do not re-resolve it.
+Remote resolution uses computed exported roles and optional role-scope metadata.
 
 | Resolution error | Meaning / action |
 | --- | --- |
 | `repo_ambiguous` | REPO matches several repo IDs; use an exact ID or longer unique suffix. |
-| `main_ambiguous` | Several workspaces have mains; inspect the listed workspace IDs and choose a concrete `HOST/LABEL`. |
-| `main_unresolved` | No current main in the selected scope/repo; inspect status, never fall back to another host/home/workspace. |
+| `main_ambiguous` | Several distinct role groups have mains; inspect listed anchor workspace IDs and choose a concrete `HOST/LABEL`. |
+| `main_unresolved` | No current main in the selected group/repo; inspect status, never fall back to another host/home/group. |
 | `agent_ambiguous` | A label matches several agents across repos; inspect candidate addresses/repos rather than guessing. |
 
 Examples: `mail send --to main@dxp-api --body 'Review the API contract.'`
 or `mail send --to beta/main@org/dxp-api --body 'Review the API contract.'`.
 Before using legacy `send`, `request` or `batch`, inspect repository participation:
 manual/auto same-repository traffic between participating agents is refused with
-`use_mailbox`, with each endpoint's role evaluated in its own host-qualified
-workspace. Use `mail send`, not another transport. All batch targets are
+`use_mailbox`, with each endpoint's role evaluated in its own host-local
+role group. Use `mail send`, not another transport. All batch targets are
 resolved and policy-checked before any dispatch; a refusal or discovery/policy
 failure aborts the coordinated batch without partial submission. Off-mode,
 nonparticipating and other-repository legacy traffic retains its previous
@@ -340,46 +342,78 @@ The Python settings service is
 `RepoSettings(store).show(repo_id,host,workspace_id)` and
 `mutate(repo_id,field,value,*,host=None,workspace_id=None)`, reserved for the user
 Settings UI, with **no agent mutation CLI**. `main` and `members` mutations
-require an explicit local host/workspace scope and reject inactive or
-out-of-scope targets. `main` is `null` or `{host,terminal_id}`; `members` is a
+require an explicit local host/workspace request, resolve its anchor role group,
+and reject inactive or out-of-group targets. `main` is `null` or `{host,terminal_id}`; `members` is a
 unique list of those targets. `mode` (`off|manual|auto`) and `thresholds`
 (`idle_minutes:3,coalesce_seconds:30,wakes_per_hour:6,max_hop:10` defaults)
 remain repo-wide, as does read-only `home`.
 
-`fields(connection,repo_id)` contains only repo-wide fields;
-`workspace_fields(connection,repo_id,host,workspace_id)` reads the local scope.
-`main(connection,repo_id,host,workspace_id)` selects that scope's main;
-`role(agent,connection=None)` is the shared role calculation for runtime,
-status export, sidebar and borders. Replicated fields independently win by
+`fields(connection,repo_id)` contains only repo-wide fields.
+`scope_workspace` centrally resolves the requested workspace to its anchor;
+`scope_agents` selects the active repo/host agents across that role group.
+`workspace_fields(connection,repo_id,host,workspace_id)` reads anchor settings;
+`main(connection,repo_id,host,workspace_id)` selects that group's main.
+`show` reports `workspace_id` as anchor and `requested_workspace_id` as original.
+`role(agent,connection=None)` shares that calculation across runtime, status
+export, sidebar and borders. Replicated fields independently win by
 `(version,origin_host)`; same-version different values record the deterministic
 canonical-name winner and conflict. Different fields' concurrent edits survive.
-Workspace main/member settings stay on their owning host and never enter peer
-publication or repo-wide conflict/member projections. Peers receive each
-agent's authoritative role through origin-host status export.
+Main/member settings stay host-local and never enter peer publication or
+repo-wide conflict/member projections. Peers consume origin-host computed roles;
+additive role-scope export metadata is optional under unchanged protocol 1.
 
 First enabling a repository creates a version-1 home proposal; **offline peers
 do not prevent local use**. Observed concurrent home proposals converge by
 canonical-name tie order. Home is not the authority for workspace roles.
 Main election is derived on read, not stored or published as `computed_main`.
-A valid explicit main must be active in the exact `(repo_id, host, workspace_id)`
-scope. A target that becomes inactive or moves out is ignored without rewriting
-the setting. In auto mode, the sole active agent becomes main; with several,
-exactly one active main-checkout agent becomes main. Otherwise there is none.
-A single agent in a worktree workspace therefore gets its own main role.
+A valid explicit main must be active in the same repo/host/anchor role group.
+A target that becomes inactive or moves out is ignored without rewriting the
+setting. Auto election otherwise requires an active agent in the anchor:
+the sole active group agent wins, or, with several, the unique active
+main-checkout agent. An open anchor with no agent yields no auto main even if
+only one linked agent exists. All other auto group agents remain workers.
 
 `--to main` resolves on the sender's host at send time against the sender's
 current scope and stores the concrete terminal target in the immutable message.
-Missing main produces `main_unresolved` naming the workspace; there is no
-fallback to a repo-global main, another workspace, or an offline home route.
+Missing main produces `main_unresolved` naming the scope; there is no fallback
+to a repo-global main, another role group, or an offline home route.
 Receipts and withdrawals follow the saved target. Explicit named mail crosses
 both workspaces and repositories. `[HOST/]main@REPO` selects the unique main
-across that repo's workspaces on the chosen host, as described under
+across distinct role groups on the chosen host, as described under
 **Recipient selectors**; it does not change plain `main` semantics.
 Legacy unresolved symbolic messages, including remote-origin sends and home
 relays, fail with `legacy_symbolic_main` and an instruction to upgrade every
 host. Upgrade and run `ledger reconcile` on every host before using these routes.
 
 #### Workspace role migration
+Schema v9 adds a host-local `workspaces` table with `host`, `workspace_id`,
+`repo_key`, `is_linked_worktree` and `label` from the open Herdr snapshot,
+including workspaces with no agents. For the same repo and host, linked
+workspaces join a deterministically selected open nonlinked workspace with the
+same Herdr `worktree.repo_key`. No metadata or no open anchor means their own
+workspace scope. There is no git-common-directory fallback for plain workspaces.
+Anchor opening/closing or group membership changes refresh affected roles.
+
+Only the anchor's explicit main/member settings apply while grouped. Existing
+linked-workspace settings are neither migrated nor copied nor deleted: they
+remain unchanged, ignored while grouped, and apply again when ungrouped.
+An explicit main may be any active agent in the group. Mode, home and thresholds
+remain repo-wide. All main/member reads, mutation validation and recipient
+resolution use the same group.
+
+Back up the database before upgrade. Stop old HAM processes sharing the host
+ledger, update host code and copied skills together, run upgraded `ledger reconcile`
+to migrate writable storage to v9, then restart the host's HAM processes.
+Read-only opens do not migrate. Protocol 1 is unchanged and old peers may consume
+computed roles without optional scope metadata, but still compute old semantics
+for their own agents. Old code cannot open schema-v9 storage: do not mix versions
+on one host ledger. Downgrade requires restoring the backed-up database.
+OMP extension and Claude hook contracts are unchanged.
+See [current migration and rollout](../../../docs/migration.md#worktree-role-grouping-schema-v9).
+
+The following v7 migration is historical; v9 supersedes its independent
+workspace role semantics:
+
 
 Schema v7 creates local workspace settings. During v6→v7 migration, legacy
 repo-level main/member targets matching active local agents are mapped to each
@@ -391,7 +425,7 @@ own targets independently. Unmappable inactive/unknown local targets are dropped
 are removed. Protocol remains 1:
 incoming legacy role fields succeed without applying changes, so older peer
 outboxes do not fail permanently. New code publishes only repo-wide settings.
-See [migration guidance](../../../docs/migration.md#workspace-role-migration-schema-v7).
+See [historical v7 migration](../../../docs/migration.md#workspace-role-migration-schema-v7).
 
 ### Modes, roles, settings and status
 
@@ -418,8 +452,8 @@ hosts may temporarily disagree until settings propagate; there is no home failov
 | Mode | Main | Workers / receiving |
 | --- | --- | --- |
 | `off` | None | No roles or automatic wakes, and no participation-based legacy rejection. Explicit inbox reads and natural user-turn receiving remain allowed. |
-| `manual` | Active explicit user-designated terminal in the same repo/host/workspace, otherwise none | Explicit in-scope members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
-| `auto` | Active in-scope explicit designation first; otherwise the sole active agent; with several, exactly one active main-checkout agent in the scope | All other agents in that scope, even when no main can be selected. Worktree workspaces elect independently; identical workspace IDs on different hosts do not collide. |
+| `manual` | Active explicit user-designated terminal in the same repo/host/anchor role group, otherwise none | Anchor's explicit group members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
+| `auto` | Active group explicit designation first; otherwise requires an active anchor agent, then the sole active group agent or unique active main-checkout agent | All other group agents, even without a main. An open no-agent anchor prevents auto main even with one linked agent. Ungrouped workspaces keep independent election; host IDs never collide. |
 
 The stable terminal slot survives a pane move; roles follow its current scope,
 and displays in both the old and new scopes are refreshed. A new native

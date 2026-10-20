@@ -245,7 +245,12 @@ def settings_scope(store: LedgerStore, repo_id: str | None,
             if pane and pane.get("workspace_id"):
                 workspace_id = pane["workspace_id"]
                 break
-    return {"repo_id": repo_id, "host": store.host, "workspace_id": workspace_id}
+    requested_workspace_id = workspace_id
+    if repo_id and workspace_id:
+        with store.read() as connection:
+            workspace_id = RepoSettings.scope_workspace(connection, repo_id, store.host, workspace_id)
+    return {"repo_id": repo_id, "host": store.host, "workspace_id": workspace_id,
+            "requested_workspace_id": requested_workspace_id}
 
 
 class SnapshotCache:
@@ -299,7 +304,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
     board = status_board(store, repo_id=None, host="local", environment=environment, **board_options)
     agents = board["agents"]
     panes = []
-    workspaces = []
+    workspaces = board.get("workspaces", [])
     if environment is not None:
         try:
             if cache is None:
@@ -309,7 +314,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
                 live_snapshot = cache.herdr_snapshot(environment, agents=agents)
             if live_snapshot is not None:
                 panes = live_snapshot.get("panes", [])
-                workspaces = live_snapshot.get("workspaces", [])
+                workspaces = live_snapshot.get("workspaces", workspaces)
                 labels = {pane["terminal_id"]: pane.get("label") or "" for pane in panes}
                 for agent in agents:
                     current = labels.get(agent["terminal_id"], "")
@@ -329,7 +334,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
                 "peers": RemoteLedger(store).peers(), "outbox": RemoteLedger(store).outbox()}
     scope = snapshot["scope"]
     if repo_id:
-        snapshot["settings"] = (settings.show(repo_id, scope["host"], scope["workspace_id"])
+        snapshot["settings"] = (settings.show(repo_id, scope["host"], scope["requested_workspace_id"])
                                 if scope["workspace_id"] else settings.show(repo_id))
     host = next((item for item in board.get("hosts", []) if item["host"] == store.host), {})
     if "resources" in host:
@@ -427,7 +432,7 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
         settings = RepoSettings(store)
         result = settings.mutate(repo_id, request["field"], request["value"],
                                  host=scope["host"] if scope["workspace_id"] else None,
-                                 workspace_id=scope["workspace_id"])
+                                 workspace_id=scope["requested_workspace_id"])
         from ledger_display import LedgerDisplay
         result["display"] = LedgerDisplay(store).refresh()
         return maintain(store, result, environment)
@@ -877,14 +882,17 @@ class MailboxApp:
                 stale = host in self.remote_errors or agent.get("stale", False)
                 values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
         local_host = self.local.get("host")
-        workspace = self.agents_workspace()
+        scope = self.local.get("scope", self.settings_context)
+        workspace = scope.get("workspace_id")
         return sorted(values, key=lambda agent: (
             self.repo_id is not None and agent["repo_id"] != self.repo_id,
             agent["host"] != local_host, agent["host"],
             (Path(agent["repo_id"]).name, agent["repo_id"])
             if self.repo_id is not None and agent["repo_id"] != self.repo_id else ("", ""),
-            not (agent["host"] == local_host and workspace and agent.get("workspace_id") == workspace),
-            not bool(agent.get("workspace_id")), agent.get("workspace_id") or "",
+            not (agent["host"] == local_host and workspace and self.role_workspace(agent) == workspace),
+            not bool(self.role_workspace(agent)), self.role_workspace(agent) or "",
+            agent.get("workspace_id") != self.role_workspace(agent),
+            agent.get("workspace_id") or "",
             agent.get("alias") or "", agent["terminal_id"]))
 
     def agents_workspace(self) -> str | None:
@@ -892,7 +900,12 @@ class MailboxApp:
         # order stable until tick() can restore selection by identity on refresh;
         # reading the live ledger here could reorder the OLD snapshot first.
         # current_settings_scope() would also discard pending Settings edits.
-        return self.local.get("scope", self.settings_context).get("workspace_id")
+        scope = self.local.get("scope", self.settings_context)
+        return scope.get("requested_workspace_id", scope.get("workspace_id"))
+
+    @staticmethod
+    def role_workspace(agent: Mapping[str, Any]) -> str | None:
+        return agent.get("role_workspace_id") or agent.get("workspace_id") or None
 
     def workspace_label(self, host: str, workspace: str | None,
                         agents: Sequence[Mapping[str, Any]]) -> str:
@@ -900,10 +913,11 @@ class MailboxApp:
             return "No workspace"
         snapshot = self.local if host == self.local.get("host") else self.remote.get(host, {})
         for item in snapshot.get("workspaces", []):
-            if item.get("workspace_id") == workspace and item.get("label"):
+            if (item.get("host", host) == host and item.get("workspace_id") == workspace
+                    and item.get("label")):
                 return str(item["label"])
         # Pane labels name panes, not workspaces. Only explicit workspace labels
-        # are suitable here; current remote ledger boards normally carry IDs only.
+        # are suitable here; older peer boards may carry workspace IDs only.
         for item in [*snapshot.get("panes", []), *agents]:
             if item.get("workspace_id") == workspace and item.get("workspace_label"):
                 return str(item["workspace_label"])
@@ -1308,10 +1322,16 @@ class MailboxApp:
                     and settings.get("host") in {None, scope["host"]})
         return bool(settings) and all(settings.get(key) == value for key, value in scope.items())
 
-    def settings_agent_in_scope(self, agent: Mapping[str, Any]) -> bool:
+    def settings_agent_in_scope(self, agent: Mapping[str, Any], *, live: bool = True) -> bool:
         scope = self.current_settings_scope()
-        return (all(agent.get(key) == scope[key] for key in ("repo_id", "host", "workspace_id"))
-                and not agent.get("stale") and agent.get("active", True))
+        if (not scope["workspace_id"] or
+                any(agent.get(key) != scope[key] for key in ("repo_id", "host")) or
+                not agent.get("workspace_id") or
+                (live and (agent.get("stale") or not agent.get("active", True)))):
+            return False
+        with self.store.read() as connection:
+            return RepoSettings.scope_workspace(
+                connection, scope["repo_id"], scope["host"], agent["workspace_id"]) == scope["workspace_id"]
 
     def configured_members_in_scope(self) -> list[dict[str, Any]]:
         scope = self.current_settings_scope()
@@ -1320,15 +1340,15 @@ class MailboxApp:
         for target in self.setting_value("members") or []:
             agent = known.get((target["host"], target["terminal_id"]))
             if (target["host"] == scope["host"] and
-                    (agent is None or all(agent.get(key) == scope[key]
-                                          for key in ("repo_id", "host", "workspace_id")))):
+                    (agent is None or self.settings_agent_in_scope(agent, live=False))):
                 members.append(target)
         return members
 
     def setting_label(self, field: str) -> str:
         scope = self.current_settings_scope()
         if field in {"main", "members"}:
-            return f"{field.title()} (workspace {scope['workspace_id'] or 'unavailable'} @ {scope['host']})"
+            return (f"{field.title()} (workspace {scope['workspace_id'] or 'unavailable'}"
+                    f" @ {scope['host']}) · role group")
         return f"{field} (repo-wide)" if field == "mode" else field
 
     def setting_value(self, field: str) -> Any:
@@ -1386,10 +1406,15 @@ class MailboxApp:
             entries = [
                 ("off · No main or worker roles.", "off"),
                 ("manual · Explicit main and checked members only.", "manual"),
-                ("auto · Infer this workspace's sole agent or unique main-checkout agent; others are workers.", "auto"),
+                ("auto · Infer the group's sole agent or unique main-checkout agent; an empty linked anchor has no auto main.", "auto"),
             ]
         else:
-            agents = [agent for agent in self.agents() if self.settings_agent_in_scope(agent)]
+            scope = self.current_settings_scope()
+            with self.store.read() as connection:
+                active = {(agent["host"], agent["terminal_id"]) for agent in RepoSettings.scope_agents(
+                    connection, scope["repo_id"], scope["host"], scope["workspace_id"])} if scope["workspace_id"] else set()
+            agents = [agent for agent in self.agents()
+                      if self.identity(agent) in active and self.settings_agent_in_scope(agent)]
             entries = [("(none)", None)] if field == "main" else []
             for agent in agents:
                 if not agent.get("stale"):
@@ -1509,7 +1534,7 @@ class MailboxApp:
         if key in ("m", " "):
             agent = self.selected("agents")
             if not agent or not self.settings_agent_in_scope(agent):
-                self.set_status("Choose a live agent in the opener's workspace on this host first.", "error")
+                self.set_status("Choose a live agent in the opener's workspace role group on this host first.", "error")
                 return
             target = {name: agent[name] for name in ("host", "terminal_id")}
             field, value = "main", target
@@ -2211,12 +2236,15 @@ class MailboxApp:
                     # Long sections retain context without hiding the selected row.
                     context = [line for line in lines[section:first_agent]
                                if line[1] in {-2, -3}][:height - 1]
-                    workspace = next((index for index in range(chosen, section, -1)
-                                      if lines[index][1] == -4), None)
+                    anchor = next((index for index in range(chosen, section, -1)
+                                   if lines[index][1] == -4), None)
+                    workspace = next((index for index in range(chosen, anchor or section, -1)
+                                      if lines[index][1] == -5), None)
                     body_start = first_agent
-                    if workspace is not None and len(context) < height - 1:
-                        context.append(lines[workspace])
-                        body_start = workspace + 1
+                    for heading in (anchor, workspace):
+                        if heading is not None and len(context) < height - 1:
+                            context.append(lines[heading])
+                            body_start = heading + 1
                     body_height = height - len(context)
                     scroll = max(body_start, min(scroll, chosen), chosen - body_height + 1)
                     self.scrolls[region] = scroll
@@ -2274,19 +2302,33 @@ class MailboxApp:
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
             previous_group: Any = object()
+            previous_workspace: Any = object()
             for index, agent in group:
-                group_key = agent["repo_id"] if other_repos else agent.get("workspace_id") or None
+                group_key = agent["repo_id"] if other_repos else (agent["repo_id"], self.role_workspace(agent))
+                workspace = agent.get("workspace_id") or None
+                anchor = self.role_workspace(agent)
                 if group_key != previous_group:
                     members = [item for _, item in group
-                               if (item["repo_id"] if other_repos else item.get("workspace_id") or None) == group_key]
-                    current = bool(not other_repos and group_key and host == self.local.get("host")
-                                   and group_key == current_workspace)
+                               if (item["repo_id"] if other_repos else
+                                   (item["repo_id"], self.role_workspace(item))) == group_key]
+                    current = bool(not other_repos and anchor and host == self.local.get("host")
+                                   and anchor == current_workspace)
                     suffix = f" · {len(members)}" + (" · current" if current else "")
                     name = (Path(group_key).name if other_repos else
-                            self.workspace_label(host, group_key, members))
+                            self.workspace_label(host, anchor, members))
                     label = "  " + truncate_display_text(name, max(0, width - 2 - display_width(suffix))) + suffix
                     lines.append((label, -4, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
                     previous_group = group_key
+                    previous_workspace = object()
+                if not other_repos and workspace != anchor and workspace != previous_workspace:
+                    members = [item for _, item in group if item["repo_id"] == agent["repo_id"]
+                               and item.get("workspace_id") == workspace and self.role_workspace(item) == anchor]
+                    current = bool(host == self.local.get("host") and workspace == current_workspace)
+                    suffix = f" (worktree) · {len(members)}" + (" · current" if current else "")
+                    name = self.workspace_label(host, workspace, members)
+                    label = "    " + truncate_display_text(name, max(0, width - 4 - display_width(suffix))) + suffix
+                    lines.append((label, -5, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
+                previous_workspace = workspace
                 chosen = index == self.selections["agents"]
                 marker = "▌" if chosen and self.focus == "agents" else " "
                 turn = agent.get("turn_state") or "unknown"
@@ -2800,7 +2842,9 @@ class MailboxApp:
             return result
         scope = self.current_settings_scope()
         result = [f"Target: repository {self.repo_id or '(select an agent first)'} · "
-                  f"workspace {scope['workspace_id'] or 'unavailable'} @ {scope['host']}"]
+                  f"workspace {scope['workspace_id'] or 'unavailable'} @ {scope['host']} · role group · "
+                  f"opener workspace: {scope['requested_workspace_id'] or 'unavailable'} · "
+                  "Main/member changes save at the anchor."]
         for index, field in enumerate(self.SETTINGS):
             value = self.settings_pending.get(field, self.setting_value(field))
             if field in DEFAULT_THRESHOLDS:

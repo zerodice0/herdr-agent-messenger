@@ -68,6 +68,63 @@ class WorkerHandoffTest(unittest.TestCase):
         registry.reconcile(shells, refresh_display=False)
         self.assertFalse(ledger_worker.maintenance_pending(self.store))
 
+    def test_anchor_main_watches_linked_shell_and_tracks_group_moves_and_close(self):
+        registry = AgentRegistry(self.store)
+        observed = snapshot(self.repo, moved=True)
+        observed["workspaces"] = [
+            {"workspace_id": "w1", "worktree": {"repo_key": "/repo/.git", "is_linked_worktree": False}},
+            {"workspace_id": "w2", "worktree": {"repo_key": "/repo/.git", "is_linked_worktree": True}},
+            {"workspace_id": "w3", "worktree": {"repo_key": "/repo/.git", "is_linked_worktree": True}},
+        ]
+        registry.reconcile(observed, refresh_display=False)
+        settings = RepoSettings(self.store)
+        with patch.object(RepoSettings, "_display_result", return_value={}):
+            settings.mutate(self.sender["repo_id"], "main",
+                            {"host": self.store.host, "terminal_id": "term-b"},
+                            host=self.store.host, workspace_id="w2")
+        observed["agents"] = []
+        registry.reconcile(observed, refresh_display=False)
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        target = next(pane for pane in observed["panes"] if pane["terminal_id"] == "term-b")
+        target["workspace_id"] = "w3"
+        registry.reconcile(observed, refresh_display=False)
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        target["workspace_id"] = "unrelated"
+        registry.reconcile(observed, refresh_display=False)
+        self.assertFalse(ledger_worker.maintenance_pending(self.store))
+        target["workspace_id"] = "w2"
+        registry.reconcile(observed, refresh_display=False)
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        observed["workspaces"] = observed["workspaces"][1:]
+        observed["panes"] = [target]
+        registry.reconcile(observed, refresh_display=False)
+        self.assertFalse(ledger_worker.maintenance_pending(self.store))
+
+    def test_ignored_linked_main_setting_does_not_watch_until_anchor_closes(self):
+        registry = AgentRegistry(self.store)
+        observed = snapshot(self.repo, moved=True)
+        registry.reconcile(observed, refresh_display=False)
+        settings = RepoSettings(self.store)
+        with patch.object(RepoSettings, "_display_result", return_value={}):
+            settings.mutate(self.sender["repo_id"], "main",
+                            {"host": self.store.host, "terminal_id": "term-b"},
+                            host=self.store.host, workspace_id="w2")
+        with self.store.read() as connection:
+            retained = [tuple(row) for row in connection.execute("SELECT * FROM workspace_settings")]
+        observed["agents"] = []
+        observed["workspaces"] = [
+            {"workspace_id": "w1", "worktree": {"repo_key": "/repo/.git", "is_linked_worktree": False}},
+            {"workspace_id": "w2", "worktree": {"repo_key": "/repo/.git", "is_linked_worktree": True}},
+        ]
+        registry.reconcile(observed, refresh_display=False)
+        self.assertFalse(ledger_worker.maintenance_pending(self.store))
+        observed["workspaces"] = observed["workspaces"][1:]
+        observed["panes"] = [pane for pane in observed["panes"] if pane["terminal_id"] == "term-b"]
+        registry.reconcile(observed, refresh_display=False)
+        self.assertTrue(ledger_worker.maintenance_pending(self.store))
+        with self.store.read() as connection:
+            self.assertEqual([tuple(row) for row in connection.execute("SELECT * FROM workspace_settings")], retained)
+
     def test_enabled_mode_keeps_worktree_workspace_maintenance_without_main(self):
         registry = AgentRegistry(self.store)
         registry.reconcile(snapshot(self.repo, moved=True), refresh_display=False)

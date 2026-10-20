@@ -251,6 +251,20 @@ class AgentRegistry:
         raw_agents = snapshot.get("agents")
         if not isinstance(panes, list) or not isinstance(raw_agents, list):
             raise LedgerError("invalid_snapshot", "A complete panes+agents snapshot is required.")
+        raw_workspaces = snapshot.get("workspaces", [])
+        if not isinstance(raw_workspaces, list):
+            raise LedgerError("invalid_snapshot", "Workspace metadata must be a list.")
+        workspaces: dict[str, tuple[str, int, str]] = {}
+        for raw in raw_workspaces:
+            if not isinstance(raw, dict) or not raw.get("workspace_id"):
+                raise LedgerError("invalid_snapshot", "Every workspace must identify its location.")
+            workspace_id = str(raw["workspace_id"])
+            if workspace_id in workspaces:
+                raise LedgerError("invalid_snapshot", "Duplicate workspace in snapshot.")
+            worktree = raw.get("worktree")
+            repo_key = str(worktree.get("repo_key") or "") if isinstance(worktree, dict) else ""
+            linked = int(bool(worktree.get("is_linked_worktree"))) if isinstance(worktree, dict) else 0
+            workspaces[workspace_id] = (repo_key, linked, str(raw.get("label") or workspace_id))
         locations: dict[str, dict[str, str]] = {}
         for raw in panes:
             if not isinstance(raw, dict) or not raw.get("terminal_id") or not raw.get("pane_id"):
@@ -297,6 +311,22 @@ class AgentRegistry:
             from ledger_settings import RepoSettings
             settings = RepoSettings(self.store)
             affected_scopes: set[tuple[str, str, str]] = set()
+            old_scope_by_workspace: dict[tuple[str, str, str], str] = {}
+            old_scope_terminals: dict[tuple[str, str, str], set[str]] = {}
+            for agent in connection.execute("SELECT * FROM agents WHERE host=? AND active=1", (self.store.host,)):
+                scope = (agent["repo_id"], agent["host"], agent["workspace_id"])
+                anchor = settings.scope_workspace(connection, *scope)
+                old_scope_by_workspace[scope] = anchor
+                old_scope_terminals.setdefault((*scope[:2], anchor), set()).add(agent["terminal_id"])
+            # This is a complete open-workspace snapshot, including empty anchors.
+            # Missing worktree metadata deliberately restores independent scopes.
+            connection.execute("DELETE FROM workspaces WHERE host=?", (self.store.host,))
+            connection.executemany("INSERT INTO workspaces VALUES (?,?,?,?,?)",
+                                   [(self.store.host, workspace_id, *metadata)
+                                    for workspace_id, metadata in workspaces.items()])
+            for scope, old_anchor in old_scope_by_workspace.items():
+                if settings.scope_workspace(connection, *scope) != old_anchor:
+                    affected_scopes.add(scope)
             old_terminals = {row[0] for row in connection.execute(
                 "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (self.store.host,))}
             for terminal, location in locations.items():
@@ -355,10 +385,15 @@ class AgentRegistry:
                     changed_panes.add(value["pane_id"])
             # A move, arrival or departure can change the derived main for every
             # survivor in both scopes, even when their own registry rows did not change.
+            current_panes = {row["terminal_id"]: row["pane_id"] for row in connection.execute(
+                "SELECT terminal_id,pane_id FROM agents WHERE host=? AND active=1", (self.store.host,))}
             for repo_id, host, workspace_id in affected_scopes:
-                changed_panes.update(row[0] for row in connection.execute(
-                    "SELECT pane_id FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND active=1",
-                    (repo_id, host, workspace_id)))
+                old_anchor = old_scope_by_workspace.get((repo_id, host, workspace_id), workspace_id)
+                changed_panes.update(current_panes[terminal] for terminal in
+                                     old_scope_terminals.get((repo_id, host, old_anchor), ())
+                                     if terminal in current_panes)
+                changed_panes.update(agent["pane_id"] for agent in settings.scope_agents(
+                    connection, repo_id, host, workspace_id))
             changed_ids: list[str] = []
             for row in connection.execute(
                     "SELECT d.message_id,d.recipient_terminal_id,d.recipient_repo_id,d.state FROM deliveries d "
@@ -410,7 +445,12 @@ class AgentRegistry:
             if repo_id is not None:
                 query += " AND a.repo_id=?"
                 parameters = (repo_id,)
-            return [dict(row) for row in connection.execute(query + " ORDER BY a.host,a.alias,a.terminal_id", parameters)]
+            from ledger_settings import RepoSettings
+            settings = RepoSettings(self.store)
+            return [{**dict(row), "role": settings.role(row, connection=connection),
+                     "role_workspace_id": settings.scope_workspace(
+                         connection, row["repo_id"], row["host"], row["workspace_id"])}
+                    for row in connection.execute(query + " ORDER BY a.host,a.alias,a.terminal_id", parameters)]
 
     def resolve_context(self, environment: Mapping[str, str] | None = None,
                         snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:

@@ -45,18 +45,78 @@ confirm `extension_present=1`, or report **installed, activation pending**.
 Plugin loading never writes client configuration; the new-repository `auto`
 default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
 
-## Workspace role migration (schema v7)
+## Worktree role grouping (schema v9)
 
-A writable ledger open upgrades older ledgers additively to schema v7.
+This is the current role contract; the schema-v7 section below is historical.
+Roles, main/member selection, Settings mutations and `--to main` share
+`(repo_id, canonical host, anchor_workspace_id)`. Mode, home and wake thresholds
+remain repository-wide.
+
+The additive `workspaces` table stores `host`, `workspace_id`, `repo_key`,
+`is_linked_worktree` and `label` for open workspaces from the Herdr snapshot,
+including workspaces with no agents. For the same repo and host, a linked
+workspace anchors to a deterministically selected open nonlinked workspace
+with matching Herdr `worktree.repo_key`. Without that metadata or an open
+anchor, it retains its own workspace scope. There is no git-common-directory
+fallback: ordinary workspaces must not be conflated.
+
+Existing `workspace_settings` rows are not migrated, copied or deleted.
+While linked workspaces are grouped, only the anchor's explicit main/member
+settings apply; linked settings remain unchanged and apply again if ungrouped.
+A valid explicit main may be anywhere in the group. Otherwise auto mode elects
+from active group agents only when the anchor has an active agent: the sole
+agent, or, with several, the unique active main-checkout agent. An open anchor
+without an agent has **no auto main**, even with a sole linked agent. Manual
+workers are the anchor's selected group members except main; auto workers are
+all other group agents. Opening/closing an anchor changes the group and refreshes
+affected roles. `repo show` returns `workspace_id` as the resolved anchor and
+`requested_workspace_id` as the original workspace.
+
+`--to main` resolves the sender's group and saves a concrete target; it does not
+choose another group or home. `[HOST/]main@REPO` counts distinct role groups,
+not each linked workspace: zero mains gives `main_unresolved`, several groups
+with mains give `main_ambiguous`. Named `HOST/LABEL` addressing is unchanged.
+
+### Storage upgrade and mixed-version rollout
+
+1. Back up each host's ledger database before upgrading. Stop its old HAM
+   plugin/worker/Mailbox processes and receiving sessions that load HAM code;
+   deploy the same upgraded code and refresh copied skills together on that host.
+   Do not let old and new processes share the upgraded ledger.
+2. From the updated HAM checkout on each host, run
+   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`.
+   Writable reconciliation upgrades older storage to schema v9 and records the
+   open-workspace metadata. Read-only commands never perform the migration.
+3. Restart the host's HAM processes with the upgraded code. The OMP extension
+   and Claude hook contracts are unchanged; no new adapter/hook configuration
+   is required. Resume group-dependent routing after the participating hosts
+   have upgraded and reconciled.
+
+Protocol remains **1**. Optional additive role-scope metadata in status exports
+does not require peer support: old peers can display the origin host's computed
+roles. They still compute old semantics for their own local agents until
+upgraded. Legacy role-setting payloads remain successful no-ops; only repo-wide
+settings replicate. Schema-v8 mail compatibility requirements still apply.
+Wire compatibility does **not** imply shared-database compatibility: old code
+cannot open a schema-v9 database. A downgrade requires restoring the backed-up
+pre-upgrade database, not editing a schema-version marker.
+
+## Workspace role migration (schema v7)
+> Historical v6→v7 migration record. Its independent-workspace role semantics
+> are superseded by [schema-v9 worktree grouping](#worktree-role-grouping-schema-v9).
+> Use the v9 rollout above for current deployments.
+
+
+At the time of schema v7, a writable ledger open upgraded older ledgers to v7.
 During rollout, run `ledger reconcile` on each host before using read commands.
 Read-only opening of a v6 ledger returns `schema_upgrade_required`, directing
 the user to run `ledger reconcile`; it never migrates or otherwise mutates the
 ledger on read.
 
-Main and worker membership now belong to `(repo_id, canonical host, Herdr workspace_id)`, so
-each worktree workspace can have its own main. Mode, home and wake thresholds
-remain repository-wide; mail history and explicit named cross-workspace mail
-remain repository-wide too.
+Schema v7 assigned main and worker membership to
+`(repo_id, canonical host, Herdr workspace_id)`, allowing independent worktree
+mains. Schema v9 supersedes that election boundary with role groups. Mode,
+home, wake thresholds and mail history remained repository-wide.
 
 On each host, migration maps legacy repo-level `main` and `members` targets
 matching active local agents into those agents' current scopes, grouping
@@ -87,7 +147,7 @@ Mailbox Settings labels repo-wide Mode/Thresholds separately from the
 opener's workspace Main/Members. Update copied skills along with the host
 code so agents use this routing and role contract.
 
-Deploy schema v7 on **every host**, in this order:
+The historical schema-v7 deployment sequence was:
 
 1. Update the HAM code and copied skills on every host; replace old Mailbox
    panes and restart receiving runtimes/workers with the upgraded code.

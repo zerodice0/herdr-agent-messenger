@@ -87,15 +87,40 @@ class RepoSettings:
             "SELECT * FROM repo_settings WHERE repo_id=?", (repo_id,))}
 
     @staticmethod
+    def scope_workspace(connection: Any, repo_id: str, host: str, workspace_id: str) -> str:
+        """Resolve only Herdr's host-local linked-worktree metadata, never Git paths."""
+        workspace = connection.execute(
+            "SELECT repo_key,is_linked_worktree FROM workspaces WHERE host=? AND workspace_id=?",
+            (host, workspace_id)).fetchone()
+        if workspace is None or not workspace["repo_key"] or not workspace["is_linked_worktree"]:
+            return workspace_id
+        anchor = connection.execute(
+            "SELECT workspace_id FROM workspaces WHERE host=? AND repo_key=? AND is_linked_worktree=0 "
+            "ORDER BY workspace_id LIMIT 1", (host, workspace["repo_key"])).fetchone()
+        return anchor["workspace_id"] if anchor is not None else workspace_id
+
+    @staticmethod
+    def scope_agents(connection: Any, repo_id: str, host: str, workspace_id: str) -> list[dict[str, Any]]:
+        anchor = RepoSettings.scope_workspace(connection, repo_id, host, workspace_id)
+        return [dict(row) for row in connection.execute(
+            "SELECT * FROM agents WHERE repo_id=? AND host=? AND active=1 ORDER BY workspace_id,terminal_id",
+            (repo_id, host))
+            if RepoSettings.scope_workspace(connection, repo_id, host, row["workspace_id"]) == anchor]
+
+    @staticmethod
     def workspace_fields(connection: Any, repo_id: str, host: str,
                          workspace_id: str) -> dict[str, dict[str, Any]]:
+        workspace_id = RepoSettings.scope_workspace(connection, repo_id, host, workspace_id)
         return {row["field"]: {**dict(row), "value": json.loads(row["value"])} for row in connection.execute(
             "SELECT * FROM workspace_settings WHERE repo_id=? AND host=? AND workspace_id=?",
             (repo_id, host, workspace_id))}
 
     def show(self, repo_id: str, host: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+        requested_workspace_id = workspace_id
         with self.store.read() as connection:
             fields = self.fields(connection, repo_id)
+            if host is not None and workspace_id is not None:
+                workspace_id = self.scope_workspace(connection, repo_id, host, workspace_id)
             scoped = self.workspace_fields(connection, repo_id, host, workspace_id) if host is not None and workspace_id is not None else {}
             conflicts = [dict(row) for row in connection.execute(
                 "SELECT * FROM setting_conflicts WHERE repo_id=? ORDER BY seq", (repo_id,))]
@@ -105,6 +130,7 @@ class RepoSettings:
             computed = self._computed_main(connection, repo_id, host, workspace_id) if (
                 host is not None and workspace_id is not None and fields.get("mode", {}).get("value") == "auto") else None
         return {"repo_id": repo_id, "host": host, "workspace_id": workspace_id,
+                "requested_workspace_id": requested_workspace_id,
                 "home_host": fields.get("home", {}).get("value"),
                 "mode": fields.get("mode", {}).get("value", "off"), "settings": {**fields, **scoped},
                 "main": main, "members": scoped.get("members", {}).get("value", []), "computed_main": computed,
@@ -173,6 +199,7 @@ class RepoSettings:
                           host: str | None, workspace_id: str | None) -> None:
         if host != self.store.host or not isinstance(workspace_id, str) or not workspace_id:
             raise LedgerError("invalid_scope", "Workspace settings require a local host and workspace ID.")
+        workspace_id = self.scope_workspace(connection, repo_id, host, workspace_id)
         validate_setting({"repo_id": repo_id, "field": field, "value": value, "version": 1,
                           "origin_host": host, "changed_by": "user", "changed_at": time.time()})
         scoped = self.workspace_fields(connection, repo_id, host, workspace_id)
@@ -182,9 +209,10 @@ class RepoSettings:
                 "SELECT repo_id,workspace_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
                 (target["host"], target["terminal_id"])).fetchone()
             if (target["host"] != host or
-                    (agent is not None and (agent["repo_id"] != repo_id or agent["workspace_id"] != workspace_id)) or
+                    (agent is not None and (agent["repo_id"] != repo_id or
+                     self.scope_workspace(connection, repo_id, host, agent["workspace_id"]) != workspace_id)) or
                     (agent is None and (field == "main" or target not in existing))):
-                raise LedgerError("target_out_of_scope", f"Target must be an active agent in workspace {workspace_id} on {host}.")
+                raise LedgerError("target_out_of_scope", f"Target must be an active agent in role scope {workspace_id} on {host}.")
         connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)", (repo_id, time.time()))
         version = max((row["version"] for row in scoped.values()), default=0) + 1
         connection.execute("INSERT INTO workspace_settings VALUES (?,?,?,?,?,?,?,?) "
@@ -222,10 +250,12 @@ class RepoSettings:
 
     @staticmethod
     def _computed_main(connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
-        agents = connection.execute(
-            "SELECT terminal_id,is_main_checkout FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND active=1",
-            (repo_id, host, workspace_id)).fetchall()
-        candidates = agents if len(agents) == 1 else [agent for agent in agents if agent["is_main_checkout"]]
+        workspace_id = RepoSettings.scope_workspace(connection, repo_id, host, workspace_id)
+        agents = RepoSettings.scope_agents(connection, repo_id, host, workspace_id)
+        # An open empty anchor never elects a linked worktree, even if it is the
+        # sole active agent. Ordinary ungrouped workspaces keep the sole-agent rule.
+        candidates = (agents if len(agents) == 1 else [agent for agent in agents if agent["is_main_checkout"]])
+        candidates = [agent for agent in candidates if agent["workspace_id"] == workspace_id]
         return {"host": host, "terminal_id": candidates[0]["terminal_id"]} if len(candidates) == 1 else None
 
     def main(self, connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
@@ -233,9 +263,9 @@ class RepoSettings:
         if mode == "off":
             return None
         explicit = self.workspace_fields(connection, repo_id, host, workspace_id).get("main", {}).get("value")
-        if explicit and explicit["host"] == host and connection.execute(
-                "SELECT 1 FROM agents WHERE repo_id=? AND host=? AND workspace_id=? AND terminal_id=? AND active=1",
-                (repo_id, host, workspace_id, explicit["terminal_id"])).fetchone():
+        if explicit and explicit in [
+                {"host": agent["host"], "terminal_id": agent["terminal_id"]}
+                for agent in self.scope_agents(connection, repo_id, host, workspace_id)]:
             return explicit
         return self._computed_main(connection, repo_id, host, workspace_id) if mode == "auto" else None
 

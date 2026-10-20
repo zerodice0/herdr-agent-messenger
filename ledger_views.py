@@ -23,12 +23,14 @@ def status_board(store: LedgerStore, *, repo_id: str | None = None,
     peers = remote.peers() if host is None else ([] if include_local else [remote.peer(host)])
     hosts: list[dict[str, Any]] = []
     agents: list[dict[str, Any]] = []
+    workspaces: list[dict[str, Any]] = []
     targets = ([{"canonical_name": store.host, "uuid": store.host_uuid}] if include_local else []) + peers
     for target in targets:
         canonical = target["canonical_name"]
         local = canonical == store.host
         error = None
         resources = None
+        host_workspaces: list[dict[str, Any]] = []
         try:
             exported = (remote.status_export(repo_id, resources=True, resource_scanner=resource_scanner) if local else
                         remote.query_status(canonical, repo_id, refresh=False, resources=True))
@@ -37,8 +39,12 @@ def status_board(store: LedgerStore, *, repo_id: str | None = None,
                     if repo_id is None or row["repo_id"] == repo_id]
             if any(row["host"] != canonical for row in rows):
                 raise LedgerError("peer_identity_conflict", "Status rows do not belong to the verified host.")
+            host_workspaces = exported.get("workspaces", [])
+            if any(row.get("host") != canonical for row in host_workspaces):
+                raise LedgerError("peer_identity_conflict", "Workspace rows do not belong to the verified host.")
             unread: int | str = sum(row["unread"] for row in rows)
         except LedgerError as failure:
+            host_workspaces = []
             if local:
                 raise
             error = {"code": failure.code, "message": failure.message}
@@ -53,9 +59,11 @@ def status_board(store: LedgerStore, *, repo_id: str | None = None,
             if verified_previous:
                 resources = next((item.get("resources") for item in previous.get("hosts", [])
                                   if item.get("host") == canonical), None)
+                host_workspaces = [row for row in previous.get("workspaces", []) if row.get("host") == canonical]
             unread = "?"
         hosts.append({"host": canonical, "uuid": target["uuid"], "local": local,
                       "stale": error is not None, "error": error, "unread": unread,
                       "agents": rows, **({"resources": resources} if resources is not None else {})})
         agents.extend(rows)
-    return {"repo_id": repo_id, "agents": agents, "hosts": hosts}
+        workspaces.extend(host_workspaces)
+    return {"repo_id": repo_id, "agents": agents, "hosts": hosts, "workspaces": workspaces}

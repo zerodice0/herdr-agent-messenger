@@ -961,7 +961,7 @@ class LedgerCoreTest(unittest.TestCase):
         mail = Mailbox(migrated)
         with migrated.read() as connection:
             self.assertEqual(connection.execute(
-                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "8")
+                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], str(SCHEMA_VERSION))
             self.assertEqual(connection.execute(
                 "SELECT value FROM ledger_meta WHERE key='history_cursor_key'").fetchone()[0], cursor_key)
             self.assertEqual(migrated.host_uuid, self.store.host_uuid)
