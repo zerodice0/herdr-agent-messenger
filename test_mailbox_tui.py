@@ -790,7 +790,7 @@ class MailboxUiTest(unittest.TestCase):
             return [SendResult(target, True)]
         with patch('mailbox_tui.query_local_agents', return_value=[target]), \
              patch('mailbox_tui.dispatch_user_prompts', side_effect=dispatch):
-            result = dispatch_direct(self.store, self.recipient, '직접 입력', self.environment)
+            result = dispatch_direct(self.store, self.recipient, '직접 입력', self.environment, repo_id=self.repo_id)
         self.assertEqual((result['acceptance'], result['via']), ('accepted', 'direct'))
         self.assertFalse(result.get('delivered_at'))
         self.assertEqual(self.mail.list_threads(self.repo_id)['threads'], [])
@@ -800,7 +800,7 @@ class MailboxUiTest(unittest.TestCase):
         target = self.target()
         with patch('mailbox_tui.query_local_agents', return_value=[target]), \
              patch('mailbox_tui.dispatch_user_prompts', return_value=[SendResult(target, False, 'timeout', True)]):
-            result = dispatch_direct(self.store, self.recipient, 'Uncertain', self.environment)
+            result = dispatch_direct(self.store, self.recipient, 'Uncertain', self.environment, repo_id=self.repo_id)
         self.assertEqual(result['acceptance'], 'unknown')
         self.assertFalse(result.get('delivered_at'))
         self.assertEqual(self.mail.list_threads(self.repo_id)['threads'], [])
@@ -815,7 +815,8 @@ class MailboxUiTest(unittest.TestCase):
         target = replace(self.target(), session_id='')
         with patch('mailbox_tui.query_local_agents', return_value=[target]), \
              patch('mailbox_tui.dispatch_user_prompts', return_value=[SendResult(target, True)]) as transport:
-            result = dispatch_direct(self.store, recipient, 'User selected this terminal', self.environment)
+            result = dispatch_direct(self.store, recipient, 'User selected this terminal', self.environment,
+                                     repo_id=self.repo_id)
         self.assertEqual(result['acceptance'], 'accepted')
         self.assertEqual(transport.call_count, 1)
 
@@ -837,7 +838,7 @@ class MailboxUiTest(unittest.TestCase):
         target = replace(self.target(), host='peer-alias', local=False)
         with patch('mailbox_tui.query_remote_agents', return_value=ProbeResult('peer-alias', (target,), True)) as query, \
              patch('mailbox_tui.dispatch_user_prompts', return_value=[SendResult(target, True)]) as transport:
-            result = dispatch_direct(self.store, recipient, 'Remote user text', environment)
+            result = dispatch_direct(self.store, recipient, 'Remote user text', environment, repo_id=self.repo_id)
         self.assertEqual(result['acceptance'], 'accepted')
         self.assertEqual(query.call_args.kwargs['remote_sockets'], {'peer-alias': '/test/peer.sock'})
         self.assertEqual(transport.call_args.kwargs['remote_sockets'], {'peer-alias': '/test/peer.sock'})
@@ -1071,7 +1072,7 @@ class MailboxUiTest(unittest.TestCase):
                                   'host': 'remote', 'previous': previous}, self.environment)
         self.assertIs(result, board)
         self.assertEqual(view.call_args.kwargs,
-                         {'repo_id': self.repo_id, 'host': 'remote',
+                         {'repo_id': None, 'host': 'remote',
                           'environment': self.environment, 'previous': previous})
 
 
@@ -1087,7 +1088,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertTrue(app.agents()[0]['stale'])
         self.assertEqual(app.agents()[0]['unread'], '?')
         app.repo_id = 'another-repository'
-        self.assertEqual(app.agents(), [])
+        self.assertEqual(app.agents()[0]['terminal_id'], 'remote-terminal')
         app.repo_id = self.repo_id
         app.local['peers'][0]['uuid'] = 'replacement-uuid'
         self.assertEqual(app.agents(), [])
@@ -1437,14 +1438,16 @@ class MailboxUiTest(unittest.TestCase):
                           '--env', f'{OPENER_PANE}=w1:p1',
                           '--env', f'{OPENER_TERMINAL}=opener'])
 
-    def test_open_input_refreshes_snapshot_when_repository_changes(self):
+    def test_cross_repo_input_preserves_opener_scope_and_pending_snapshot(self):
         app = self.app()
         app.start_job('snapshot', 'snapshot')
         old_snapshot = app.jobs['snapshot']
+        scope = dict(app.settings_context)
         app.open_input({**self.recipient, 'repo_id': 'different-repo'})
-        self.assertTrue(old_snapshot.closed)
-        self.assertIsNot(app.jobs['snapshot'], old_snapshot)
-        self.assertEqual(app.jobs['snapshot'].request['repo_id'], 'different-repo')
+        self.assertFalse(old_snapshot.closed)
+        self.assertIs(app.jobs['snapshot'], old_snapshot)
+        self.assertEqual(app.repo_id, self.repo_id)
+        self.assertEqual(app.settings_context, scope)
 
     def move_opener(self, workspace='w2'):
         with self.store.transaction() as connection:
@@ -2493,7 +2496,7 @@ class MailboxUiTest(unittest.TestCase):
             'local-current-a', 'local-current-b', 'local-current-z',
             'local-other-a', 'local-other-z', 'local-missing',
             'aa-peer-w0', 'aa-peer-w1', 'aa-peer-missing',
-            'zz-peer-w0', 'zz-peer-w1', 'zz-peer-missing'])
+            'zz-peer-w0', 'zz-peer-w1', 'zz-peer-missing', 'wrong-repo'])
         app.settings_pending = {'mode': 'auto'}
         app.settings_context = {**app.settings_context, 'workspace_id': 'old-workspace'}
         self.assertEqual(app.agents()[0]['workspace_id'], 'w1')
@@ -2606,6 +2609,154 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertIn('ALIAS', snapshot.line(1))
             if height >= 4:
                 self.assertIn('w3 · 21', snapshot.line(2))
+
+    def cross_repo_app(self):
+        app = self.workspace_app()
+        base = app.local['agents'][0]
+        app.local['agents'].append({
+            **base, 'repo_id': '/work/zeta', 'terminal_id': 'local-zeta', 'alias': 'zeta-agent'})
+        app.remote['aa-peer']['agents'].extend([
+            {**base, 'host': 'aa-peer', 'repo_id': '/work/monitor_mobile',
+             'terminal_id': 'mobile-b', 'alias': 'purple-deer', 'workspace_id': 'w0'},
+            {**base, 'host': 'aa-peer', 'repo_id': '/work/monitor_mobile',
+             'terminal_id': 'mobile-a', 'alias': 'brown-turtle', 'workspace_id': 'w1'},
+            {**base, 'host': 'aa-peer', 'repo_id': '/work/alpha',
+             'terminal_id': 'peer-alpha', 'alias': 'alpha-agent'}])
+        return app
+
+    def test_other_repositories_follow_all_current_repo_hosts_and_group_host_repo(self):
+        app = self.cross_repo_app()
+        agents = app.agents()
+        other = [agent for agent in agents if agent['repo_id'] != self.repo_id]
+        self.assertEqual([agent['terminal_id'] for agent in other],
+                         ['wrong-repo', 'local-zeta', 'peer-alpha', 'mobile-b', 'mobile-a'])
+        self.assertTrue(all(agent['repo_id'] == self.repo_id for agent in agents[:-len(other)]))
+        app.screen = Screen(80, 100)
+        app.render_agents((0, 0, 80, 100))
+        lines = app.screen.snapshot().lines()
+        heading = next(index for index, line in enumerate(lines) if 'Other repositories' in line)
+        text = '\n'.join(lines)
+        self.assertLess(text.index('zz-peer'), text.index('Other repositories'))
+        self.assertLess(text.index('Other repositories'), text.index('another-repo · 1'))
+        self.assertLess(text.index('zeta · 1'), text.index('alpha · 1'))
+        self.assertEqual(text.count('monitor_mobile · 2'), 1)
+        self.assertEqual(text.count('· current'), 1)
+        for row in range(heading, len(lines)):
+            if any(label in lines[row] for label in
+                   ('Other repositories', '▾ ', 'ALIAS', 'another-repo ·', 'zeta ·',
+                    'alpha ·', 'monitor_mobile ·')):
+                self.assertFalse(any(rect[0] == row for rect, kind, _ in app.hit_map if kind == 'list-row'))
+        target = self.select_agent(app, 'mobile-a')
+        app.screen = Screen(80, 100)
+        app.hit_map = []
+        app.add_hit((0, 0, 80, 100), 'region', 'agents')
+        app.render_agents((0, 0, 80, 100))
+        hit = next(rect for rect, kind, index in app.hit_map
+                   if kind == 'list-row' and app.agents()[index]['terminal_id'] == 'mobile-a')
+        app.key(MouseEvent(hit[0], hit[1] + 10, 'press'))
+        self.assertEqual(app.identity(app.recipient), app.identity(target))
+        self.assertEqual(app.repo_id, self.repo_id)
+
+    def test_other_repo_long_name_truncates_and_sticky_rows_preserve_mouse_target(self):
+        app = self.app()
+        base = app.local['agents'][0]
+        repo = '/work/' + 'very-long-repository-' * 8
+        app.local['agents'].extend({**base, 'repo_id': repo, 'terminal_id': f'other-{index:02}',
+                                    'alias': f'other-{index:02}'} for index in range(20))
+        self.select_agent(app, 'other-19')
+        for height, width in ((1, 32), (4, 40), (8, 78), (24, 80)):
+            with self.subTest(height=height, width=width):
+                app.screen = Screen(height, width)
+                app.hit_map = []
+                app.render_agents((0, 0, height, width))
+                lines = app.screen.snapshot().lines()
+                self.assertTrue(any('other-19' in line for line in lines))
+                self.assertEqual(app.screen.out_of_bounds, [])
+                if height >= 4:
+                    host_row = next(index for index, line in enumerate(lines)
+                                    if '▾ ' + self.store.host in line)
+                    self.assertIn('ALIAS', lines[host_row + 1])
+                    self.assertIn('…', lines[host_row + 2])
+                    self.assertTrue(lines[host_row + 2].rstrip().endswith(' · 20'))
+                self.assertTrue(any(kind == 'list-row' and index == app.selections['agents']
+                                    for _, kind, index in app.hit_map))
+
+    def test_cross_repo_selection_compose_sends_opener_repo_and_other_recipient(self):
+        other_root = self.root / 'other-repository'
+        other_root.mkdir()
+        extra = {'terminal_id': 'term-other', 'pane_id': 'w2:p1', 'workspace_id': 'w2',
+                 'agent': 'codex', 'agent_status': 'idle', 'name': 'brown-turtle',
+                 'agent_session': {'value': 'other-session'}, 'cwd': str(other_root)}
+        self.registry.reconcile({**self.snapshot, 'agents': [*self.snapshot['agents'], extra],
+                                 'panes': [*self.snapshot['panes'], extra]}, refresh_display=False)
+        app = self.app()
+        recipient = self.select_agent(app, 'term-other')
+        self.assertNotEqual(recipient['repo_id'], self.repo_id)
+        app.key('\r')
+        self.type_text(app, 'Cross repository note')
+        app.key('\r')
+        request = app.jobs['mutation'].request
+        self.assertEqual(request['repo_id'], self.repo_id)
+        self.assertEqual(request['recipient']['terminal_id'], 'term-other')
+        self.assertEqual(request['recipient']['repo_id'], recipient['repo_id'])
+        result = execute_job(request, self.environment)
+        message = self.mail.show_thread(result['thread_id'])['messages'][0]
+        self.assertEqual(message['repo_id'], self.repo_id)
+        self.assertEqual(message['sender_repo_id'], self.repo_id)
+        self.assertEqual(message['recipient_repo_id'], recipient['repo_id'])
+        self.assertEqual(message['state'], 'queued')
+
+    def test_all_repository_view_sends_without_changing_its_unscoped_view(self):
+        app = self.app()
+        app.repo_id = None
+        self.select_agent(app)
+        app.key('\r')
+        self.type_text(app, 'Unscoped operator note')
+        app.key('\r')
+        request = app.jobs['mutation'].request
+        self.assertEqual(request['repo_id'], self.recipient['repo_id'])
+        self.assertIsNone(app.repo_id)
+        result = execute_job(request, self.environment)
+        self.assertEqual(result['state'], 'queued')
+
+    def test_other_repo_direct_preserves_opener_history_and_recipient_snapshot(self):
+        app = self.app()
+        recipient = {**self.recipient, 'repo_id': '/work/other-repo'}
+        app.local['agents'] = [recipient]
+        app.key('\r')
+        app.delivery = 'direct'
+        self.type_text(app, 'Direct cross-repo operator note')
+        app.key('\r')
+        self.accept(app)
+        request = app.jobs['mutation'].request
+        self.assertEqual(request['repo_id'], self.repo_id)
+        target = self.target()
+        with patch('mailbox_tui.query_local_agents', return_value=[target]), \
+             patch('mailbox_tui.dispatch_user_prompts', return_value=[SendResult(target, True)]):
+            result = execute_job(request, self.environment)
+        self.assertEqual(result['acceptance'], 'accepted')
+        snapshot = local_snapshot(self.store, self.repo_id, self.environment)
+        submission = snapshot['submissions'][0]
+        self.assertEqual(submission['submission_id'], result['submission_id'])
+        self.assertEqual(submission['repo_id'], self.repo_id)
+        self.assertEqual(submission['target']['repo_id'], '/work/other-repo')
+
+    def test_cross_repo_thread_visible_to_opener_with_sender_tag_in_list_and_history(self):
+        result = self.mail.send_user('/work/monitor_mobile', self.recipient, body='Incoming cross-repo note')
+        app = self.app()
+        self.assertEqual(app.local['threads'][0]['thread_id'], result['thread_id'])
+        app.focus, app.preview = 'threads', 'threads'
+        app.refresh_detail()
+        app.screen = Screen(12, 120)
+        app.render_threads((0, 0, 12, 120))
+        self.assertIn('user (repo monitor_mobile)', '\n'.join(app.screen.snapshot().lines()))
+        self.assertIn('(repo monitor_mobile)', '\n'.join(app.detail_lines()))
+        self.assertEqual(app.message_sender({'sender_label': 'local', 'sender_repo_id': self.repo_id}), 'local')
+        self.assertEqual(app.message_sender({'sender_label': 'old', 'repo_id': '/work/legacy'}), 'old (repo legacy)')
+        long = app.message_sender({'sender_label': 'peer', 'sender_repo_id': '/work/' + 'long' * 30})
+        self.assertIn('…)', long)
+        for width in (32, 40, 80):
+            self.capture(app, 24, width)
 
     def test_local_snapshot_retains_human_workspace_labels(self):
         live = {**self.snapshot, 'workspaces': [{'workspace_id': 'w1', 'label': 'Human workspace'}]}

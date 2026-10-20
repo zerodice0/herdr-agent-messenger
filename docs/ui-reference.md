@@ -125,7 +125,7 @@ vertical separators or horizontal rules inside the panel. Header labels are
 **cyan and bold, without underlines**; without color they are bold only.
 Each host section starts with a **bold host label and agent count**, such as
 `▾ winmini · 1 agent` or `▾ winmini · 2 agents`, followed by its column header
-and workspace groups. The list remains repository-scoped: the local host comes
+and workspace groups. The opener's repository remains first: the local host comes
 first, with the opener's current workspace first, then other local workspaces
 by workspace ID; remote hosts follow alphabetically, grouped by workspace ID.
 Agents within each workspace sort by alias, then terminal ID. Missing workspace
@@ -136,10 +136,20 @@ Local labels come from Herdr snapshot workspace labels (or explicit
 `workspace_label` data), falling back to the workspace ID; older remote boards
 usually supply IDs only. Missing IDs display `No workspace`. Current workspace
 lines are cyan/bold (bold without color); other workspace lines are dim.
-Empty hosts have no column header. Sections have no blank separator rows.
-Host, column-header and workspace lines are inert to mouse selection and skipped
-by keyboard selection. Scrolling keeps the selected agent visible and retains
-its host/header, plus the workspace line when at least four rows fit.
+Empty hosts have no column header. Host sections have no blank separator rows.
+Below them, **Other repositories** lists local and registered-peer agents grouped
+by host (local first), then repository short name (the last path component).
+Repository names truncate to the available width; each indented repository line
+shows its agent count. One all-repository status query per peer supplies both sections.
+Host, column-header, workspace and repository lines are inert to mouse selection
+and skipped by keyboard selection. Scrolling keeps the selected agent visible and
+retains its host/header, plus its workspace or repository line when four rows fit.
+Selecting any repository's agent opens input without changing the opener's
+repository: user mail keeps that repository as sender context.
+DIRECT submissions also retain the opener's repository for history, with the
+other-repository recipient preserved in their target snapshot. In an unscoped
+all-repositories view, sending uses the selected target's repository as the
+origin fallback without changing the view.
 Findings follow only when nonzero (or unknown), with stale/error information
 when applicable; findings truncate before the count.
 
@@ -175,6 +185,10 @@ colors; titles and participants retain their normal foreground. On the pale
 selected-row background, labels instead use the high-contrast selection
 foreground and bold, preserving every glyph and word. Each entry keeps two
 lines and the same full-width mouse targets.
+
+Threads includes conversations in which the opener's repository is an origin,
+sender or recipient. Both the thread list and message history add `(repo NAME)`
+to senders from another repository; NAME is its short name, capped at 24 cells.
 
 Threads is **one list and one scrollport**, with counted `Active (N)` and
 `Handled (N)` group rules. Active/needs-attention entries come first; a blank

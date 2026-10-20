@@ -248,7 +248,9 @@ def settings_scope(store: LedgerStore, repo_id: str | None,
 def local_snapshot(store: LedgerStore, repo_id: str | None,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     settings = RepoSettings(store)
-    board = status_board(store, repo_id=repo_id, host="local", environment=environment)
+    # Discover every local target, while keeping history and settings scoped to
+    # the opener's repository below.
+    board = status_board(store, repo_id=None, host="local", environment=environment)
     agents = board["agents"]
     panes = []
     workspaces = []
@@ -286,7 +288,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
 
 
 def dispatch_direct(store: LedgerStore, recipient: Mapping[str, Any], body: str,
-                    environment: Mapping[str, str], *, subject: str = "") -> dict[str, Any]:
+                    environment: Mapping[str, str], *, repo_id: str, subject: str = "") -> dict[str, Any]:
     """Persist before transport; reuse the existing verified prompt transport.
 
     No AgentRecord is invented for the user. Terminal transport acceptance is
@@ -294,7 +296,7 @@ def dispatch_direct(store: LedgerStore, recipient: Mapping[str, Any], body: str,
     """
     prompt = user_prompt_text(body)
     mailbox = Mailbox(store, environment)
-    record = mailbox.begin_direct(recipient["repo_id"], recipient, body=prompt, subject=subject)
+    record = mailbox.begin_direct(repo_id, recipient, body=prompt, subject=subject)
     acceptance, evidence = "failed", "Recipient no longer matches selected terminal/session."
     dispatch_started = False
     remote_sockets: dict[str, str] = {}
@@ -356,14 +358,14 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
     if operation == "snapshot":
         return local_snapshot(store, repo_id, environment)
     if operation == "remote":
-        return status_board(store, repo_id=repo_id, host=request["host"], environment=environment,
+        return status_board(store, repo_id=None, host=request["host"], environment=environment,
                             previous=request.get("previous"))
     if operation == "send":
         return mail.send_user(repo_id, request["recipient"], body=request["body"], kind=request["kind"],
                               subject=request.get("subject") or "", reply_to=request.get("reply_to"))
     if operation == "direct":
         return dispatch_direct(store, request["recipient"], request["body"], environment,
-                               subject=request.get("subject") or "")
+                               repo_id=repo_id, subject=request.get("subject") or "")
     if operation == "setting":
         if not repo_id:
             raise LedgerError("invalid_settings_scope", "Select a repository before saving Settings.")
@@ -649,12 +651,14 @@ class MailboxApp:
                 values.append({**agent, "stale": stale, "unread": "?" if stale else agent.get("unread", "?")})
         local_host = self.local.get("host")
         workspace = self.agents_workspace()
-        return sorted((agent for agent in values if self.repo_id is None or agent["repo_id"] == self.repo_id),
-                      key=lambda agent: (agent["host"] != local_host, agent["host"],
-                                         not (agent["host"] == local_host and workspace
-                                              and agent.get("workspace_id") == workspace),
-                                         not bool(agent.get("workspace_id")), agent.get("workspace_id") or "",
-                                         agent.get("alias") or "", agent["terminal_id"]))
+        return sorted(values, key=lambda agent: (
+            self.repo_id is not None and agent["repo_id"] != self.repo_id,
+            agent["host"] != local_host, agent["host"],
+            (Path(agent["repo_id"]).name, agent["repo_id"])
+            if self.repo_id is not None and agent["repo_id"] != self.repo_id else ("", ""),
+            not (agent["host"] == local_host and workspace and agent.get("workspace_id") == workspace),
+            not bool(agent.get("workspace_id")), agent.get("workspace_id") or "",
+            agent.get("alias") or "", agent["terminal_id"]))
 
     def agents_workspace(self) -> str | None:
         # settings_scope() resolves this alongside the local snapshot. Keep its
@@ -878,13 +882,7 @@ class MailboxApp:
             self.set_status("Remote snapshot is stale; refresh before selecting a recipient.", "error")
             return
         self.recipient = dict(recipient)
-        changed_repo = self.repo_id != recipient["repo_id"]
-        self.repo_id, self.reply_to = recipient["repo_id"], reply_to
-        if changed_repo:
-            snapshot = self.jobs.pop("snapshot", None)
-            if snapshot is not None:
-                snapshot.close()
-            self.start_job("snapshot", "snapshot")
+        self.reply_to = reply_to
         self.draft_key = (recipient["host"], recipient["terminal_id"], reply_to)
         draft = self.drafts.get(self.draft_key, {})
         self.body, self.body_cursor = draft.get("text", ""), draft.get("cursor", 0)
@@ -936,7 +934,8 @@ class MailboxApp:
         if recipient is None or recipient.get("stale"):
             self.input_error = "Recipient is unavailable or stale; refresh before sending."
             return
-        request = {"recipient": dict(self.recipient), "body": self.body, "kind": "fyi",
+        request = {"repo_id": self.repo_id or recipient["repo_id"],
+                   "recipient": dict(self.recipient), "body": self.body, "kind": "fyi",
                    "subject": None, "reply_to": self.reply_to}
         if self.delivery == "direct":
             self.open_confirm("DIRECT · may interrupt; acceptance ≠ native delivery",
@@ -1991,8 +1990,20 @@ class MailboxApp:
                            list(self.remote_errors)),
                        key=lambda host: (host != self.local.get("host"), host))
         current_workspace = self.agents_workspace()
-        for host in hosts:
-            group = [(index, agent) for index, agent in enumerate(agents) if agent["host"] == host]
+        sections = [(host, False) for host in hosts]
+        if self.repo_id is not None:
+            sections.extend((host, True) for host in hosts
+                            if any(agent["host"] == host and agent["repo_id"] != self.repo_id
+                                   for agent in agents))
+        other_heading = False
+        for host, other_repos in sections:
+            if other_repos and not other_heading:
+                lines.append(("", -1, 0, False))
+                lines.append(("Other repositories", -1, curses.A_BOLD, False))
+                other_heading = True
+            group = [(index, agent) for index, agent in enumerate(agents)
+                     if agent["host"] == host and
+                     (self.repo_id is not None and agent["repo_id"] != self.repo_id) == other_repos]
             stale = host in self.remote_errors or any(agent.get("stale") for _, agent in group)
             count = f"{len(group)} {'agent' if len(group) == 1 else 'agents'}"
             host_width = max(0, width - display_width("▾  · " + count))
@@ -2007,18 +2018,20 @@ class MailboxApp:
                 lines.append((self.column_text(headers, columns), -3, header_style, False))
             if host in self.remote_errors:
                 lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
-            previous_workspace: Any = object()
+            previous_group: Any = object()
             for index, agent in group:
-                workspace = agent.get("workspace_id") or None
-                if workspace != previous_workspace:
-                    members = [item for _, item in group if (item.get("workspace_id") or None) == workspace]
-                    current = bool(workspace and host == self.local.get("host")
-                                   and workspace == current_workspace)
+                group_key = agent["repo_id"] if other_repos else agent.get("workspace_id") or None
+                if group_key != previous_group:
+                    members = [item for _, item in group
+                               if (item["repo_id"] if other_repos else item.get("workspace_id") or None) == group_key]
+                    current = bool(not other_repos and group_key and host == self.local.get("host")
+                                   and group_key == current_workspace)
                     suffix = f" · {len(members)}" + (" · current" if current else "")
-                    name = self.workspace_label(host, workspace, members)
+                    name = (Path(group_key).name if other_repos else
+                            self.workspace_label(host, group_key, members))
                     label = "  " + truncate_display_text(name, max(0, width - 2 - display_width(suffix))) + suffix
                     lines.append((label, -4, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
-                    previous_workspace = workspace
+                    previous_group = group_key
                 chosen = index == self.selections["agents"]
                 marker = "▌" if chosen and self.focus == "agents" else " "
                 turn = agent.get("turn_state") or "unknown"
@@ -2100,6 +2113,13 @@ class MailboxApp:
         glyph = {"message": ">", "receipt": "<", "setting": "#", "withdraw": "-"}.get(kind, "?")
         return f"{glyph} {kind}", "done" if kind in {"message", "receipt", "setting", "withdraw"} else "unknown"
 
+    def message_sender(self, message: Mapping[str, Any]) -> str:
+        sender = str(message.get("sender_label") or "—")
+        repo = message.get("sender_repo_id") or message.get("repo_id")
+        if self.repo_id is not None and repo and repo != self.repo_id:
+            sender += f" (repo {truncate_display_text(Path(repo).name, 24)})"
+        return sender
+
     def render_threads(self, rect: tuple[int, int, int, int]) -> None:
         y, x, height, width = rect
         if height <= 0 or width <= 0:
@@ -2131,7 +2151,7 @@ class MailboxApp:
                 kind, kind_palette = self.thread_kind(latest.get("kind", "unknown"))
                 body = (latest.get("body") or "").splitlines()
                 title = item.get("subject") or (body[0] if body else "(empty message)")
-                participants = f"{latest.get('sender_label', '—')} → {latest.get('recipient_address', '—')}"
+                participants = f"{self.message_sender(latest)} → {latest.get('recipient_address', '—')}"
                 metadata = f"{kind} · {participants} · {state}"
             elif item["type"] == "direct":
                 state, palette = self.thread_state(item["acceptance"], direct=True)
@@ -2211,7 +2231,7 @@ class MailboxApp:
                 if message_starts is not None:
                     message_starts.append(len(result))
                 result.extend([
-                    (header(message, index, len(messages), str(message.get("sender_label") or "—"),
+                    (header(message, index, len(messages), self.message_sender(message),
                             str(message.get("recipient_address") or "—")), curses.A_BOLD),
                     (summary,
                      self.state_style("working" if message.get("confirmation_source") == "operator" else palette)
