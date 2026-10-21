@@ -71,9 +71,12 @@ terminals use reverse video. `NO_COLOR`, including an empty value, disables all
 color-pair initialization and keeps the marker, bold and reverse fallback.
 
 Quick send gives INPUT at least eight content rows when space permits and caps
-Detail at nine outer rows. In INPUT, only the compose title is accented;
-in NAV, `›` marks the active region title. Quick-send regions are borderless.
-Held places its selected preview, dates and push warning immediately after the
+Detail at nine outer rows. In INPUT, the compose frame and title are accented;
+in NAV, `›` marks the active region title. Existing region frames and the Send
+Prompt editor's left rule remain visible. Selection markers sit beside their
+turn glyph or recipient checkbox, with a separating space. The Recipients
+section label stays accent-bold, not selected. Held places its selected preview,
+dates and push warning immediately after the
 list. Below its title, the empty state shows only `No held messages.` and
 `[Esc] Close`. Skill puts each status name two cells after the longest client
 name and highlights only the selected name/status row; long paths appear on a

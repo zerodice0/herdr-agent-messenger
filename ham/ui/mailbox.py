@@ -1958,9 +1958,6 @@ class MailboxApp:
                           curses.A_BOLD if focused else curses.A_DIM)
         if height < 2 or width < 2:
             return y, x, 0, 0
-        if self.quick_send:
-            self.put(y, x + 1, truncate_display_text(title, max(0, width - 2)), attr)
-            return y + 1, x + 1, height - 2, width - 2
         self.put(y, x, "┌" + "─" * (width - 2) + "┐", attr)
         self.put(y, x + 2, truncate_display_text(" " + title + " ", max(0, width - 4)), attr)
         for row in range(y + 1, y + height - 1):
@@ -2043,7 +2040,7 @@ class MailboxApp:
         column = x + 2
         for index, region in enumerate(("agents", "threads")):
             if index:
-                self.put(y, column, " · " if self.quick_send else " │ ", curses.A_DIM)
+                self.put(y, column, " │ ", curses.A_DIM)
                 column += 3
             label = ("› " if self.quick_send and self.mode == "nav" and region == self.focus else "") + region.title()
             attr = self.style("accent", curses.A_BOLD) if region == active and not (
@@ -2306,7 +2303,7 @@ class MailboxApp:
         agents = self.agents()
         columns = self.agent_columns(width, agents)
         header_style = self.style("accent", curses.A_BOLD)
-        headers = {"alias": "ALIAS", "turn": "   TURN" if columns[0][1] == 11 else "",
+        headers = {"alias": "ALIAS", "turn": "    TURN" if columns[0][1] == 11 else "",
                    "mail": "MAIL", "rx": "RX", "role": "ROLE", "phone": "PHN",
                    "emu": "EMU", "server": "SRV", "summary": "PHASE · SUMMARY"}
         lines: list[tuple[str, int, int, bool]] = []
@@ -2382,7 +2379,7 @@ class MailboxApp:
                 receiver = agent.get("extension_present")
                 rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
                 values = {"alias": agent.get("alias") or agent["terminal_id"],
-                          "turn": marker + glyph + " " + pad_display_text(turn, 7) + " ",
+                          "turn": marker + " " + glyph + " " + pad_display_text(turn, 7),
                           "mail": "?" if agent.get("stale") else str(agent.get("unread", "?")),
                           "rx": rx, "role": agent.get("role") or "—", **self.resource_counts(agent),
                           "summary": " · ".join(str(agent[field]) for field in ("phase", "summary")
@@ -2390,7 +2387,7 @@ class MailboxApp:
                 if values["mail"] == "0":
                     values["mail"] = "·"
                 if columns[0][1] == 3:
-                    values["turn"] = marker + glyph + " "
+                    values["turn"] = marker + " " + glyph
                 tag = self.result_tags.get(self.identity(agent))
                 if tag:
                     name = "summary" if columns[-1][0] == "summary" else "alias"
@@ -2423,7 +2420,7 @@ class MailboxApp:
                         value = glyph if size == 3 else glyph + " " + pad_display_text(turn, 7)
                         turn_attr = (attr | curses.A_BOLD if chosen else
                                      self.state_style(turn, stale=bool(agent.get("stale"))))
-                        self.put(row, x + 1, value, turn_attr)
+                        self.put(row, x + 2, value, turn_attr)
                     elif not chosen and name in counts:
                         value = counts[name]
                         if value == "·":

@@ -223,9 +223,7 @@ class MessengerRenderMixin:
             f'{self.text["recipients"]}: {selected_count} '
             f'{self.text["selected"]} · {position}'
         )
-        attribute = self.theme.style(
-            "accent", bold=True, selected=self.section == "recipients",
-        )
+        attribute = self.theme.style("accent", bold=True)
         self._safe_add(row, 0, heading, attribute)
         row += 1
         self._safe_add(
@@ -270,7 +268,7 @@ class MessengerRenderMixin:
                 agent,
                 marker,
                 state,
-                focused=False,
+                focused=focused,
                 indent=view_row.indent,
             )
             if disabled:
@@ -281,7 +279,7 @@ class MessengerRenderMixin:
                 line_attribute = 0
             if focused:
                 self.theme.draw_selected_row(
-                    self.content_screen, line_row, line[2:], width,
+                    self.content_screen, line_row, line, width, marker="",
                 )
             else:
                 self._safe_add(line_row, 0, line, line_attribute)
@@ -320,7 +318,7 @@ class MessengerRenderMixin:
         thumb = scrollbar_thumb(len(wrapped_lines), visible_rows, start)
         scrollbar_column = min(width - 2, self._message_editor_width() + 3)
         for offset in range(visible_rows):
-            marker = " "
+            marker = "│"
             if offset == 0 and start > 0:
                 marker = "↑"
             elif (
@@ -349,7 +347,7 @@ class MessengerRenderMixin:
                 scrollbar_glyph = (
                     "█"
                     if thumb_start <= offset < thumb_start + thumb_size
-                    else " "
+                    else "│"
                 )
                 self._safe_add(
                     row + offset,

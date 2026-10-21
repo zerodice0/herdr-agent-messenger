@@ -3650,10 +3650,7 @@ class MailboxUiTest(unittest.TestCase):
                         value_cells = snapshot.cells[row][offset:offset + size]
                         value = ''.join(cell.text for cell in value_cells)
                         self.assertEqual(header.strip(), expected_headers[name])
-                        if name == 'turn':
-                            if size == 11:
-                                self.assertEqual(header.index('TURN'), value.index('working'))
-                        elif header.strip() and value.strip():
+                        if name != 'turn' and header.strip() and value.strip():
                             def start(cell):
                                 return len(cell) - len(cell.lstrip())
                             if centered:
@@ -3830,6 +3827,16 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertIn(state, snapshot.line(row))
                     self.assertEqual(any(cell.attribute & curses.A_REVERSE
                                          for cell in snapshot.cells[row]), selected)
+                    line = snapshot.line(row)
+                    if selected:
+                        glyph = app.theme.turn_label(state).split(' ', 1)[0]
+                        self.assertEqual(line.count('›'), 1)
+                        marker_column = line.index('›')
+                        glyph_column = line.index(glyph, marker_column + 1)
+                        self.assertGreater(glyph_column, marker_column + 1)
+                        self.assertTrue(line[marker_column + 1:glyph_column].isspace())
+                    else:
+                        self.assertNotIn('›', line)
                     app.detail = agent
                     app.screen = Screen(30, 100)
                     app.render_detail((0, 0, 30, 100))

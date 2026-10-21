@@ -257,6 +257,10 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
             self.assertTrue(all(call.attribute & curses.A_BOLD for call in focused))
             self.assertTrue(all(call.attribute & (curses.A_REVERSE | curses.A_COLOR)
                                 for call in focused))
+            for call in focused:
+                value = call.visible_text.lstrip()
+                checkbox_column = value.index("[")
+                self.assertTrue(value[1:checkbox_column].isspace())
             for state, glyph in (("working", "●"), ("done", "✓"), ("idle", "○"), ("blocked", "!")):
                 self.assert_text_visible(snapshot, f'{glyph} {app.text["status_" + state]}')
             for line in LONG_MESSAGE:

@@ -139,6 +139,7 @@ class AgentMessengerTest(unittest.TestCase):
             agent(name="white-bison", pane_id="w1:p2", session_id="session-2"),
             status="working",
         )
+        other = agent(name="other-recipient", pane_id="w1:p3", session_id="session-3")
         screen = FakeCursesWindow(18, 88)
         with tempfile.TemporaryDirectory() as state_directory:
             environment = {
@@ -147,21 +148,36 @@ class AgentMessengerTest(unittest.TestCase):
             }
             with (
                 mock.patch.object(agent_messenger, "query_local_agents",
-                                  return_value=[sender, recipient]),
+                                  return_value=[sender, recipient, other]),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
         app.selected = {recipient.identity}
+        app.cursor = next(index for index, item in enumerate(app.filtered_agents())
+                          if item.identity == recipient.identity)
         app._render_recipients(0, 6)
         snapshot = screen.snapshot()
         row = snapshot.rows_containing(recipient.name)[0]
         self.assertTrue(snapshot.line(row).lstrip().startswith("› "))
         self.assertIn("[x]", snapshot.line(row))
         self.assertIn("● working", snapshot.line(row))
+        line = snapshot.line(row)
+        marker_column = line.index("›")
+        checkbox_column = line.index("[x]")
+        self.assertTrue(line[marker_column + 1:checkbox_column].isspace())
+        other_line = snapshot.line(snapshot.rows_containing(other.name)[0])
+        self.assertEqual(
+            agent_messenger.display_width(line[:checkbox_column]),
+            agent_messenger.display_width(other_line[:other_line.index("[ ]")]),
+        )
         rect = content_rect(18, 88, 104)
         cells = snapshot.cells[row][rect.x:rect.x + rect.width]
         self.assertTrue(all(cell.attribute & agent_messenger.curses.A_BOLD for cell in cells))
         self.assertTrue(all(cell.attribute & agent_messenger.curses.A_REVERSE for cell in cells))
+        heading = next(call for call in snapshot.draw_calls
+                       if app.text["recipients"] in call.visible_text)
+        self.assertTrue(heading.attribute & agent_messenger.curses.A_BOLD)
+        self.assertFalse(heading.attribute & agent_messenger.curses.A_REVERSE)
 
     def test_recipient_panel_grows_until_message_minimum(self):
         panel_height = agent_messenger.MessengerApp._recipient_panel_height
