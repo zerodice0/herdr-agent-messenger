@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/ham-logo.png" alt="HAM — Herdr Agent Messenger mascot logo" width="360">
+</p>
+
 # HAM — Herdr Agent Messenger
 
 [한국어](README.ko.md) · English
