@@ -181,6 +181,32 @@ class MailboxServicesTest(unittest.TestCase):
         options.update(overrides)
         return self.mail.claim_spawn_submission(operation_id, **options)
 
+    def test_user_mail_and_user_replies_default_action_while_agent_mail_defaults_fyi(self):
+        agent = self.mail.send(self.sender, self.recipient, body="Agent default")
+        user = self.mail.send_user(self.repo_id, self.recipient, body="User default")
+        reply = self.mail.send_user(self.repo_id, self.sender, body="User reply",
+                                    reply_to=agent["message_id"])
+        for sent, expected in ((agent, "fyi"), (user, "action"), (reply, "action")):
+            with self.subTest(message_id=sent["message_id"]):
+                messages = self.mail.show_thread(sent["thread_id"])["messages"]
+                message = next(row for row in messages if row["message_id"] == sent["message_id"])
+                self.assertEqual(message["kind"], expected)
+        self.assertEqual(reply["thread_id"], agent["thread_id"])
+        self.assertEqual(self.state(agent["message_id"])["state"], "queued")
+
+    def test_user_explicit_kinds_are_preserved_for_local_and_remote_mail(self):
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO peers(canonical_name,uuid,ssh_alias) VALUES (?,?,?)",
+                               ("beta", str(uuid.uuid4()), "beta-ssh"))
+        for recipient in (self.recipient, {**self.recipient, "host": "beta"}):
+            for kind in ("action", "fyi"):
+                with self.subTest(host=recipient["host"], kind=kind):
+                    sent = self.mail.send_user(self.repo_id, recipient, body="Explicit kind", kind=kind)
+                    messages = self.mail.show_thread(sent["thread_id"])["messages"]
+                    message = next(row for row in messages if row["message_id"] == sent["message_id"])
+                    self.assertEqual((message["sender"], message["kind"]), ("user", kind))
+                    self.assertEqual(message["state"], "queued" if recipient["host"] == self.store.host else "pending")
+
     def test_user_mail_has_no_fabricated_agent_and_reply_does_not_handle_parent(self):
         parent = self.message()
         reply = self.mail.send_user(self.repo_id, self.sender, body="User follow-up", kind="action",

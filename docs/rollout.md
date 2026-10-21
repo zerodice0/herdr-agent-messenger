@@ -80,3 +80,9 @@ are:
 The helper updates the Herdr plugin registration, not separately copied Codex or
 Claude skill directories. After a rollout, open **HAM Skill** on that host and
 update any project- or system-installed skill copy.
+
+For schema v10, upgrade ledger code and CLI/copied skills together before
+resuming enqueue: older CLI code misses the turn-end FYI flag. Existing v9
+deliveries remain unflagged. The OMP extension is unchanged; no extension
+restart is needed for this policy. Follow the [schema-v10 migration](migration.md#turn-end-fyi-schema-v10)
+for process replacement and database backup/rollback.

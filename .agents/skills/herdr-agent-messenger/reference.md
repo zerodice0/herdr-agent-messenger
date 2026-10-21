@@ -95,8 +95,10 @@ Successful `mail send` may include advisory `warnings` entries:
   then restart only the selected sessions if registration is pending.
 - `fyi_no_wake`: `fyi` was sent to a known ready, non-stale, participating OMP
   recipient with a registered receiver and Herdr `turn_state` of `idle` or
-  `done`. FYI alone cannot start its next turn. This advisory does not reject,
-  resend, or change the mail kind; the default remains `fyi`. It is not emitted
+  `done`. FYI enqueued while idle cannot wake it. FYI arriving during a turn
+  can be marked locally for delivery right after that turn under existing wake
+  gates (see below). This advisory does not reject, resend, or change the mail
+  kind; the CLI default remains `fyi`. It is not emitted
   for `action`, busy recipients, unknown/stale state, missing receivers,
   non-OMP clients, mode `off`, or nonmembers. Replies use the same recipient-state
   rule, including replies to an `action` parent; the parent's kind does not
@@ -106,6 +108,13 @@ Successful `mail send` may include advisory `warnings` entries:
 For replies, use `mail send --reply-to UUID --kind action` when the recipient
 must act/continue (for example, on an answer to a question or a decision);
 use `fyi` otherwise.
+
+FYI never wakes an idle recipient. At local recipient enqueue, the ledger sets
+`delivery.fyi_turn_end` only when its locally reconciled `agents.last_seen` is
+within 15 seconds and `turn_state=working`. Such FYI is delivered right after
+that turn under the existing wake gates. Idle, unknown or stale enqueue state
+leaves FYI natural-turn only; no later status update retroactively sets the flag.
+The flag is local delivery metadata, never a new kind or immutable wire field.
 
 #### History and cursor paging
 
@@ -205,8 +214,10 @@ and `disposition` (`not_applied` to requeue, `unknown` to retain the uncertain
 claim). `ledger runtime register|inspect|claim|applied` is the root OMP receiver
 boundary: registration requires the full supported session-file path; `claim` is
 one atomic bounded bundle (8 messages, 8 KiB, 2 KiB per body, every claimed ID
-present) and a wake claim must retain a hop-eligible `action`, otherwise it
-returns `no_action` without claiming FYI. `applied` ACKs only the exact session,
+present) and a wake claim must retain a hop-eligible `action` or FYI with
+`delivery.fyi_turn_end`, otherwise it returns `no_action` without claiming mail.
+`inspect.has_action` includes flagged FYI for the unchanged extension's wake
+decision; the persisted message kind remains `fyi`. `applied` ACKs only the exact session,
 marker and content hash after the extension finds that custom message in the
 public active-branch session history; that is host journal acceptance, not proof
 of later provider transforms or model understanding.
@@ -403,12 +414,18 @@ resolution use the same group.
 
 Back up the database before upgrade. Stop old HAM processes sharing the host
 ledger, update host code and copied skills together, run upgraded `ledger reconcile`
-to migrate writable storage to v9, then restart the host's HAM processes.
+to migrate writable storage to the current schema (v10, including v9 workspace metadata), then restart the host's HAM processes.
 Read-only opens do not migrate. Protocol 1 is unchanged and old peers may consume
 computed roles without optional scope metadata, but still compute old semantics
 for their own agents. Old code cannot open schema-v9 storage: do not mix versions
 on one host ledger. Downgrade requires restoring the backed-up database.
 OMP extension and Claude hook contracts are unchanged.
+
+Schema v10 adds `deliveries.fyi_turn_end INTEGER` with default 0. Existing v9
+deliveries remain conservatively unflagged. Upgrade the ledger and CLI/copied
+skills together so old enqueue code cannot omit the flag; run upgraded
+`ledger reconcile` before read-only opens. The OMP extension is unchanged and
+needs no restart for this policy. See [turn-end FYI migration](../../../docs/migration.md#turn-end-fyi-schema-v10).
 See [current migration and rollout](../../../docs/migration.md#worktree-role-grouping-schema-v9).
 
 The following v7 migration is historical; v9 supersedes its independent
@@ -612,12 +629,14 @@ not bodies. Thread Detail keeps message history and optional technical fields.
 Threads includes messages, direct submissions and OUTBOX.
 **Viewing is read-only and never ACKs, delivers, handles or resolves mail.**
 
-Agents Enter opens inline FYI input; Threads Enter opens a reply to its latest
+Agents Enter opens inline mail input; Threads Enter opens a reply to its latest
 message, resolving the recipient by host/terminal to a live, non-stale agent.
 Stale/unresolvable recipients are blocked; absent native receivers warn but
 allow mailbox sending. Detail Enter does nothing. UI mail has `sender=user`,
-kind `fyi`, no subject. Enter sends immediately without confirmation; blank
-bodies fail without sending. Shift+Enter inserts a newline using the mailbox's
+no subject. Every new compose, including replies and reopened drafts, resets to
+`action`; Ctrl+G toggles `action` / `fyi` for that compose. The selected kind is
+sent explicitly; CLI default remains `fyi`. Enter sends immediately without
+confirmation; blank bodies fail without sending. Shift+Enter inserts a newline using the mailbox's
 kitty keyboard protocol request, including through herdr in compatible terminals.
 Alt+Enter is the fallback for Moshi/mosh, which cannot negotiate that protocol.
 Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the protocol request.
@@ -775,7 +794,8 @@ selected sessions restart, confirm their receiver registration
 the current structured plugin root (or explicitly configured absolute
 `HERDR_AGENT_MESSENGER_ROOT`) and calls Python asynchronously; it never opens
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
-nonmembers. FYI alone does not start a turn. Automatic action wake requires a
+nonmembers. FYI enqueued while idle never wakes the recipient. Automatic action
+or flagged turn-end FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
 evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.

@@ -142,6 +142,18 @@ class NativeReceiverTest(unittest.TestCase):
     def states(self):
         return {row['message_id']:row['state'] for row in self.mail.read(self.recipient,all_states=True,limit=1000)['messages']}
 
+    def set_turn_state(self, state, *, age=0):
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE agent_status SET turn_state=? WHERE agent_id=?',
+                               (state, self.recipient['agent_id']))
+            connection.execute('UPDATE agents SET last_seen=? WHERE agent_id=?',
+                               (time.time()-age, self.recipient['agent_id']))
+
+    def turn_end_flag(self, message_id):
+        with self.store.read() as connection:
+            return connection.execute('SELECT fyi_turn_end FROM deliveries WHERE message_id=?',
+                                      (message_id,)).fetchone()[0]
+
     def test_full_native_session_path_registration_not_uuid_or_stale_session(self):
         for reference,code in [('only-a-uuid','invalid_session'),(str(self.root/'other-session.jsonl'),'stale_session')]:
             with self.assertRaises(LedgerError) as caught:
@@ -435,6 +447,187 @@ class NativeReceiverTest(unittest.TestCase):
         self.send()
         self.assertEqual(self.claim(wake=True)['reason'],'no_action')
         self.assertIsNotNone(self.claim()['claim_id'])
+
+    def test_working_fyi_remains_a_wake_trigger_after_idle_or_done_and_freshness_change(self):
+        for ready in ('idle', 'done'):
+            with self.subTest(ready=ready):
+                self.set_turn_state('working')
+                sent = self.send()
+                self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+                self.assertIs(sent['fyi_turn_end'], True)
+                self.assertNotIn('fyi_no_wake', [warning['code'] for warning in sent.get('warnings', [])])
+                self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+                self.assertEqual(self.claim(wake=True)['reason'], 'not_idle')
+                self.set_turn_state(ready, age=60)
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertEqual(inspected['turn_state'], ready)
+                self.assertTrue(inspected['has_action'])
+                claim = self.claim(wake=True)
+                self.assertIsNotNone(claim['claim_id'])
+                self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
+                self.assertEqual(claim['messages'][0]['kind'], 'fyi')
+                self.assertIn('[fyi]\n', claim['message']['content'])
+                self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+                self.applied(claim)
+                self.assertEqual(self.states()[sent['message_id']], 'delivered')
+
+    def test_ready_unknown_stale_and_missing_status_fyi_never_gain_turn_end_wake(self):
+        cases = (('idle', 0, False), ('done', 0, False), ('unknown', 0, False),
+                 ('blocked', 0, False), ('working', 60, False), ('working', 0, True))
+        for state, age, missing in cases:
+            with self.subTest(state=state, age=age, missing=missing):
+                self.set_turn_state(state, age=age)
+                if missing:
+                    with self.store.transaction() as connection:
+                        connection.execute('DELETE FROM agent_status WHERE agent_id=?',
+                                           (self.recipient['agent_id'],))
+                sent = self.send()
+                self.assertEqual(self.turn_end_flag(sent['message_id']), 0)
+                self.assertIsNot(sent.get('fyi_turn_end'), True)
+                if missing:
+                    with self.store.transaction() as connection:
+                        connection.execute(
+                            "INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,'idle',?)",
+                            (self.recipient['agent_id'], time.time()))
+                self.set_turn_state('idle')
+                self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+                self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+                natural = self.claim()
+                self.assertEqual([message['message_id'] for message in natural['messages']], [sent['message_id']])
+                self.applied(natural)
+                self.assertEqual(self.turn_end_flag(sent['message_id']), 0)
+
+    def test_flagged_fyi_action_and_ordinary_fyi_share_one_wake_without_kind_rewrite(self):
+        ordinary = self.send(body='Already idle FYI')
+        self.set_turn_state('working')
+        flagged = self.send(body='Arrived during work')
+        action = self.send(kind='action', body='Explicit request')
+        self.set_turn_state('done')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']],
+                         [ordinary['message_id'], flagged['message_id'], action['message_id']])
+        self.assertEqual([message['kind'] for message in claim['messages']], ['fyi', 'fyi', 'action'])
+        self.assertEqual([self.turn_end_flag(item['message_id']) for item in (ordinary, flagged, action)],
+                         [0, 1, 0])
+        self.assertEqual(self.represented_ids(claim['message']['content']),
+                         {ordinary['message_id'], flagged['message_id'], action['message_id']})
+        self.applied(claim)
+
+    def test_flagged_fyi_beyond_oldest_bundle_prefix_is_retained_as_wake_trigger(self):
+        ordinary = [self.send(body='older fyi '+str(index)) for index in range(105)]
+        self.set_turn_state('working')
+        flagged = self.send()
+        self.set_turn_state('idle')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        claim = self.claim(wake=True)
+        claimed = {message['message_id'] for message in claim['messages']}
+        self.assertEqual(len(claimed), BUNDLE_MESSAGES)
+        self.assertIn(flagged['message_id'], claimed)
+        self.assertTrue(all(message['kind'] == 'fyi' for message in claim['messages']))
+        self.assertEqual(self.represented_ids(claim['message']['content']), claimed)
+        self.assertEqual(sum(self.states()[item['message_id']] == 'queued' for item in ordinary), 98)
+
+    def test_reduced_bundle_budget_keeps_flagged_fyi_not_an_ordinary_only_prefix(self):
+        ordinary = [self.send(body='older '+str(index)) for index in range(3)]
+        self.set_turn_state('working')
+        flagged = self.send(body='Turn-end context 한글'*200)
+        self.set_turn_state('done')
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 345
+        with mock.patch('ledger_runtime.BUNDLE_BYTES', budget):
+            claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']], [flagged['message_id']])
+        self.assertEqual(self.represented_ids(claim['message']['content']), {flagged['message_id']})
+        self.assertLessEqual(len(claim['message']['content'].encode()), budget)
+        self.assertEqual({self.states()[item['message_id']] for item in ordinary}, {'queued'})
+
+    def test_over_hop_flagged_fyi_does_not_authorize_ordinary_fyi_wake(self):
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'max_hop':0})
+        ordinary = self.send()
+        self.set_turn_state('working')
+        flagged = self.send(reply_to=ordinary['message_id'])
+        self.assertEqual(self.turn_end_flag(flagged['message_id']), 1)
+        self.set_turn_state('idle')
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+        self.assertEqual([message['message_id'] for message in self.claim()['messages']], [ordinary['message_id']])
+        self.assertEqual(self.states()[flagged['message_id']], 'queued')
+
+    def test_flagged_fyi_obeys_role_coalescing_hourly_and_working_gates(self):
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds',
+                             {**self.thresholds, 'coalesce_seconds':30, 'wakes_per_hour':1})
+        self.set_turn_state('working')
+        first = self.send()
+        self.assertEqual(self.claim(wake=True)['reason'], 'not_idle')
+        self.set_turn_state('done')
+        inspected = self.receiver.inspect(**self.identity)
+        self.assertTrue(inspected['has_action'])
+        with self.store.read() as connection:
+            created_at = connection.execute('SELECT created_at FROM messages WHERE message_id=?',
+                                            (first['message_id'],)).fetchone()[0]
+        self.assertEqual(inspected['coalesce_until'], created_at+30)
+        self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
+        for mode in ('off', 'manual'):
+            self.settings.mutate(self.recipient['repo_id'], 'mode', mode)
+            self.assertEqual(self.claim(wake=True)['reason'], 'not_participating')
+            self.assertEqual(self.turn_end_flag(first['message_id']), 1)
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'auto')
+        with mock.patch('ledger_runtime.time.time', return_value=time.time()+31):
+            claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']], [first['message_id']])
+        self.set_turn_state('working')
+        second = self.send()
+        self.set_turn_state('idle')
+        self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+        self.applied(claim)
+        self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+        self.assertEqual(self.states()[second['message_id']], 'queued')
+        self.assertEqual(self.turn_end_flag(second['message_id']), 1)
+
+    def test_held_flagged_fyi_cannot_trigger_or_join_wake_until_hold_clears(self):
+        self.set_turn_state('working')
+        flagged = self.send()
+        self.set_turn_state('idle')
+        for reason in ('recipient_absent', 'recipient_changed', 'acceptance_unknown'):
+            with self.subTest(reason=reason):
+                with self.store.transaction() as connection:
+                    connection.execute('UPDATE deliveries SET hold_reason=? WHERE message_id=?',
+                                       (reason, flagged['message_id']))
+                self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+                self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+                action = self.send(kind='action')
+                claim = self.claim(wake=True)
+                self.assertEqual([message['message_id'] for message in claim['messages']], [action['message_id']])
+                self.applied(claim)
+                self.assertEqual(self.states()[flagged['message_id']], 'queued')
+                self.assertEqual(self.turn_end_flag(flagged['message_id']), 1)
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE deliveries SET hold_reason=NULL WHERE message_id=?',
+                               (flagged['message_id'],))
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual([message['message_id'] for message in self.claim(wake=True)['messages']],
+                         [flagged['message_id']])
+
+    def test_withdrawn_flagged_fyi_cannot_authorize_ordinary_fyi_after_inspect(self):
+        ordinary = self.send()
+        self.set_turn_state('working')
+        flagged = self.send()
+        self.set_turn_state('idle')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.mail.withdraw(flagged['message_id'], sender=self.sender)
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+        self.assertEqual(self.states()[ordinary['message_id']], 'queued')
+
+    def test_flagged_fyi_hold_gate_does_not_change_existing_action_hold_behavior(self):
+        action = self.send(kind='action')
+        self.assertEqual(self.turn_end_flag(action['message_id']), 0)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_absent' WHERE message_id=?",
+                               (action['message_id'],))
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']], [action['message_id']])
 
     def test_done_accepts_action_wake_before_user_focus(self):
         live = snapshot(self.repo,recipient_session=self.session)

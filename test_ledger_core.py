@@ -374,6 +374,11 @@ class LedgerCoreTest(unittest.TestCase):
         bells = {p.name: (p.stat().st_mtime_ns, p.read_bytes()) for p in self.store.bell_directory.iterdir()}
         return hashlib.sha256(data.encode()).hexdigest(), bells
 
+    def turn_end_flag(self, message_id):
+        with self.store.read() as connection:
+            return connection.execute("SELECT fyi_turn_end FROM deliveries WHERE message_id=?",
+                                      (message_id,)).fetchone()[0]
+
     def test_missing_local_receiver_is_advisory_and_preserves_queue(self):
         for client in ("omp", "claude"):
             with self.subTest(client=client):
@@ -416,6 +421,11 @@ class LedgerCoreTest(unittest.TestCase):
                 warnings = [item for item in sent.get("warnings", []) if item["code"] == "fyi_no_wake"]
                 self.assertEqual(warnings, [expected] if warned else [])
                 self.assertEqual(sent["state"], "queued")
+                self.assertEqual(self.turn_end_flag(sent["message_id"]),
+                                 int(kind == "fyi" and state == "working"))
+                self.assertEqual(sent.get("fyi_turn_end", False), kind == "fyi" and state == "working")
+                if kind == "fyi" and state == "working":
+                    self.assertIs(sent["fyi_turn_end"], True)
                 self.assertIn(sent["message_id"], [item["message_id"] for item in
                               self.mail.read(recipient)["messages"]])
 
@@ -448,6 +458,67 @@ class LedgerCoreTest(unittest.TestCase):
                                        body="Use the approved option")
                 self.assertEqual("fyi_no_wake" in [item["code"] for item in reply.get("warnings", [])], warned)
                 self.assertEqual(self.mail.read(recipient)["messages"][-1]["kind"], "fyi")
+
+    def test_enqueue_samples_fresh_authoritative_working_state_not_caller_or_message_age(self):
+        cases = (("working", 0, "fyi", 1), ("working", 60, "fyi", 0),
+                 ("idle", 0, "fyi", 0), ("done", 0, "fyi", 0),
+                 ("unknown", 0, "fyi", 0), ("working", 0, "action", 0))
+        for state, age, kind, expected in cases:
+            with self.subTest(state=state, age=age, kind=kind):
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=?,updated_at=? WHERE agent_id=?",
+                                       (state, time.time()-86400, self.recipient["agent_id"]))
+                    connection.execute("UPDATE agents SET last_seen=? WHERE agent_id=?",
+                                       (time.time()-age, self.recipient["agent_id"]))
+                # Status timestamps record transitions, not heartbeat freshness;
+                # neither that old timestamp nor payload creation time decides.
+                value = {**self.payload(), "kind": kind}
+                accepted = self.mail.enqueue(value)
+                self.assertEqual(self.turn_end_flag(value["message_id"]), expected)
+                self.assertEqual(accepted["payload_hash"], payload_hash(value))
+                self.assertEqual(accepted["state"], "queued")
+
+    def test_enqueue_dedupe_never_upgrades_or_downgrades_original_turn_end_flag(self):
+        for first_state, retry_state, expected in (("working", "idle", 1), ("idle", "working", 0)):
+            with self.subTest(first_state=first_state, retry_state=retry_state):
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=? WHERE agent_id=?",
+                                       (first_state, self.recipient["agent_id"]))
+                    connection.execute("UPDATE agents SET last_seen=? WHERE agent_id=?",
+                                       (time.time(), self.recipient["agent_id"]))
+                value = self.payload()
+                first = self.mail.enqueue(value)
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agent_status SET turn_state=? WHERE agent_id=?",
+                                       (retry_state, self.recipient["agent_id"]))
+                replayed = Mailbox(LedgerStore(self.store.directory, canonical_name="alpha")).enqueue(value)
+                self.assertEqual(replayed, first)
+                self.assertEqual(self.turn_end_flag(value["message_id"]), expected)
+                self.assertEqual(replayed["payload_hash"], payload_hash(value))
+
+    def test_enqueue_requires_active_matching_repo_and_present_local_recipient_for_flag(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agent_status SET turn_state='working' WHERE agent_id=?",
+                               (self.recipient["agent_id"],))
+        cases = ("inactive", "wrong_repo", "terminal_closed", "missing_status")
+        for case in cases:
+            with self.subTest(case=case):
+                with self.store.transaction() as connection:
+                    connection.execute("UPDATE agents SET active=?,last_seen=? WHERE agent_id=?",
+                                       (int(case != "inactive"), time.time(), self.recipient["agent_id"]))
+                    connection.execute("UPDATE terminal_slots SET present=? WHERE host=? AND terminal_id=?",
+                                       (int(case != "terminal_closed"), self.store.host, self.recipient["terminal_id"]))
+                    if case == "missing_status":
+                        connection.execute("DELETE FROM agent_status WHERE agent_id=?",
+                                           (self.recipient["agent_id"],))
+                value = self.payload()
+                if case == "wrong_repo":
+                    value.update(sender_repo_id=self.sender["repo_id"], recipient_repo_id="git:org/other")
+                accepted = self.mail.enqueue(value)
+                self.assertEqual(self.turn_end_flag(value["message_id"]), 0)
+                self.assertEqual(accepted["hold_reason"],
+                                 {"inactive": "recipient_absent", "wrong_repo": "recipient_changed",
+                                  "terminal_closed": "terminal_closed", "missing_status": None}[case])
 
     def test_host_persistence_permissions_and_wrong_reopen(self):
         other = LedgerStore(self.store.directory)
@@ -920,6 +991,62 @@ class LedgerCoreTest(unittest.TestCase):
         with self.assertRaises(LedgerError) as caught:
             self.mail.enqueue(modern)
         self.assertEqual(caught.exception.code, "message_conflict")
+
+    def test_v9_migration_is_conservative_for_existing_fyi_and_flags_only_new_accepts(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agent_status SET turn_state='working' WHERE agent_id=?",
+                               (self.recipient["agent_id"],))
+            connection.execute("UPDATE agents SET last_seen=? WHERE agent_id=?",
+                               (time.time(), self.recipient["agent_id"]))
+        old_fyi, old_action, held_fyi = self.payload(), {**self.payload(), "kind": "action"}, self.payload()
+        for value in (old_fyi, old_action, held_fyi):
+            self.mail.enqueue(value)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_changed' WHERE message_id=?",
+                               (held_fyi["message_id"],))
+            connection.execute("ALTER TABLE deliveries DROP COLUMN fyi_turn_end")
+            connection.execute("UPDATE ledger_meta SET value='9' WHERE key='schema_version'")
+            before = [dict(row) for row in connection.execute("SELECT * FROM deliveries ORDER BY message_id")]
+            hashes = [tuple(row) for row in connection.execute(
+                "SELECT message_id,payload_hash FROM messages ORDER BY message_id")]
+            receipts = [tuple(row) for row in connection.execute(
+                "SELECT * FROM dedupe_receipts ORDER BY message_id")]
+        migrated = LedgerStore(self.store.directory, canonical_name="alpha")
+        mail = Mailbox(migrated)
+        with migrated.read() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "10")
+            column = next(row for row in connection.execute("PRAGMA table_info(deliveries)")
+                          if row["name"] == "fyi_turn_end")
+            self.assertEqual((column["type"], column["notnull"], column["dflt_value"]), ("INTEGER", 1, "0"))
+            after = list(connection.execute("SELECT * FROM deliveries ORDER BY message_id"))
+            self.assertEqual([{key: row[key] for key in row.keys() if key != "fyi_turn_end"} for row in after], before)
+            self.assertEqual([row["fyi_turn_end"] for row in after], [0, 0, 0])
+            self.assertEqual([tuple(row) for row in connection.execute(
+                "SELECT message_id,payload_hash FROM messages ORDER BY message_id")], hashes)
+            self.assertEqual([tuple(row) for row in connection.execute(
+                "SELECT * FROM dedupe_receipts ORDER BY message_id")], receipts)
+        # A retry is still the old acceptance, even with fresh working status.
+        mail.enqueue(old_fyi)
+        self.assertEqual(self.turn_end_flag(old_fyi["message_id"]), 0)
+        with migrated.transaction() as connection:
+            connection.execute("UPDATE agents SET last_seen=? WHERE agent_id=?",
+                               (time.time(), self.recipient["agent_id"]))
+        new_fyi = self.payload()
+        mail.enqueue(new_fyi)
+        self.assertEqual(self.turn_end_flag(new_fyi["message_id"]), 1)
+        reopened = LedgerStore(migrated.directory, canonical_name="alpha")
+        with reopened.read() as connection:
+            flags = {row["message_id"]: row["fyi_turn_end"]
+                     for row in connection.execute("SELECT message_id,fyi_turn_end FROM deliveries")}
+        self.assertEqual(flags, {old_fyi["message_id"]: 0, old_action["message_id"]: 0,
+                                 held_fyi["message_id"]: 0, new_fyi["message_id"]: 1})
+        for invalid in (None, -1, 2):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with reopened.transaction() as connection:
+                        connection.execute("UPDATE deliveries SET fyi_turn_end=? WHERE message_id=?",
+                                           (invalid, new_fyi["message_id"]))
 
     def test_v7_migration_backfills_endpoint_repos_preserving_queues_holds_and_hashes(self):
         held = self.payload()

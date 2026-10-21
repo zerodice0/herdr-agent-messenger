@@ -24,6 +24,9 @@ IMMUTABLE_FIELDS = ("message_id", "thread_id", "repo_id", "reply_to", "origin_ho
                     "recipient_host", "recipient_terminal_id", "recipient_address")
 REPO_FIELDS = ("sender_repo_id", "recipient_repo_id")
 MAX_HISTORY_CURSOR_SIZE = 32768
+# The worker refreshes local Herdr observations every five seconds. Do not infer
+# an interrupted turn from a cache older than three sweeps.
+LOCAL_TURN_STATE_MAX_AGE = 15
 
 
 def _history_scope(repo_id: str | None, limit: int) -> None:
@@ -140,7 +143,7 @@ class Mailbox:
         return self._submit_message(payload, sender=sender, recipient=recipient, auto_handle_parent=True)
 
     def send_user(self, repo_id: str, recipient: Mapping[str, Any], *, body: str,
-                  kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
+                  kind: str = "action", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
         """Send as the operator from repo_id context, including to another repo.
 
         Replies keep the retained thread origin; repo_id still records this
@@ -220,6 +223,11 @@ class Mailbox:
             value = validate_payload(payload)
             from ledger_remote import RemoteLedger
             result = RemoteLedger(self.store, self.environment).submit(connection, value)
+            if payload["kind"] == "fyi" and recipient["host"] == self.store.host:
+                delivery = connection.execute("SELECT fyi_turn_end FROM deliveries WHERE message_id=?",
+                                              (payload["message_id"],)).fetchone()
+                if delivery is not None:
+                    result["fyi_turn_end"] = bool(delivery[0])
             if (sender is not None and auto_handle_parent and parent and
                     parent["recipient_host"] == self.store.host and
                     parent["recipient_repo_id"] == sender["repo_id"] and
@@ -298,11 +306,23 @@ class Mailbox:
                                              (self.store.host, target["recipient_terminal_id"])).fetchone()
             hold = "recipient_absent" if target_agent is None else ("recipient_changed" if target_agent[0] != target["recipient_repo_id"] else None)
         at = time.time()
+        fyi_turn_end = False
+        if authoritative and state == "queued" and hold is None and value["kind"] == "fyi":
+            # Capture recipient-host enqueue state, never a sender's cached view.
+            # last_seen records reconciliation freshness; status.updated_at only
+            # changes on transitions and can be old during a healthy long turn.
+            working = connection.execute(
+                "SELECT a.last_seen,s.turn_state FROM agents a JOIN agent_status s USING(agent_id) "
+                "WHERE a.host=? AND a.terminal_id=? AND a.repo_id=? AND a.active=1",
+                (self.store.host, target["recipient_terminal_id"], target["recipient_repo_id"])).fetchone()
+            fyi_turn_end = bool(working and working["turn_state"] == "working"
+                                and 0 <= at - working["last_seen"] <= LOCAL_TURN_STATE_MAX_AGE)
         connection.execute(
             "INSERT INTO deliveries(message_id,recipient_address,recipient_host,recipient_terminal_id,recipient_repo_id,workspace_id,pane_id,"
-            "state,hold_reason,authoritative,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "state,hold_reason,authoritative,updated_at,fyi_turn_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (value["message_id"], target["recipient_address"], target["recipient_host"], target["recipient_terminal_id"],
-             target["recipient_repo_id"], slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '', state, hold, authoritative, at))
+             target["recipient_repo_id"], slot["workspace_id"] if slot else '', slot["pane_id"] if slot else '',
+             state, hold, authoritative, at, fyi_turn_end))
         if state in FINAL_STATES:
             connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, value["message_id"]))
         return save_receipt(connection, value["message_id"])

@@ -810,6 +810,7 @@ class MailboxApp:
         self.draft_key: tuple[str, str, str | None] | None = None
         self.body, self.body_cursor, self.draft_version = "", 0, 0
         self.delivery, self.reply_to = "mailbox", None
+        self.mail_kind = "action"
         self.recipient: dict[str, Any] | None = None
         self.submitted: dict[str, Any] | None = None
         self.result_tags: dict[tuple[str, str], tuple[str, float]] = {}
@@ -1132,6 +1133,7 @@ class MailboxApp:
         draft = self.drafts.get(self.draft_key, {})
         self.body, self.body_cursor = draft.get("text", ""), draft.get("cursor", 0)
         self.draft_version, self.delivery = draft.get("version", 0), draft.get("delivery", "mailbox")
+        self.mail_kind = "action"
         self.mode, self.input_error = "input", ""
         self.input_scroll = None
         self.save_draft()
@@ -1180,7 +1182,7 @@ class MailboxApp:
             self.input_error = "Recipient is unavailable or stale; refresh before sending."
             return
         request = {"repo_id": self.repo_id or recipient["repo_id"],
-                   "recipient": dict(self.recipient), "body": self.body, "kind": "fyi",
+                   "recipient": dict(self.recipient), "body": self.body, "kind": self.mail_kind,
                    "subject": None, "reply_to": self.reply_to}
         if self.delivery == "direct":
             self.open_confirm("DIRECT · may interrupt; acceptance ≠ native delivery",
@@ -1637,6 +1639,10 @@ class MailboxApp:
             self.delivery = "direct" if self.delivery == "mailbox" else "mailbox"
             self.draft_version += 1
             self.save_draft()
+        elif key == "\x07":
+            self.mail_kind = "fyi" if self.mail_kind == "action" else "action"
+            self.draft_version += 1
+            self.save_draft()
         elif key == "\r":
             self.submit()
         elif key != "\n":
@@ -1968,8 +1974,8 @@ class MailboxApp:
         if self.mode == "viewer":
             return ["↑↓ scroll", "t technical", "Esc close"]
         if self.mode == "input":
-            return ["Enter send", "Shift+Enter / Alt+Enter newline", "Esc keep draft",
-                    "^D direct", "F1 help", "^R refresh"]
+            return ["Enter send", "^G action/fyi", "Shift+Enter / Alt+Enter newline",
+                    "Esc keep draft", "^D direct", "F1 help", "^R refresh"]
         if self.mode == "confirm":
             return ["Enter choose", "Tab/←→ select", "Esc cancel", "↑↓ scroll"]
         if self.mode == "evidence":
@@ -2787,9 +2793,11 @@ class MailboxApp:
 
     def render_input(self, rect: tuple[int, int, int, int]) -> None:
         direct = self.delivery == "direct"
-        title = ("Reply to " if self.reply_to else "To ") + self.address(self.recipient) + " · FYI"
+        title = ("Reply to " if self.reply_to else "To ") + self.address(self.recipient)
         if direct:
             title = "DIRECT · " + title + " · may interrupt; acceptance ≠ native delivery"
+        else:
+            title = f"[{self.mail_kind.upper()} ^G] " + title
         y, x, height, width = self.box(rect, title, True, direct)
         x, width = x + 1, width - 1
         if height <= 0 or width <= 0:
@@ -2877,7 +2885,7 @@ class MailboxApp:
     def render_overlay(self, body: tuple[int, int, int, int]) -> None:
         body_y, body_x, height, width = body
         if self.mode == "help":
-            context = ["INPUT: Enter send · Shift+Enter / Alt+Enter newline · Esc keep draft · ^D direct · ^R refresh"
+            context = ["INPUT: Enter send · ^G action/fyi · Shift+Enter / Alt+Enter newline · Esc keep draft · ^D direct · ^R refresh"
                        if self.help_return == "input" else " / ".join(self.footer_hints_for_nav())]
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
@@ -2897,7 +2905,8 @@ class MailboxApp:
                     "INPUT: printable characters are text (including q, ?, digits, :, /)",
                     "←→ Home/End Backspace/Delete edit · ↑↓ move between lines",
                     "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",
-                    "FYI mailbox sends immediately; direct input always asks for confirmation.",
+                    "Quick send and replies start as action; Ctrl+G toggles action/fyi for this compose.",
+                    "Mailbox sends immediately; direct input always asks for confirmation.",
                     "Inspection never acknowledges messages. Direct acceptance ≠ native delivery.",
                     "Receiver warning: runtime status on the recipient host; ask before runtime install omp/claude.",
                     "If already installed, restart only the selected sessions to register their receiver.",

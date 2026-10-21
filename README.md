@@ -16,7 +16,7 @@ for coordination across local and registered SSH hosts.
 - Automatic labels such as `blue-otter` with matching color markers
 - Local and SSH agent discovery using concrete aliases from `~/.ssh/config`
 - Durable cross-repository threads, explicit handling, and `off` / `manual` / `auto` participation modes
-- A keyboard-first mailbox/status TUI with inline FYI quick-send, replies, and confirmed direct input
+- A keyboard-first mailbox/status TUI with inline action/FYI compose, replies, and confirmed direct input
 - A bundled `herdr-agent-messenger` skill for Codex, Claude Code, and omp, split into short `SKILL.md` and on-demand `reference.md`
 - Labeled interactive-session creation with `spawn --message`, plus standalone and permitted legacy request, wait, read, batch, and rollout helpers
 - Separately opt-in omp and Claude receiving runtimes; Codex uses explicit inbox reads at work boundaries
@@ -86,7 +86,8 @@ Agents, Threads and read-only Detail regions, plus a Settings overlay (`s`).
 Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)**, or **HAM: Mailbox
 (quick send)**; the popup closes after a successful send. In NAV, Tab/Shift+Tab,
 arrows or h/l move between regions; arrows or j/k select rows. On an Agents row,
-Enter opens inline FYI input and Enter sends immediately; on Threads, Enter replies.
+Enter opens inline mail input and Enter sends immediately; on Threads, Enter replies.
+Each new compose starts as `action`; Ctrl+G toggles `action` / `fyi` for that compose.
 Shift+Enter adds a newline via the mailbox's kitty keyboard protocol request
 (through herdr in kitty-compatible terminals). Use Alt+Enter on Moshi/mosh;
 Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the request.
@@ -195,8 +196,12 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
   --message MESSAGE_UUID
 ```
 
-`fyi` is informational; `action` can qualify for an omp wake when Herdr `turn_state` is `idle` or `done`. FYI alone does
-not start a turn. Reads are view-only, including reads by subagents sharing a
+`fyi` is informational and never wakes an idle recipient. FYI arriving during a
+recipient turn is delivered right after that turn under the existing wake gates:
+the local ledger marks it only when fresh recipient state is `working` at enqueue.
+Idle, unknown or stale state leaves FYI for natural-turn delivery.
+`action` can qualify for an omp wake when Herdr `turn_state` is `idle` or `done`.
+The CLI `--kind` default remains `fyi`. Reads are view-only, including reads by subagents sharing a
 pane. Explicit handling can mark queued mail handled without inventing a
 delivered timestamp. Replies to mail addressed to the current recipient
 atomically handle that parent. Use `mail show --thread UUID` to inspect the
@@ -396,6 +401,12 @@ copied skills together on each host; downgrade requires a backed-up database.
 See [schema-v9 migration and rollout](docs/migration.md#worktree-role-grouping-schema-v9).
 The earlier [schema-v7 migration](docs/migration.md#workspace-role-migration-schema-v7)
 is historical; v9 supersedes its independent-workspace role semantics.
+
+Schema v10 adds the local `deliveries.fyi_turn_end` flag, defaulting to false;
+existing v9 deliveries remain conservatively unflagged. Upgrade the ledger and
+CLI/copied skills together so older enqueue code cannot omit the flag. The OMP
+extension is unchanged and needs no restart for this policy.
+See [turn-end FYI migration](docs/migration.md#turn-end-fyi-schema-v10).
 
 Skill installation does **not implicitly** install a receiving runtime. Opt in
 through the installer's explicit runtime choice/flag or separately

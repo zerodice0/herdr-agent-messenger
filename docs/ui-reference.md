@@ -299,13 +299,19 @@ row. Arrow keys, Home/End, the wheel, resize and toggling use the same bounds.
 ### Inline input and replies
 
 Select an Agents row and press `Enter`. The full-width input box below Detail
-(or below the focused region in single mode) shows `To host/alias · FYI`;
-UI mail is always `sender=user`, kind `fyi`, without a subject. Input space is
-reserved before choosing the body layout, so opening or growing input can switch
+(or below the focused region in single mode) shows the recipient and selected
+mail kind, initially `ACTION`. UI mail is `sender=user`, without a subject.
+Input space is reserved before choosing the body layout, so opening or growing input can switch
 from stacked to single mode. A missing native receiver produces a warning but
 still permits sending to the mailbox. A stale recipient cannot be selected for input.
 Threads `Enter` opens the same input as a reply to the thread's latest message.
 The recipient must resolve to a live, non-stale agent; otherwise an error is shown.
+Every new compose, including replies and reopened drafts, resets to `action`.
+`Ctrl+G` toggles `action` / `fyi` for that compose, and the selected kind is sent
+explicitly; the CLI default remains `fyi`. FYI never wakes an idle recipient;
+FYI arriving during a turn is delivered right after that turn under existing
+wake gates when local enqueue observes fresh `working` recipient state.
+Idle/unknown/stale FYI stays natural-turn only.
 
 - `Enter` sends mailbox text immediately, without a review or confirmation step.
   A blank body is rejected without sending.

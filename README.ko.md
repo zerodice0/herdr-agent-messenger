@@ -16,7 +16,7 @@ HAM은 Herdr용 에이전트 라벨링 및 다중 에이전트 메시징 플러�
 - `blue-otter` 같은 자동 라벨과 색상 표시를 제공합니다.
 - `~/.ssh/config`의 명시적 별칭으로 로컬·SSH 에이전트를 탐색합니다.
 - 저장소 간 대화 이력과 명시적 처리 기록, `off` / `manual` / `auto` 참여 모드를 제공합니다.
-- 키보드 중심 메일함·상태 TUI에서 인라인 FYI 전송, 답장과 확인을 거치는 직접 입력을 제공합니다.
+- 키보드 중심 메일함·상태 TUI에서 인라인 action/FYI 입력, 답장과 확인을 거치는 직접 입력을 제공합니다.
 - Codex, Claude Code, omp용 스킬을 짧은 `SKILL.md`와 필요할 때 읽는 `reference.md`로 제공합니다.
 - `spawn --message`로 라벨이 있는 세션과 첫 프롬프트를 생성하며, 단독 사용과 정책이 허용하는 기존 요청·대기·읽기·배치·원격 배포 도구도 지원합니다.
 - omp와 Claude 수신 런타임은 별도로 선택해 설치합니다. Codex는 작업 경계에서 받은 메일을 명시적으로 읽습니다.
@@ -87,7 +87,8 @@ Detail 영역을 배치하며 `s`로 Settings를 엽니다. **HAM: Mailbox (Righ
 **HAM: Mailbox (Tab)** 또는 **HAM: Mailbox (quick send)**로 열 수 있고,
 팝업은 전송 성공 후 닫힙니다. NAV에서 Tab·Shift+Tab, 좌우 방향키나 h/l로
 영역을 옮기고 상하 방향키나 j/k로 행을 고릅니다. Agents 행에서 Enter로 인라인
-FYI 입력창을 열고 Enter로 즉시 전송하며, Threads의 Enter는 답장을 엽니다.
+메일 입력창을 열고 Enter로 즉시 전송하며, Threads의 Enter는 답장을 엽니다.
+새 입력창은 매번 `action`으로 시작하며 Ctrl+G로 `action` / `fyi`를 전환합니다.
 Shift+Enter는 메일함이 요청한 kitty 키보드 프로토콜로 줄을 바꿉니다.
 kitty 호환 터미널에서는 herdr를 통해 동작하며 Moshi/mosh에서는 Alt+Enter를
 사용하세요. Ctrl+J는 줄바꿈 키가 아닙니다. `HAM_MAILBOX_NO_KITTY=1`로 요청을 끕니다.
@@ -197,8 +198,12 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py in
   --message MESSAGE_UUID
 ```
 
-`fyi`는 참고 정보이며, `action`은 조건에 맞으면 Herdr의 `turn_state`가 `idle` 또는 `done`인 omp 세션에서 턴을
-시작할 수 있습니다. FYI만으로는 턴을 시작하지 않습니다. 같은 pane을 쓰는
+`fyi`는 참고 정보이며 유휴 수신자를 깨우지 않습니다. 수신자의 턴이 진행되는 동안
+도착한 FYI는 기존 깨우기 조건에 따라 그 턴 직후 전달합니다. 로컬 원장은 enqueue
+시점에 확인한 최신 수신자 상태가 `working`일 때만 이 메일에 표시를 남깁니다.
+유휴 상태이거나 상태를 알 수 없거나 오래된 경우에는 자연스러운 턴에서만 수신합니다.
+`action`은 조건에 맞으면 Herdr의 `turn_state`가 `idle` 또는 `done`인 omp 세션에서
+턴을 시작할 수 있습니다. CLI의 `--kind` 기본값은 계속 `fyi`입니다. 같은 pane을 쓰는
 서브에이전트가 읽어도 조회는 전달·처리 상태를 바꾸지 않습니다. 명시적 처리는
 대기 중인 메일을 네이티브 전달 시각 없이 처리 완료로 바꿀 수 있습니다.
 현재 수신자에게 온 메일에 답장하면 해당 원문도 같은 트랜잭션에서 처리됩니다.
@@ -399,6 +404,12 @@ flock worker는 일시적 오류를 같은 메시지 ID로 재시도합니다. �
 [스키마 v9 마이그레이션·배포 안내](docs/ko/migration.md#worktree-역할-그룹스키마-v9)를 참고하세요.
 기존 [스키마 v7 안내](docs/ko/migration.md#workspace-역할-마이그레이션스키마-v7)는
 과거 기록이며, workspace별 독립 역할 규칙은 v9의 그룹 규칙으로 대체됐습니다.
+
+스키마 v10은 로컬 `deliveries.fyi_turn_end` 표시를 추가하며 기본값은 false입니다.
+기존 v9 전달에는 보수적으로 표시를 남기지 않습니다. 이전 enqueue 코드가 표시를
+누락하지 않도록 원장과 CLI·복사한 스킬을 함께 갱신하세요. 이 정책에서 OMP 확장은
+바뀌지 않으므로 확장을 다시 시작할 필요가 없습니다.
+[턴 종료 후 FYI 마이그레이션](docs/ko/migration.md#턴-종료-후-fyi스키마-v10)을 참고하세요.
 
 스킬 설치는 수신 런타임을 **자동으로 설치하지 않습니다**. 설치기의 명시적 선택이나
 플래그로 동의하거나, 각 호스트에서 `runtime install omp` 또는

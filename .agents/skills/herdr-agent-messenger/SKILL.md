@@ -33,7 +33,7 @@ python3 scripts/herdr_agent_messenger.py status board --repo --host local
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing mailbox boundaries'
 ```
 
-`--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Only eligible OMP `action` can start a later turn; FYI alone cannot. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Explicit/atomic handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
+CLI `--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). FYI never wakes an idle recipient; FYI arriving during a turn is delivered right after that turn under existing wake gates when fresh local enqueue state is `working`. Idle/unknown/stale FYI stays natural-turn only. TUI compose defaults to `action`; Ctrl+G toggles action/FYI, resetting on every new compose. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Explicit/atomic handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
 
 `status set` takes a **positional phase**, not `--phase`; it works even off. Herdr owns turn state; do not infer it from phase. `status clear` removes phase/summary, retaining alias/active role and manual user borders.
 
@@ -51,7 +51,9 @@ Cross-repo wakes retain recipient repo settings/role and all gates. Occupancy ho
 
 Schema v9 adds open-workspace metadata, including no-agent anchors, without moving existing settings. Protocol 1 stays unchanged; optional scope export metadata lets old peers consume computed roles. Old code cannot open v9 storage: upgrade/restart all host HAM processes and copied skills together; downgrade needs the backed-up database. OMP extension/Claude hook contracts are unchanged. Reference **Workspace role migration**.
 
-- **OMP:** opt-in root receiver; action wake needs Herdr `turn_state` of `idle` or `done`, empty supported TUI editor, quiet/idle input, no pending work, eligible membership and rate/hop guards. Uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves same-session active-branch journal acceptance, not provider success.
+Schema v10 adds local `deliveries.fyi_turn_end` (default 0); existing v9 deliveries stay unflagged. Upgrade ledger and CLI/copied skills together: older enqueue code misses the flag. OMP extension unchanged; no extension restart for this policy.
+
+- **OMP:** opt-in root receiver; action or flagged turn-end FYI wake needs Herdr `turn_state` of `idle` or `done`, empty supported TUI editor, quiet/idle input, no pending work, eligible membership and rate/hop guards. Uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves same-session active-branch journal acceptance, not provider success.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. ACK needs exact SDK context + fresh request correlation or typed hook bytes/hash + causal journal witness. The latter proves host-context application, not provider-wire bytes/understanding. Stdout alone is not delivery. Limits: reference **Receiving runtimes**.
 - **Codex:** skill-guided pull at work boundaries, then explicit handling; no automatic receiver/wake or invented delivered receipt.
 

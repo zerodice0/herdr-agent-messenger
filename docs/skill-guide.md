@@ -178,7 +178,7 @@ max-hop gates are unchanged. Legacy collaboration policy is also unchanged:
 Successful sends can return advisory warnings without changing the default
 `fyi` kind. `fyi_no_wake` means FYI was sent to a known ready, non-stale,
 participating OMP recipient with a registered receiver and Herdr `turn_state`
-of `idle` or `done`; FYI alone cannot start a turn. No such warning is emitted
+of `idle` or `done`; FYI enqueued while idle cannot wake it. No such warning is emitted
 for action, busy/unknown/stale recipients, missing receivers, other clients,
 mode `off`, or nonmembers. Replies follow the same recipient-state rule even
 when their parent was action. Choose `--kind action` when the recipient must
@@ -489,6 +489,11 @@ See [current migration and rollout](migration.md#worktree-role-grouping-schema-v
 the v7 section is historical and its independent linked-workspace semantics
 are superseded.
 
+Schema v10 adds `deliveries.fyi_turn_end` with default 0. Existing v9 deliveries
+stay conservatively unflagged. Upgrade ledger and CLI/copied skills together;
+older enqueue code can miss the flag. The extension contract is unchanged and
+this policy needs no extension restart. See [turn-end FYI migration](migration.md#turn-end-fyi-schema-v10).
+
 Public status is independent of coordination mode:
 
 ```bash
@@ -588,11 +593,13 @@ repo/host/workspace scope and applied immediately; an older snapshot cannot
 overwrite it. Repo-wide propagation can remain pending while a peer is offline;
 workspace edits do not propagate. Local saving does not require all peers online.
 
-Agents Enter opens inline FYI input; Threads Enter opens a reply to the latest
+Agents Enter opens inline mail input; Threads Enter opens a reply to the latest
 message with a live, non-stale agent resolved by host/terminal identity.
 Stale/unresolvable recipients are blocked; missing native receivers warn but
-still allow mail. UI mail is `sender=user`, kind `fyi`, without a subject.
-Enter sends mailbox text immediately without confirmation; blank bodies are rejected.
+still allow mail. UI mail is `sender=user`, without a subject. Every new compose,
+including a reply or reopened draft, resets to `action`. Ctrl+G toggles `action`
+/ `fyi` for that compose; the selected kind is sent explicitly. The CLI default
+remains `fyi`. Enter sends immediately without confirmation; blank bodies are rejected.
 Shift+Enter adds a newline via the requested kitty keyboard protocol, including
 through herdr in compatible terminals. Alt+Enter is the Moshi/mosh fallback
 because they cannot negotiate the protocol. Ctrl+J is not a newline key.
@@ -624,7 +631,7 @@ replay an unknown claim or send a replacement while application is uncertain.
 native session file; the extension delegates ledger work to Python. In a
 supported TUI, automatic wake needs an empty editor, quiet input for
 `idle_minutes`, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime with no pending message, `willContinue`, or retry
-hold, an eligible action and participating role, plus coalescing/hourly/hop
+hold, an eligible action or flagged turn-end FYI and participating role, plus coalescing/hourly/hop
 limits. Eligibility is rechecked in the same tick immediately before enqueue.
 It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself
 does not block this wake; it is not the legacy focused-pane hold.
@@ -635,10 +642,16 @@ retry window and clears its own status on success; exhaustion shows unavailable.
 HAM never publishes that path itself. Conflicting reported paths remain
 `stale_session`.
 
-FYI alone never starts a turn. Natural user turns can receive action and FYI
-even in off mode or for manual nonmembers. An action wake includes eligible
-FYI in the same bounded bundle: at most eight messages / 8 KiB total, with each
-body bounded to 2 KiB and exact-message-ID read instructions for truncation.
+FYI never wakes an idle recipient. FYI arriving during a turn is delivered right
+after that turn under existing wake gates: local enqueue records
+`delivery.fyi_turn_end` only for fresh `working` state (local reconciliation's
+`agents.last_seen` within 15 seconds). Idle, unknown or stale state leaves FYI
+natural-turn only; later state changes do not retroactively flag it. The flag
+is local delivery metadata, not a change of mail kind or wire payload.
+Natural user turns can receive both kinds even in off mode or for manual
+nonmembers. An eligible action or flagged FYI can wake with other eligible FYI
+in the same bounded bundle: at most eight messages / 8 KiB total, each body
+bounded to 2 KiB with exact-message-ID read instructions for truncation.
 The runtime watches the local bell with `fs.watch` and has a five-minute
 code-only safety check. Its ACK proves exact claimed content/hash in the
 same-session active-branch journal, **not** provider-request inclusion, model

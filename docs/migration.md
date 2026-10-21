@@ -23,7 +23,7 @@ detected after installation are labeled automatically.
 
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
-- **OMP adapter:** native receiving and eligible automatic action wake.
+- **OMP adapter:** native receiving and eligible action/flagged turn-end FYI wake.
 - **Claude hooks:** native receiving at turn boundaries, with no idle wake.
 - **Codex:** skill-guided inbox pull, with no adapter required.
 
@@ -44,6 +44,31 @@ sessions need restarting; restart only the sessions they select. After restart,
 confirm `extension_present=1`, or report **installed, activation pending**.
 Plugin loading never writes client configuration; the new-repository `auto`
 default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
+
+## Turn-end FYI (schema v10)
+
+Schema v10 adds local `deliveries.fyi_turn_end INTEGER NOT NULL DEFAULT 0`.
+Existing v9 deliveries stay conservatively unflagged: old records cannot prove
+the recipient was working when they arrived.
+
+FYI never wakes an idle recipient. During local recipient enqueue, only a
+locally reconciled `working` state with `agents.last_seen` within 15 seconds
+sets the flag (normal local reconciliation sweeps run every five seconds).
+Flagged FYI is delivered right after that turn under existing wake gates;
+idle, unknown or stale enqueue state stays natural-turn only. Remote wire
+payloads do not carry this flag; the final recipient's ledger decides locally.
+
+Back up the ledger and stop old HAM workers/Mailbox processes. Upgrade host
+ledger code and CLI/copied skills together, then run upgraded `ledger reconcile`
+and start replacement HAM processes. Older enqueue code can otherwise miss the
+flag, and old code cannot open v10 storage. Read-only opens do not migrate. Downgrade requires restoring
+the pre-upgrade database. OMP extension and Claude hooks are unchanged; this
+policy requires no extension restart or runtime reinstall.
+
+Each new TUI compose starts as `action`; Ctrl+G toggles `action` / `fyi` and
+the selection resets when a new compose opens. CLI `--kind` still defaults to
+`fyi`.
+
 
 ## Worktree role grouping (schema v9)
 
@@ -85,8 +110,8 @@ with mains give `main_ambiguous`. Named `HOST/LABEL` addressing is unchanged.
    Do not let old and new processes share the upgraded ledger.
 2. From the updated HAM checkout on each host, run
    `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`.
-   Writable reconciliation upgrades older storage to schema v9 and records the
-   open-workspace metadata. Read-only commands never perform the migration.
+   Writable reconciliation upgrades older storage to the current schema
+   (v10, including v9 workspace metadata). Read-only commands never migrate.
 3. Restart the host's HAM processes with the upgraded code. The OMP extension
    and Claude hook contracts are unchanged; no new adapter/hook configuration
    is required. Resume group-dependent routing after the participating hosts

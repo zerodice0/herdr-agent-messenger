@@ -492,6 +492,79 @@ class RemoteLedgerTest(unittest.TestCase):
         sent = mailbox.send(self.agents["alpha"], unknown, body="Status omitted by older peer")
         self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
 
+    def turn_end_flag(self, host, message_id):
+        with self.stores[host].read() as connection:
+            return connection.execute('SELECT fyi_turn_end FROM deliveries WHERE message_id=?',
+                                      (message_id,)).fetchone()[0]
+
+    def test_remote_turn_end_flag_uses_recipient_host_accept_state_not_origin_or_export(self):
+        shadow = self.add_agent('alpha', self.agents['beta']['terminal_id'], 'shadow-workspace')
+        cases = (('working', 'idle', 'working', 0, 0),
+                 ('idle', 'working', 'idle', 0, 1),
+                 ('working', 'working', 'working', 60, 0),
+                 ('working', 'unknown', 'working', 0, 0))
+        for origin_state, recipient_state, exported_state, age, expected in cases:
+            with self.subTest(origin=origin_state, recipient=recipient_state, exported=exported_state, age=age):
+                with self.stores['alpha'].transaction() as connection:
+                    connection.execute('UPDATE agent_status SET turn_state=? WHERE agent_id IN (?,?)',
+                                       (origin_state, self.agents['alpha']['agent_id'], shadow['agent_id']))
+                    connection.execute('UPDATE agents SET last_seen=? WHERE agent_id=?',
+                                       (time.time(), shadow['agent_id']))
+                # The exported mapping can disagree with the authoritative
+                # host by the time its queued transport is finally accepted.
+                selected = {**self.agents['beta'], 'turn_state':exported_state}
+                sent = Mailbox(self.stores['alpha'], self.environment).send(
+                    self.agents['alpha'], selected, body='Recipient-host acceptance decides')
+                self.assertEqual(sent['state'], 'pending')
+                self.assertNotIn('fyi_turn_end', sent)
+                self.assertEqual(self.turn_end_flag('alpha', sent['message_id']), 0)
+                route = json.loads(next(item['payload'] for item in self.services['alpha'].outbox()
+                                        if item['message_id'] == sent['message_id']))
+                self.assertNotIn('fyi_turn_end', route['message'])
+                self.assertNotIn('fyi_turn_end', route['resolved'])
+                with self.stores['beta'].transaction() as connection:
+                    connection.execute('UPDATE agent_status SET turn_state=? WHERE agent_id=?',
+                                       (recipient_state, self.agents['beta']['agent_id']))
+                    connection.execute('UPDATE agents SET last_seen=? WHERE agent_id=?',
+                                       (time.time()-age, self.agents['beta']['agent_id']))
+                self.drain()
+                self.assertEqual(self.current('beta', sent['message_id'])['state'], 'queued')
+                self.assertEqual(self.turn_end_flag('beta', sent['message_id']), expected)
+                # Receipt propagation must not turn the origin's non-local
+                # delivery into an authoritative wake trigger.
+                self.assertEqual(self.turn_end_flag('alpha', sent['message_id']), 0)
+                messages = Mailbox(self.stores['beta']).read(self.agents['beta'])['messages']
+                accepted = next(item for item in messages if item['message_id'] == sent['message_id'])
+                self.assertEqual(accepted['kind'], 'fyi')
+
+    def test_remote_lost_ack_retries_preserve_first_accept_turn_end_flag_in_both_directions(self):
+        for first_state, retry_state, expected in (('working', 'idle', 1), ('idle', 'working', 0)):
+            with self.subTest(first=first_state, retry=retry_state):
+                sent = self.send()
+                with self.stores['beta'].transaction() as connection:
+                    connection.execute('UPDATE agent_status SET turn_state=? WHERE agent_id=?',
+                                       (first_state, self.agents['beta']['agent_id']))
+                    connection.execute('UPDATE agents SET last_seen=? WHERE agent_id=?',
+                                       (time.time(), self.agents['beta']['agent_id']))
+                self.links['alpha'].failures['beta'] = ['lost_ack']
+                self.assertEqual(self.services['alpha'].pump()['deferred'], 1)
+                self.assertEqual(self.turn_end_flag('beta', sent['message_id']), expected)
+                with self.stores['beta'].transaction() as connection:
+                    connection.execute('UPDATE agent_status SET turn_state=? WHERE agent_id=?',
+                                       (retry_state, self.agents['beta']['agent_id']))
+                    connection.execute('UPDATE agents SET last_seen=? WHERE agent_id=?',
+                                       (time.time(), self.agents['beta']['agent_id']))
+                self.services['alpha'].pump(now=time.time()+1000)
+                self.drain()
+                self.assertEqual(self.turn_end_flag('beta', sent['message_id']), expected)
+                self.assertEqual(self.turn_end_flag('alpha', sent['message_id']), 0)
+                item = next(item for item in self.services['alpha'].outbox()
+                            if item['message_id'] == sent['message_id'])
+                self.assertEqual(item['attempts'], 2)
+                with self.stores['beta'].read() as connection:
+                    self.assertEqual(connection.execute('SELECT count(*) FROM deliveries WHERE message_id=?',
+                                                        (sent['message_id'],)).fetchone()[0], 1)
+
     def current(self, host, message_id):
         with self.stores[host].read() as connection:
             return receipt(connection, message_id)

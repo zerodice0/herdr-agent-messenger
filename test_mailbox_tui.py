@@ -1549,7 +1549,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.mode, 'input')
         self.assertTrue(app.running)
 
-    def test_newline_then_enter_sends_immediate_user_fyi_without_subject(self):
+    def test_newline_then_enter_sends_immediate_user_action_without_subject(self):
         app = self.app()
         self.select_agent(app)
         app.key('\r')
@@ -1560,16 +1560,126 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIsNone(app.confirm)
         request = app.jobs['mutation'].request
         self.assertEqual(request['operation'], 'send')
-        self.assertEqual(request['kind'], 'fyi')
+        self.assertEqual(request['kind'], 'action')
         self.assertFalse(request.get('subject'))
         self.assertEqual(request['recipient']['terminal_id'], 'term-b')
         result = execute_job(request, self.environment)
         message = self.mail.show_thread(result['thread_id'])['messages'][0]
         self.assertEqual(message['sender'], 'user')
-        self.assertEqual(message['kind'], 'fyi')
+        self.assertEqual(message['kind'], 'action')
         self.assertEqual(message['body'], '첫 줄\nsecond line')
         self.assertFalse(message.get('subject'))
         self.assertEqual(message['recipient_terminal_id'], 'term-b')
+
+    def test_ctrl_g_toggles_transmitted_kind_for_quick_send_and_thread_reply(self):
+        parent = self.mail.send_user(self.repo_id, self.recipient, body='Original')
+        for reply in (False, True):
+            for toggles, expected in ((1, 'fyi'), (2, 'action')):
+                with self.subTest(reply=reply, toggles=toggles):
+                    app = self.app()
+                    if reply:
+                        app.key('\t')
+                        app.selections['threads'] = next(
+                            index for index, item in enumerate(app.items('threads'))
+                            if item['thread_id'] == parent['thread_id'])
+                    else:
+                        self.select_agent(app)
+                    app.key('\r')
+                    self.type_text(app, 'Selected kind')
+                    before = app.body, app.body_cursor, app.delivery
+                    for _ in range(toggles):
+                        app.key('\x07')
+                    self.assertEqual((app.body, app.body_cursor, app.delivery), before)
+                    app.key('\r')
+                    request = app.jobs['mutation'].request
+                    self.assertEqual(request['kind'], expected)
+                    self.assertEqual(request['reply_to'] is not None, reply)
+                    result = execute_job(request, self.environment)
+                    messages = self.mail.show_thread(result['thread_id'])['messages']
+                    message = next(row for row in messages if row['message_id'] == result['message_id'])
+                    self.assertEqual(message['kind'], expected)
+                    if reply:
+                        self.assertEqual(result['thread_id'], parent['thread_id'])
+
+    def test_new_compose_resets_kind_even_when_resuming_recipient_or_reply_draft(self):
+        sent = self.mail.send_user(self.repo_id, self.recipient, body='Original')
+        app = self.app()
+        self.select_agent(app)
+        app.key('\r')
+        self.type_text(app, 'Agent draft')
+        app.key('\x07')
+        app.key(ESCAPE)
+        self.select_agent(app, 'term-a')
+        app.key('\r')
+        self.assertEqual(app.mail_kind, 'action')
+        app.key(ESCAPE)
+        self.select_agent(app)
+        app.key('\r')
+        self.assertEqual((app.mail_kind, app.body), ('action', 'Agent draft'))
+        app.key('\x07')
+        app.key(ESCAPE)
+        app.key('\t')
+        app.key('\r')
+        self.assertEqual((app.mail_kind, app.reply_to), ('action', sent['message_id']))
+        self.type_text(app, 'Reply draft')
+        app.key('\x07')
+        app.key(ESCAPE)
+        app.key('\r')
+        self.assertEqual((app.mail_kind, app.body), ('action', 'Reply draft'))
+
+    def test_successful_send_resets_next_compose_to_action(self):
+        app = self.app()
+        self.select_agent(app)
+        app.key('\r')
+        self.type_text(app, 'FYI once')
+        app.key('\x07')
+        app.key('\r')
+        request = app.jobs['mutation'].request
+        app.jobs['mutation'].result = execute_job(request, self.environment)
+        app.tick()
+        self.assertEqual(app.mode, 'nav')
+        app.key('\r')
+        self.assertEqual((app.mail_kind, app.body), ('action', ''))
+
+    def test_kind_chip_and_toggle_hint_stay_visible_at_80_by_24(self):
+        self.mail.send_user(self.repo_id, self.recipient, body='Original')
+        for reply in (False, True):
+            with self.subTest(reply=reply):
+                app = self.app()
+                for agent in app.local['agents']:
+                    agent['alias'] = 'long-recipient-' * 12
+                if reply:
+                    app.key('\t')
+                else:
+                    self.select_agent(app)
+                app.key('\r')
+                for expected in ('ACTION', 'FYI', 'ACTION'):
+                    snapshot = self.capture(app, height=24, width=80)
+                    self.assertIn(f'[{expected} ^G]', '\n'.join(snapshot.lines()))
+                    self.assertIn('^G action/fyi', snapshot.lines()[-1])
+                    app.key('\x07')
+
+    def test_help_and_direct_roundtrip_preserve_compose_kind(self):
+        app = self.app()
+        app.key('\r')
+        app.key('\x07')
+        app.key(F1)
+        self.assertEqual(app.mode, 'help')
+        app.key(ESCAPE)
+        self.assertEqual((app.mode, app.mail_kind), ('input', 'fyi'))
+        app.key('\x04')
+        self.assertEqual(app.delivery, 'direct')
+        app.key('\x04')
+        self.assertEqual((app.delivery, app.mail_kind), ('mailbox', 'fyi'))
+
+    def test_help_describes_action_default_and_ctrl_g_toggle(self):
+        app = self.app()
+        app.key('?')
+        app.key(curses.KEY_END)
+        snapshot = self.capture(app, height=60, width=160)
+        help_text = '\n'.join(snapshot.lines())
+        self.assertIn('Quick send and replies start as action; Ctrl+G toggles action/fyi', help_text)
+        self.assertNotIn('FYI mailbox sends', help_text)
 
     def test_blank_body_is_field_local_error_without_job(self):
         app = self.app()
@@ -1632,12 +1742,15 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.mode, 'input')
         self.assertEqual(app.reply_to, latest['message_id'])
         self.assertEqual(app.recipient['terminal_id'], 'term-b')
+        self.assertEqual(app.mail_kind, 'action')
         self.type_text(app, 'Reply')
         app.key('\r')
+        self.assertEqual(app.jobs['mutation'].request['kind'], 'action')
         result = execute_job(app.jobs['mutation'].request, self.environment)
         messages = self.mail.show_thread(result['thread_id'])['messages']
         reply = next(message for message in messages if message['message_id'] == result['message_id'])
         self.assertEqual(reply['reply_to'], latest['message_id'])
+        self.assertEqual(reply['kind'], 'action')
 
     def test_unresolvable_thread_participant_does_not_open_input(self):
         self.mail.send_user(self.repo_id, self.recipient, body='Unavailable')

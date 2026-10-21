@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
  via TEXT, delivered_agent_id TEXT, authoritative INTEGER NOT NULL,
  delivered_at REAL, handled_at REAL, updated_at REAL NOT NULL,
  withdraw_requested INTEGER NOT NULL DEFAULT 0, evidence TEXT,
- confirmation_source TEXT CHECK(confirmation_source IN ('native','operator')));
+ confirmation_source TEXT CHECK(confirmation_source IN ('native','operator')),
+ fyi_turn_end INTEGER NOT NULL DEFAULT 0 CHECK(fyi_turn_end IN (0,1)));
 CREATE INDEX IF NOT EXISTS inbox_slot ON deliveries(recipient_host,recipient_terminal_id,state);
 CREATE TABLE IF NOT EXISTS dedupe_receipts (
  message_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, origin_host TEXT NOT NULL,
@@ -203,9 +204,13 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
+                if "fyi_turn_end" not in columns:
+                    # Historical enqueue-time state cannot be reconstructed safely.
+                    connection.execute("ALTER TABLE deliveries ADD COLUMN fyi_turn_end INTEGER NOT NULL "
+                                       "DEFAULT 0 CHECK(fyi_turn_end IN (0,1))")
                 if "recipient_repo_id" not in columns:
                     connection.execute("ALTER TABLE deliveries ADD COLUMN recipient_repo_id TEXT NOT NULL DEFAULT ''")
                     connection.execute(

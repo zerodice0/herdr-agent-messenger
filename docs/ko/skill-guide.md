@@ -204,7 +204,7 @@ queued/delivered 원문은 답장 저장과 같은 트랜잭션에서 handled로
 전송에 성공해도 참고용 경고가 나올 수 있으며, 기본 종류인 `fyi`는 바뀌지 않습니다.
 `fyi_no_wake`는 수신기가 등록된 참여 OMP 수신자가 준비된 상태이며 stale이 아니고,
 Herdr의 `turn_state`가 `idle` 또는 `done`일 때 FYI를 보냈다는 뜻입니다.
-FYI만으로는 턴을 시작하지 않습니다. action, 작업 중이거나 상태를 알 수 없거나
+유휴 상태에서 도착한 FYI는 수신자를 깨우지 않습니다. action, 작업 중이거나 상태를 알 수 없거나
 stale인 수신자, 수신기 미등록, 다른 클라이언트, `off` 모드, 비회원에게는
 이 경고가 나오지 않습니다. 답장도 같은 수신자 상태 기준을 따르며 원문이 action이어도
 예외는 없습니다. 질문의 답이나 결정에 따라 수신자가 행동하거나 작업을 이어가야 하면
@@ -518,6 +518,12 @@ main·members 설정은 해당 호스트에만 저장하며 복제하지 않습�
 [현재 마이그레이션·배포 안내](migration.md#worktree-역할-그룹스키마-v9)를 참고하세요.
 v7 절은 과거 기록이며 연결된 workspace의 독립 역할 규칙은 v9로 대체됐습니다.
 
+스키마 v10은 기본값이 0인 `deliveries.fyi_turn_end`를 추가합니다. 기존 v9 전달은
+보수적으로 표시하지 않습니다. 이전 enqueue 코드가 표시를 누락하지 않도록 원장과
+CLI·복사한 스킬을 함께 갱신하세요. 확장 계약은 바뀌지 않으며 이 정책 때문에
+확장을 다시 시작할 필요는 없습니다.
+[턴 종료 후 FYI 마이그레이션](migration.md#턴-종료-후-fyi스키마-v10)을 참고하세요.
+
 공개 상태는 조정 모드와 별개로 사용할 수 있습니다.
 
 ```bash
@@ -615,11 +621,13 @@ workspace main·members 변경은 로컬에만 저장합니다. 새 편집에는
 pending으로 남을 수 있지만 workspace 설정은 전파하지 않습니다. 로컬 저장은
 모든 peer의 접속을 기다리지 않습니다.
 
-Agents에서 Enter를 누르면 인라인 FYI 입력창을 엽니다. Threads의 Enter는 최신
+Agents에서 Enter를 누르면 인라인 메일 입력창을 엽니다. Threads의 Enter는 최신
 메시지에 답장하며, 호스트·terminal ID로 현재의 stale이 아닌 에이전트를 찾습니다.
 stale이거나 찾을 수 없는 수신자는 차단합니다. native 수신기가 없으면 경고하지만
-메일은 보낼 수 있습니다. UI 메일은 `sender=user`, 종류 `fyi`이며 제목은 없습니다.
-Enter는 별도 확인 없이 즉시 메일을 보내며 빈 본문은 거절합니다.
+메일은 보낼 수 있습니다. UI 메일은 `sender=user`이며 제목은 없습니다. 답장이나
+보존한 초안을 다시 여는 경우를 포함해 새 입력창은 매번 `action`으로 초기화합니다.
+Ctrl+G로 해당 입력창의 `action` / `fyi`를 전환하고 선택한 종류를 명시해 전송합니다.
+CLI 기본값은 계속 `fyi`입니다. Enter는 별도 확인 없이 즉시 전송하며 빈 본문은 거절합니다.
 Shift+Enter는 메일함이 요청한 kitty 키보드 프로토콜로 줄을 바꿉니다.
 호환 터미널에서는 herdr를 통해서도 동작합니다. Moshi/mosh는 이 프로토콜을
 협상하지 못하므로 Alt+Enter를 사용하세요. Ctrl+J는 줄바꿈 키가 아닙니다.
@@ -653,7 +661,7 @@ request/journal 증거, 모델의 이해나 작업 처리 완료가 아닙니다
 session 파일에서만 동작하며 원장 작업은 Python에 맡깁니다. 지원되는 TUI에서
 자동 깨우기를 하려면 편집기가 비어 있고 `idle_minutes` 동안 입력이 없어야 합니다.
 Herdr의 `turn_state`가 `idle` 또는 `done`이고 OMP 런타임이 유휴 상태이며 pending 메시지, `willContinue`, retry hold가 없고, 참여 역할과
-적격 action이 있으며 병합·시간당 횟수·hop 제한도 만족해야 합니다. enqueue 직전
+적격 action 또는 턴 종료 후 전달 표시가 있는 FYI가 있으며 병합·시간당 횟수·hop 제한도 만족해야 합니다. enqueue 직전
 같은 tick에서 조건을 다시 확인합니다. 에이전트 발신의 `nextTurn` + `triggerTurn`을
 사용하며 steer하지 않습니다. 포커스 자체는 이 깨우기를 막지 않으므로 기존
 focused-pane 보류와 구분하세요.
@@ -664,9 +672,15 @@ OMP 등록의 `native_session_pending`은 Herdr의 native 세션 보고가 아�
 HAM이 경로를 대신 보고하지 않으며, 이미 보고된 경로와 다르면 계속
 `stale_session`으로 거부합니다.
 
-FYI만으로는 turn을 시작하지 않습니다. 자연스러운 사용자 turn에서는 off나 manual
-비회원도 action과 FYI를 수신할 수 있습니다. action 깨우기는 적격 FYI도 같은
-묶음에 포함합니다. 묶음은 최대 8개 메시지/8 KiB이며 각 본문은 2 KiB로 제한하고,
+FYI는 유휴 수신자를 깨우지 않습니다. 턴 진행 중 도착한 FYI는 기존 깨우기 조건에
+따라 그 턴 직후 전달합니다. 로컬 enqueue 시점에 로컬 조정으로 갱신한
+`agents.last_seen`이 15초 이내이고 상태가 `working`일 때만
+`delivery.fyi_turn_end`를 기록합니다. 유휴 상태이거나 상태를 알 수 없거나 오래된
+경우에는 자연스러운 턴에서만 수신하며, 나중에 상태가 바뀌어도 표시하지 않습니다.
+이 표시는 로컬 전달 메타데이터이며 메일 종류나 wire payload를 바꾸지 않습니다.
+자연스러운 사용자 turn에서는 off나 manual 비회원도 두 종류를 모두 수신합니다.
+적격 action 또는 표시된 FYI의 깨우기는 다른 적격 FYI도 같은 묶음에 포함합니다.
+묶음은 최대 8개 메시지/8 KiB이며 각 본문은 2 KiB로 제한하고,
 잘린 부분에는 정확한 메시지 ID로 읽는 지침을 넣습니다. `fs.watch`로 로컬 초인종을
 관찰하며 5분마다 코드 전용 안전 확인을 합니다. ACK는 같은 세션의 활성 분기
 journal에 정확한 claim 내용과 해시가 있다는 뜻이지, provider 요청 포함, 모델의
