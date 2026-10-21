@@ -56,21 +56,28 @@ Held at 96, and Skill at 80. Below 80 columns, the side gutters shrink to one
 cell. These are content limits, not requested Herdr pane sizes; split and tab
 mailboxes retain their existing geometry.
 
+Each overlay begins with `HAM · <Surface>` and muted task context on one line,
+followed by a blank row. Quick send puts INPUT/NAV at the right edge; Held puts
+the visible-list position there. Context is clipped by terminal-cell width,
+including wide characters. Split and tab mailbox titles are unchanged.
+
 The four surfaces share semantic colors and `[Key] Action` hints. Hints stay
 together and use at most two rows. They retain their declared navigation/action
 order, with close last; priority only determines which hints are omitted when
 space is short, preserving close/help and essential editing actions before
-secondary shortcuts. `NO_COLOR`, including an empty value,
-disables color-pair initialization everywhere while preserving bold, reverse
-selection, glyphs and state names.
+secondary shortcuts. Selection always uses `›` and bold text. On 256-color
+terminals it adds a dark-grey full-row band with the default foreground; other
+terminals use reverse video. `NO_COLOR`, including an empty value, disables all
+color-pair initialization and keeps the marker, bold and reverse fallback.
 
 Quick send gives INPUT at least eight content rows when space permits and caps
-Detail at nine outer rows. In INPUT, only the compose frame/title is accented;
-in NAV, `›` marks the active region title. Held places its selected preview,
-dates and push warning immediately after the list. Its empty state shows only
-`No held messages.` and `[Esc] Close`. Skill puts each status name two cells
-after the longest client name and highlights only the selected name/status row;
-long paths appear on a separate detail line.
+Detail at nine outer rows. In INPUT, only the compose title is accented;
+in NAV, `›` marks the active region title. Quick-send regions are borderless.
+Held places its selected preview, dates and push warning immediately after the
+list. Below its title, the empty state shows only `No held messages.` and
+`[Esc] Close`. Skill puts each status name two cells after the longest client
+name and highlights only the selected name/status row; long paths appear on a
+separate detail line.
 
 ### Responsive regions and navigation
 

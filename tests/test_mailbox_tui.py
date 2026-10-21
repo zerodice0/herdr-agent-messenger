@@ -1941,6 +1941,22 @@ class MailboxUiTest(unittest.TestCase):
                                         for call in footer))
                     self.assertEqual((app.body, app.body_cursor, app.focus, app.drafts), before)
 
+    def test_quick_send_has_one_title_without_the_old_mailbox_header(self):
+        from ham.ui.tui_style import content_rect
+        for mode in ('nav', 'input'):
+            for height, width in ((27, 62), (37, 92), (52, 172)):
+                with self.subTest(mode=mode, width=width):
+                    app = self.app(quick_send=True)
+                    if mode == 'input':
+                        app.key('\r')
+                    snapshot = self.capture(app, height, width)
+                    rect = content_rect(height, width, 120)
+                    self.assertEqual(snapshot.rows_containing('HAM · '), [rect.y])
+                    self.assertTrue(snapshot.line(rect.y).lstrip().startswith('HAM · Quick send'))
+                    self.assertEqual(snapshot.line(rect.y + 1), '')
+                    self.assertFalse(any(call.visible_text.strip() == 'HAM'
+                                         for call in snapshot.draw_calls))
+
     def test_quick_send_success_preserves_other_nonblank_drafts(self):
         for other_text in ('other draft', ' \n '):
             with self.subTest(other_text=other_text):

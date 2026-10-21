@@ -69,7 +69,7 @@ from ham.ui.terminal_text import (
     wrap_display_text,
     wrap_message_lines,
 )
-from ham.ui.tui_style import Theme, content_rect, draw_empty, draw_footer, draw_status, footer_lines
+from ham.ui.tui_style import Theme, content_rect, draw_empty, draw_footer, draw_status, draw_title, footer_lines
 
 
 PLUGIN_ID = "herdr.agent-messenger"
@@ -1235,9 +1235,10 @@ class HeldMessagesApp:
 
         hints = _help_hints(self.text["held_help"])
         if not self.items:
+            draw_title(content, self.theme, "Held", "0 held", width)
             close_hints = [hint for hint in hints if hint.key == "Esc"]
-            row = draw_empty(
-                content, 0, 0, width, self.text["held_empty"], self.theme,
+            row = 2 + draw_empty(
+                content, 2, 0, width, self.text["held_empty"], self.theme,
                 hints=close_hints,
             )
             if self.error:
@@ -1268,22 +1269,21 @@ class HeldMessagesApp:
             position = f"{'↑' if self.offset else ''}{first}-{last}/{len(self.items)}"
             if last < len(self.items):
                 position += "↓"
-            context = self.text["held_context"].format(count=len(self.items))
-            add(0, f"{context} · {position}", self.theme.style(bold=True))
+            draw_title(
+                content, self.theme, "Held", f"{len(self.items)} held",
+                width, indicator=position,
+            )
             row = 2
             for index in range(self.offset, last):
                 item = self.items[index]
                 state = self.text[f"held_{item.state}"]
-                marker = "›" if index == self.cursor else " "
-                add(
-                    row,
-                    f"{marker} " + self.text["held_item"].format(
-                        sender=item.sender, recipient=item.recipient, state=state,
-                    ),
-                    self.theme.style(
-                        bold=index == self.cursor, selected=index == self.cursor,
-                    ),
+                label = self.text["held_item"].format(
+                    sender=item.sender, recipient=item.recipient, state=state,
                 )
+                if index == self.cursor:
+                    self.theme.draw_selected_row(content, row, label, width)
+                else:
+                    add(row, f"  {label}")
                 row += 1
             row += 1
             for offset, line in enumerate(preview_lines):

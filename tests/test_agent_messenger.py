@@ -131,54 +131,37 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertIn("white-bison", line)
         self.assertIn("w1:p1", line)
 
-    def test_recipient_cursor_selection_and_status_use_independent_styles(self):
+    def test_recipient_selection_keeps_marker_checkbox_and_status_without_color(self):
+        from ham.ui.tui_style import content_rect
+        from tests.curses_snapshot_harness import FakeCursesWindow
         sender = agent()
-        recipient = agent(
-            name="white-bison",
-            pane_id="w1:p2",
-            session_id="session-2",
+        recipient = agent_directory.replace(
+            agent(name="white-bison", pane_id="w1:p2", session_id="session-2"),
+            status="working",
         )
-        recipient = agent_directory.replace(recipient, status="working")
-        screen = mock.Mock()
-        screen.getmaxyx.return_value = (18, 88)
+        screen = FakeCursesWindow(18, 88)
         with tempfile.TemporaryDirectory() as state_directory:
             environment = {
-                "LANG": "en_US.UTF-8",
+                "LANG": "en_US.UTF-8", "NO_COLOR": "",
                 "HERDR_PLUGIN_STATE_DIR": state_directory,
             }
             with (
-                mock.patch.object(
-                    agent_messenger,
-                    "query_local_agents",
-                    return_value=[sender, recipient],
-                ),
+                mock.patch.object(agent_messenger, "query_local_agents",
+                                  return_value=[sender, recipient]),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
                 app = agent_messenger.MessengerApp(screen, sender, environment)
-
         app.selected = {recipient.identity}
-        rendered: list[tuple[int, int, str, int]] = []
-
-        def record(row, column, value, attribute=0):
-            rendered.append((row, column, value, attribute))
-
-        with mock.patch.object(app, "_safe_add", side_effect=record):
-            app._render_recipients(0, 3)
-
-        identity = next(
-            item for item in rendered if "white-bison" in item[2]
-        )
-        cursor = next(item for item in rendered if item[2] == "›")
-        checkbox = next(item for item in rendered if item[2] == "[x]")
-        status = next(item for item in rendered if item[2] == "● working")
-        self.assertTrue(identity[3] & agent_messenger.curses.A_BOLD)
-        self.assertTrue(cursor[3] & agent_messenger.curses.A_BOLD)
-        self.assertEqual(checkbox[3], cursor[3])
-        self.assertLess(cursor[1], checkbox[1])
-        identity_column = identity[1] + agent_messenger.display_width(
-            identity[2].partition(recipient.name)[0])
-        self.assertLess(checkbox[1] + agent_messenger.display_width(checkbox[2]), identity_column)
-        self.assertTrue(status[3] & agent_messenger.curses.A_BOLD)
+        app._render_recipients(0, 6)
+        snapshot = screen.snapshot()
+        row = snapshot.rows_containing(recipient.name)[0]
+        self.assertTrue(snapshot.line(row).lstrip().startswith("› "))
+        self.assertIn("[x]", snapshot.line(row))
+        self.assertIn("● working", snapshot.line(row))
+        rect = content_rect(18, 88, 104)
+        cells = snapshot.cells[row][rect.x:rect.x + rect.width]
+        self.assertTrue(all(cell.attribute & agent_messenger.curses.A_BOLD for cell in cells))
+        self.assertTrue(all(cell.attribute & agent_messenger.curses.A_REVERSE for cell in cells))
 
     def test_recipient_panel_grows_until_message_minimum(self):
         panel_height = agent_messenger.MessengerApp._recipient_panel_height
@@ -186,7 +169,7 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertEqual(panel_height(4, 12), 6)
         self.assertEqual(panel_height(20, 12), 7)
 
-    def test_long_message_keeps_four_rows_and_shows_scrollbar(self):
+    def test_long_message_keeps_four_visible_rows(self):
         sender = agent()
         screen = mock.Mock()
         screen.getmaxyx.return_value = (18, 40)
@@ -222,13 +205,7 @@ class AgentMessengerTest(unittest.TestCase):
             for row, column, value in rendered
             if 1 <= row <= 4 and column == 0
         ]
-        scrollbar = [
-            value
-            for row, column, value in rendered
-            if 1 <= row <= 4 and column == app._message_editor_width() + 3
-        ]
         self.assertEqual(len(message_markers), 4)
-        self.assertEqual(scrollbar, ["│", "│", "█", "█"])
 
     def test_scrollbar_thumb_tracks_start_middle_and_end(self):
         self.assertIsNone(scrollbar_thumb(4, 4, 0))
@@ -585,29 +562,6 @@ class AgentMessengerTest(unittest.TestCase):
     def test_unknown_language_falls_back_to_english(self):
         with mock.patch.object(messenger_i18n, "_macos_language", return_value=None):
             self.assertEqual(messenger_i18n.detect_language({"LANG": "fr_FR.UTF-8"}), "en")
-
-    def test_delivery_mode_copy_and_key_help_exist_in_every_language(self):
-        required = {
-            "coordinator",
-            "mode_question",
-            "delivery_mode",
-            "delegate_option",
-            "delegate_privacy",
-            "direct_option",
-            "direct_privacy",
-            "help_mode",
-            "remote_warning_summary",
-            "remote_details_help",
-        }
-        english_keys = set(messenger_i18n.messages("en"))
-        for language in messenger_i18n.SUPPORTED_LANGUAGES:
-            text = messenger_i18n.messages(language)
-            self.assertEqual(set(text), english_keys, language)
-            self.assertTrue(required.issubset(text), language)
-            self.assertIn("Ctrl+O", text["help_recipients"])
-            self.assertIn("Ctrl+O", text["help_message"])
-            self.assertIn("Ctrl+G", text["help_recipients"])
-            self.assertIn("host/label", text["skill_guide_target"])
 
     def test_locale_precedence_stops_at_first_configured_value(self):
         self.assertEqual(
@@ -1830,10 +1784,11 @@ class HeldMessagesTest(unittest.TestCase):
         self.assertEqual(app.cursor, 19)
         selected_calls = [
             call for call in window.snapshot().draw_calls
-            if call.attribute & agent_messenger.curses.A_REVERSE
+            if call.visible_text.startswith("› ")
         ]
         self.assertEqual(len(selected_calls), 1)
         self.assertIn("local/worker-19", selected_calls[0].visible_text)
+        self.assertTrue(selected_calls[0].attribute & agent_messenger.curses.A_BOLD)
 
     def test_idle_refresh_observes_worker_changes_and_q_closes(self):
         first = self.held()

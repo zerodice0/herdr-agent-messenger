@@ -232,13 +232,12 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
                     recipient_row = self.assert_text_visible(snapshot, app.text["recipients"]).row
                     message_row = self.assert_text_visible(snapshot, app.text["message"]).row
                     self.assertGreater(message_row, recipient_row)
-                    markers = [
-                        call for call in snapshot.draw_calls
-                        if call.column == rect.x and call.visible_text in {"│", "↑", "↓"}
-                        and call.row > message_row
-                    ]
-                    self.assertGreaterEqual(len(markers), MESSAGE_MIN_VISIBLE_ROWS)
-                    self.assert_text_visible(snapshot, "[Esc]", unclipped=True)
+                    footer = self.assert_text_visible(snapshot, "[Esc]", unclipped=True)
+                    editor_rows = {
+                        call.row for call in snapshot.draw_calls
+                        if call.column == rect.x + 2 and message_row < call.row < footer.row
+                    }
+                    self.assertGreaterEqual(len(editor_rows), MESSAGE_MIN_VISIBLE_ROWS)
                     self.assertEqual(app.message_lines, LONG_MESSAGE)
 
     def test_large_snapshot_preserves_unicode_groups_selection_and_remote_errors(self):
@@ -252,6 +251,12 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
             self.assertEqual(agent_row, workspace_row + 1)
             self.assertIn(SELECTED.pane_id, snapshot.line(agent_row))
             self.assertEqual(snapshot.line(agent_row).count("[x]"), 1)
+            focused = [call for call in snapshot.draw_calls
+                       if call.visible_text.lstrip().startswith("›")]
+            self.assertTrue(focused, snapshot.formatted())
+            self.assertTrue(all(call.attribute & curses.A_BOLD for call in focused))
+            self.assertTrue(all(call.attribute & (curses.A_REVERSE | curses.A_COLOR)
+                                for call in focused))
             for state, glyph in (("working", "●"), ("done", "✓"), ("idle", "○"), ("blocked", "!")):
                 self.assert_text_visible(snapshot, f'{glyph} {app.text["status_" + state]}')
             for line in LONG_MESSAGE:
@@ -262,7 +267,6 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
             app.render()
             details = app.screen.snapshot()
             self.assert_capture_in_bounds(details)
-            self.assert_text_visible(details, app.text["remote_details_title"])
             self.assert_text_visible(details, "offline-서울")
             self.assert_text_visible(details, "connection timed out")
             self.assertEqual((app.message_lines, app.selected), before)

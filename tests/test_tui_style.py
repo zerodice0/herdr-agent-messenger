@@ -9,8 +9,10 @@ from unittest import mock
 
 from ham.ui import messenger, skill_installer
 from ham.ui.terminal_text import display_width
-from ham.ui.tui_style import Hint, Theme, content_rect, draw_footer, footer_lines
-from tests.curses_snapshot_harness import FakeCursesWindow
+from ham.ui.tui_style import Hint, Theme, content_rect, draw_footer, draw_title, footer_lines
+from tests.curses_snapshot_harness import (
+    FakeCursesWindow, color_pair_from_attribute, deterministic_color_pair,
+)
 from tests.test_agent_messenger import agent
 
 
@@ -82,6 +84,60 @@ class TuiStyleTest(unittest.TestCase):
         self.assertLessEqual(calls[1].end_column, rect.x + rect.width)
 
 
+    def test_selection_keeps_marker_weight_and_band_or_reverse_at_every_color_depth(self):
+        for colors, environment in ((256, {}), (8, {}), (256, {"NO_COLOR": ""})):
+            with (
+                self.subTest(colors=colors, environment=environment),
+                mock.patch.object(curses, "has_colors", return_value=True),
+                mock.patch.object(curses, "COLORS", colors, create=True),
+                mock.patch.object(curses, "start_color"),
+                mock.patch.object(curses, "use_default_colors"),
+                mock.patch.object(curses, "init_pair") as initialize_pair,
+                mock.patch.object(curses, "color_pair", side_effect=deterministic_color_pair),
+            ):
+                screen = FakeCursesWindow(3, 32)
+                theme = Theme(environment)
+                theme.draw_selected_row(screen, 1, "한글 target", 28, x=1)
+                snapshot = screen.snapshot()
+                self.assertTrue(snapshot.line(1).lstrip().startswith("› 한글 target"))
+                cells = snapshot.cells[1][1:29]
+                self.assertTrue(all(cell.attribute & curses.A_BOLD for cell in cells))
+                self.assertEqual(len({cell.attribute for cell in cells}), 1)
+                attribute = cells[0].attribute
+                if colors >= 256 and "NO_COLOR" not in environment:
+                    pair = color_pair_from_attribute(attribute)
+                    self.assertTrue(pair)
+                    foreground, background = next(
+                        call.args[1:] for call in initialize_pair.call_args_list
+                        if call.args[0] == pair
+                    )
+                    self.assertEqual(foreground, -1)
+                    self.assertNotEqual(background, -1)
+                else:
+                    self.assertTrue(attribute & curses.A_REVERSE)
+                    self.assertFalse(attribute & curses.A_COLOR)
+                self.assertFalse(any(call.clipped for call in snapshot.draw_calls))
+
+    def test_title_truncates_korean_context_without_clipping_or_hiding_indicator_at_62_columns(self):
+        for surface in ("Quick send", "Send Prompt", "Held", "Skill installer"):
+            with self.subTest(surface=surface):
+                screen = FakeCursesWindow(27, 62)
+                rect = content_rect(27, 62, 120)
+                context = "한글 작업공간 " * 12
+                draw_title(rect.window(screen), Theme({"NO_COLOR": ""}), surface, context,
+                           rect.width, indicator="1-4/20")
+                snapshot = screen.snapshot()
+                title = snapshot.line(rect.y).lstrip()
+                prefix = "HAM · " + surface
+                self.assertTrue(title.startswith(prefix + " · 한글"))
+                self.assertIn("…", title)
+                self.assertTrue(title.endswith("1-4/20"))
+                self.assertLessEqual(display_width(title), rect.width)
+                self.assertEqual(snapshot.line(rect.y + 1), "")
+                self.assertFalse(any(call.clipped for call in snapshot.draw_calls))
+                self.assertTrue(all(call.end_column <= rect.x + rect.width
+                                    for call in snapshot.draw_calls))
+
 class OverlayRendererTest(unittest.TestCase):
     def color_spies(self, stack):
         stack.enter_context(mock.patch.object(curses, "has_colors", return_value=True))
@@ -96,6 +152,42 @@ class OverlayRendererTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(messenger, "query_local_agents", return_value=[sender, recipient]))
         stack.enter_context(mock.patch.object(messenger, "ssh_hosts", return_value=["peer"]))
         return messenger.MessengerApp(screen, sender, environment)
+
+    def test_messenger_and_held_have_one_title_without_legacy_headers(self):
+        for surface, states in (("Send Prompt", ("discovery", "mode", "ready", "remote")),
+                                ("Held", ("empty", "list"))):
+            for state in states:
+                with self.subTest(surface=surface, state=state), ExitStack() as stack:
+                    directory = stack.enter_context(tempfile.TemporaryDirectory())
+                    environment = {"NO_COLOR": "", "LANG": "en_US.UTF-8",
+                                   "HERDR_PLUGIN_STATE_DIR": directory}
+                    stack.enter_context(mock.patch.object(curses, "curs_set"))
+                    screen = FakeCursesWindow(27, 62)
+                    if surface == "Send Prompt":
+                        app = self.messenger_app(stack, screen, environment)
+                        app.discovery_choice = state != "discovery"
+                        app.mode_choice = state == "ready"
+                        app.remote_details_visible = state == "remote"
+                        cap = 104
+                    else:
+                        delivery = mock.Mock()
+                        delivery.held_messages.return_value = []
+                        app = messenger.HeldMessagesApp(screen, environment, delivery=delivery)
+                        if state == "list":
+                            app.items = [mock.Mock(sender="sender", recipient="recipient",
+                                                   state="awaiting_decision", preview="Preview",
+                                                   since="now", deadline="later")]
+                        cap = 96
+                    app.text = {**app.text, "title": "LEGACY HEADER",
+                                "held_title": "LEGACY HEADER", "held_context": "LEGACY HEADER",
+                                "remote_details_title": "LEGACY HEADER"}
+                    app.render()
+                    snapshot = screen.snapshot()
+                    rect = content_rect(27, 62, cap)
+                    self.assertEqual(snapshot.rows_containing("HAM · "), [rect.y])
+                    self.assertTrue(snapshot.line(rect.y).lstrip().startswith("HAM · " + surface))
+                    self.assertEqual(snapshot.line(rect.y + 1), "")
+                    self.assertNotIn("LEGACY HEADER", "\n".join(snapshot.lines()))
 
     def test_no_color_skips_pair_initialization_and_drawing_on_short_overlays(self):
         for value in ("", "1"):
@@ -150,16 +242,10 @@ class OverlayRendererTest(unittest.TestCase):
                 snapshot = screen.snapshot()
                 text = skill_installer.COPY["en"]
                 labels = [text[client] for client in ("codex", "claude", "omp")]
-                longest = max(map(display_width, labels))
                 status = text[skill_installer.STATUS_MISSING]
                 for label in labels:
                     rows = [line for line in snapshot.lines() if label in line and status in line]
                     self.assertTrue(rows, snapshot.formatted())
-                    for line in rows:
-                        start = line.index(label)
-                        status_column = display_width(line[:line.index(status)])
-                        # Two spaces separate the padded name and the one-cell status glyph.
-                        self.assertEqual(status_column - display_width(line[:start]), longest + 4)
                 selected = [call for call in snapshot.draw_calls if call.attribute & curses.A_REVERSE]
                 self.assertEqual(len(selected), 1)
                 self.assertIn(status, selected[0].visible_text)

@@ -65,6 +65,7 @@ class Theme:
 
     def __init__(self, environment: Mapping[str, str] | None = None):
         self.colors_enabled = False
+        self.selection_pair = False
         if "NO_COLOR" in (os.environ if environment is None else environment):
             return
         try:
@@ -80,17 +81,30 @@ class Theme:
                                                 curses.COLOR_YELLOW, curses.COLOR_RED), 1):
                 curses.init_pair(pair, foreground, background)
             self.colors_enabled = True
+            if background == -1 and getattr(curses, "COLORS", 0) >= 256:
+                curses.init_pair(5, -1, 236)
+                self.selection_pair = True
         except curses.error:
             pass
 
     def style(self, role: str = "text", *, bold: bool = False, selected: bool = False) -> int:
         attr = curses.A_BOLD if bold else 0
         if selected or role == "selection":
-            return attr | curses.A_REVERSE
+            return self.selection_style()
         if role == "muted":
             attr |= curses.A_DIM
         pair = self._PAIRS.get(role)
         return attr | (curses.color_pair(pair) if pair and self.colors_enabled else 0)
+
+    def selection_style(self) -> int:
+        """Selection always has weight and a marker, never just a color cue."""
+        return curses.A_BOLD | (curses.color_pair(5) if self.selection_pair else curses.A_REVERSE)
+
+    def draw_selected_row(self, screen, y: int, text: str, width: int, x: int = 0,
+                          *, marker: str = "› ") -> None:
+        value = truncate_display_text(marker + text, max(0, width))
+        _put(screen, y, x, value + " " * max(0, width - display_width(value)),
+             self.selection_style())
 
     def turn_style(self, state: str, *, selected: bool = False, stale: bool = False) -> int:
         role = "muted" if stale else self._TURN_ROLES.get(state, "muted")
@@ -146,6 +160,24 @@ def _put(screen, y: int, x: int, text: str, attr: int = 0):
             screen.addstr(y, x, truncate_display_text(text, max(0, width - x - int(y == height - 1))), attr)
         except curses.error:
             pass
+
+
+def draw_title(screen, theme: Theme, surface: str, context: str, width: int,
+               indicator: str = "") -> None:
+    """One cell-aware title with reserved right context and a quiet blank row."""
+    title = truncate_display_text("HAM · " + surface, max(0, width))
+    title_width = display_width(title)
+    indicator_width = display_width(indicator)
+    show_indicator = bool(indicator) and title_width + 2 + indicator_width <= width
+    context_end = width - indicator_width - 2 if show_indicator else width
+    _put(screen, 0, 0, title, theme.style("accent", bold=True))
+    if context_end > title_width:
+        _put(screen, 0, title_width,
+             truncate_display_text(" · " + context, context_end - title_width),
+             theme.style("muted"))
+    if show_indicator:
+        _put(screen, 0, width - indicator_width, indicator, theme.style("muted"))
+    _put(screen, 1, 0, " " * max(0, width))
 
 
 def draw_footer(screen, y: int, x: int, width: int, hints: Sequence[Hint], theme: Theme,

@@ -30,7 +30,7 @@ from ham.ui.terminal_text import (
     truncate_display_text,
     wrap_display_text,
 )
-from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, draw_status, footer_lines
+from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, draw_status, draw_title, footer_lines
 from ham.ledger.store import LedgerError
 from ham.ops import runtime_installer as runtime_installer
 
@@ -58,7 +58,6 @@ class InstallTarget:
 
 COPY = {
     "en": {
-        "title": "Install HAM Skill",
         "intro": "Select where HAM (Herdr Agent Messenger) should be available.",
         "project": "Project",
         "system": "System",
@@ -74,7 +73,6 @@ COPY = {
         "already_current": "Already current.",
         "installed": "Skill installed. Start a new agent session to discover it.",
         "runtime_installed": "Installed",
-        "runtime_title": "Receiving dependency",
         "runtime_intro": "Plugin and skill do not install a receiver. Codex uses skill-guided pull.",
         "runtime_not_now": "Not now (default)",
         "runtime_install": "Install {client} receiver",
@@ -84,7 +82,6 @@ COPY = {
         "runtime_activation": "Only sessions you choose to restart pick up the receiver; confirm extension_present=1, otherwise installed, activation pending.",
         "runtime_report": "Receiving runtimes",
         "failed": "Installation failed: {error}",
-        "usage_title": "Use HAM",
         "usage_intro": "Address agents as host/label; use local for this Herdr server.",
         "usage_codex": "Codex: type $ham, then select HAM — Herdr Agent Messenger.",
         "usage_claude": "Claude Code: invoke /herdr-agent-messenger.",
@@ -98,7 +95,6 @@ COPY = {
         "open_failed": "Could not open the skill installer.",
     },
     "ko": {
-        "title": "HAM 스킬 설치",
         "intro": "HAM(Herdr Agent Messenger)을 사용할 범위를 선택하세요.",
         "project": "프로젝트",
         "system": "시스템",
@@ -114,7 +110,6 @@ COPY = {
         "already_current": "이미 최신 상태입니다.",
         "installed": "스킬을 설치했습니다. 새 에이전트 세션을 시작하면 스킬을 찾을 수 있습니다.",
         "runtime_installed": "설치됨",
-        "runtime_title": "수신 의존성",
         "runtime_intro": "플러그인과 스킬은 수신기를 설치하지 않습니다. Codex는 스킬 안내에 따라 메일을 가져옵니다.",
         "runtime_not_now": "나중에 (기본값)",
         "runtime_install": "{client} 수신기 설치",
@@ -124,7 +119,6 @@ COPY = {
         "runtime_activation": "직접 선택해 재시작한 세션에만 수신기가 적용됩니다. extension_present=1을 확인하지 못하면 설치됨, 활성화 대기 상태입니다.",
         "runtime_report": "수신 런타임",
         "failed": "설치 실패: {error}",
-        "usage_title": "HAM 사용법",
         "usage_intro": "에이전트는 host/label로 지정하며 현재 Herdr 서버는 local을 사용합니다.",
         "usage_codex": "Codex: $ham을 입력한 뒤 HAM — Herdr Agent Messenger를 선택하세요.",
         "usage_claude": "Claude Code: /herdr-agent-messenger를 호출하세요.",
@@ -138,7 +132,6 @@ COPY = {
         "open_failed": "스킬 설치 창을 열 수 없습니다.",
     },
     "ja": {
-        "title": "HAM スキルをインストール",
         "intro": "HAM (Herdr Agent Messenger) を使用する範囲を選択してください。",
         "project": "プロジェクト",
         "system": "システム",
@@ -154,7 +147,6 @@ COPY = {
         "already_current": "すでに最新です。",
         "installed": "スキルをインストールしました。新しいエージェントセッションでスキルを検出できます。",
         "runtime_installed": "インストール済み",
-        "runtime_title": "受信の依存関係",
         "runtime_intro": "プラグインとスキルは受信機をインストールしません。Codex はスキルに従い取得します。",
         "runtime_not_now": "今はしない (既定)",
         "runtime_install": "{client} の受信機をインストール",
@@ -164,7 +156,6 @@ COPY = {
         "runtime_activation": "選択して再起動したセッションだけが受信機を読み込みます。extension_present=1 を確認できなければインストール済み・有効化待ちです。",
         "runtime_report": "受信ランタイム",
         "failed": "インストール失敗: {error}",
-        "usage_title": "HAM の使い方",
         "usage_intro": "エージェントは host/label で指定し、現在の Herdr サーバーには local を使います。",
         "usage_codex": "Codex: $ham と入力し、HAM — Herdr Agent Messenger を選択します。",
         "usage_claude": "Claude Code: /herdr-agent-messenger を呼び出します。",
@@ -408,6 +399,8 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
     status_kind = "success" if status in (text["installed"], text["already_current"]) else "info"
     cursor = 0
     scroll = 0
+    root = project_root(environment)
+    title_context = f"project {root.name if root is not None else '—'}"
     while True:
         runtimes = runtime_installer.summary(environment)["clients"]
         missing = [runtime for runtime in runtimes if not runtime["installed"] and not runtime["error"]]
@@ -423,9 +416,8 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
             lines.append((f'{runtime["client"]}: {state}', theme.style(role)))
             lines.append((runtime["destination"], theme.style("muted")))
         lines.append(("", 0))
-        lines += [(("› " if index == cursor else "  ") + label,
-                   theme.style(bold=index == cursor, selected=index == cursor))
-                  for index, label in enumerate(options)]
+        selected_option_row = len(lines) + cursor
+        lines += [("  " + label, theme.style()) for label in options]
         if cursor:
             runtime = missing[cursor - 1]
             files = (("ham-mailbox.ts", "ham-mailbox.install.json") if runtime["client"] == "omp" else
@@ -437,8 +429,15 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
         view = content_rect(*screen.getmaxyx(), 80).window(screen)
         height, width = view.getmaxyx()
         usable_width = max(1, width - 1)
-        wrapped = [(line, attribute) for value, attribute in lines
-                   for line in (wrap_display_text(value, max(1, min(76, usable_width))) if value else [""])]
+        draw_title(view, theme, "Skill installer", title_context, usable_width)
+        wrapped = []
+        for index, (value, attribute) in enumerate(lines):
+            selected = index == selected_option_row
+            if selected:
+                value = value[2:]
+            line_width = max(1, min(76, usable_width) - (2 if selected else 0))
+            for line_index, line in enumerate(wrap_display_text(value, line_width) if value else [""]):
+                wrapped.append((line, attribute, selected, line_index))
         status_lines = wrap_display_text(status, usable_width) if status else []
         footer_height = len(footer_lines(hints, usable_width))
         status_height = min(len(status_lines), max(0, height - footer_height - 3))
@@ -447,9 +446,14 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
             scroll = max(0, len(wrapped) - body_height)
         scroll = max(0, min(scroll, len(wrapped) - body_height))
         visible = wrapped[scroll:scroll + body_height]
-        for row, (value, attribute) in [(0, (text["runtime_title"], theme.style(bold=True))),
-                                        *enumerate(visible, 2)]:
+        for row, (value, attribute, selected, line_index) in enumerate(visible, 2):
             if not 0 <= row < height:
+                continue
+            if selected:
+                theme.draw_selected_row(
+                    view, row, value, usable_width,
+                    marker="› " if line_index == 0 else "  ",
+                )
                 continue
             try:
                 view.addnstr(row, 0, truncate_display_text(value, usable_width),
@@ -512,6 +516,8 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
     values = dict(os.environ if environment is None else environment)
     text = COPY[detect_language(values)]
     targets = installation_targets(values)
+    root = project_root(values)
+    title_context = f"project {root.name if root is not None else '—'}"
 
     def run(screen: curses.window) -> int:
         screen.keypad(True)
@@ -536,6 +542,7 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
             view = content_rect(*screen.getmaxyx(), 80).window(screen)
             height, width = view.getmaxyx()
             usable_width = max(1, width - 1)
+            draw_title(view, theme, "Skill installer", title_context, usable_width)
 
             def add(row: int, column: int, value: str, attribute: int = 0) -> None:
                 if not (0 <= row < height and 0 <= column < width):
@@ -552,7 +559,6 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                     pass
 
             if usage_visible:
-                add(0, 0, text["usage_title"], theme.style(bold=True))
                 row = 2
                 footer_height = len(footer_lines(usage_hints, usable_width))
                 body_end = max(2, height - footer_height)
@@ -584,8 +590,7 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                     usage_visible = False
                 continue
 
-            add(0, 0, text["title"], theme.style(bold=True))
-            row = 1
+            row = 2
             for line in wrap_display_text(text["intro"], max(1, width - 2)):
                 add(row, 0, line)
                 row += 1
@@ -601,10 +606,9 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                 menu.append((scope_label, None))
                 for index, target in enumerate(targets):
                     if target.scope == scope:
-                        marker = "›" if index == cursor else " "
                         name = pad_display_text(text[target.agent], name_width)
                         label = f"{STATUS_BADGES[states[index]]} {text[states[index]]}"
-                        menu.append((f"{marker} {name}  {label}", index))
+                        menu.append((f"  {name}  {label}", index))
                 menu.append(("", None))
 
             destination = targets[cursor].destination
@@ -617,13 +621,13 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
             menu_height = max(1, height - row - tail_space)
             selected_row = next(index for index, (_, target) in enumerate(menu) if target == cursor)
             menu_start = max(0, min(selected_row - menu_height + 1, len(menu) - menu_height))
-            row_width = max(display_width(value) for value, target in menu if target is not None)
             for value, index in menu[menu_start:menu_start + menu_height]:
                 if index is None:
                     add(row, 0, value, theme.style("accent", bold=True))
                 elif index == cursor:
-                    add(row, 2, pad_display_text(value, row_width),
-                        theme.style(bold=True, selected=True))
+                    theme.draw_selected_row(
+                        view, row, value[2:], usable_width - 2, x=2,
+                    )
                 else:
                     add(row, 2, value[:2] + pad_display_text(text[targets[index].agent], name_width))
                     add(row, 2 + status_column,

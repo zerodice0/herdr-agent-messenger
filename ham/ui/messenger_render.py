@@ -13,7 +13,7 @@ from ham.ui.terminal_text import (
     wrap_display_text,
     wrap_message_lines,
 )
-from ham.ui.tui_style import Hint, content_rect, draw_footer, draw_status, footer_lines
+from ham.ui.tui_style import Hint, content_rect, draw_footer, draw_status, draw_title, footer_lines
 
 
 MESSAGE_MIN_VISIBLE_ROWS = 4
@@ -52,8 +52,8 @@ class MessengerRenderMixin:
         _height, width = self._content_size()
         return max(1, min(88, width - 5))
 
-    def _status_attribute(self, agent: AgentRecord) -> int:
-        return self.theme.turn_style(agent.status, stale=agent.stale)
+    def _status_attribute(self, agent: AgentRecord, *, selected: bool = False) -> int:
+        return self.theme.turn_style(agent.status, selected=selected, stale=agent.stale)
 
     @staticmethod
     def _recipient_panel_height(record_count: int, content_height: int) -> int:
@@ -67,11 +67,12 @@ class MessengerRenderMixin:
         self.content_screen = self._content_rect().window(self.screen)
         height, width = self._content_size()
         failures = self._unavailable_hosts()
-        self._safe_add(
-            0, 0, self.text["remote_details_title"],
-            self.theme.style("warning", bold=True),
+        draw_title(
+            self.content_screen, self.theme, "Send Prompt",
+            f"coordinator {self.sender.qualified_name} · {len(self.selected)} selected",
+            width,
         )
-        self._safe_add(1, 0, self._remote_summary(), self.theme.style("warning"))
+        self._safe_add(2, 0, self._remote_summary(), self.theme.style("warning"))
         footer_rows = len(self._help_lines(self.text["remote_details_help"]))
         visible_rows = max(1, height - 3 - footer_rows)
         maximum_offset = max(0, len(failures) - visible_rows)
@@ -127,13 +128,14 @@ class MessengerRenderMixin:
             self.text["discover_remote_option"],
             self.text["local_only_option"],
         )
+        _height, width = self._content_size()
         for index, label in enumerate(options):
-            marker = "›" if index == self.discovery_option else " "
-            attribute = self.theme.style(
-                bold=index == self.discovery_option,
-                selected=index == self.discovery_option,
-            )
-            self._safe_add(row + 2 + index, 2, f"{marker} {label}", attribute)
+            if index == self.discovery_option:
+                self.theme.draw_selected_row(
+                    self.content_screen, row + 2 + index, label, width - 2, x=2,
+                )
+            else:
+                self._safe_add(row + 2 + index, 2, f"  {label}")
         return row + 5
 
     def _render_mode_choice(self, row: int) -> int:
@@ -161,17 +163,18 @@ class MessengerRenderMixin:
         _height, width = self._content_size()
         option_row = row + 2
         for index, (label, description) in enumerate(options):
-            marker = "›" if index == self.mode_option else " "
-            attribute = self.theme.style(bold=True, selected=index == self.mode_option)
             label_lines = wrap_display_text(label, width - 6)
             for line_index, line in enumerate(label_lines):
-                prefix = f"{marker} " if line_index == 0 else "  "
-                self._safe_add(
-                    option_row + line_index,
-                    2,
-                    f"{prefix}{line}",
-                    attribute,
-                )
+                if index == self.mode_option:
+                    self.theme.draw_selected_row(
+                        self.content_screen, option_row + line_index, line,
+                        width - 2, x=2, marker="› " if line_index == 0 else "  ",
+                    )
+                else:
+                    self._safe_add(
+                        option_row + line_index, 2, f"  {line}",
+                        self.theme.style(bold=True),
+                    )
             option_row += len(label_lines)
             description_lines = wrap_display_text(description, width - 7)
             for line in description_lines:
@@ -267,7 +270,7 @@ class MessengerRenderMixin:
                 agent,
                 marker,
                 state,
-                focused=focused,
+                focused=False,
                 indent=view_row.indent,
             )
             if disabled:
@@ -276,27 +279,25 @@ class MessengerRenderMixin:
                 line_attribute = self.theme.style(bold=True)
             else:
                 line_attribute = 0
-            self._safe_add(line_row, 0, line, line_attribute)
             if focused:
-                self._safe_add(
-                    line_row,
-                    view_row.indent,
-                    "›",
-                    self.theme.style("accent", bold=True),
+                self.theme.draw_selected_row(
+                    self.content_screen, line_row, line[2:], width,
                 )
+            else:
+                self._safe_add(line_row, 0, line, line_attribute)
             if agent.identity in self.selected:
                 self._safe_add(
                     line_row,
                     view_row.indent + 2,
                     "[x]",
-                    self.theme.style("accent", bold=True),
+                    self.theme.style("accent", bold=True, selected=focused),
                 )
             status_column = display_width(line) - display_width(state)
             self._safe_add(
                 line_row,
                 status_column,
                 state,
-                self._status_attribute(agent),
+                self._status_attribute(agent, selected=focused),
             )
         return row + list_rows
 
@@ -319,7 +320,7 @@ class MessengerRenderMixin:
         thumb = scrollbar_thumb(len(wrapped_lines), visible_rows, start)
         scrollbar_column = min(width - 2, self._message_editor_width() + 3)
         for offset in range(visible_rows):
-            marker = "│"
+            marker = " "
             if offset == 0 and start > 0:
                 marker = "↑"
             elif (
@@ -348,7 +349,7 @@ class MessengerRenderMixin:
                 scrollbar_glyph = (
                     "█"
                     if thumb_start <= offset < thumb_start + thumb_size
-                    else "│"
+                    else " "
                 )
                 self._safe_add(
                     row + offset,
@@ -369,19 +370,12 @@ class MessengerRenderMixin:
         self.message_cursor = None
         self.content_screen = self._content_rect().window(self.screen)
         height, width = self._content_size()
-        self._safe_add(
-            0,
-            0,
-            self.text["send_prompt"],
-            self.theme.style("accent", bold=True),
+        draw_title(
+            self.content_screen, self.theme, "Send Prompt",
+            f"coordinator {self.sender.qualified_name} · {len(self.selected)} selected",
+            width,
         )
-        self._safe_add(
-            1,
-            0,
-            f'{self.text["coordinator"]}: {self.sender.qualified_name}',
-            self.theme.style(),
-        )
-        row = 3
+        row = 2
 
         if not self.discovery_choice:
             row = self._render_choice(row)

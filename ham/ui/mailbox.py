@@ -36,7 +36,7 @@ from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import repository_identity
 from ham.ledger.store import LedgerError, LedgerStore, ledger_directory
 from ham.ledger.views import status_board
-from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, footer_lines
+from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, draw_title, footer_lines
 from ham.ui.terminal_text import (character_index_at_display_column, display_width,
                            pad_display_text, truncate_display_text,
                            wrap_display_text, wrap_message_lines)
@@ -1958,6 +1958,9 @@ class MailboxApp:
                           curses.A_BOLD if focused else curses.A_DIM)
         if height < 2 or width < 2:
             return y, x, 0, 0
+        if self.quick_send:
+            self.put(y, x + 1, truncate_display_text(title, max(0, width - 2)), attr)
+            return y + 1, x + 1, height - 2, width - 2
         self.put(y, x, "┌" + "─" * (width - 2) + "┐", attr)
         self.put(y, x + 2, truncate_display_text(" " + title + " ", max(0, width - 4)), attr)
         for row in range(y + 1, y + height - 1):
@@ -2040,7 +2043,7 @@ class MailboxApp:
         column = x + 2
         for index, region in enumerate(("agents", "threads")):
             if index:
-                self.put(y, column, " │ ", curses.A_DIM)
+                self.put(y, column, " · " if self.quick_send else " │ ", curses.A_DIM)
                 column += 3
             label = ("› " if self.quick_send and self.mode == "nav" and region == self.focus else "") + region.title()
             attr = self.style("accent", curses.A_BOLD) if region == active and not (
@@ -2090,20 +2093,25 @@ class MailboxApp:
             self.refresh_detail()
         height, width = self.screen.getmaxyx()
         self.layout = "tiny" if width < 32 or height < 10 else "single"
-        word = self.mode_word()
-        word = truncate_display_text(word, width)
-        right = max(0, width - display_width(word))
-        self.put(0, 0, "HAM", curses.A_BOLD)
         repo = self.repo_id or "all repositories"
         short_repo = Path(repo).name
-        self.put(0, 5, truncate_display_text(short_repo, max(0, right - 6)), curses.A_DIM)
-        self.put(0, right, word, self.style("accent", curses.A_BOLD))
+        if self.quick_send:
+            draw_title(self.screen, self.theme, "Quick send",
+                       f"{short_repo} · to {self.address(self.recipient)}", width,
+                       self.mode.upper())
+        else:
+            word = truncate_display_text(self.mode_word(), width)
+            right = max(0, width - display_width(word))
+            self.put(0, 0, "HAM", curses.A_BOLD)
+            self.put(0, 5, truncate_display_text(short_repo, max(0, right - 6)), curses.A_DIM)
+            self.put(0, right, word, self.style("accent", curses.A_BOLD))
         hints = self.footer_hints()
         max_footer_rows = 2 if self.quick_send else 1
         footer_rows = len(footer_lines(hints, max(0, width - 1), max_footer_rows))
         draw_footer(self.screen, height - footer_rows, 0, max(0, width - 1), hints, self.theme,
                     max_rows=max_footer_rows)
         bottom = height - footer_rows
+        content_top = 2 if self.quick_send else 1
         input_visible = self.layout != "tiny" and self.input_active()
         notice = self.receiver_notice()
         status = self.status if not (input_visible and self.status == self.input_error) else ""
@@ -2123,7 +2131,7 @@ class MailboxApp:
             self.refresh_detail()
             input_rect = None
             if input_visible:
-                body_height = max(0, bottom - 1)
+                body_height = max(0, bottom - content_top)
                 lines = wrap_message_lines(self.body.split("\n"), width=max(1, width - 4),
                                            cursor_row=0, cursor_column=0)[0]
                 rows = min(max(3, body_height // 3), max(3, len(lines)))
@@ -2134,7 +2142,7 @@ class MailboxApp:
                 input_height = min(input_height, max(3 + int(bool(self.input_error)), body_height - 3))
                 bottom -= input_height
                 input_rect = (bottom, 0, input_height, width)
-            for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
+            for region, rect in self.region_rects(content_top, max(0, bottom - content_top), width).items():
                 self.add_hit(rect, "region", region)
                 tabs = self.layout == "single" or (self.layout == "tabbed" and region != "detail")
                 title = "" if tabs else region.title()
@@ -2153,7 +2161,7 @@ class MailboxApp:
             if input_rect:
                 self.render_input(input_rect)
             if self.mode in {"confirm", "settings", "help", "evidence"}:
-                self.render_overlay((1, 0, max(0, bottom - 1), width))
+                self.render_overlay((content_top, 0, max(0, bottom - content_top), width))
         if self.mode == "viewer":
             self.render_viewer()
         if self.cursor_position is not None:
@@ -2368,7 +2376,7 @@ class MailboxApp:
                     lines.append((label, -5, self.style("accent", curses.A_BOLD) if current else curses.A_DIM, False))
                 previous_workspace = workspace
                 chosen = index == self.selections["agents"]
-                marker = "▌" if chosen and self.focus == "agents" else " "
+                marker = " "
                 turn = agent.get("turn_state") or "unknown"
                 glyph = self.theme.turn_label(turn).split()[0]
                 receiver = agent.get("extension_present")
@@ -2396,7 +2404,10 @@ class MailboxApp:
         if not agents:
             lines.append((" No agents. r refresh", -1, curses.A_DIM, False))
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("agents", lines, height), y):
-            self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
+            if _index >= 0 and _index == self.selections["agents"]:
+                self.theme.draw_selected_row(self.screen, row, text[1:], width, x, marker="›")
+            else:
+                self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
                 agent = agents[_index]
                 turn = agent.get("turn_state") or "unknown"
@@ -2475,7 +2486,7 @@ class MailboxApp:
                 lines.append((label + "─" * max(0, width - display_width(label)),
                               -1, curses.A_BOLD | (curses.A_DIM if handled else 0), False))
             chosen = index == self.selections["threads"]
-            marker = "▌" if chosen and self.focus == "threads" else "▸" if chosen else " "
+            marker = " "
             if item["type"] == "thread":
                 messages = item.get("messages", [])
                 latest = messages[-1] if messages else {}
@@ -2506,7 +2517,11 @@ class MailboxApp:
         if not lines:
             lines = [(" No threads. Enter on an agent to send.", -1, curses.A_DIM, False)]
         for row, (text, _index, attr, _primary) in enumerate(self.list_window("threads", lines, height - 1), y + 1):
-            self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
+            if _index >= 0 and _index == self.selections["threads"]:
+                self.theme.draw_selected_row(self.screen, row, text[2:], width, x,
+                                             marker="› " if _primary else "  ")
+            else:
+                self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
             if _index >= 0:
                 state, palette, kind, kind_palette = accents[_index]
                 label, tone = (state, palette) if _primary else (kind, kind_palette)

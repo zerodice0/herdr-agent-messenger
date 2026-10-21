@@ -499,10 +499,45 @@ class AgentSkillInstallerTest(unittest.TestCase):
                     screen.addstr.call_args_list + screen.addnstr.call_args_list]
         rendered_text = "".join(rendered)
         text = agent_skill_installer.COPY["en"]
-        self.assertIn(text["usage_title"], rendered)
         for key in ("usage_codex", "usage_claude", "usage_omp"):
             self.assertIn(text[key], rendered_text)
         self.assertGreaterEqual(screen.refresh.call_count, 3)
+
+    def test_installer_views_keep_one_title_without_legacy_headers(self):
+        from ham.ui.tui_style import content_rect
+        from tests.curses_snapshot_harness import FakeCursesWindow
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"HOME": directory, "NO_COLOR": "", "LANG": "en_US.UTF-8"}
+            screen = FakeCursesWindow(27, 62)
+            screen.keypad = mock.Mock()
+            snapshots = []
+            keys = iter(("?", "\x1b", "\x1b"))
+
+            def next_key():
+                snapshots.append(screen.snapshot())
+                return next(keys)
+
+            screen.get_wch = next_key
+            text = agent_skill_installer.COPY["en"]
+            with (
+                mock.patch.object(agent_skill_installer.curses, "wrapper",
+                                  side_effect=lambda callback: callback(screen)),
+                mock.patch.object(agent_skill_installer.curses, "curs_set"),
+                mock.patch.object(agent_skill_installer, "installation_status",
+                                  return_value=agent_skill_installer.STATUS_MISSING),
+                mock.patch.dict(text, {key: "LEGACY HEADER"
+                                       for key in ("title", "runtime_title", "usage_title")}),
+            ):
+                agent_skill_installer.overlay(environment)
+                keys = iter(("\n",))
+                agent_skill_installer.offer_runtime_install(screen, environment, text)
+            self.assertEqual(len(snapshots), 4)
+            rect = content_rect(27, 62, 80)
+            for snapshot in snapshots:
+                self.assertEqual(snapshot.rows_containing("HAM · "), [rect.y])
+                self.assertTrue(snapshot.line(rect.y).lstrip().startswith("HAM · Skill installer"))
+                self.assertEqual(snapshot.line(rect.y + 1), "")
+                self.assertNotIn("LEGACY HEADER", "\n".join(snapshot.lines()))
 
 
 class ReceivingRuntimeConsentTest(unittest.TestCase):
@@ -580,7 +615,7 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
             result = agent_skill_installer.offer_runtime_install(screen, self.environment, agent_skill_installer.COPY["en"])
         self.assertFalse(any(call.args[0] == "install" for call in manage.call_args_list))
         rendered = self.rendered(screen)
-        for expected in ("Receiving dependency", "omp: Not installed", "claude: Not installed",
+        for expected in ("omp: Not installed", "claude: Not installed",
                          "› Not now (default)", "Codex uses skill-guided pull"):
             self.assertIn(expected, rendered)
         self.assertEqual(result, "")
