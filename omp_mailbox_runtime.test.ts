@@ -86,8 +86,11 @@ class Fixture {
   statuses = new Map<string, string>();
   statusChanges: { key: string; text: string | undefined }[] = [];
   operations: string[] = [];
+  inspections: { has_action: boolean; coalesce_until: number }[] = [];
+  clock?: number;
   timers = new Map<object, () => unknown>();
   timeoutTokens = new Set<object>();
+  timeoutDelays = new Map<object, number>();
   terminalInput?: (data: string) => unknown;
   context: ExtensionContext;
   adapter: MailboxAdapter;
@@ -97,8 +100,9 @@ class Fixture {
   throwSend = false;
 
   constructor() {
-    const timeout = (callback: () => unknown) => {
-      const token = {}; this.timers.set(token, callback); this.timeoutTokens.add(token); return token;
+    const timeout = (callback: () => unknown, delay: number) => {
+      const token = {}; this.timers.set(token, callback); this.timeoutTokens.add(token);
+      this.timeoutDelays.set(token, delay); return token;
     };
     const interval = (callback: () => unknown) => { const token = {}; this.timers.set(token, callback); return token; };
     const owner = this;
@@ -108,7 +112,9 @@ class Fixture {
       sessionManager: { getSessionFile: () => this.session, getBranch: () => [...this.branch] },
       isIdle: () => this.idle, hasPendingMessages: () => this.queued,
       setTimeout: timeout, setInterval: interval,
-      clearTimer: (token: object) => { this.timeoutTokens.delete(token); return this.timers.delete(token); },
+      clearTimer: (token: object) => {
+        this.timeoutTokens.delete(token); this.timeoutDelays.delete(token); return this.timers.delete(token);
+      },
       ui: {
         get supportsEditor() { return owner.editorSupported; },
         getEditorText: () => this.editor, getEditorComponent: () => undefined,
@@ -133,6 +139,8 @@ class Fixture {
       if (operation === "register") await this.beforeRegister?.(data);
       const raw = operation === "register" ? await this.fixture(operation, data) : await this.cli(operation, data);
       const result = parseReply(operation, raw);
+      if (operation === "inspect" && "has_action" in result)
+        this.inspections.push({ has_action: result.has_action, coalesce_until: result.coalesce_until });
       if (operation === "register") await this.afterRegister?.(data);
       if ("claim_id" in result && result.claim_id !== null && this.afterClaim) await this.afterClaim(data, result);
       return result;
@@ -144,10 +152,15 @@ class Fixture {
     const token = this.timeoutTokens.values().next().value;
     if (!token) throw new Error("no timeout scheduled");
     const callback = this.timers.get(token);
-    this.timeoutTokens.delete(token); this.timers.delete(token);
+    this.timeoutTokens.delete(token); this.timeoutDelays.delete(token); this.timers.delete(token);
     await callback?.();
   }
   private async execute(args: string[], data: Record<string, unknown>): Promise<unknown> {
+    // Keep Python's real ledger clock aligned with Bun's fake clock without waiting.
+    if (this.clock !== undefined) args = args[0] === "-c"
+      ? ["-c", `import time\ntime.time = lambda: ${this.clock / 1000}\n${args[1]}`, ...args.slice(2)]
+      : ["-c", "import runpy,sys,time\nnow=float(sys.argv.pop(1)); time.time=lambda: now\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name='__main__')",
+        String(this.clock / 1000), ...args];
     const child = Bun.spawn(["python3", ...args], { cwd: root, env: this.environment, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify(data)); child.stdin.end();
     const text = await new Response(child.stdout).text();
@@ -303,6 +316,44 @@ test("idle action atomically bundles FYI and nextTurn trigger; no premature deli
   view = await f.view(); expect(view.messages.map(m => m.state)).toEqual(["delivered", "delivered"]); expect(view.wakes).toBe(1);
 });
 
+test("idle-arrived FYI re-inspects on its eligibility timer and wakes after 300 seconds without a new event", async () => {
+  const now = Date.UTC(2026, 9, 21, 12);
+  setSystemTime(now);
+  const f = new Fixture();
+  f.clock = now;
+  await f.fixture("setup");
+  await f.send();
+  // Start watching after enqueue so no mail bell can substitute for the deadline timer.
+  await f.adapter.start(f.context);
+  f.operations.length = 0;
+  let wakeClaim = false;
+  f.afterClaim = async data => { wakeClaim = data.wake === true; };
+
+  f.clock = now + 250; setSystemTime(f.clock);
+  await f.runNextTimeout();
+  expect(f.inspections).toEqual([{ has_action: true, coalesce_until: now / 1000 + 300 }]);
+  expect(f.operations).toEqual(["inspect"]);
+  expect(f.sent).toHaveLength(0);
+  expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
+  expect([...f.timeoutDelays.values()]).toEqual([299750]);
+
+  // Only invoke the extension's scheduled callback; no kick, input, bell, or safety interval.
+  f.clock = now + 300000; setSystemTime(f.clock);
+  await f.runNextTimeout();
+  expect(f.operations).toEqual(["inspect", "inspect", "claim"]);
+  expect(f.inspections).toHaveLength(2);
+  expect(wakeClaim).toBe(true);
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+  expect(f.sent[0].message.content).toContain("Real isolated body / fyi");
+  expect(f.sent[0].message.content).toContain("FYI only: read and continue; reply only if it changes your work.\n");
+  const view = await f.view();
+  expect(view.messages[0].state).toBe("delivering");
+  expect(view.messages[0].claim_id).not.toBeNull();
+  expect(view.wakes).toBe(0);
+  expect(f.warnings).toEqual([]);
+});
+
 test("done action claims a wake with quiet empty editor before user focus", async () => {
   const f = new Fixture(); await f.setup(); await f.send("action");
   await f.fixture("turn_state", { session_ref: f.session, turn_state: "done" });
@@ -326,7 +377,7 @@ test("working Herdr state never claims a wake despite quiet empty editor", async
   expect(view.wakes).toBe(0);
 });
 
-test("FYI alone cannot create a turn; task agents never register or consume", async () => {
+test("young FYI waits for eligibility; task agents never register or consume", async () => {
   const f = new Fixture(); await f.setup(); await f.send(); await f.adapter.kick(f.context);
   expect(f.sent).toHaveLength(0); expect((await f.view()).messages[0].state).toBe("queued");
   f.kind = "task";

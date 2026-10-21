@@ -13,7 +13,7 @@ import uuid
 from unittest import mock
 
 from ledger_mail import Mailbox
-from ledger_runtime import BUNDLE_BYTES, BUNDLE_MESSAGES, MESSAGE_BYTES, NativeReceiver, render_bundle
+from ledger_runtime import BUNDLE_BYTES, BUNDLE_MESSAGES, FYI_WAKE_DELAY_SECONDS, MESSAGE_BYTES, NativeReceiver, render_bundle
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry
 from ledger_store import LedgerError, LedgerStore
@@ -51,6 +51,15 @@ class RenderBundleTest(unittest.TestCase):
                 self.assertEqual(content, expected)
                 self.assertEqual(len(content.encode()), size)
                 self.assertEqual(hashlib.sha256(content.encode()).hexdigest(), digest)
+
+    def test_fyi_only_guidance_is_small_and_absent_from_action_or_mixed_bundles(self):
+        guidance = 'FYI only: read and continue; reply only if it changes your work.\n'
+        fyis = [{**message, 'kind':'fyi'} for message in self.messages(2)]
+        content = render_bundle(fyis, self.marker)
+        self.assertTrue(content.startswith(self.prefix + guidance))
+        self.assertEqual(len((self.prefix + guidance).encode()), 480)
+        for messages in (self.messages(1), [fyis[0], self.messages(1)[0]]):
+            self.assertNotIn(guidance, render_bundle(messages, self.marker))
 
     def test_cross_repo_header_exact_bytes_hash_and_send_time_sender_repo(self):
         message = {**self.messages(1)[0], 'origin_host': 'macbook', 'sender_label': 'purple-deer',
@@ -424,29 +433,174 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(self.states()[sent['message_id']],'queued')
 
 
-    def test_action_disappearing_between_inspect_and_atomic_claim_never_wakes_fyi(self):
+    def test_action_disappearing_between_inspect_and_atomic_claim_cannot_wake_young_fyi(self):
         fyi = self.send()
         action = self.send(kind='action')
         self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
         self.mail.withdraw(action['message_id'],sender=self.sender)
         claim = self.claim(wake=True)
         self.assertIsNone(claim['claim_id'])
-        self.assertEqual(claim['reason'],'no_action')
+        self.assertEqual(claim['reason'],'coalescing')
         self.assertEqual(self.states()[fyi['message_id']],'queued')
 
     def test_over_hop_action_does_not_authorize_fyi_only_wake(self):
         self.settings.mutate(self.recipient['repo_id'],'thresholds',{**self.thresholds,'max_hop':0})
         fyi = self.send()
         action = self.send(kind='action',reply_to=fyi['message_id'])
-        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
-        self.assertEqual(self.claim(wake=True)['reason'],'no_action')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual(self.claim(wake=True)['reason'],'coalescing')
         self.assertEqual(self.states()[action['message_id']],'queued')
         self.assertEqual([message['message_id'] for message in self.claim()['messages']],[fyi['message_id']])
 
-    def test_fyi_alone_never_wakes_but_is_eligible_on_user_turn(self):
+    def test_young_fyi_is_delayed_but_is_eligible_on_user_turn(self):
         self.send()
-        self.assertEqual(self.claim(wake=True)['reason'],'no_action')
+        self.assertEqual(self.claim(wake=True)['reason'],'coalescing')
         self.assertIsNotNone(self.claim()['claim_id'])
+
+    def test_idle_fyi_deadline_and_atomic_wake_claim_at_exact_300_seconds(self):
+        self.set_turn_state('idle')
+        enqueued = time.time()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued):
+            sent = self.send()
+        self.assertEqual(FYI_WAKE_DELAY_SECONDS, 300)
+        self.assertEqual(self.turn_end_flag(sent['message_id']), 0)
+        for age in (0, 299.999, 300):
+            with self.subTest(age=age), mock.patch('ledger_runtime.time.time', return_value=enqueued+age):
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertTrue(inspected['has_action'])  # Pending work keeps the extension's timer alive.
+                self.assertEqual(inspected['coalesce_until'], enqueued+300)
+                claim = self.claim(wake=True)
+                if age < 300:
+                    self.assertGreater(inspected['coalesce_until'], enqueued+age)
+                    self.assertEqual(claim['reason'], 'coalescing')
+                    self.assertIsNone(claim['claim_id'])
+                    self.assertEqual(self.states()[sent['message_id']], 'queued')
+                else:
+                    self.assertLessEqual(inspected['coalesce_until'], enqueued+age)
+                    self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
+                    self.assertIn('FYI only: read and continue;', claim['message']['content'])
+                    self.assertEqual(self.receiver.inspect(**self.identity)['wake_count'], 1)
+                    self.applied(claim)
+                    self.assertEqual(self.receiver.inspect(**self.identity)['wake_count'], 1)
+
+    def test_existing_unflagged_queued_fyi_uses_local_queue_age_not_sender_age(self):
+        sent = self.send()
+        enqueued = time.time()
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE messages SET created_at=? WHERE message_id=?',
+                               (enqueued-3600, sent['message_id']))
+            connection.execute('UPDATE deliveries SET updated_at=? WHERE message_id=?',
+                               (enqueued, sent['message_id']))
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+299):
+            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+300)
+            self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+301):
+            self.assertIsNotNone(self.claim(wake=True)['claim_id'])
+
+    def test_oldest_idle_fyi_deadline_batches_younger_fyi_without_restarting_delay(self):
+        enqueued = time.time()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued):
+            first = self.send()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued+250):
+            second = self.send()
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+300):
+            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+300)
+            claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']],
+                         [first['message_id'], second['message_id']])
+
+    def test_idle_fyi_wakes_obey_role_hourly_and_max_hop(self):
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'wakes_per_hour':1})
+        enqueued = time.time()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued):
+            first = self.send()
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+300):
+            for mode in ('off', 'manual'):
+                self.settings.mutate(self.recipient['repo_id'], 'mode', mode)
+                self.assertIsNone(self.receiver.inspect(**self.identity)['role'])
+                self.assertEqual(self.claim(wake=True)['reason'], 'not_participating')
+            self.settings.mutate(self.recipient['repo_id'], 'mode', 'auto')
+            first_claim = self.claim(wake=True)
+            second = self.send()
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+600):
+            self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+            self.applied(first_claim)
+            self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+            self.assertEqual(self.states()[second['message_id']], 'queued')
+        natural = self.claim()
+        self.applied(natural)
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'max_hop':0})
+        reply = self.send(reply_to=first['message_id'])
+        with mock.patch('ledger_runtime.time.time', return_value=time.time()+301):
+            self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+            self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+            self.assertEqual(self.states()[reply['message_id']], 'queued')
+
+    def test_aged_fyi_does_not_hide_eligible_action_outside_bounded_prefix(self):
+        enqueued = time.time()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued):
+            for index in range(BUNDLE_MESSAGES+2):
+                self.send(body='older FYI '+str(index))
+        action = self.send(kind='action')
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+300):
+            claim = self.claim(wake=True)
+        self.assertIn(action['message_id'], [message['message_id'] for message in claim['messages']])
+        self.assertNotIn('FYI only:', claim['message']['content'])
+
+    def test_held_idle_fyi_cannot_trigger_or_join_wake_until_hold_clears(self):
+        sent = self.send()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_changed' WHERE message_id=?",
+                               (sent['message_id'],))
+        with mock.patch('ledger_runtime.time.time', return_value=time.time()+301):
+            self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+            self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+            action = self.send(kind='action')
+            claim = self.claim(wake=True)
+            self.assertEqual([message['message_id'] for message in claim['messages']], [action['message_id']])
+            self.applied(claim)
+            with self.store.transaction() as connection:
+                connection.execute('UPDATE deliveries SET hold_reason=NULL WHERE message_id=?', (sent['message_id'],))
+            self.assertIsNotNone(self.claim(wake=True)['claim_id'])
+
+    def test_eligible_idle_fyi_beyond_prefix_survives_small_bundle_budget(self):
+        enqueued = time.time()
+        ready = self.send(body='Already queued FYI')
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE deliveries SET updated_at=? WHERE message_id=?',
+                               (enqueued-301, ready['message_id']))
+        for index in range(BUNDLE_MESSAGES+2):
+            sent = self.send(body='young FYI '+str(index))
+            with self.store.transaction() as connection:
+                # An older sender clock must not make locally young FYI eligible.
+                connection.execute('UPDATE messages SET created_at=? WHERE message_id=?',
+                                   (enqueued-3600-index, sent['message_id']))
+        inspected = self.receiver.inspect(**self.identity)
+        self.assertLessEqual(inspected['coalesce_until'], time.time())
+        budget = 480 + 345  # FYI-only prefix plus room for one bounded message.
+        with mock.patch('ledger_runtime.BUNDLE_BYTES', budget):
+            claim = self.claim(wake=True)
+        self.assertIn(ready['message_id'], [message['message_id'] for message in claim['messages']])
+        self.assertLessEqual(len(claim['message']['content'].encode()), budget)
+        self.assertEqual(self.represented_ids(claim['message']['content']),
+                         {message['message_id'] for message in claim['messages']})
+
+    def test_proven_unapplied_idle_fyi_restarts_delay_when_requeued(self):
+        enqueued = time.time()
+        with mock.patch('ledger_mail.time.time', return_value=enqueued):
+            sent = self.send()
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+300):
+            claim = self.claim(wake=True)
+            self.mail.release(claim_id=claim['claim_id'], agent_id=self.recipient['agent_id'],
+                              generation=self.recipient['generation'], disposition='not_applied',
+                              evidence='not submitted')
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+599):
+            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+600)
+            self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
+        with mock.patch('ledger_runtime.time.time', return_value=enqueued+600):
+            self.assertEqual([message['message_id'] for message in self.claim(wake=True)['messages']],
+                             [sent['message_id']])
+
 
     def test_working_fyi_remains_a_wake_trigger_after_idle_or_done_and_freshness_change(self):
         for ready in ('idle', 'done'):
@@ -455,7 +609,7 @@ class NativeReceiverTest(unittest.TestCase):
                 sent = self.send()
                 self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
                 self.assertIs(sent['fyi_turn_end'], True)
-                self.assertNotIn('fyi_no_wake', [warning['code'] for warning in sent.get('warnings', [])])
+                self.assertNotIn('fyi_wake_after_seconds', sent)
                 self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
                 self.assertEqual(self.claim(wake=True)['reason'], 'not_idle')
                 self.set_turn_state(ready, age=60)
@@ -490,8 +644,8 @@ class NativeReceiverTest(unittest.TestCase):
                             "INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,'idle',?)",
                             (self.recipient['agent_id'], time.time()))
                 self.set_turn_state('idle')
-                self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
-                self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+                self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+                self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
                 natural = self.claim()
                 self.assertEqual([message['message_id'] for message in natural['messages']], [sent['message_id']])
                 self.applied(natural)
@@ -548,8 +702,8 @@ class NativeReceiverTest(unittest.TestCase):
         flagged = self.send(reply_to=ordinary['message_id'])
         self.assertEqual(self.turn_end_flag(flagged['message_id']), 1)
         self.set_turn_state('idle')
-        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
-        self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         self.assertEqual([message['message_id'] for message in self.claim()['messages']], [ordinary['message_id']])
         self.assertEqual(self.states()[flagged['message_id']], 'queued')
 
@@ -615,8 +769,8 @@ class NativeReceiverTest(unittest.TestCase):
         self.set_turn_state('idle')
         self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
         self.mail.withdraw(flagged['message_id'], sender=self.sender)
-        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
-        self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
+        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         self.assertEqual(self.states()[ordinary['message_id']], 'queued')
 
     def test_flagged_fyi_hold_gate_does_not_change_existing_action_hold_behavior(self):

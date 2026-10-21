@@ -38,7 +38,7 @@ The last command prints the packaged canonical skill path. Project installs are 
 
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
-- **OMP adapter:** native receiving and eligible action/flagged turn-end FYI wake.
+- **OMP adapter:** native receiving and eligible action/FYI wake.
 - **Claude hooks:** native receiving at turn boundaries, with no idle wake.
 - **Codex:** skill-guided inbox pull; no adapter is needed.
 
@@ -141,7 +141,7 @@ not evidence of a missing skill or a general Claude authentication failure.
 
 Use the mailbox to leave durable messages without injecting a prompt into a busy
 agent. Receiving runtimes may admit them at a natural user boundary; eligible
-OMP action mail or flagged turn-end FYI can cause an automatic turn under the
+OMP action or FYI mail can cause an automatic turn under the
 rules below. Run from a registered Herdr agent pane:
 
 ```bash
@@ -175,16 +175,15 @@ role. Modes, idle/done readiness, hourly per-recipient limit, coalescing and
 max-hop gates are unchanged. Legacy collaboration policy is also unchanged:
 `use_mailbox` still applies only to participating same-repo pairs.
 
+Choose `--kind action` when the recipient must act, answer, or continue (for
+example, on an answer/decision); use `fyi` for reference information. Eligible
+action wakes promptly; FYI is batched for an idle participating OMP wake after
+about five minutes, or delivered right after a turn when it arrives mid-turn.
+Existing wake safeguards apply.
+
 Successful sends can return advisory warnings without changing the default
-`fyi` kind. `fyi_no_wake` means FYI was sent to a known ready, non-stale,
-participating OMP recipient with a registered receiver and Herdr `turn_state`
-of `idle` or `done`; FYI enqueued while idle cannot wake it. No such warning is emitted
-for action, busy/unknown/stale recipients, missing receivers, other clients,
-mode `off`, or nonmembers. Replies follow the same recipient-state rule even
-when their parent was action. Choose `--kind action` when the recipient must
-act/continue (for example, on an answer/decision), `fyi` otherwise.
-See the [reference warning list](../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
-for `recipient_no_receiver` and the full advisory contract.
+`fyi` kind. See the [reference warning list](../.agents/skills/herdr-agent-messenger/reference.md#local-mailbox)
+for `recipient_no_receiver` and the advisory contract.
 
 `inbox read` accepts `--message UUID`, `--all`, `--limit N` (default 100,
 1–1000), and `--verbose`. Defaults retain IDs/sender/body/state/reply context;
@@ -493,6 +492,9 @@ Schema v10 adds `deliveries.fyi_turn_end` with default 0. Existing v9 deliveries
 stay conservatively unflagged. Upgrade ledger and CLI/copied skills together;
 older enqueue code can miss the flag. The extension contract is unchanged and
 this policy needs no extension restart. See [turn-end FYI migration](migration.md#turn-end-fyi-schema-v10).
+Delayed idle FYI uses the existing local delivery timestamp: queued FYI becomes
+wake-eligible 300 seconds after local recipient enqueue, including mail already
+queued before the update. No new schema, setting, or data migration is needed.
 
 Public status is independent of coordination mode:
 
@@ -631,7 +633,7 @@ replay an unknown claim or send a replacement while application is uncertain.
 native session file; the extension delegates ledger work to Python. In a
 supported TUI, automatic wake needs an empty editor, quiet input for
 `idle_minutes`, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime with no pending message, `willContinue`, or retry
-hold, an eligible action or flagged turn-end FYI and participating role, plus coalescing/hourly/hop
+hold, an eligible action or FYI and participating role, plus coalescing/hourly/hop
 limits. Eligibility is rechecked in the same tick immediately before enqueue.
 It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself
 does not block this wake; it is not the legacy focused-pane hold.
@@ -642,16 +644,21 @@ retry window and clears its own status on success; exhaustion shows unavailable.
 HAM never publishes that path itself. Conflicting reported paths remain
 `stale_session`.
 
-FYI never wakes an idle recipient. FYI arriving during a turn is delivered right
-after that turn under existing wake gates: local enqueue records
-`delivery.fyi_turn_end` only for fresh `working` state (local reconciliation's
-`agents.last_seen` within 15 seconds). Idle, unknown or stale state leaves FYI
-natural-turn only; later state changes do not retroactively flag it. The flag
-is local delivery metadata, not a change of mail kind or wire payload.
+Eligible action wakes promptly. Queued FYI becomes wake-eligible 300 seconds
+after local recipient enqueue for batched idle wakes; existing queued mail uses
+its local delivery timestamp, not the sender's message creation time.
+FYI arriving during a turn is delivered right after that turn under existing
+wake gates: local enqueue records `delivery.fyi_turn_end` only for fresh
+`working` state (local reconciliation's `agents.last_seen` within 15 seconds),
+bypassing the 300-second delay. Later state changes do not retroactively set
+the flag. All wake gates still apply, including participation and idle state.
+The flag is local delivery metadata, not a change of mail kind or wire payload.
 Natural user turns can receive both kinds even in off mode or for manual
-nonmembers. An eligible action or flagged FYI can wake with other eligible FYI
-in the same bounded bundle: at most eight messages / 8 KiB total, each body
-bounded to 2 KiB with exact-message-ID read instructions for truncation.
+nonmembers. Wakes use the same bounded bundle: at most eight messages / 8 KiB
+total, each body bounded to 2 KiB with exact-message-ID read instructions for
+truncation. Action wakes can also bundle FYI younger than 300 seconds.
+FYI-only bundles ask the recipient to read and continue, replying only if the
+information changes its work.
 The runtime watches the local bell with `fs.watch` and has a five-minute
 code-only safety check. Its ACK proves exact claimed content/hash in the
 same-session active-branch journal, **not** provider-request inclusion, model

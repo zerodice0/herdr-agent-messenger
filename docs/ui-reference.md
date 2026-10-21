@@ -308,10 +308,13 @@ Threads `Enter` opens the same input as a reply to the thread's latest message.
 The recipient must resolve to a live, non-stale agent; otherwise an error is shown.
 Every new compose, including replies and reopened drafts, resets to `action`.
 `Ctrl+G` toggles `action` / `fyi` for that compose, and the selected kind is sent
-explicitly; the CLI default remains `fyi`. FYI never wakes an idle recipient;
-FYI arriving during a turn is delivered right after that turn under existing
-wake gates when local enqueue observes fresh `working` recipient state.
-Idle/unknown/stale FYI stays natural-turn only.
+explicitly; the CLI default remains `fyi`. Use action when the recipient must
+act, answer, or continue; eligible action wakes promptly. FYI is batched for
+an idle participating OMP wake after about five minutes (300 seconds from local
+recipient enqueue, including already queued mail without migration). FYI arriving
+during a turn is delivered right after that turn when local enqueue observes
+fresh `working` state. Existing wake safeguards apply to both paths. Action
+wakes can include younger FYI; FYI alone needs a reply only if it changes work.
 
 - `Enter` sends mailbox text immediately, without a review or confirmation step.
   A blank body is rejected without sending.

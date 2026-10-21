@@ -19,9 +19,10 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
 
 - **Durable agent mail:** send, reply, and explicitly handle threads across
   repositories and registered hosts. Delivery and completed work stay distinct.
-- **Action or FYI:** eligible `action` mail wakes an idle OMP agent; `fyi` waits
-  for a natural turn. FYI arriving during an active turn can be delivered just
-  after that turn, under the same wake gates. CLI sends default to `fyi`.
+- **Action or FYI:** eligible `action` mail wakes an idle participating OMP agent
+  promptly; `fyi` is batched for a wake after about five minutes. FYI arriving
+  during a turn is delivered right after it, under existing wake safeguards.
+  CLI sends default to `fyi`.
 - **Main and workers:** `off`, `manual`, and `auto` participation modes, with
   linked worktrees grouped under their main-checkout workspace. Roles and
   summaries also appear in HAM-owned Herdr borders; manual names are preserved.
@@ -87,8 +88,8 @@ python3 "$HAM_CLI" mail send \
 ```
 
 A reply also handles its addressed parent atomically, so a separate `inbox handle`
-is unnecessary when replying. Choose `--kind action` if the answer requires the
-recipient to continue; use `fyi` for information that need not wake an idle agent.
+is unnecessary when replying. Choose `--kind action` if the recipient must act,
+answer, or continue; use `fyi` for reference information.
 Use `--to main` for your role group's main, or `[HOST/]main@REPO` for another
 repository's unique main, such as `studio/main@acme/webapp`.
 

@@ -31,7 +31,7 @@ agents detected after installation receive `color-animal` labels such as
 
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
-- **OMP adapter:** native receiving and eligible action/flagged turn-end FYI wake.
+- **OMP adapter:** native receiving and eligible action/FYI wake.
 - **Claude hooks:** native receiving at turn boundaries, with no idle wake.
 - **Codex:** skill-guided inbox pull, with no adapter required.
 
@@ -59,12 +59,18 @@ Schema v10 adds local `deliveries.fyi_turn_end INTEGER NOT NULL DEFAULT 0`.
 Existing v9 deliveries stay conservatively unflagged: old records cannot prove
 the recipient was working when they arrived.
 
-FYI never wakes an idle recipient. During local recipient enqueue, only a
-locally reconciled `working` state with `agents.last_seen` within 15 seconds
-sets the flag (normal local reconciliation sweeps run every five seconds).
-Flagged FYI is delivered right after that turn under existing wake gates;
-idle, unknown or stale enqueue state stays natural-turn only. Remote wire
-payloads do not carry this flag; the final recipient's ledger decides locally.
+Eligible action wakes an idle participating OMP promptly. Queued FYI becomes
+wake-eligible 300 seconds after local recipient enqueue for batched idle wakes,
+under the same safeguards. This delayed path adds no schema or settings:
+existing queued FYI uses its local delivery timestamp without migration.
+
+During local recipient enqueue, a locally reconciled `working` state with
+`agents.last_seen` within 15 seconds sets the turn-end flag (normal local
+reconciliation sweeps run every five seconds). Flagged FYI is delivered right
+after that turn under existing wake gates, without waiting 300 seconds.
+Idle, unknown or stale enqueue state does not set the flag but still permits
+the delayed path once eligible. Remote wire payloads do not carry this flag;
+the final recipient's ledger decides locally.
 
 Back up the ledger and stop old HAM workers/Mailbox processes. Upgrade host
 ledger code and CLI/copied skills together, then run upgraded `ledger reconcile`

@@ -19,6 +19,7 @@ MESSAGE_BYTES = 2048
 BUNDLE_BYTES = 8192
 BUNDLE_MESSAGES = 8
 WAKE_READY_STATES = frozenset({'idle', 'done'})
+FYI_WAKE_DELAY_SECONDS = 300
 
 
 def truncate_utf8(value: str, maximum: int) -> str:
@@ -38,6 +39,8 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
               'Reply: mail send --to HOST/LABEL --reply-to ID --kind action --body TEXT.\n'
               'Use action to enable work (answers/decisions); fyi otherwise.\n'
               'No receipt replies/ACK loops.\n')
+    if messages and all(message['kind'] == 'fyi' for message in messages):
+        prefix += 'FYI only: read and continue; reply only if it changes your work.\n'
     headers = []
     for message in messages:
         sender_repo = message.get('sender_repo_id', message.get('repo_id', ''))
@@ -67,18 +70,21 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
     return content if len(content.encode('utf-8')) <= BUNDLE_BYTES else None
 
 
-def wake_candidate(row: Mapping[str, Any]) -> bool:
-    """Keep the inspect.has_action wire contract, including turn-end FYI."""
-    return row['kind'] == 'action' or bool(row['fyi_turn_end'])
+def wake_ready_at(row: Mapping[str, Any], coalesce_seconds: float) -> float:
+    """Use recipient-host queue age for idle FYI, never the sender's clock."""
+    coalesced = row['created_at'] + coalesce_seconds
+    if row['kind'] == 'fyi' and not row['fyi_turn_end']:
+        return max(coalesced, row['queued_at'] + FYI_WAKE_DELAY_SECONDS)
+    return coalesced
 
 
-def fit_claim_rows(rows: Sequence[Mapping[str, Any]], *, require_wake: bool) -> list[Mapping[str, Any]]:
-    """Largest representable prefix; a wake retains a wake-eligible message."""
+def fit_claim_rows(rows: Sequence[Mapping[str, Any]], *, wake_trigger: str | None = None) -> list[Mapping[str, Any]]:
+    """Largest representable prefix; a wake retains its admitted trigger."""
     marker = 'HAM_CLAIM_' + '0' * 36 + '_' + '0' * 32  # same byte length as the real marker
     for count in range(len(rows),0,-1):
         chosen = list(rows[:count])
-        if require_wake and not any(wake_candidate(row) for row in chosen):
-            trigger = next((row for row in rows if wake_candidate(row)),None)
+        if wake_trigger is not None and not any(row['message_id'] == wake_trigger for row in chosen):
+            trigger = next((row for row in rows if row['message_id'] == wake_trigger),None)
             if trigger is None:
                 return []
             chosen = sorted([*chosen[:-1],trigger],key=lambda row:(row['created_at'],row['message_id']))
@@ -129,19 +135,26 @@ class NativeReceiver:
         return {'thresholds':thresholds,'mode':mode,'role':role,'turn_state':status[0] if status else 'unknown',
                 'wake_count':wake_count+reservations,'pending_claims':pending_claims}
 
-    def _eligible(self,connection: Any,agent: Mapping[str, Any],maximum_hop: int,*,wake: bool) -> list[Any]:
-        base = ('SELECT m.*,d.recipient_address,d.recipient_repo_id,d.fyi_turn_end '
+    def _eligible(self,connection: Any,agent: Mapping[str, Any],maximum_hop: int,*,wake: bool,
+                  coalesce_seconds: float = 0, now: float = 0) -> list[Any]:
+        hold_gate = "(m.kind='action' OR d.hold_reason IS NULL)" if wake else '(d.fyi_turn_end=0 OR d.hold_reason IS NULL)'
+        base = ('SELECT m.*,d.recipient_address,d.recipient_repo_id,d.fyi_turn_end,d.updated_at AS queued_at '
                 'FROM messages m JOIN deliveries d USING(message_id) '
                 "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' "
                 'AND d.recipient_repo_id=? AND m.hop<=? '
-                'AND (d.fyi_turn_end=0 OR d.hold_reason IS NULL) ')
+                'AND '+hold_gate+' ')
         parameters = (self.store.host,agent['terminal_id'],agent['repo_id'],maximum_hop)
         rows = connection.execute(base+'ORDER BY m.created_at,m.message_id LIMIT ?',(*parameters,BUNDLE_MESSAGES)).fetchall()
-        if wake and not any(wake_candidate(row) for row in rows):
+        if wake and rows:
+            # The earliest deadline may be beyond the oldest bounded prefix
+            # (e.g. a young FYI backlog followed by an action or turn-end FYI).
             trigger = connection.execute(
-                base+"AND (m.kind='action' OR d.fyi_turn_end=1) "
-                "ORDER BY m.created_at,m.message_id LIMIT 1",parameters).fetchone()
-            if trigger:
+                base+"ORDER BY CASE WHEN m.kind='action' AND m.created_at+?<=? THEN 0 ELSE 1 END,"
+                "CASE WHEN m.kind='fyi' AND d.fyi_turn_end=0 "
+                "THEN MAX(d.updated_at+?,m.created_at+?) ELSE m.created_at+? END,"
+                "m.created_at,m.message_id LIMIT 1",
+                (*parameters,coalesce_seconds,now,FYI_WAKE_DELAY_SECONDS,coalesce_seconds,coalesce_seconds)).fetchone()
+            if not any(row['message_id'] == trigger['message_id'] for row in rows):
                 rows = sorted([*rows[:BUNDLE_MESSAGES-1],trigger],key=lambda row:(row['created_at'],row['message_id']))
         return rows
 
@@ -150,10 +163,12 @@ class NativeReceiver:
         with self.store.read() as connection:
             agent = check_generation(connection,self.store.host,terminal_id,agent_id,generation)
             state = self._state(connection,agent,now)
-            rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=True)
-            triggers = [row for row in rows if wake_candidate(row)]
-        return {**state,'queued_count':len(rows),'has_action':bool(triggers),
-                'coalesce_until':min((row['created_at'] for row in triggers),default=0)+state['thresholds']['coalesce_seconds']}
+            rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=True,
+                                  coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
+        # has_action means pending wake work, including delayed FYI. False makes
+        # the unchanged OMP extension return without scheduling a deadline probe.
+        return {**state,'queued_count':len(rows),'has_action':bool(rows),
+                'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in rows),default=0)}
 
     def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False) -> dict[str, Any]:
         now = time.time()
@@ -162,8 +177,11 @@ class NativeReceiver:
             if agent['client']!='omp' or not agent['extension_present']:
                 raise LedgerError('extension_absent','Only the registered OMP receiver may admit native context.')
             state = self._state(connection,agent,now)
-            rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=wake)
-            triggers = [row for row in rows if wake_candidate(row)]
+            rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=wake,
+                                  coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
+            trigger = min(rows,key=lambda row:(
+                not (row['kind']=='action' and wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now),
+                wake_ready_at(row,state['thresholds']['coalesce_seconds'])),default=None) if wake else None
             reason = None
             if wake:
                 if state['role'] is None:
@@ -172,13 +190,13 @@ class NativeReceiver:
                     reason = 'not_idle'
                 elif state['wake_count']>=state['thresholds']['wakes_per_hour']:
                     reason = 'hourly_limit'
-                elif not triggers:
+                elif trigger is None:
                     reason = 'no_action'
-                elif min(row['created_at'] for row in triggers)+state['thresholds']['coalesce_seconds']>now:
+                elif wake_ready_at(trigger,state['thresholds']['coalesce_seconds'])>now:
                     reason = 'coalescing'
             if reason or not rows:
                 return {'claim_id':None,'reason':reason or 'empty','messages':[]}
-            rows = fit_claim_rows(rows,require_wake=wake)
+            rows = fit_claim_rows(rows,wake_trigger=trigger['message_id'] if trigger is not None else None)
             if not rows:
                 return {'claim_id':None,'reason':'unrepresentable','messages':[]}
             claim = Mailbox._claim_messages(connection,rows,agent_id,generation,'wake' if wake else 'before_agent_start')
@@ -246,8 +264,7 @@ class NativeReceiver:
             if pending:
                 return {**empty,'agent':registered}
             state = self._state(connection,current,now)
-            rows = fit_claim_rows(self._eligible(connection,current,state['thresholds']['max_hop'],wake=False),
-                                  require_wake=False)
+            rows = fit_claim_rows(self._eligible(connection,current,state['thresholds']['max_hop'],wake=False))
             if not rows:
                 return {**empty,'agent':registered}
             claim = Mailbox._claim_messages(connection,rows,registered['agent_id'],registered['generation'],'hook')

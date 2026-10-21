@@ -18,6 +18,7 @@ import uuid
 
 from ledger_mail import Mailbox, payload_hash, validate_payload
 from ledger_remote import RemoteLedger, SSHTransport
+from ledger_runtime import NativeReceiver
 from ledger_settings import DEFAULT_THRESHOLDS, RepoSettings
 from ledger_status import AgentRegistry, repository_identity
 from ledger_store import LedgerError, LedgerStore, public_receipt, queue_outbox, receipt
@@ -461,7 +462,7 @@ class RemoteLedgerTest(unittest.TestCase):
                     self.agents["alpha"], exported, body="No absence evidence")
                 self.assertNotIn("warnings", result)
 
-    def test_fyi_remote_ready_receiver_advisory_requires_current_known_context(self):
+    def test_fyi_remote_ready_receiver_delay_requires_current_known_context(self):
         self.settings_for("beta").mutate(self.repo_id, "mode", "auto")
         with self.stores["beta"].transaction() as connection:
             connection.execute("UPDATE agents SET client='omp',extension_present=1 WHERE active=1")
@@ -473,29 +474,77 @@ class RemoteLedgerTest(unittest.TestCase):
                 recipient = self.services["alpha"].resolve_recipient("beta/beta-owl", self.agents["alpha"])
                 sent = mailbox.send(self.agents["alpha"], recipient, body="Remote decision")
                 self.assertEqual(sent["state"], "pending")
-                self.assertEqual("fyi_no_wake" in [item["code"] for item in sent.get("warnings", [])],
-                                 state in {"idle", "done"})
+                # Remote ready state is a cached estimate; the recipient host
+                # starts the actual delay only when it accepts the message.
+                if state in {"idle", "done"}:
+                    self.assertEqual(sent["fyi_wake_after_seconds"], 300)
+                else:
+                    self.assertNotIn("fyi_wake_after_seconds", sent)
         recipient = {**recipient, "turn_state": "idle"}
         cases = ({"stale": True}, {"turn_state": None}, {"active": 0},
                  {"extension_present": None}, {"client": "claude"}, {"role": None})
         for fields in cases:
             with self.subTest(fields=fields):
                 sent = mailbox.send(self.agents["alpha"], {**recipient, **fields}, body="Unknown or ineligible")
-                self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+                self.assertNotIn("fyi_wake_after_seconds", sent)
         for state in ("idle", "done"):
             with self.subTest(action_state=state):
                 sent = mailbox.send(self.agents["alpha"], {**recipient, "turn_state": state},
                                     kind="action", body="Continue now")
-                self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+                self.assertNotIn("fyi_wake_after_seconds", sent)
         unknown = dict(recipient)
         unknown.pop("turn_state")
         sent = mailbox.send(self.agents["alpha"], unknown, body="Status omitted by older peer")
-        self.assertNotIn("fyi_no_wake", [item["code"] for item in sent.get("warnings", [])])
+        self.assertNotIn("fyi_wake_after_seconds", sent)
 
     def turn_end_flag(self, host, message_id):
         with self.stores[host].read() as connection:
             return connection.execute('SELECT fyi_turn_end FROM deliveries WHERE message_id=?',
                                       (message_id,)).fetchone()[0]
+
+    def test_remote_fyi_delay_starts_at_recipient_enqueue_and_dedupe_preserves_deadline(self):
+        self.settings_for('beta').mutate(self.repo_id, 'mode', 'auto')
+        snapshot = self.snapshots['beta']
+        snapshot['agents'][0].update(agent='omp', agent_session={
+            'value': str(self.root / 'beta-session.jsonl')})
+        registry = AgentRegistry(self.stores['beta'])
+        registry.reconcile(snapshot, refresh_display=False)
+        recipient = registry.list()[0]
+        receiver = NativeReceiver(self.stores['beta'])
+        recipient = receiver.register(recipient, session_ref=recipient['session_ref'])['agent']
+        identity = {key: recipient[key] for key in ('terminal_id', 'agent_id', 'generation')}
+        enqueued_at = time.time()
+        created_at = enqueued_at - 3600
+        with mock.patch('ledger_mail.time.time', return_value=created_at):
+            sent = Mailbox(self.stores['alpha'], self.environment).send(
+                self.agents['alpha'], recipient, body='Old sender clock must not mature FYI')
+        route = json.loads(next(item['payload'] for item in self.services['alpha'].outbox()
+                                if item['message_id'] == sent['message_id']))
+        self.assertEqual(route['message']['created_at'], created_at)
+        envelope = self.services['alpha'].envelope(route)
+        deadline = enqueued_at + 300
+        with mock.patch('ledger_mail.time.time', return_value=enqueued_at):
+            accepted = self.services['beta'].receive('accept', envelope)
+            self.assertEqual(accepted['state'], 'queued')
+            self.assertEqual(self.turn_end_flag('beta', sent['message_id']), 0)
+            self.assertEqual(self.current('beta', sent['message_id'])['updated_at'], enqueued_at)
+            inspected = receiver.inspect(**identity)
+            self.assertIs(inspected['has_action'], True)
+            self.assertEqual(inspected['coalesce_until'], deadline)
+            self.assertEqual(receiver.claim(**identity, wake=True)['reason'], 'coalescing')
+        for retry_at in (enqueued_at + 120, deadline - 1):
+            with self.subTest(retry_at=retry_at), mock.patch('ledger_mail.time.time', return_value=retry_at):
+                replayed = self.services['beta'].receive('accept', envelope)
+                self.assertEqual(replayed, accepted)
+                self.assertEqual(self.current('beta', sent['message_id'])['updated_at'], enqueued_at)
+                inspected = receiver.inspect(**identity)
+                self.assertIs(inspected['has_action'], True)
+                self.assertEqual(inspected['coalesce_until'], deadline)
+                self.assertEqual(receiver.claim(**identity, wake=True)['reason'], 'coalescing')
+        with mock.patch('ledger_mail.time.time', return_value=deadline):
+            claim = receiver.claim(**identity, wake=True)
+            self.assertIsNotNone(claim['claim_id'])
+            self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
 
     def test_remote_turn_end_flag_uses_recipient_host_accept_state_not_origin_or_export(self):
         shadow = self.add_agent('alpha', self.agents['beta']['terminal_id'], 'shadow-workspace')

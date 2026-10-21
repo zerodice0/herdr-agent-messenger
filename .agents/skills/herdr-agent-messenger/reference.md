@@ -93,28 +93,22 @@ Successful `mail send` may include advisory `warnings` entries:
   and Codex pull-only recipients do not produce this warning. Run `runtime status`
   on the recipient host, request consent before installing a missing runtime,
   then restart only the selected sessions if registration is pending.
-- `fyi_no_wake`: `fyi` was sent to a known ready, non-stale, participating OMP
-  recipient with a registered receiver and Herdr `turn_state` of `idle` or
-  `done`. FYI enqueued while idle cannot wake it. FYI arriving during a turn
-  can be marked locally for delivery right after that turn under existing wake
-  gates (see below). This advisory does not reject, resend, or change the mail
-  kind; the CLI default remains `fyi`. It is not emitted
-  for `action`, busy recipients, unknown/stale state, missing receivers,
-  non-OMP clients, mode `off`, or nonmembers. Replies use the same recipient-state
-  rule, including replies to an `action` parent; the parent's kind does not
-  exempt a currently idle recipient. A future action wake still needs all
-  normal runtime/admission gates.
 
 For replies, use `mail send --reply-to UUID --kind action` when the recipient
-must act/continue (for example, on an answer to a question or a decision);
-use `fyi` otherwise.
+must act, answer, or continue (for example, on an answer to a question or a decision);
+use `fyi` otherwise. Eligible action wakes promptly under existing safeguards.
 
-FYI never wakes an idle recipient. At local recipient enqueue, the ledger sets
-`delivery.fyi_turn_end` only when its locally reconciled `agents.last_seen` is
-within 15 seconds and `turn_state=working`. Such FYI is delivered right after
-that turn under the existing wake gates. Idle, unknown or stale enqueue state
-leaves FYI natural-turn only; no later status update retroactively sets the flag.
-The flag is local delivery metadata, never a new kind or immutable wire field.
+Queued FYI becomes wake-eligible 300 seconds after local recipient enqueue,
+allowing a batched wake of an idle participating OMP recipient. Existing queued
+FYI uses its local delivery timestamp without migration, not the sender's message
+creation time. The timer uses `deliveries.updated_at` for the current queued
+interval: a proven `not_applied` release or operator requeue restarts the delay.
+At local enqueue, the ledger also sets `delivery.fyi_turn_end`
+when its locally reconciled `agents.last_seen` is within 15 seconds and
+`turn_state=working`; that FYI can wake right after the turn without waiting
+300 seconds. Later status updates do not retroactively set the flag. Both paths
+retain all runtime/admission gates. The flag is local delivery metadata, never
+a new kind or immutable wire field.
 
 #### History and cursor paging
 
@@ -214,10 +208,17 @@ and `disposition` (`not_applied` to requeue, `unknown` to retain the uncertain
 claim). `ledger runtime register|inspect|claim|applied` is the root OMP receiver
 boundary: registration requires the full supported session-file path; `claim` is
 one atomic bounded bundle (8 messages, 8 KiB, 2 KiB per body, every claimed ID
-present) and a wake claim must retain a hop-eligible `action` or FYI with
-`delivery.fyi_turn_end`, otherwise it returns `no_action` without claiming mail.
-`inspect.has_action` includes flagged FYI for the unchanged extension's wake
-decision; the persisted message kind remains `fyi`. `applied` ACKs only the exact session,
+present). A wake claim needs a hop-eligible `action`, turn-end-flagged FYI,
+or FYI queued locally for at least 300 seconds. Young FYI or mail still awaiting
+coalescing returns `coalescing`; no eligible queued row returns `no_action`.
+Neither result claims mail. An eligible action, aged FYI, or turn-end FYI wake
+can bundle younger unheld FYI within the existing batch limits.
+`inspect.has_action` is true for pending future FYI; `coalesce_until` schedules
+its 300-second deadline through the unchanged extension, instead of waiting for
+the five-minute safety scan (which could take roughly five to ten minutes).
+The persisted kind remains `fyi`.
+FYI-only bundles say to read and continue, replying only if it changes the
+recipient's work. `applied` ACKs only the exact session,
 marker and content hash after the extension finds that custom message in the
 public active-branch session history; that is host journal acceptance, not proof
 of later provider transforms or model understanding.
@@ -426,6 +427,8 @@ deliveries remain conservatively unflagged. Upgrade the ledger and CLI/copied
 skills together so old enqueue code cannot omit the flag; run upgraded
 `ledger reconcile` before read-only opens. The OMP extension is unchanged and
 needs no restart for this policy. See [turn-end FYI migration](../../../docs/migration.md#turn-end-fyi-schema-v10).
+Delayed idle FYI adds no schema or settings: existing queued FYI becomes eligible
+300 seconds after its local recipient enqueue timestamp, without migration.
 See [current migration and rollout](../../../docs/migration.md#worktree-role-grouping-schema-v9).
 
 The following v7 migration is historical; v9 supersedes its independent
@@ -794,11 +797,15 @@ selected sessions restart, confirm their receiver registration
 the current structured plugin root (or explicitly configured absolute
 `HERDR_AGENT_MESSENGER_ROOT`) and calls Python asynchronously; it never opens
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
-nonmembers. FYI enqueued while idle never wakes the recipient. Automatic action
-or flagged turn-end FYI wake requires a
+nonmembers. Eligible action wakes promptly; FYI is batched for an idle wake
+after 300 seconds locally queued, or right after a turn when locally flagged
+at fresh `working` enqueue. Automatic action or FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
 evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.
+The unchanged extension checks input quiet/editor and Herdr-ready gates before
+the deadline; a draft or blocked status may retain existing one-second guard
+rechecks even during the FYI delay.
 Final conditions and agent-attributed
 `sendMessage(...,{deliverAs:"nextTurn",triggerTurn:true})` occur in the same
 synchronous tick, never steering an ongoing turn; unavailable editor/RPC/ACP
