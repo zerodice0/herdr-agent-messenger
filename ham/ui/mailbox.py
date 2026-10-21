@@ -1977,32 +1977,35 @@ class MailboxApp:
 
     def footer_hints(self) -> list[Hint]:
         if self.mode == "viewer":
-            return [Hint("Esc", "Close", 0), Hint("↑↓", "Scroll"), Hint("t", "Technical")]
+            return [Hint("↑↓", "Scroll"), Hint("t", "Technical"), Hint("Esc", "Close", 0)]
         if self.mode == "input":
             return [Hint("Enter", "Send", 0), Hint("Shift+Enter", "Newline", 1),
-                    Hint("Esc", "Keep draft", 2), Hint("Ctrl+G", "Action/FYI", 3),
-                    Hint("F1", "Help", 4), Hint("Ctrl+D", "Direct"), Hint("Ctrl+R", "Refresh")]
+                    Hint("Ctrl+G", "Action/FYI", 3), Hint("Ctrl+D", "Direct"),
+                    Hint("Ctrl+R", "Refresh"), Hint("F1", "Help", 4), Hint("Esc", "Keep draft", 2)]
         if self.mode == "confirm":
-            return [Hint("Esc", "Cancel", 0), Hint("Enter", "Choose"), Hint("Tab/←→", "Select"), Hint("↑↓", "Scroll")]
+            return [Hint("Tab/←→", "Select"), Hint("↑↓", "Scroll"), Hint("Enter", "Choose"), Hint("Esc", "Cancel", 0)]
         if self.mode == "evidence":
-            return [Hint("Esc", "Cancel", 0), Hint("Enter", "Review"), Hint("←→", "Edit")]
+            return [Hint("←→", "Edit"), Hint("Enter", "Review"), Hint("Esc", "Cancel", 0)]
         if self.mode == "settings":
             if self.settings_picker is not None:
-                hints = [Hint("Esc", "Cancel", 0), Hint("↑↓", "Select"), Hint("Enter", "Save")]
-                return hints + ([Hint("Space", "Toggle")] if self.settings_picker["field"] == "members" else [])
+                hints = [Hint("↑↓", "Select")]
+                if self.settings_picker["field"] == "members":
+                    hints.append(Hint("Space", "Toggle"))
+                return hints + [Hint("Enter", "Save"), Hint("Esc", "Cancel", 0)]
             if self.settings_numeric is not None:
-                return [Hint("Esc", "Cancel", 0), Hint("Enter", "Save"), Hint("←→", "Cursor"), Hint("", "Digits only")]
-            return [Hint("Esc", "Discard/close", 0), Hint("↑↓", "Select"), Hint("Enter", "Pick/save"),
-                    Hint("←→", "Adjust"), Hint("m", "Main"), Hint("Space", "Member")]
+                return [Hint("", "Digits only"), Hint("←→", "Cursor"), Hint("Enter", "Save"), Hint("Esc", "Cancel", 0)]
+            return [Hint("↑↓", "Select"), Hint("←→", "Adjust"), Hint("Enter", "Pick/save"),
+                    Hint("m", "Main"), Hint("Space", "Member"), Hint("Esc", "Discard/close", 0)]
         if self.mode == "help":
-            return [Hint("Esc", "Close", 0), Hint("F1", "Close", 1), Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")]
+            return [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page"), Hint("F1", "Close", 1), Hint("Esc", "Close", 0)]
         context = ([Hint("Space", "View"), Hint("Enter", "Send")] if self.focus == "agents" else
                    [Hint("Space", "View"), Hint("Enter", "Reply"), Hint("w", "Withdraw"),
                     Hint("t", "Retry"), Hint("a/n", "Recover")] if self.focus == "threads" else
                    [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")] +
                    ([Hint("t", "Technical")] if self.technical_supported() else []))
-        return [Hint("q", "Close", 0), Hint("F1", "Help", 1)] + context + [
-            Hint("Tab", "Focus"), Hint("s", "Settings"), Hint("r", "Refresh"), Hint("e", "Errors")]
+        return [Hint("Tab", "Focus")] + context + [
+            Hint("s", "Settings"), Hint("r", "Refresh"), Hint("e", "Errors"),
+            Hint("F1", "Help", 1), Hint("q", "Close", 0)]
 
     def side_by_side_width(self) -> int:
         # Each half needs its own two border cells. Use the same full-column

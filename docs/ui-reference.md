@@ -57,8 +57,10 @@ cell. These are content limits, not requested Herdr pane sizes; split and tab
 mailboxes retain their existing geometry.
 
 The four surfaces share semantic colors and `[Key] Action` hints. Hints stay
-together, use at most two rows, and prioritize close/help and essential editing
-actions over secondary shortcuts. `NO_COLOR`, including an empty value,
+together and use at most two rows. They retain their declared navigation/action
+order, with close last; priority only determines which hints are omitted when
+space is short, preserving close/help and essential editing actions before
+secondary shortcuts. `NO_COLOR`, including an empty value,
 disables color-pair initialization everywhere while preserving bold, reverse
 selection, glyphs and state names.
 

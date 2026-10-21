@@ -118,20 +118,25 @@ class Hint:
 
 
 def footer_lines(hints: Sequence[Hint], width: int, max_rows: int = 2) -> list[list[Hint]]:
-    """Keep whole hints, admitting essential actions before secondary ones."""
-    rows: list[list[Hint]] = []
-    used: list[int] = []
-    for hint in sorted(hints, key=lambda item: item.priority):
-        cells = display_width(hint.text)
-        if cells > width:
-            continue
-        if rows and used[-1] + 2 + cells <= width:
-            rows[-1].append(hint)
-            used[-1] += 2 + cells
-        elif len(rows) < max_rows:
-            rows.append([hint])
-            used.append(cells)
-    return rows
+    """Preserve declaration order; shed lower-priority hints only when needed."""
+    admitted = [index for index, hint in enumerate(hints)
+                if display_width(hint.text) <= width]
+    while admitted:
+        rows: list[list[Hint]] = []
+        used = 0
+        for index in admitted:
+            hint = hints[index]
+            cells = display_width(hint.text)
+            if rows and used + 2 + cells <= width:
+                rows[-1].append(hint)
+                used += 2 + cells
+            else:
+                rows.append([hint])
+                used = cells
+        if len(rows) <= max_rows:
+            return rows
+        admitted.remove(max(admitted, key=lambda index: (hints[index].priority, index)))
+    return []
 
 
 def _put(screen, y: int, x: int, text: str, attr: int = 0):

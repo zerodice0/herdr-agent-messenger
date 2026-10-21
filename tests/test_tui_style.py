@@ -32,22 +32,38 @@ class TuiStyleTest(unittest.TestCase):
                     self.assertGreaterEqual(rect.x, 1 if width < 80 else 2)
                     self.assertLessEqual(rect.x + rect.width, width)
 
-    def test_narrow_footer_keeps_essential_actions_before_secondary_hints(self):
+    def test_full_width_footer_keeps_declaration_order_regardless_of_priority(self):
+        hints = [
+            Hint("Ctrl+R", "Refresh", 100),
+            Hint("Ctrl+D", "Direct", 100),
+            Hint("Shift+Enter", "Newline", 2),
+            Hint("F1", "Help", 1),
+            Hint("Esc", "Close", 0),
+        ]
+        width = sum(display_width(hint.text) for hint in hints) + 2 * (len(hints) - 1)
+        self.assertEqual(footer_lines(hints, width), [hints])
+
+    def test_narrow_footer_sheds_secondary_hints_without_reordering_survivors(self):
         secondary = [Hint("Ctrl+R", "Refresh", 100), Hint("Ctrl+D", "Direct", 100)]
         essential = [Hint("Esc", "Close", 0), Hint("F1", "Help", 1),
                      Hint("Shift+Enter", "Newline", 2)]
+        hints = [*secondary, *reversed(essential)]
         for width in (32, 40, 60):
             with self.subTest(width=width):
-                rows = footer_lines([*secondary, *reversed(essential)], width)
+                rows = footer_lines(hints, width)
                 self.assertLessEqual(len(rows), 2)
                 flattened = [hint for row in rows for hint in row]
-                self.assertEqual(flattened[:3], essential)
+                self.assertEqual(flattened, [hint for hint in hints if hint in flattened])
+                for hint in essential:
+                    self.assertIn(hint, flattened)
+                if width in (32, 40):
+                    self.assertLess(len(flattened), len(hints))
                 self.assertTrue(all(
                     sum(display_width(hint.text) for hint in row) + 2 * (len(row) - 1) <= width
                     for row in rows
                 ))
                 screen = FakeCursesWindow(6, width + 2)
-                draw_footer(screen, 1, 1, width, [*secondary, *essential], Theme({"NO_COLOR": ""}))
+                draw_footer(screen, 1, 1, width, hints, Theme({"NO_COLOR": ""}))
                 snapshot = screen.snapshot()
                 self.assertTrue(all(not call.clipped for call in snapshot.draw_calls))
                 for hint in essential:
