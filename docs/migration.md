@@ -61,8 +61,10 @@ the recipient was working when they arrived.
 
 Eligible action wakes an idle participating OMP promptly. Queued FYI becomes
 wake-eligible 300 seconds after local recipient enqueue for batched idle wakes,
-under the same safeguards. This delayed path adds no schema or settings:
-existing queued FYI uses its local delivery timestamp without migration.
+under the same safeguards. This is a minimum, not a scheduled wake: natural
+events or the five-minute safety check normally yield about five to ten minutes.
+This delayed path adds no schema or settings: existing queued FYI uses its
+local delivery timestamp without migration.
 
 During local recipient enqueue, a locally reconciled `working` state with
 `agents.last_seen` within 15 seconds sets the turn-end flag (normal local

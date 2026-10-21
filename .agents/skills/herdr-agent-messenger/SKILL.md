@@ -33,7 +33,7 @@ python3 scripts/herdr_agent_messenger.py status board --repo --host local
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing mailbox boundaries'
 ```
 
-CLI `--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Action wakes promptly; FYI wakes idle participating OMP in batches after ~5 minutes from local enqueue, or right after a turn if enqueued during fresh `working` state; existing wake gates apply. TUI compose defaults to `action`; Ctrl+G toggles action/FYI, resetting on every new compose. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Explicit/atomic handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
+CLI `--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Action wakes promptly; FYI wakes idle participating OMP in batches after ~5–10 minutes from local enqueue, or right after a turn if enqueued during fresh `working` state; existing wake gates apply. TUI compose defaults to `action`; Ctrl+G toggles action/FYI, resetting on every new compose. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Explicit/atomic handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
 
 `status set` takes a **positional phase**, not `--phase`; it works even off. Herdr owns turn state; do not infer it from phase. `status clear` removes phase/summary, retaining alias/active role and manual user borders.
 

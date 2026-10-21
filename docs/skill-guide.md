@@ -178,7 +178,7 @@ max-hop gates are unchanged. Legacy collaboration policy is also unchanged:
 Choose `--kind action` when the recipient must act, answer, or continue (for
 example, on an answer/decision); use `fyi` for reference information. Eligible
 action wakes promptly; FYI is batched for an idle participating OMP wake after
-about five minutes, or delivered right after a turn when it arrives mid-turn.
+about five to ten minutes, or delivered right after a turn when it arrives mid-turn.
 Existing wake safeguards apply.
 
 Successful sends can return advisory warnings without changing the default
@@ -495,6 +495,9 @@ this policy needs no extension restart. See [turn-end FYI migration](migration.m
 Delayed idle FYI uses the existing local delivery timestamp: queued FYI becomes
 wake-eligible 300 seconds after local recipient enqueue, including mail already
 queued before the update. No new schema, setting, or data migration is needed.
+The 300 seconds is minimum eligibility, not a scheduled delivery guarantee;
+idle-only FYI normally wakes on a natural event or the next five-minute safety
+check, about five to ten minutes after enqueue if other gates permit.
 
 Public status is independent of coordination mode:
 
@@ -645,8 +648,10 @@ HAM never publishes that path itself. Conflicting reported paths remain
 `stale_session`.
 
 Eligible action wakes promptly. Queued FYI becomes wake-eligible 300 seconds
-after local recipient enqueue for batched idle wakes; existing queued mail uses
-its local delivery timestamp, not the sender's message creation time.
+after local recipient enqueue, not guaranteed to wake at that instant. Natural
+events and the five-minute safety scan normally trigger a batched idle wake
+after about five to ten minutes. Existing queued mail uses its local delivery
+timestamp, not the sender's message creation time.
 FYI arriving during a turn is delivered right after that turn under existing
 wake gates: local enqueue records `delivery.fyi_turn_end` only for fresh
 `working` state (local reconciliation's `agents.last_seen` within 15 seconds),
@@ -660,7 +665,10 @@ truncation. Action wakes can also bundle FYI younger than 300 seconds.
 FYI-only bundles ask the recipient to read and continue, replying only if the
 information changes its work.
 The runtime watches the local bell with `fs.watch` and has a five-minute
-code-only safety check. Its ACK proves exact claimed content/hash in the
+code-only safety check. Young ordinary FYI keeps `inspect.has_action=false`
+until eligible; it does not arm a deadline or pre-eligibility one-second
+draft/status polling. Once eligible, all normal wake gates still apply.
+Its ACK proves exact claimed content/hash in the
 same-session active-branch journal, **not** provider-request inclusion, model
 understanding, or handled work.
 

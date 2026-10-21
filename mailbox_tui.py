@@ -2907,7 +2907,7 @@ class MailboxApp:
                     "Ctrl+J is ignored; use Shift+Enter or Alt+Enter for a newline.",
                     "Quick send and replies start as action; Ctrl+G toggles action/fyi for this compose.",
                     "Action: recipient must act/answer; wakes participating idle OMP promptly under safeguards.",
-                    "FYI: batched idle OMP wake after ~5 min locally queued; mid-turn FYI arrives after that turn.",
+                    "FYI: batched idle OMP wake after ~5-10 min locally queued; mid-turn FYI arrives after that turn.",
                     "Existing wake safeguards apply to both kinds; FYI needs no reply unless it changes your work.",
                     "Mailbox sends immediately; direct input always asks for confirmation.",
                     "Inspection never acknowledges messages. Direct acceptance ≠ native delivery.",

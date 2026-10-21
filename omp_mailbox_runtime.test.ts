@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { MailboxAdapter, callReceiver, parseReply, type ClaimBundle, type NativeMessage } from "./integrations/omp/ham-mailbox";
+import { MailboxAdapter, callReceiver, parseReply, type ClaimBundle, type NativeMessage, type ReceiverReplies } from "./integrations/omp/ham-mailbox";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -86,11 +86,16 @@ class Fixture {
   statuses = new Map<string, string>();
   statusChanges: { key: string; text: string | undefined }[] = [];
   operations: string[] = [];
-  inspections: { has_action: boolean; coalesce_until: number }[] = [];
+  inspections: ReceiverReplies["inspect"][] = [];
+  cachedInspection?: ReceiverReplies["inspect"];
+  transformInspection?: (state: ReceiverReplies["inspect"]) => ReceiverReplies["inspect"];
+  registrationReply?: ReceiverReplies["register"];
+  cacheRegistrations = false;
   clock?: number;
   timers = new Map<object, () => unknown>();
   timeoutTokens = new Set<object>();
-  timeoutDelays = new Map<object, number>();
+  timerDueAt = new Map<object, number>();
+  timerIntervals = new Map<object, number>();
   terminalInput?: (data: string) => unknown;
   context: ExtensionContext;
   adapter: MailboxAdapter;
@@ -102,9 +107,12 @@ class Fixture {
   constructor() {
     const timeout = (callback: () => unknown, delay: number) => {
       const token = {}; this.timers.set(token, callback); this.timeoutTokens.add(token);
-      this.timeoutDelays.set(token, delay); return token;
+      this.timerDueAt.set(token, Date.now() + delay); return token;
     };
-    const interval = (callback: () => unknown) => { const token = {}; this.timers.set(token, callback); return token; };
+    const interval = (callback: () => unknown, delay: number) => {
+      const token = {}; this.timers.set(token, callback);
+      this.timerDueAt.set(token, Date.now() + delay); this.timerIntervals.set(token, delay); return token;
+    };
     const owner = this;
     const context = {
       get mode() { return owner.mode; }, hasUI: true, cwd: path.join(this.directory, "repo"),
@@ -113,7 +121,8 @@ class Fixture {
       isIdle: () => this.idle, hasPendingMessages: () => this.queued,
       setTimeout: timeout, setInterval: interval,
       clearTimer: (token: object) => {
-        this.timeoutTokens.delete(token); this.timeoutDelays.delete(token); return this.timers.delete(token);
+        this.timeoutTokens.delete(token); this.timerDueAt.delete(token); this.timerIntervals.delete(token);
+        return this.timers.delete(token);
       },
       ui: {
         get supportsEditor() { return owner.editorSupported; },
@@ -137,10 +146,15 @@ class Fixture {
     this.adapter = new MailboxAdapter(extensionAPI, async (operation, data) => {
       this.operations.push(operation);
       if (operation === "register") await this.beforeRegister?.(data);
-      const raw = operation === "register" ? await this.fixture(operation, data) : await this.cli(operation, data);
+      const raw = operation === "inspect" && this.cachedInspection ? this.cachedInspection
+        : operation === "register" ? this.cacheRegistrations && this.registrationReply
+          ? this.registrationReply : await this.fixture(operation, data) : await this.cli(operation, data);
       const result = parseReply(operation, raw);
-      if (operation === "inspect" && "has_action" in result)
-        this.inspections.push({ has_action: result.has_action, coalesce_until: result.coalesce_until });
+      if (operation === "register" && "agent" in result) this.registrationReply = result;
+      if (operation === "inspect" && "has_action" in result) {
+        if (this.transformInspection) Object.assign(result, this.transformInspection(result));
+        this.inspections.push(result);
+      }
       if (operation === "register") await this.afterRegister?.(data);
       if ("claim_id" in result && result.claim_id !== null && this.afterClaim) await this.afterClaim(data, result);
       return result;
@@ -152,8 +166,21 @@ class Fixture {
     const token = this.timeoutTokens.values().next().value;
     if (!token) throw new Error("no timeout scheduled");
     const callback = this.timers.get(token);
-    this.timeoutTokens.delete(token); this.timeoutDelays.delete(token); this.timers.delete(token);
+    this.timeoutTokens.delete(token); this.timerDueAt.delete(token); this.timers.delete(token);
     await callback?.();
+  }
+  async advanceTo(until: number) {
+    while (true) {
+      let next: object | undefined, due = Infinity;
+      for (const [token, at] of this.timerDueAt) if (at < due) { next = token; due = at; }
+      if (!next || due > until) break;
+      this.clock = due; setSystemTime(due);
+      const callback = this.timers.get(next), interval = this.timerIntervals.get(next);
+      if (interval !== undefined) this.timerDueAt.set(next, due + interval);
+      else { this.timeoutTokens.delete(next); this.timerDueAt.delete(next); this.timers.delete(next); }
+      await callback?.();
+    }
+    this.clock = until; setSystemTime(until);
   }
   private async execute(args: string[], data: Record<string, unknown>): Promise<unknown> {
     // Keep Python's real ledger clock aligned with Bun's fake clock without waiting.
@@ -316,32 +343,32 @@ test("idle action atomically bundles FYI and nextTurn trigger; no premature deli
   view = await f.view(); expect(view.messages.map(m => m.state)).toEqual(["delivered", "delivered"]); expect(view.wakes).toBe(1);
 });
 
-test("idle-arrived FYI re-inspects on its eligibility timer and wakes after 300 seconds without a new event", async () => {
+test("idle-arrived FYI waits without polling then wakes through the 300-second safety callback", async () => {
   const now = Date.UTC(2026, 9, 21, 12);
   setSystemTime(now);
   const f = new Fixture();
   f.clock = now;
   await f.fixture("setup");
   await f.send();
-  // Start watching after enqueue so no mail bell can substitute for the deadline timer.
+  // Watch only after enqueue, so no mail bell can substitute for the safety callback.
   await f.adapter.start(f.context);
   f.operations.length = 0;
   let wakeClaim = false;
   f.afterClaim = async data => { wakeClaim = data.wake === true; };
 
-  f.clock = now + 250; setSystemTime(f.clock);
-  await f.runNextTimeout();
-  expect(f.inspections).toEqual([{ has_action: true, coalesce_until: now / 1000 + 300 }]);
+  await f.advanceTo(now + 299999);
+  expect(f.inspections).toHaveLength(1);
+  expect(f.inspections[0]).toMatchObject({ has_action: false, coalesce_until: 0 });
   expect(f.operations).toEqual(["inspect"]);
+  expect(f.timeoutTokens.size).toBe(0);
   expect(f.sent).toHaveLength(0);
   expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
-  expect([...f.timeoutDelays.values()]).toEqual([299750]);
 
-  // Only invoke the extension's scheduled callback; no kick, input, bell, or safety interval.
-  f.clock = now + 300000; setSystemTime(f.clock);
-  await f.runNextTimeout();
-  expect(f.operations).toEqual(["inspect", "inspect", "claim"]);
+  // advanceTo invokes the actual registered interval; no explicit kick or fresh event.
+  await f.advanceTo(now + 300000);
+  expect(f.operations).toEqual(["inspect", "register", "inspect", "claim"]);
   expect(f.inspections).toHaveLength(2);
+  expect(f.inspections[1]).toMatchObject({ has_action: true, coalesce_until: now / 1000 + 300 });
   expect(wakeClaim).toBe(true);
   expect(f.sent).toHaveLength(1);
   expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
@@ -352,6 +379,54 @@ test("idle-arrived FYI re-inspects on its eligibility timer and wakes after 300 
   expect(view.messages[0].claim_id).not.toBeNull();
   expect(view.wakes).toBe(0);
   expect(f.warnings).toEqual([]);
+});
+
+test("young FYI avoids one-second draft and nonready polling: old versus conservative inspection counts", async () => {
+  const now = Date.UTC(2026, 9, 21, 12);
+  for (const gate of ["draft", "working"] as const) {
+    const counts: Record<string, number> = {};
+    const boundaryCounts: Record<string, number> = {};
+    for (const encoding of ["old", "conservative"] as const) {
+      setSystemTime(now);
+      const f = new Fixture();
+      f.clock = now;
+      await f.fixture("setup");
+      if (gate === "working") await f.fixture("turn_state", { session_ref: f.session, turn_state: "working" });
+      else f.editor = "unfinished human draft";
+      await f.send();
+      await f.adapter.start(f.context);
+      // Cache real replies so hundreds of callback-driven probes stay in-process.
+      // The old response differs solely in advertising future FYI as actionable.
+      f.cacheRegistrations = true;
+      f.transformInspection = state => f.cachedInspection = {
+        ...state, has_action: encoding === "old", coalesce_until: encoding === "old" ? now / 1000 + 300 : 0,
+      };
+      f.beforeRegister = async () => {
+        if (Date.now() >= now + 300000) {
+          // Safety refresh observes the real ledger's now-eligible response.
+          f.cacheRegistrations = false;
+          f.cachedInspection = undefined; f.transformInspection = undefined;
+        }
+      };
+      await f.advanceTo(now + 299999);
+      counts[encoding] = f.inspections.length;
+      expect(f.sent).toHaveLength(0);
+      expect(f.operations).not.toContain("claim");
+      if (encoding === "conservative") {
+        expect(f.inspections[0]).toMatchObject({ has_action: false, coalesce_until: 0 });
+        expect(f.timeoutTokens.size).toBe(0);
+      }
+      await f.advanceTo(now + 300000);
+      boundaryCounts[encoding] = f.inspections.length - counts[encoding];
+      expect(f.sent).toHaveLength(0);
+      expect(f.operations).not.toContain("claim");
+      expect(f.inspections.at(-1)).toMatchObject({ has_action: true });
+      expect(f.warnings).toEqual([]);
+    }
+    // Count the initial inspection plus timers in [0, 300s); report the boundary separately.
+    expect(counts).toEqual({ old: 300, conservative: 1 });
+    expect(boundaryCounts).toEqual({ old: 1, conservative: 1 });
+  }
 });
 
 test("done action claims a wake with quiet empty editor before user focus", async () => {

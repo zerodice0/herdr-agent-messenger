@@ -447,7 +447,7 @@ class NativeReceiverTest(unittest.TestCase):
         self.settings.mutate(self.recipient['repo_id'],'thresholds',{**self.thresholds,'max_hop':0})
         fyi = self.send()
         action = self.send(kind='action',reply_to=fyi['message_id'])
-        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
         self.assertEqual(self.claim(wake=True)['reason'],'coalescing')
         self.assertEqual(self.states()[action['message_id']],'queued')
         self.assertEqual([message['message_id'] for message in self.claim()['messages']],[fyi['message_id']])
@@ -467,16 +467,16 @@ class NativeReceiverTest(unittest.TestCase):
         for age in (0, 299.999, 300):
             with self.subTest(age=age), mock.patch('ledger_runtime.time.time', return_value=enqueued+age):
                 inspected = self.receiver.inspect(**self.identity)
-                self.assertTrue(inspected['has_action'])  # Pending work keeps the extension's timer alive.
-                self.assertEqual(inspected['coalesce_until'], enqueued+300)
                 claim = self.claim(wake=True)
                 if age < 300:
-                    self.assertGreater(inspected['coalesce_until'], enqueued+age)
+                    self.assertFalse(inspected['has_action'])
+                    self.assertEqual(inspected['coalesce_until'], 0)
                     self.assertEqual(claim['reason'], 'coalescing')
                     self.assertIsNone(claim['claim_id'])
                     self.assertEqual(self.states()[sent['message_id']], 'queued')
                 else:
-                    self.assertLessEqual(inspected['coalesce_until'], enqueued+age)
+                    self.assertTrue(inspected['has_action'])
+                    self.assertEqual(inspected['coalesce_until'], enqueued+300)
                     self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
                     self.assertIn('FYI only: read and continue;', claim['message']['content'])
                     self.assertEqual(self.receiver.inspect(**self.identity)['wake_count'], 1)
@@ -492,7 +492,7 @@ class NativeReceiverTest(unittest.TestCase):
             connection.execute('UPDATE deliveries SET updated_at=? WHERE message_id=?',
                                (enqueued, sent['message_id']))
         with mock.patch('ledger_runtime.time.time', return_value=enqueued+299):
-            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+300)
+            self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         with mock.patch('ledger_runtime.time.time', return_value=enqueued+301):
             self.assertIsNotNone(self.claim(wake=True)['claim_id'])
@@ -595,7 +595,7 @@ class NativeReceiverTest(unittest.TestCase):
                               generation=self.recipient['generation'], disposition='not_applied',
                               evidence='not submitted')
         with mock.patch('ledger_runtime.time.time', return_value=enqueued+599):
-            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+600)
+            self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         with mock.patch('ledger_runtime.time.time', return_value=enqueued+600):
             self.assertEqual([message['message_id'] for message in self.claim(wake=True)['messages']],
@@ -644,7 +644,7 @@ class NativeReceiverTest(unittest.TestCase):
                             "INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,'idle',?)",
                             (self.recipient['agent_id'], time.time()))
                 self.set_turn_state('idle')
-                self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+                self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
                 self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
                 natural = self.claim()
                 self.assertEqual([message['message_id'] for message in natural['messages']], [sent['message_id']])
@@ -702,7 +702,7 @@ class NativeReceiverTest(unittest.TestCase):
         flagged = self.send(reply_to=ordinary['message_id'])
         self.assertEqual(self.turn_end_flag(flagged['message_id']), 1)
         self.set_turn_state('idle')
-        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
         self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         self.assertEqual([message['message_id'] for message in self.claim()['messages']], [ordinary['message_id']])
         self.assertEqual(self.states()[flagged['message_id']], 'queued')
@@ -769,7 +769,7 @@ class NativeReceiverTest(unittest.TestCase):
         self.set_turn_state('idle')
         self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
         self.mail.withdraw(flagged['message_id'], sender=self.sender)
-        self.assertTrue(self.receiver.inspect(**self.identity)['has_action'])
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
         self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
         self.assertEqual(self.states()[ordinary['message_id']], 'queued')
 

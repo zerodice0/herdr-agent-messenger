@@ -165,10 +165,12 @@ class NativeReceiver:
             state = self._state(connection,agent,now)
             rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=True,
                                   coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
-        # has_action means pending wake work, including delayed FYI. False makes
-        # the unchanged OMP extension return without scheduling a deadline probe.
-        return {**state,'queued_count':len(rows),'has_action':bool(rows),
-                'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in rows),default=0)}
+        # Keep young ordinary FYI out of the extension's one-second editor/status
+        # guard retries. Its existing safety interval and natural events recheck.
+        triggers = [row for row in rows if row['kind']=='action' or row['fyi_turn_end']
+                    or wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now]
+        return {**state,'queued_count':len(rows),'has_action':bool(triggers),
+                'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0)}
 
     def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False) -> dict[str, Any]:
         now = time.time()

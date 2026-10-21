@@ -98,10 +98,13 @@ For replies, use `mail send --reply-to UUID --kind action` when the recipient
 must act, answer, or continue (for example, on an answer to a question or a decision);
 use `fyi` otherwise. Eligible action wakes promptly under existing safeguards.
 
-Queued FYI becomes wake-eligible 300 seconds after local recipient enqueue,
-allowing a batched wake of an idle participating OMP recipient. Existing queued
+Queued FYI becomes wake-eligible 300 seconds after local recipient enqueue.
+This is a minimum, not a scheduled delivery guarantee: natural events and the
+five-minute safety scan normally wake an idle participating OMP after about
+five to ten minutes, subject to all other gates. Send-result `fyi_wake_after_seconds`
+reports the minimum delay, not a promised delivery time. Existing queued
 FYI uses its local delivery timestamp without migration, not the sender's message
-creation time. The timer uses `deliveries.updated_at` for the current queued
+creation time. Queue age uses `deliveries.updated_at` for the current queued
 interval: a proven `not_applied` release or operator requeue restarts the delay.
 At local enqueue, the ledger also sets `delivery.fyi_turn_end`
 when its locally reconciled `agents.last_seen` is within 15 seconds and
@@ -213,10 +216,11 @@ or FYI queued locally for at least 300 seconds. Young FYI or mail still awaiting
 coalescing returns `coalescing`; no eligible queued row returns `no_action`.
 Neither result claims mail. An eligible action, aged FYI, or turn-end FYI wake
 can bundle younger unheld FYI within the existing batch limits.
-`inspect.has_action` is true for pending future FYI; `coalesce_until` schedules
-its 300-second deadline through the unchanged extension, instead of waiting for
-the five-minute safety scan (which could take roughly five to ten minutes).
-The persisted kind remains `fyi`.
+For young ordinary FYI, `inspect.has_action=false` until `wake_ready_at<=now`;
+the unchanged extension does not schedule a future FYI deadline. Natural
+events or its existing five-minute safety scan discover eligibility, trading
+about five to ten minutes of latency for no pre-eligibility one-second
+draft/status polling. The persisted kind remains `fyi`.
 FYI-only bundles say to read and continue, replying only if it changes the
 recipient's work. `applied` ACKs only the exact session,
 marker and content hash after the extension finds that custom message in the
@@ -798,14 +802,15 @@ the current structured plugin root (or explicitly configured absolute
 `HERDR_AGENT_MESSENGER_ROOT`) and calls Python asynchronously; it never opens
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
 nonmembers. Eligible action wakes promptly; FYI is batched for an idle wake
-after 300 seconds locally queued, or right after a turn when locally flagged
+after about five to ten minutes (300 seconds is minimum eligibility), or right
+after a turn when locally flagged
 at fresh `working` enqueue. Automatic action or FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
 evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.
-The unchanged extension checks input quiet/editor and Herdr-ready gates before
-the deadline; a draft or blocked status may retain existing one-second guard
-rechecks even during the FYI delay.
+Young ordinary FYI does not enter wake-gate polling before eligibility;
+after eligibility, the unchanged quiet/editor and Herdr-ready gates can still
+defer its wake.
 Final conditions and agent-attributed
 `sendMessage(...,{deliverAs:"nextTurn",triggerTurn:true})` occur in the same
 synchronous tick, never steering an ongoing turn; unavailable editor/RPC/ACP

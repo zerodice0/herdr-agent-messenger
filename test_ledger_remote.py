@@ -474,8 +474,9 @@ class RemoteLedgerTest(unittest.TestCase):
                 recipient = self.services["alpha"].resolve_recipient("beta/beta-owl", self.agents["alpha"])
                 sent = mailbox.send(self.agents["alpha"], recipient, body="Remote decision")
                 self.assertEqual(sent["state"], "pending")
-                # Remote ready state is a cached estimate; the recipient host
-                # starts the actual delay only when it accepts the message.
+                # Remote ready state is a cached estimate of the minimum delay;
+                # the recipient starts that delay on acceptance and wakes on a
+                # later receiver safety probe, subject to existing wake gates.
                 if state in {"idle", "done"}:
                     self.assertEqual(sent["fyi_wake_after_seconds"], 300)
                 else:
@@ -529,8 +530,8 @@ class RemoteLedgerTest(unittest.TestCase):
             self.assertEqual(self.turn_end_flag('beta', sent['message_id']), 0)
             self.assertEqual(self.current('beta', sent['message_id'])['updated_at'], enqueued_at)
             inspected = receiver.inspect(**identity)
-            self.assertIs(inspected['has_action'], True)
-            self.assertEqual(inspected['coalesce_until'], deadline)
+            self.assertIs(inspected['has_action'], False)
+            self.assertEqual(inspected['coalesce_until'], 0)
             self.assertEqual(receiver.claim(**identity, wake=True)['reason'], 'coalescing')
         for retry_at in (enqueued_at + 120, deadline - 1):
             with self.subTest(retry_at=retry_at), mock.patch('ledger_mail.time.time', return_value=retry_at):
@@ -538,10 +539,13 @@ class RemoteLedgerTest(unittest.TestCase):
                 self.assertEqual(replayed, accepted)
                 self.assertEqual(self.current('beta', sent['message_id'])['updated_at'], enqueued_at)
                 inspected = receiver.inspect(**identity)
-                self.assertIs(inspected['has_action'], True)
-                self.assertEqual(inspected['coalesce_until'], deadline)
+                self.assertIs(inspected['has_action'], False)
+                self.assertEqual(inspected['coalesce_until'], 0)
                 self.assertEqual(receiver.claim(**identity, wake=True)['reason'], 'coalescing')
         with mock.patch('ledger_mail.time.time', return_value=deadline):
+            inspected = receiver.inspect(**identity)
+            self.assertIs(inspected['has_action'], True)
+            self.assertEqual(inspected['coalesce_until'], deadline)
             claim = receiver.claim(**identity, wake=True)
             self.assertIsNotNone(claim['claim_id'])
             self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
