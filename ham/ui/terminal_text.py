@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
-import re
 from typing import Sequence
 import unicodedata
 
@@ -15,12 +13,6 @@ class WrappedMessageLine:
     logical_row: int
     start: int
     end: int
-
-
-@dataclass(frozen=True)
-class ShortcutHelpSpan:
-    text: str
-    keycap: bool = False
 
 
 def display_width(value: str) -> int:
@@ -135,93 +127,6 @@ def wrap_display_text(value: str, width: int) -> list[str]:
         cursor_column=len(value),
     )
     return [line.text for line in wrapped]
-
-
-def wrap_help_text(value: str, width: int) -> list[str]:
-    """Return the plain-text form of keycap-styled shortcut help lines."""
-
-    return [
-        "".join(span.text for span in line)
-        for line in shortcut_help_spans(value, width)
-    ]
-
-
-def shortcut_help_spans(
-    value: str,
-    width: int,
-) -> list[tuple[ShortcutHelpSpan, ...]]:
-    """Lay out shortcut items while keeping each key and action together."""
-
-    width = max(1, width)
-    items: list[tuple[ShortcutHelpSpan, ...]] = []
-    for raw_item in re.split(r"\s{2,}", value.strip()):
-        if not raw_item:
-            continue
-        parts = raw_item.split(maxsplit=1)
-        key = parts[0]
-        is_key = bool(
-            key in {"↑↓", "Enter", "Space", "Tab", "Esc", "?"}
-            or re.fullmatch(r"Ctrl\+[A-Za-z]", key)
-            or re.fullmatch(r"[A-Z]", key)
-        )
-        if len(parts) == 1 or not is_key:
-            items.append((ShortcutHelpSpan(parts[0]),))
-            if len(parts) > 1:
-                items[-1] = (ShortcutHelpSpan(raw_item),)
-            continue
-        label = parts[1]
-        items.append(
-            (
-                ShortcutHelpSpan(f"[{key}]", keycap=True),
-                ShortcutHelpSpan(f" {label}"),
-            )
-        )
-
-    if not items:
-        return [(ShortcutHelpSpan(""),)]
-
-    item_widths = [sum(display_width(span.text) for span in item) for item in items]
-
-    def segment_width(start: int, end: int) -> int:
-        return sum(item_widths[start:end]) + max(0, end - start - 1)
-
-    minimum_lines = 1
-    current_width = 0
-    for item_width in item_widths:
-        if current_width and current_width + 1 + item_width > width:
-            minimum_lines += 1
-            current_width = item_width
-        else:
-            current_width += (1 if current_width else 0) + item_width
-
-    best_boundaries: tuple[int, ...] | None = None
-    best_score: tuple[int, int] | None = None
-    for cuts in combinations(range(1, len(items)), minimum_lines - 1):
-        boundaries = (0, *cuts, len(items))
-        widths = [
-            segment_width(boundaries[index], boundaries[index + 1])
-            for index in range(minimum_lines)
-        ]
-        if any(line_width > width for line_width in widths):
-            continue
-        score = (max(widths), max(widths) - min(widths))
-        if best_score is None or score < best_score:
-            best_score = score
-            best_boundaries = boundaries
-
-    if best_boundaries is None:
-        best_boundaries = (0, len(items))
-
-    lines: list[tuple[ShortcutHelpSpan, ...]] = []
-    for boundary_index in range(len(best_boundaries) - 1):
-        start, end = best_boundaries[boundary_index : boundary_index + 2]
-        spans: list[ShortcutHelpSpan] = []
-        for item_index in range(start, end):
-            if spans:
-                spans.append(ShortcutHelpSpan(" "))
-            spans.extend(items[item_index])
-        lines.append(tuple(spans))
-    return lines
 
 
 def truncate_display_text(value: str, width: int) -> str:

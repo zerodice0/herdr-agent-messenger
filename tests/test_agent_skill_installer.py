@@ -476,7 +476,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
 
     def test_question_mark_opens_usage_and_escape_returns_to_targets(self):
         screen = mock.Mock()
-        screen.getmaxyx.return_value = (22, 60)
+        screen.getmaxyx.return_value = (37, 92)
         screen.get_wch.side_effect = ["?", "\x1b", "\x1b"]
 
         with (
@@ -495,17 +495,14 @@ class AgentSkillInstallerTest(unittest.TestCase):
                 0,
             )
 
-        rendered = [call.args[2] for call in screen.addnstr.call_args_list]
+        rendered = [call.args[2] for call in
+                    screen.addstr.call_args_list + screen.addnstr.call_args_list]
         rendered_text = "".join(rendered)
-        self.assertIn("Use HAM", rendered)
-        self.assertIn(
-            "Codex: type $ham, then select HAM — Herdr Agent Messenger.",
-            rendered_text,
-        )
-        self.assertIn("Claude Code: invoke /herdr-agent-messenger.", rendered)
-        self.assertIn("omp: ask in natural language", rendered_text)
-        self.assertIn("skill://herdr-agent-messenger.", rendered_text)
-        self.assertIn("Example target: local/yellow-falcon", rendered)
+        text = agent_skill_installer.COPY["en"]
+        self.assertIn(text["usage_title"], rendered)
+        for key in ("usage_codex", "usage_claude", "usage_omp"):
+            self.assertIn(text[key], rendered_text)
+        self.assertGreaterEqual(screen.refresh.call_count, 3)
 
 
 class ReceivingRuntimeConsentTest(unittest.TestCase):
@@ -532,7 +529,8 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
 
     @staticmethod
     def rendered(screen):
-        return "".join(call.args[2] for call in screen.addnstr.call_args_list)
+        return "".join(call.args[2] for call in
+                       screen.addstr.call_args_list + screen.addnstr.call_args_list)
 
     def test_noninteractive_skill_install_discloses_missing_runtimes_without_installing(self):
         result, report = self.run_install(["install", "omp"])

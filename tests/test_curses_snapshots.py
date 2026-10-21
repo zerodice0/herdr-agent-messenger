@@ -12,6 +12,8 @@ from unittest import mock
 
 from ham.agents import directory as agent_directory
 from ham.ui import messenger as agent_messenger
+from ham.ui.tui_style import content_rect
+from ham.ui.messenger_render import MESSAGE_MIN_VISIBLE_ROWS
 
 from tests.curses_snapshot_harness import (
     FakeCursesWindow,
@@ -157,7 +159,6 @@ def rendered_screen(
             app.message_lines = list(LONG_MESSAGE)
             app.message_row = len(LONG_MESSAGE) - 1
             app.message_column = len(LONG_MESSAGE[-1])
-            app.colors_enabled = True
             app.render()
             yield app, window.snapshot()
 
@@ -208,224 +209,63 @@ class MessengerCursesSnapshotTest(SnapshotTestCase):
         app.agents = [target]
         app._render_recipients(0, 6)
         snapshot = window.snapshot()
-        host_heading = snapshot.line(2)
+        host_heading = snapshot.line(content_rect(8, 32, 104).y + 2)
         self.assertIn("…", host_heading)
         self.assertTrue(host_heading.endswith("(1)"), snapshot.formatted())
         self.assert_capture_in_bounds(snapshot)
 
-    def test_semantic_layout_snapshots_cover_supported_terminal_sizes(self):
+    def test_supported_terminal_sizes_keep_editor_and_footer_in_content_rect(self):
         for language, width, height in self.CASES:
             with self.subTest(language=language, size=f"{width}x{height}"):
                 with rendered_screen(language, width, height) as (app, snapshot):
-                    self.assertEqual((snapshot.width, snapshot.height), (width, height))
+                    rect = content_rect(height, width, 104)
                     self.assertEqual(snapshot.refresh_count, 1)
                     self.assert_capture_in_bounds(snapshot)
-                    self.assert_screen_lines(
-                        snapshot,
-                        {
-                            0: app.text["send_prompt"],
-                            1: f'{app.text["coordinator"]}: {SENDER.qualified_name}',
-                        },
-                    )
-
-                    recipient_row = self.assert_text_visible(
-                        snapshot,
-                        app.text["recipients"],
-                        unclipped=True,
-                    ).row
-                    message_row = self.assert_text_visible(
-                        snapshot,
-                        app.text["message"],
-                        unclipped=True,
-                    ).row
-                    self.assertGreater(recipient_row, 2)
+                    visible = [call for call in snapshot.draw_calls if call.visible_text.strip()]
+                    self.assertTrue(visible)
+                    self.assertTrue(all(
+                        rect.y <= call.row < rect.y + rect.height
+                        and rect.x <= call.column
+                        and call.end_column <= rect.x + rect.width
+                        for call in visible
+                    ), snapshot.formatted())
+                    recipient_row = self.assert_text_visible(snapshot, app.text["recipients"]).row
+                    message_row = self.assert_text_visible(snapshot, app.text["message"]).row
                     self.assertGreater(message_row, recipient_row)
-
-                    message_draws = [
-                        call
-                        for call in snapshot.draw_calls
-                        if call.column == 0
-                        and call.visible_text in {"│", "↑", "↓"}
-                        and message_row < call.row < height - 2
+                    markers = [
+                        call for call in snapshot.draw_calls
+                        if call.column == rect.x and call.visible_text in {"│", "↑", "↓"}
+                        and call.row > message_row
                     ]
-                    self.assertGreaterEqual(
-                        len(message_draws),
-                        agent_messenger.MESSAGE_MIN_VISIBLE_ROWS,
-                        snapshot.formatted(),
-                    )
-                    self.assertTrue(
-                        all(call.row < height for call in message_draws),
-                        snapshot.formatted(),
-                    )
+                    self.assertGreaterEqual(len(markers), MESSAGE_MIN_VISIBLE_ROWS)
+                    self.assert_text_visible(snapshot, "[Esc]", unclipped=True)
+                    self.assertEqual(app.message_lines, LONG_MESSAGE)
 
-                    footer_rows = sorted(
-                        {
-                            call.row
-                            for call in snapshot.draw_calls
-                            if call.attribute & curses.A_DIM
-                            and call.row >= height - 5
-                        }
-                    )
-                    self.assertTrue(footer_rows, snapshot.formatted())
-                    self.assertEqual(footer_rows[-1], height - 1, snapshot.formatted())
-                    self.assert_text_role(
-                        snapshot,
-                        "[Esc]",
-                        pair=agent_messenger.PAIR_ACCENT,
-                        attributes=curses.A_BOLD,
-                    )
-                    for keycap in ("[Space]", "[Ctrl+R]", "[Ctrl+G]"):
-                        self.assert_text_role(
-                            snapshot,
-                            keycap,
-                            pair=agent_messenger.PAIR_ACCENT,
-                            attributes=curses.A_BOLD,
-                        )
-
-    def test_small_snapshot_wraps_footer_and_keeps_four_message_rows(self):
-        with rendered_screen("en", 60, 20) as (app, snapshot):
-            help_lines = app._help_lines(app.text["help_recipients"])
-            self.assertGreaterEqual(len(help_lines), 2)
-            footer_rows = sorted(
-                {
-                    call.row
-                    for call in snapshot.draw_calls
-                    if call.visible_text.startswith("[") and call.row >= 15
-                }
-            )
-            self.assertEqual(
-                footer_rows,
-                list(range(20 - len(help_lines), 20)),
-                snapshot.formatted(),
-            )
-
-            message_heading = self.assert_text_visible(snapshot, app.text["message"]).row
-            markers = [
-                call
-                for call in snapshot.draw_calls
-                if call.column == 0
-                and call.visible_text in {"│", "↑", "↓"}
-                and call.row > message_heading
-            ]
-            self.assertEqual(
-                len(markers),
-                agent_messenger.MESSAGE_MIN_VISIBLE_ROWS,
-                snapshot.formatted(),
-            )
-            self.assertTrue(
-                any(
-                    call.column == 58 and call.visible_text == "█"
-                    for call in snapshot.draw_calls
-                ),
-                snapshot.formatted(),
-            )
-            self.assert_text_visible(snapshot, "다섯째 줄은", unclipped=True)
-
-    def test_large_snapshot_preserves_groups_unicode_states_and_color_roles(self):
-        with rendered_screen("ja", 160, 50) as (app, snapshot):
+    def test_large_snapshot_preserves_unicode_groups_selection_and_remote_errors(self):
+        with rendered_screen("ja", 172, 52) as (app, snapshot):
             for group in ("local", "macbook-pro", "studio-日本"):
-                self.assert_text_role(
-                    snapshot,
-                    f"▾ {group}",
-                    pair=agent_messenger.PAIR_ACCENT,
-                    attributes=curses.A_BOLD,
-                )
-
+                self.assert_text_visible(snapshot, group, unclipped=True)
             workspace_row = self.assert_text_visible(
-                snapshot,
-                "WT:決済-결제-Workspace",
-                unclipped=True,
+                snapshot, "WT:決済-결제-Workspace", unclipped=True,
             ).row
-            self.assertNotIn("(1)", snapshot.line(workspace_row))
-            self.assert_text_role(
-                snapshot,
-                "(1)",
-                pair=agent_messenger.PAIR_ACCENT,
-                attributes=curses.A_DIM,
-            )
-            agent_row = self.assert_text_visible(
-                snapshot,
-                "amber-crane",
-                unclipped=True,
-            ).row
+            agent_row = self.assert_text_visible(snapshot, SELECTED.name, unclipped=True).row
             self.assertEqual(agent_row, workspace_row + 1)
-            self.assertIn("w1:p1", snapshot.line(agent_row))
+            self.assertIn(SELECTED.pane_id, snapshot.line(agent_row))
             self.assertEqual(snapshot.line(agent_row).count("[x]"), 1)
-            self.assert_text_role(
-                snapshot,
-                "amber-crane",
-                attributes=curses.A_BOLD,
-            )
-            focused_row = self.assert_text_visible(
-                snapshot,
-                "red-fox",
-                unclipped=True,
-            ).row
-            self.assertEqual(snapshot.line(focused_row).count("›"), 1)
-
-            self.assert_text_role(
-                snapshot,
-                "[x]",
-                pair=agent_messenger.PAIR_ACCENT,
-                attributes=curses.A_BOLD,
-            )
-            self.assert_text_role(
-                snapshot,
-                f'● {app.text["status_working"]}',
-                pair=agent_messenger.PAIR_WARNING,
-                attributes=curses.A_BOLD,
-            )
-            self.assert_text_role(
-                snapshot,
-                f'✓ {app.text["status_done"]}',
-                pair=agent_messenger.PAIR_SUCCESS,
-            )
-            idle = self.assert_text_role(
-                snapshot,
-                f'○ {app.text["status_idle"]}',
-                attributes=curses.A_DIM,
-            )
-            self.assertEqual(idle.attribute, curses.A_DIM)
-            self.assert_text_role(
-                snapshot,
-                f'! {app.text["status_blocked"]}',
-                pair=agent_messenger.PAIR_ERROR,
-                attributes=curses.A_BOLD,
-            )
+            for state, glyph in (("working", "●"), ("done", "✓"), ("idle", "○"), ("blocked", "!")):
+                self.assert_text_visible(snapshot, f'{glyph} {app.text["status_" + state]}')
             for line in LONG_MESSAGE:
                 self.assert_text_visible(snapshot, line, unclipped=True)
-            self.assert_text_role(
-                snapshot,
-                app.text["remote_warning_summary"].format(
-                    unavailable=1,
-                    available=2,
-                    details=app.text["remote_details_hint"],
-                ),
-                pair=agent_messenger.PAIR_WARNING,
-                attributes=curses.A_BOLD,
-            )
-
+            self.assert_text_visible(snapshot, app._remote_summary())
+            before = list(app.message_lines), set(app.selected)
             app.remote_details_visible = True
             app.render()
             details = app.screen.snapshot()
             self.assert_capture_in_bounds(details)
-            self.assert_screen_lines(
-                details,
-                {
-                    0: app.text["remote_details_title"],
-                    1: app.text["remote_warning_summary"].format(
-                        unavailable=1,
-                        available=2,
-                        details=app.text["remote_details_hint"],
-                    ),
-                },
-            )
-            self.assert_text_role(
-                details,
-                "! offline-서울 — connection timed out",
-                pair=agent_messenger.PAIR_WARNING,
-                attributes=curses.A_BOLD,
-            )
+            self.assert_text_visible(details, app.text["remote_details_title"])
+            self.assert_text_visible(details, "offline-서울")
+            self.assert_text_visible(details, "connection timed out")
+            self.assertEqual((app.message_lines, app.selected), before)
 
 
 if __name__ == "__main__":

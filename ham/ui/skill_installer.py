@@ -18,16 +18,19 @@ from typing import Mapping, Sequence
 from ham.ui.messenger import (
     bundled_skill_path,
     decode_json_object,
-    display_width,
     launch_plugin_overlay,
     SKILL_INSTALLER_ENTRYPOINT,
     SKILL_PROJECT_ROOT_ENV,
-    shortcut_help_spans,
     show_notification,
+)
+from ham.ui.messenger_i18n import detect_language
+from ham.ui.terminal_text import (
+    display_width,
+    pad_display_text,
     truncate_display_text,
     wrap_display_text,
 )
-from ham.ui.messenger_i18n import detect_language
+from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, draw_status, footer_lines
 from ham.ledger.store import LedgerError
 from ham.ops import runtime_installer as runtime_installer
 
@@ -387,9 +390,22 @@ def runtime_report(environment: Mapping[str, str] | None, text: Mapping[str, str
     return text["runtime_report"] + ": " + "; ".join(entries) + ". " + text["runtime_activation"]
 
 
+def _footer_hints(value: str) -> list[Hint]:
+    hints = []
+    for item in value.split("  "):
+        key, separator, action = item.partition(" ")
+        if separator:
+            priority = 0 if key in ("Esc", "Enter", "?") else 100
+            hints.append(Hint(key, action, priority))
+    return hints
+
+
 def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
                           text: Mapping[str, str], status: str = "") -> str:
     """Display both runtimes; installing requires selecting a non-default choice."""
+    theme = Theme(environment)
+    hints = _footer_hints(text["runtime_help"])
+    status_kind = "success" if status in (text["installed"], text["already_current"]) else "info"
     cursor = 0
     scroll = 0
     while True:
@@ -398,38 +414,55 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
         options = [text["runtime_not_now"]] + [
             text["runtime_install"].format(client=runtime["client"]) for runtime in missing]
         cursor = min(cursor, len(options) - 1)
-        lines = [text["runtime_intro"], ""]
+        lines = [(text["runtime_intro"], theme.style()), ("", 0)]
         for runtime in runtimes:
             error = runtime["error"]
             state = (error["code"] + ": " + error["message"] if error else
                      text["runtime_installed"] if runtime["installed"] else text["missing"])
-            lines.append(f'{runtime["client"]}: {state}')
-            lines.append(runtime["destination"])
-        lines += ["", status, ""]
-        lines += [("› " if index == cursor else "  ") + label
+            role = "error" if error else "success" if runtime["installed"] else "text"
+            lines.append((f'{runtime["client"]}: {state}', theme.style(role)))
+            lines.append((runtime["destination"], theme.style("muted")))
+        lines.append(("", 0))
+        lines += [(("› " if index == cursor else "  ") + label,
+                   theme.style(bold=index == cursor, selected=index == cursor))
                   for index, label in enumerate(options)]
         if cursor:
             runtime = missing[cursor - 1]
             files = (("ham-mailbox.ts", "ham-mailbox.install.json") if runtime["client"] == "omp" else
                      ("hooks/ham-mailbox.py", "ham-mailbox.install.json", "settings.json (SessionStart, UserPromptSubmit)"))
-            lines += ["", runtime["destination"], text["runtime_files"].format(files=", ".join(files)),
-                      text["runtime_consent"]]
+            lines += [("", 0), (runtime["destination"], theme.style("muted")),
+                      (text["runtime_files"].format(files=", ".join(files)), theme.style()),
+                      (text["runtime_consent"], theme.style())]
         screen.erase()
-        height, width = screen.getmaxyx()
-        wrapped = [line for value in lines for line in (wrap_display_text(value, max(1, width - 2)) if value else [""])]
-        body_height = max(1, height - 3)
+        view = content_rect(*screen.getmaxyx(), 80).window(screen)
+        height, width = view.getmaxyx()
+        usable_width = max(1, width - 1)
+        wrapped = [(line, attribute) for value, attribute in lines
+                   for line in (wrap_display_text(value, max(1, min(76, usable_width))) if value else [""])]
+        status_lines = wrap_display_text(status, usable_width) if status else []
+        footer_height = len(footer_lines(hints, usable_width))
+        status_height = min(len(status_lines), max(0, height - footer_height - 3))
+        body_height = max(1, height - footer_height - status_height - 3)
         if scroll < 0:
             scroll = max(0, len(wrapped) - body_height)
         scroll = max(0, min(scroll, len(wrapped) - body_height))
-        for row, value in [(0, text["runtime_title"]), *enumerate(wrapped[scroll:scroll + body_height], 1),
-                           (height - 1, text["runtime_help"])]:
+        visible = wrapped[scroll:scroll + body_height]
+        for row, (value, attribute) in [(0, (text["runtime_title"], theme.style(bold=True))),
+                                        *enumerate(visible, 2)]:
             if not 0 <= row < height:
                 continue
             try:
-                screen.addnstr(row, 0, truncate_display_text(value, max(0, width - 1)),
-                               max(0, width - 1), curses.A_BOLD if row == 0 else 0)
+                view.addnstr(row, 0, truncate_display_text(value, usable_width),
+                             usable_width, attribute)
             except curses.error:
                 pass
+        row = 2 + len(visible)
+        if status_height:
+            row += 1
+            for line in status_lines[:status_height]:
+                draw_status(view, row, 0, usable_width, line, theme, kind=status_kind)
+                row += 1
+        draw_footer(view, row, 0, usable_width, hints, theme)
         screen.refresh()
         key = screen.get_wch()
         if key in ("\x1b", "q", "Q"):
@@ -446,10 +479,13 @@ def offer_runtime_install(screen: curses.window, environment: Mapping[str, str],
             try:
                 runtime_installer.manage("install", runtime["destination"], client=runtime["client"])
                 status = text["runtime_activation"]
+                status_kind = "warning"
             except LedgerError as error:
                 status = error.code + ": " + error.message
+                status_kind = "error"
             except OSError as error:
                 status = str(error)
+                status_kind = "error"
             cursor = 0
             scroll = 0
 
@@ -479,75 +515,47 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
 
     def run(screen: curses.window) -> int:
         screen.keypad(True)
+        theme = Theme(values)
         cursor = 0
         status = text["ready"]
+        status_kind = "info"
         usage_visible = False
-        colors_enabled = False
-        if curses.has_colors():
-            try:
-                curses.start_color()
-                try:
-                    curses.use_default_colors()
-                    background = -1
-                except curses.error:
-                    background = curses.COLOR_BLACK
-                curses.init_pair(1, curses.COLOR_GREEN, background)
-                curses.init_pair(2, curses.COLOR_YELLOW, background)
-                curses.init_pair(3, curses.COLOR_RED, background)
-                curses.init_pair(4, curses.COLOR_CYAN, background)
-                colors_enabled = True
-            except curses.error:
-                pass
-
-        def badge_style(skill_status: str) -> int:
-            if not colors_enabled:
-                return curses.A_BOLD
-            pair = {
-                STATUS_CURRENT: 1,
-                STATUS_OUTDATED: 2,
-                STATUS_CONFLICT: 3,
-            }.get(skill_status)
-            return curses.color_pair(pair) | curses.A_BOLD if pair else curses.A_DIM
-
-        def render_footer(value: str, height: int, width: int) -> int:
-            lines = shortcut_help_spans(value, max(1, width - 1))
-            start = max(0, height - len(lines))
-            key_attribute = curses.A_BOLD
-            if colors_enabled:
-                key_attribute |= curses.color_pair(4)
-            for offset, spans in enumerate(lines):
-                column = 0
-                for span in spans:
-                    add(
-                        start + offset,
-                        column,
-                        span.text,
-                        key_attribute if span.keycap else curses.A_DIM,
-                    )
-                    column += display_width(span.text)
-            return len(lines)
+        hints = _footer_hints(text["help"])
+        usage_hints = _footer_hints(text["usage_help"])
+        status_roles = {
+            STATUS_CURRENT: "success",
+            STATUS_OUTDATED: "warning",
+            STATUS_CONFLICT: "error",
+            STATUS_UNAVAILABLE: "warning",
+        }
+        name_width = max(display_width(text[target.agent]) for target in targets)
+        status_column = 2 + name_width + 2
 
         while True:
             screen.erase()
-            height, width = screen.getmaxyx()
+            view = content_rect(*screen.getmaxyx(), 80).window(screen)
+            height, width = view.getmaxyx()
+            usable_width = max(1, width - 1)
 
             def add(row: int, column: int, value: str, attribute: int = 0) -> None:
                 if not (0 <= row < height and 0 <= column < width):
                     return
                 try:
-                    screen.addnstr(
+                    view.addnstr(
                         row,
                         column,
-                        truncate_display_text(value, max(0, width - column - 1)),
-                        max(0, width - column - 1),
+                        truncate_display_text(value, max(0, usable_width - column)),
+                        max(0, usable_width - column),
                         attribute,
                     )
                 except curses.error:
                     pass
 
             if usage_visible:
-                add(0, 0, text["usage_title"], curses.A_BOLD)
+                add(0, 0, text["usage_title"], theme.style(bold=True))
                 row = 2
+                footer_height = len(footer_lines(usage_hints, usable_width))
+                body_end = max(2, height - footer_height)
                 for value in (
                     text["usage_intro"],
                     "",
@@ -561,13 +569,11 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                     text["usage_scope"],
                     text["usage_standalone"],
                 ):
-                    if not value:
-                        row += 1
-                        continue
-                    for line in wrap_display_text(value, max(1, width - 4)):
-                        add(row, 2, line)
-                        row += 1
-                render_footer(text["usage_help"], height, width)
+                    for line in wrap_display_text(value, max(1, min(76, width - 4))) if value else [""]:
+                        if row < body_end:
+                            add(row, 2, line)
+                            row += 1
+                draw_footer(view, min(row + 1, body_end), 0, usable_width, usage_hints, theme)
                 try:
                     curses.curs_set(0)
                 except curses.error:
@@ -578,50 +584,65 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                     usage_visible = False
                 continue
 
-            add(0, 0, text["title"], curses.A_BOLD)
+            add(0, 0, text["title"], theme.style(bold=True))
             row = 1
-            for line in wrap_display_text(text["intro"], max(1, width - 4)):
-                add(row, 2, line)
+            for line in wrap_display_text(text["intro"], max(1, width - 2)):
+                add(row, 0, line)
                 row += 1
             row += 1
+            states = [installation_status(target.destination) for target in targets]
+            menu: list[tuple[str, int | None]] = []
             for scope in ("project", "system"):
-                scope_targets = [target for target in targets if target.scope == scope]
                 scope_label = text[scope]
                 if scope == "project":
                     root = project_root(values)
                     if root is not None:
                         scope_label += f" · {root.name}"
-                add(row, 2, scope_label, curses.A_BOLD)
+                menu.append((scope_label, None))
+                for index, target in enumerate(targets):
+                    if target.scope == scope:
+                        marker = "›" if index == cursor else " "
+                        name = pad_display_text(text[target.agent], name_width)
+                        label = f"{STATUS_BADGES[states[index]]} {text[states[index]]}"
+                        menu.append((f"{marker} {name}  {label}", index))
+                menu.append(("", None))
+
+            destination = targets[cursor].destination
+            detail = str(destination) if destination is not None else text["unavailable"]
+            detail_lines = wrap_display_text(detail, max(1, usable_width - 2))
+            status_lines = wrap_display_text(status, usable_width)
+            footer_height = len(footer_lines(hints, usable_width))
+            # Keep feedback and controls together; only overflowing menus scroll.
+            tail_space = len(detail_lines) + len(status_lines) + footer_height + 1
+            menu_height = max(1, height - row - tail_space)
+            selected_row = next(index for index, (_, target) in enumerate(menu) if target == cursor)
+            menu_start = max(0, min(selected_row - menu_height + 1, len(menu) - menu_height))
+            row_width = max(display_width(value) for value, target in menu if target is not None)
+            for value, index in menu[menu_start:menu_start + menu_height]:
+                if index is None:
+                    add(row, 0, value, theme.style("accent", bold=True))
+                elif index == cursor:
+                    add(row, 2, pad_display_text(value, row_width),
+                        theme.style(bold=True, selected=True))
+                else:
+                    add(row, 2, value[:2] + pad_display_text(text[targets[index].agent], name_width))
+                    add(row, 2 + status_column,
+                        f"{STATUS_BADGES[states[index]]} {text[states[index]]}",
+                        theme.style(status_roles.get(states[index], "text")))
                 row += 1
-                for target in scope_targets:
-                    index = targets.index(target)
-                    selected = index == cursor
-                    marker = "›" if selected else " "
-                    attribute = curses.A_REVERSE | curses.A_BOLD if selected else 0
-                    skill_status = installation_status(target.destination)
-                    add(row, 4, f"{marker} {text[target.agent]}", attribute)
-                    badge = f" {STATUS_BADGES[skill_status]} "
-                    add(
-                        row,
-                        max(4, width - len(badge) - 2),
-                        badge,
-                        badge_style(skill_status) | curses.A_REVERSE,
-                    )
-                    row += 1
+            tail_end = max(0, height - footer_height)
+            for line in detail_lines:
+                if row >= tail_end - len(status_lines) - 1:
+                    break
+                add(row, 2, line)
                 row += 1
-            row += 1
-            footer_line_count = len(
-                shortcut_help_spans(text["help"], max(1, width - 1))
-            )
-            footer_start = height - footer_line_count
-            selected_status = installation_status(targets[cursor].destination)
-            detail = f"{STATUS_BADGES[selected_status]} {text[selected_status]}"
-            add(min(row, footer_start - 2), 2, detail, badge_style(selected_status))
-            row += 1
-            for line in wrap_display_text(status, max(1, width - 2)):
-                add(min(row, footer_start - 1), 0, line)
+            row = min(row + 1, max(0, tail_end - len(status_lines)))
+            for line in status_lines:
+                if row >= tail_end:
+                    break
+                draw_status(view, row, 0, usable_width, line, theme, kind=status_kind)
                 row += 1
-            render_footer(text["help"], height, width)
+            draw_footer(view, row, 0, usable_width, hints, theme)
             try:
                 curses.curs_set(0)
             except curses.error:
@@ -644,8 +665,13 @@ def overlay(environment: Mapping[str, str] | None = None) -> int:
                         install_target(target)
                         status = text["installed"]
                     status = offer_runtime_install(screen, values, text, status)
+                    status_kind = (
+                        "warning" if status == text["runtime_activation"] else
+                        "success" if status in (text["installed"], text["already_current"]) else "error"
+                    )
                 except OSError as error:
                     status = text["failed"].format(error=error)
+                    status_kind = "error"
             elif key in ("\x1b", "q", "Q"):
                 return 0
 

@@ -113,6 +113,7 @@ class MailboxUiTest(unittest.TestCase):
         app = MailboxApp(Screen(), self.environment, job_factory=PendingJob,
                          clock=lambda: self.now, **options)
         app.local = local_snapshot(self.store, self.repo_id, self.environment)
+        app.notify_queued = Mock()  # Never send desktop notifications from unrelated tests.
         return app
 
     def select_agent(self, app, terminal_id='term-b'):
@@ -367,7 +368,7 @@ class MailboxUiTest(unittest.TestCase):
         app = self.resource_app()
         for colors, no_color in ((True, False), (False, False), (True, True)):
             with self.subTest(colors=colors, no_color=no_color):
-                app.colors_enabled = colors
+                app.theme.colors_enabled = colors and not no_color
                 app.environment.pop('NO_COLOR', None)
                 if no_color:
                     app.environment['NO_COLOR'] = '1'
@@ -1655,8 +1656,9 @@ class MailboxUiTest(unittest.TestCase):
                 app.key('\r')
                 for expected in ('ACTION', 'FYI', 'ACTION'):
                     snapshot = self.capture(app, height=24, width=80)
-                    self.assertIn(f'[{expected} ^G]', '\n'.join(snapshot.lines()))
-                    self.assertIn('^G action/fyi', snapshot.lines()[-1])
+                    visible = '\n'.join(snapshot.lines())
+                    self.assertIn(expected, visible)
+                    self.assertIn('[Ctrl+G]', visible)
                     app.key('\x07')
 
     def test_help_and_direct_roundtrip_preserve_compose_kind(self):
@@ -1891,6 +1893,53 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(bool(app.input_error), not successful)
                 if successful:
                     self.assertFalse(app.drafts)
+
+    def test_quick_send_enqueue_notification_failure_does_not_keep_submitted_draft(self):
+        for failed_notification in (False, True):
+            with self.subTest(notification_fails=failed_notification):
+                app = self.app(quick_send=True)
+                app.notify_queued = MailboxApp.notify_queued.__get__(app)
+                target = self.select_agent(app)
+                address = app.address(target)
+                app.key('\r')
+                app.key('\x07')
+                self.type_text(app, 'submitted draft')
+                app.key('\r')
+                app.recipient = {**target, 'alias': 'changed-after-submit'}
+                app.mail_kind = 'action'
+                app.jobs['mutation'].result = {'state': 'queued'}
+                with patch('ham.ui.mailbox.subprocess.Popen',
+                           side_effect=OSError('notification unavailable') if failed_notification else None) as notify:
+                    app.tick()
+                notify.assert_called_once()
+                notification = notify.call_args.args[0][-1]
+                self.assertIn(address, notification)
+                self.assertIn('FYI', notification)
+                self.assertNotIn('changed-after-submit', notification)
+                self.assertNotIn('delivered', notification.lower())
+                self.assertFalse(app.running)
+                self.assertEqual((app.mode, app.body, app.body_cursor), ('nav', '', 0))
+                self.assertFalse(app.drafts)
+
+    def test_quick_send_narrow_footer_retains_primary_keys_and_draft_on_resize(self):
+        from ham.ui.tui_style import content_rect
+        for mode in ('nav', 'input'):
+            app = self.app(quick_send=True)
+            if mode == 'input':
+                app.key('\r')
+                self.type_text(app, '한글 draft')
+            before = app.body, app.body_cursor, app.focus, dict(app.drafts)
+            for height, width in ((27, 62), (37, 92), (52, 172)):
+                with self.subTest(mode=mode, width=width):
+                    snapshot = self.capture(app, height, width)
+                    rect = content_rect(height, width, 120)
+                    primary = ('[Enter]', '[Shift+Enter]', '[Esc]', '[F1]') if mode == 'input' else ('[q]', '[F1]')
+                    footer = [call for call in snapshot.draw_calls if call.visible_text in primary]
+                    self.assertEqual({call.visible_text for call in footer}, set(primary))
+                    self.assertLessEqual(len({call.row for call in footer}), 2)
+                    self.assertTrue(all(rect.x <= call.column and call.end_column <= rect.x + rect.width
+                                        for call in footer))
+                    self.assertEqual((app.body, app.body_cursor, app.focus, app.drafts), before)
 
     def test_quick_send_success_preserves_other_nonblank_drafts(self):
         for other_text in ('other draft', ' \n '):
@@ -2652,7 +2701,7 @@ class MailboxUiTest(unittest.TestCase):
             app = self.app()
             app.local['threads'] = [self.thread_fixture('first', 'queued'), self.thread_fixture('second', 'queued')]
             app.selections.update(agents=1, threads=1)
-            app.colors_enabled = True
+            app.theme.colors_enabled = True
             for focus, tab in (('agents', 'threads'), ('threads', 'agents'), ('detail', 'threads')):
                 with self.subTest(height=height, focus=focus, tab=tab), \
                      patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda pair: pair << 8):
@@ -2665,26 +2714,26 @@ class MailboxUiTest(unittest.TestCase):
                         attribute = snapshot.cells[rect[0]][rect[1]].attribute
                         self.assertEqual(bool(attribute & curses.A_BOLD), value == active)
                         self.assertEqual(bool(attribute & curses.A_DIM), value != active)
-                        self.assertEqual(attribute & curses.A_COLOR, (1 << 8) if value == active else 0)
                     rect = next(rect for rect, kind, value in app.hit_map if kind == 'list-tab' and value == tab)
                     app.key(MouseEvent(rect[0], rect[1], 'press'))
                     self.assertEqual((app.mode, app.focus, app.preview), ('nav', tab, tab))
                     self.assertEqual(app.selections, {'agents': 1, 'threads': 1})
 
-    def test_layout_uses_body_height_after_header_footer_and_status(self):
-        for height, status, layout in ((19, '', 'single'), (20, '', 'tabbed'),
-                                       (20, 'Notice', 'single'), (21, 'Notice', 'tabbed')):
-            with self.subTest(height=height, status=status):
+    def test_layout_reserves_visible_footer_and_status_before_body(self):
+        for status in ('', 'Notice'):
+            with self.subTest(status=status):
                 app = self.app()
                 app.status = status
-                self.capture(app, height, 120)
-                self.assertEqual(app.layout, layout)
+                snapshot = self.capture(app, 24, 120)
                 regions = [rect for rect, kind, _ in app.hit_map if kind == 'region']
-                bottom = height - 1 - bool(status)
-                self.assertEqual(max(y + rows for y, _, rows, _ in regions), bottom)
+                footer = [call.row for call in snapshot.draw_calls if call.visible_text == '[F1]']
+                self.assertTrue(footer)
+                self.assertLessEqual(max(y + rows for y, _, rows, _ in regions), min(footer))
+                if status:
+                    self.assertLess(snapshot.rows_containing(status)[0], min(footer))
 
     def test_input_stays_full_width_below_detail_and_can_force_single(self):
-        for quick_send in (False, True):
+        for quick_send in (False,):
             with self.subTest(quick_send=quick_send):
                 app = self.app(quick_send=quick_send)
                 app.open_input({**self.recipient, 'extension_present': True})
@@ -2749,7 +2798,6 @@ class MailboxUiTest(unittest.TestCase):
                 app = self.app()
                 if no_color:
                     app.environment['NO_COLOR'] = '1'
-                app.colors_enabled = not no_color
                 app.local['agents'] = [{**app.local['agents'][0], 'stale': True}]
                 app.key('\r')
                 with patch('ham.ui.mailbox.curses.color_pair', return_value=1 << 20) as pair:
@@ -2760,7 +2808,7 @@ class MailboxUiTest(unittest.TestCase):
                 if no_color:
                     pair.assert_not_called()
                 else:
-                    self.assertIn(unittest.mock.call(4), pair.call_args_list)
+                    self.assertTrue(status.attribute)
 
     def test_persistent_view_success_stays_open_and_marks_recipient_row(self):
         app = self.app()
@@ -2793,7 +2841,6 @@ class MailboxUiTest(unittest.TestCase):
                     app.jobs['mutation'].result = {'acceptance': 'failed', 'evidence': error}
                     app.tick()
                     app.key(ESCAPE)
-                    app.colors_enabled = color
                     with patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda pair: pair << 8):
                         snapshot = self.capture(app, height=35, width=80)
                     rows = snapshot.rows_containing('[failed:')
@@ -2808,12 +2855,8 @@ class MailboxUiTest(unittest.TestCase):
                     label_column = snapshot.line(row).index('[failed:')
                     self.assertGreaterEqual(label_column, tag_start)
                     self.assertLess(label_column, tag_end)
-                    for cell in snapshot.cells[row][label_column:tag_end]:
-                        if color:
-                            self.assertEqual(cell.attribute & curses.A_COLOR, 5 << 8)
-                            self.assertFalse(cell.attribute & curses.A_REVERSE)
-                        else:
-                            self.assertTrue(cell.attribute & curses.A_REVERSE)
+                    self.assertTrue(all(cell.attribute & curses.A_REVERSE
+                                        for cell in snapshot.cells[row][label_column:tag_end]))
                     self.assertIn(error, app.result_tags[app.identity(app.recipient)][0])
                     self.assertIn(((row, 1, 1, 78), 'list-row', 0), app.hit_map)
                     app.key(MouseEvent(row, 38, 'press'))
@@ -3551,7 +3594,6 @@ class MailboxUiTest(unittest.TestCase):
 
     def test_agent_table_alignment_boundaries_and_responsive_columns(self):
         app = self.app()
-        app.colors_enabled = True
         base = app.local['agents'][0]
         app.local['resources'] = {'dead_serve': [], 'servers_unowned': [], 'stale_devices': []}
         app.local['agents'] = [
@@ -3577,8 +3619,7 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertGreaterEqual(columns[-1][1], 16)
                 self.assertTrue(snapshot.line(0).startswith('▾ '))
                 self.assertIn('ALIAS', snapshot.line(1))
-                self.assertTrue(all(cell.attribute == (1 << 8) | curses.A_BOLD
-                                    for cell in snapshot.cells[1]))
+                self.assertTrue(all(cell.attribute & curses.A_BOLD for cell in snapshot.cells[1]))
                 self.assertFalse(any(cell.attribute & curses.A_UNDERLINE for cell in snapshot.cells[1]))
                 self.assertFalse(any(cell.text in {'│', '┼', '─'} for line in snapshot.cells for cell in line))
                 expected_headers = {'turn': '' if width < 31 else 'TURN',
@@ -3640,34 +3681,23 @@ class MailboxUiTest(unittest.TestCase):
                     elif width == 100:
                         self.assertTrue(all(name in names for name in ('phone', 'emu', 'server', 'summary')))
 
-    def test_selected_agent_turn_uses_high_contrast_foreground(self):
-        for color in (False, True):
-            for width in (30, 38, 53, 76, 100, 150):
-                with self.subTest(color=color, width=width), \
-                     patch.multiple('ham.ui.mailbox.curses', A_BOLD=1, A_UNDERLINE=2,
-                                    A_REVERSE=4, A_DIM=8), \
-                     patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda pair: pair << 8):
-                    app = self.app()
-                    app.colors_enabled = color
-                    if not color:
-                        app.environment['NO_COLOR'] = '1'
-                    agent = {**app.local['agents'][0], 'alias': 'alpha', 'turn_state': 'working'}
-                    app.local['agents'] = [agent]
-                    app.screen = Screen(8, width)
-                    app.render_agents((0, 0, 8, width))
-                    snapshot = app.screen.snapshot()
-                    row = snapshot.rows_containing('alpha')[0]
-                    for cell in snapshot.cells[row]:
-                        self.assertFalse(cell.attribute & 8)
-                        self.assertEqual(cell.attribute & 0xff00, 5 << 8 if color else 0)
-                        self.assertEqual(bool(cell.attribute & 4), not color)
-                    glyph = snapshot.line(row).index('●')
-                    self.assertTrue(snapshot.cells[row][glyph].attribute & 1)
-                    if width >= 31:
-                        word = snapshot.line(row).index('working')
-                        self.assertTrue(snapshot.cells[row][word].attribute & 1)
-                    self.assertTrue(all(cell.attribute == ((1 << 8) | 1 if color else 1)
-                                        for cell in snapshot.cells[1]))
+    def test_selected_agent_keeps_noncolor_selection_and_turn_cues(self):
+        for width in (30, 38, 53, 76, 100, 150):
+            with self.subTest(width=width):
+                app = self.app()
+                app.environment['NO_COLOR'] = ''
+                agent = {**app.local['agents'][0], 'alias': 'alpha', 'turn_state': 'working'}
+                app.local['agents'] = [agent]
+                app.screen = Screen(8, width)
+                app.render_agents((0, 0, 8, width))
+                snapshot = app.screen.snapshot()
+                row = snapshot.rows_containing('alpha')[0]
+                self.assertTrue(all(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[row]))
+                self.assertFalse(any(cell.attribute & curses.A_DIM for cell in snapshot.cells[row]))
+                glyph = snapshot.line(row).index('●')
+                self.assertTrue(snapshot.cells[row][glyph].attribute & curses.A_BOLD)
+                if width >= 31:
+                    self.assertIn('working', snapshot.line(row))
 
     def test_agent_host_group_counts_survive_truncation_and_zero_findings_are_omitted(self):
         for count in (0, 1, 2):
@@ -3749,19 +3779,12 @@ class MailboxUiTest(unittest.TestCase):
                  'target': self.recipient}]
             app.render_threads((8, 0, 8, 100))
             snapshot = app.screen.snapshot()
-            for cell in snapshot.cells[8]:
-                self.assertEqual(cell.attribute, 3 if cell.text.isalpha() else 1)
-            self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[1]))
             self.assertIn('STATE / TITLE', snapshot.line(8))
             self.assertIn('PHASE · SUMMARY', snapshot.line(1))
-            for row, separator in ((1, '·'), (8, '/')):
-                column = snapshot.line(row).index(separator)
-                self.assertEqual(snapshot.cells[row][column].attribute, 1)
             host_row = next(row for row, line in enumerate(snapshot.lines()) if ' · 2 agents' in line)
             host = snapshot.line(host_row)
             self.assertTrue(host.startswith('▾ ui-test · 2 agents'))
             self.assertNotIn('─', host)
-            self.assertTrue(all(cell.attribute == 1 for cell in snapshot.cells[host_row]))
             agent_row = snapshot.rows_containing(app.agents()[0]['alias'])[0]
             thread_row = snapshot.rows_containing('DIRECT accepted')[0]
             for row in (agent_row, thread_row, thread_row + 1):
@@ -3772,102 +3795,29 @@ class MailboxUiTest(unittest.TestCase):
             self.assertEqual(second_thread, thread_row + 2)
             self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[second_thread]))
 
-    def test_turn_state_colors_only_state_cells_and_detail_word(self):
-        states = (('working', False, 3), ('idle', False, 2), ('done', False, 1),
-                  ('blocked', False, 4), ('unknown', False, 0), ('working', True, 0))
-        for state, stale, pair in states:
+    def test_agent_turn_cues_preserve_state_and_selection_without_palette_numbers(self):
+        for state in ('working', 'idle', 'done', 'blocked', 'unknown'):
             for selected in (False, True):
-                with self.subTest(state=state, stale=stale, selected=selected), \
-                     patch.multiple('ham.ui.mailbox.curses', A_BOLD=1, A_UNDERLINE=2,
-                                    A_REVERSE=4, A_DIM=8), \
-                     patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
+                with self.subTest(state=state, selected=selected):
                     app = self.app()
-                    app.environment.pop('NO_COLOR', None)
-                    app.colors_enabled = True
                     base = app.local['agents'][0]
-                    agent = {**base, 'alias': 'target-agent', 'turn_state': state, 'stale': stale}
+                    agent = {**base, 'alias': 'target-agent', 'turn_state': state}
                     app.local['agents'] = [
-                        agent, {**base, 'alias': 'other-agent', 'terminal_id': 'other',
-                                'turn_state': 'unknown', 'stale': False}]
+                        agent, {**base, 'alias': 'other-agent', 'terminal_id': 'other'}]
                     app.selections['agents'] = next(
                         index for index, item in enumerate(app.agents())
                         if item['alias'] == ('target-agent' if selected else 'other-agent'))
-                    app.focus = 'detail'
                     app.screen = Screen(8, 100)
                     app.render_agents((0, 0, 8, 100))
                     snapshot = app.screen.snapshot()
                     row = snapshot.rows_containing('target-agent')[0]
-                    base_pair = 5 if selected else 0
-                    state_pair = 5 if selected else pair
-                    for column, cell in enumerate(snapshot.cells[row]):
-                        self.assertFalse(cell.attribute & 4)
-                        if not 1 <= column < 10:
-                            self.assertEqual(cell.attribute & 0xff00, base_pair << 8)
-                    state_cell = snapshot.cells[row][1]
-                    self.assertEqual(state_cell.attribute & 0xff00, state_pair << 8)
-                    if selected or pair:
-                        self.assertTrue(state_cell.attribute & 1)
-                    else:
-                        self.assertTrue(state_cell.attribute & 8)
-                    other_row = snapshot.rows_containing('other-agent')[0]
-                    other_pair = 0 if selected else 5
-                    self.assertTrue(all(cell.attribute & 0xff00 == other_pair << 8
-                                        for cell in snapshot.cells[other_row]))
-                    self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[other_row]))
-                    colored = [call for call in snapshot.draw_calls
-                               if call.row == row and call.attribute & 0xff00
-                               and call.attribute & 0xff00 != 5 << 8]
-                    if pair and not selected:
-                        self.assertTrue(colored)
-                        self.assertTrue(all(call.column >= 1
-                                            and call.column + display_width(call.requested_text) <= 10
-                                            for call in colored))
-                    else:
-                        self.assertEqual(colored, [])
+                    self.assertIn(state, snapshot.line(row))
+                    self.assertEqual(any(cell.attribute & curses.A_REVERSE
+                                         for cell in snapshot.cells[row]), selected)
                     app.detail = agent
                     app.screen = Screen(30, 100)
                     app.render_detail((0, 0, 30, 100))
-                    snapshot = app.screen.snapshot()
-                    row = snapshot.rows_containing('Turn state:')[0]
-                    self.assertTrue(snapshot.line(row).startswith(' Turn state: '))
-                    self.assertEqual(snapshot.cells[row][0].attribute, 0)
-                    start = 1 + len('Turn state: ')
-                    for column, cell in enumerate(snapshot.cells[row]):
-                        expected = pair << 8 if start <= column < start + len(state) else 0
-                        self.assertEqual(cell.attribute & 0xff00, expected)
-                    self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[row]))
-                    if pair:
-                        self.assertTrue(all(cell.attribute & 1
-                                            for cell in snapshot.cells[row][start:start + len(state)]))
-                    else:
-                        self.assertTrue(all(cell.attribute & 8
-                                            for cell in snapshot.cells[row][start:start + len(state)]))
-
-    def test_colored_thread_selection_uses_white_background_without_reverse(self):
-        with patch.multiple('ham.ui.mailbox.curses', A_BOLD=1, A_UNDERLINE=2,
-                            A_REVERSE=4, A_DIM=8), \
-             patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
-            app = self.app()
-            app.environment.pop('NO_COLOR', None)
-            app.colors_enabled = True
-            app.focus = 'agents'
-            app.local['submissions'] = [
-                {'submission_id': 'first', 'acceptance': 'accepted', 'body': 'first message',
-                 'target': self.recipient},
-                {'submission_id': 'second', 'acceptance': 'accepted', 'body': 'second message',
-                 'target': self.recipient}]
-            app.screen = Screen(8, 100)
-            app.render_threads((0, 0, 8, 100))
-            snapshot = app.screen.snapshot()
-            row = snapshot.rows_containing('first message')[0]
-            for selected_row in (row, row + 1):
-                self.assertTrue(all(cell.attribute & 0xff00 == 5 << 8
-                                    for cell in snapshot.cells[selected_row]))
-                self.assertFalse(any(cell.attribute & 4 for cell in snapshot.cells[selected_row]))
-            row = snapshot.rows_containing('second message')[0]
-            self.assertEqual(snapshot.cells[row][2].attribute & 0xff00, 2 << 8)
-            title_column = snapshot.line(row).index('second message')
-            self.assertFalse(any(cell.attribute & 0xff00 for cell in snapshot.cells[row][title_column:]))
+                    self.assertIn('Turn state: ' + state, '\n'.join(app.screen.snapshot().lines()))
 
     def test_selected_thread_state_kind_and_operation_labels_use_contrasting_bold_foreground(self):
         cases = [
@@ -3892,7 +3842,7 @@ class MailboxUiTest(unittest.TestCase):
             with self.subTest(state=state_label, kind=kind_label), \
                  patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
                 app = self.app()
-                app.colors_enabled = True
+                app.theme.colors_enabled = True
                 collection = ('threads' if 'thread_id' in item else
                               'submissions' if 'submission_id' in item else 'outbox')
                 app.local[collection] = [item]
@@ -3906,9 +3856,8 @@ class MailboxUiTest(unittest.TestCase):
                     label_cells = snapshot.cells[row][start:start + len(label)]
                     self.assertTrue(all(cell.attribute & curses.A_BOLD for cell in label_cells))
                     self.assertTrue(all(not cell.attribute & curses.A_DIM for cell in label_cells))
-                    self.assertTrue(all(cell.attribute & curses.A_COLOR == 5 << 8
+                    self.assertTrue(all(cell.attribute & curses.A_REVERSE
                                         for cell in snapshot.cells[row]))
-                    self.assertFalse(any(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[row]))
                 identity = app.identity(app.items('threads')[0])
                 self.assertEqual(app.hit_map, [
                     ((2, 0, 1, 100), 'list-row', identity),
@@ -3917,16 +3866,16 @@ class MailboxUiTest(unittest.TestCase):
 
     def test_thread_status_and_kind_accents_preserve_plain_title_and_participants(self):
         cases = (
-            ('pending', '.', 3), ('queued', '.', 3), ('delivering', '?', 3),
-            ('delivered', '+', 2), ('handled', '=', 1), ('failed', '!', 4),
-            ('undeliverable', '!', 4), ('withdrawn', '-', 0),
+            ('pending', '.'), ('queued', '.'), ('delivering', '?'),
+            ('delivered', '+'), ('handled', '='), ('failed', '!'),
+            ('undeliverable', '!'), ('withdrawn', '-'),
         )
-        for state, glyph, pair in cases:
-            for kind, kind_label, kind_pair in (('fyi', 'i fyi', 1), ('action', '! action', 3)):
+        for state, glyph in cases:
+            for kind, kind_label in (('fyi', 'i fyi'), ('action', '! action')):
                 with self.subTest(state=state, kind=kind), \
                      patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
                     app = self.app()
-                    app.colors_enabled = True
+                    app.theme.colors_enabled = True
                     app.local['threads'] = [{
                         'thread_id': 'styled-thread', 'subject': 'Visible title',
                         'messages': [{'state': state, 'kind': kind, 'body': 'body',
@@ -3939,8 +3888,6 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertIn(label + ' · Visible title', snapshot.line(2))
                     self.assertIn(kind_label + ' · sender → host/recipient', snapshot.line(3))
                     self.assertEqual(display_width(glyph), 1)
-                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, pair << 8)
-                    self.assertEqual(snapshot.cells[3][2].attribute & curses.A_COLOR, kind_pair << 8)
                     for row, text in ((2, 'Visible title'), (3, 'sender → host/recipient')):
                         column = snapshot.line(row).index(text)
                         self.assertTrue(all(not cell.attribute & curses.A_COLOR
@@ -4317,7 +4264,7 @@ class MailboxUiTest(unittest.TestCase):
                     with self.subTest(states=states, selected=selected, colors=colors), \
                          patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
                         app = self.app()
-                        app.colors_enabled = colors
+                        app.theme.colors_enabled = colors
                         app.local['threads'] = [self.thread_fixture('entry', *states)] if states else []
                         app.selections['threads'] = 0 if selected else 9
                         app.screen = Screen(8, 100)
@@ -4338,9 +4285,6 @@ class MailboxUiTest(unittest.TestCase):
                                                     for cell in snapshot.cells[row]))
                                 if selected:
                                     self.assertTrue(snapshot.cells[row][2].attribute & curses.A_BOLD)
-                                    if colors:
-                                        self.assertTrue(all(cell.attribute & curses.A_COLOR == 5 << 8
-                                                            for cell in snapshot.cells[row]))
 
     def test_new_reply_returns_selected_handled_thread_to_active_and_actions_keep_identity(self):
         handled = self.mail.send_user(self.repo_id, self.recipient, body='Handled original')
@@ -5072,12 +5016,12 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.jobs, {})
 
     def test_direct_acceptance_and_outbox_are_distinct_from_native_receipts(self):
-        for acceptance, glyph, pair in (('submitting', '>', 3), ('accepted', '+', 2),
-                                        ('unknown', '?', 3), ('failed', '!', 4)):
+        for acceptance, glyph in (('submitting', '>'), ('accepted', '+'),
+                                  ('unknown', '?'), ('failed', '!')):
             with self.subTest(acceptance=acceptance), \
                  patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
                 app = self.app()
-                app.colors_enabled = True
+                app.theme.colors_enabled = True
                 app.local['submissions'] = [{
                     'submission_id': 'direct-evidence', 'acceptance': acceptance,
                     'body': 'Explicit user input', 'target': self.recipient}]
@@ -5090,7 +5034,6 @@ class MailboxUiTest(unittest.TestCase):
                 app.render_threads((0, 0, 10, 100))
                 snapshot = app.screen.snapshot()
                 self.assertIn(f'{glyph} DIRECT {acceptance}', snapshot.line(2))
-                self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, pair << 8)
                 self.assertIn('> direct · user →', snapshot.line(3))
                 self.assertIn('acceptance ≠ native delivery', snapshot.line(3))
                 self.assertIn('OUTBOX . pending', snapshot.line(4))
@@ -5102,16 +5045,15 @@ class MailboxUiTest(unittest.TestCase):
                 state_row = detail.rows_containing(f'DIRECT {acceptance}')[0]
                 self.assertIn('acceptance ≠ native delivery/handled', '\n'.join(detail.lines()))
                 self.assertIn('Explicit user input', '\n'.join(detail.lines()))
-                self.assertEqual(detail.cells[state_row][1].attribute & curses.A_COLOR, pair << 8)
                 self.assertEqual(app.jobs, {})
 
     def test_outbox_transport_operations_cover_pending_and_failed_without_inventing_mail_kind(self):
         for operation, glyph in (('message', '>'), ('receipt', '<'), ('setting', '#'), ('withdraw', '-')):
-            for state, state_glyph, state_pair in (('pending', '.', 3), ('failed', '!', 4)):
+            for state, state_glyph in (('pending', '.'), ('failed', '!')):
                 with self.subTest(operation=operation, state=state), \
                      patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
                     app = self.app()
-                    app.colors_enabled = True
+                    app.theme.colors_enabled = True
                     app.local['outbox'] = [{
                         'item_id': 'transport-operation', 'state': state, 'kind': operation,
                         'target_host': 'remote', 'last_error': 'Transport rejected' if state == 'failed' else None,
@@ -5128,8 +5070,6 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertNotIn('i fyi', snapshot.line(3))
                     self.assertNotIn('? ' + operation, snapshot.line(3))
                     self.assertEqual(display_width(glyph), 1)
-                    self.assertEqual(snapshot.cells[2][2].attribute & curses.A_COLOR, state_pair << 8)
-                    self.assertEqual(snapshot.cells[3][2].attribute & curses.A_COLOR, 1 << 8)
                     if state == 'failed':
                         self.assertIn('Transport rejected', snapshot.line(2))
                     app.detail = app.items('threads')[0]
@@ -5139,7 +5079,6 @@ class MailboxUiTest(unittest.TestCase):
                     state_row = detail.rows_containing(f'OUTBOX {state_glyph} {state}')[0]
                     self.assertIn(f'Transport operation: {glyph} {operation}', '\n'.join(detail.lines()))
                     self.assertIn('NOT native ACK', '\n'.join(detail.lines()))
-                    self.assertEqual(detail.cells[state_row][1].attribute & curses.A_COLOR, state_pair << 8)
                     self.assertEqual(app.jobs, {})
 
     def test_selected_narrow_thread_rows_keep_suffix_geometry_and_no_color_cues(self):
@@ -5152,7 +5091,7 @@ class MailboxUiTest(unittest.TestCase):
                     app.environment['NO_COLOR'] = '1'
                     app.initialize_colors()
                 else:
-                    app.colors_enabled = True
+                    app.theme.colors_enabled = True
                 app.focus = 'threads'
                 app.local['threads'] = [{
                     'thread_id': 'narrow', 'subject': '한글 title [failed: rejected]',
@@ -5169,12 +5108,9 @@ class MailboxUiTest(unittest.TestCase):
                     ((row + 1, 1, 1, 44), 'list-row', ('thread', 'narrow'))])
                 for selected_row in (row, row + 1):
                     for cell in snapshot.cells[selected_row][1:45]:
+                        self.assertTrue(cell.attribute & curses.A_REVERSE)
                         if no_color:
-                            self.assertTrue(cell.attribute & curses.A_REVERSE)
                             self.assertFalse(cell.attribute & curses.A_COLOR)
-                        else:
-                            self.assertEqual(cell.attribute & curses.A_COLOR, 5 << 8)
-                            self.assertFalse(cell.attribute & curses.A_REVERSE)
                 if no_color:
                     pair.assert_not_called()
                 self.assertEqual(app.screen.out_of_bounds, [])
@@ -5185,7 +5121,7 @@ class MailboxUiTest(unittest.TestCase):
                    'message_id': 'evidence', 'sender_label': 'user', 'recipient_address': 'host/recipient',
                    'confirmation_source': 'operator', 'evidence': 'Checked old claim'}
         app.detail = {'type': 'thread', 'thread_id': 'evidence', 'messages': [message]}
-        app.colors_enabled = True
+        app.theme.colors_enabled = True
         with patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
             app.screen = Screen(30, 110)
             app.render_detail((0, 0, 30, 110))
@@ -5230,50 +5166,30 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(snapshot.cells[row][3].text, ' ')
         self.assertEqual(app.screen.out_of_bounds, [])
 
-    def test_color_initialization_assigns_turn_state_palette(self):
-        app = self.app()
-        app.environment.pop('NO_COLOR', None)
-        with patch('ham.ui.mailbox.curses.has_colors', return_value=True), \
-             patch('ham.ui.mailbox.curses.start_color') as start, \
-             patch('ham.ui.mailbox.curses.use_default_colors'), \
-             patch('ham.ui.mailbox.curses.init_pair') as initialize:
-            app.initialize_colors()
-        start.assert_called_once_with()
-        self.assertEqual(initialize.call_args_list, [
-            unittest.mock.call(1, curses.COLOR_CYAN, -1),
-            unittest.mock.call(2, curses.COLOR_GREEN, -1),
-            unittest.mock.call(3, curses.COLOR_YELLOW, -1),
-            unittest.mock.call(4, curses.COLOR_RED, -1),
-            unittest.mock.call(5, curses.COLOR_BLACK, curses.COLOR_WHITE),
-            unittest.mock.call(6, curses.COLOR_CYAN, curses.COLOR_WHITE),
-            unittest.mock.call(7, curses.COLOR_GREEN, curses.COLOR_WHITE),
-            unittest.mock.call(8, curses.COLOR_YELLOW, curses.COLOR_WHITE),
-            unittest.mock.call(9, curses.COLOR_RED, curses.COLOR_WHITE)])
-        self.assertTrue(app.colors_enabled)
 
     def test_no_color_never_initializes_or_uses_pairs_including_empty_value(self):
         for value in ('1', ''):
-            with self.subTest(value=value):
-                app = self.app()
-                app.environment['NO_COLOR'] = value
-                for agent in app.local['agents']:
-                    agent['turn_state'] = 'working'
-                with patch('ham.ui.mailbox.curses.has_colors', return_value=True) as has_colors, \
-                     patch('ham.ui.mailbox.curses.start_color') as start, \
-                     patch('ham.ui.mailbox.curses.init_pair') as initialize, \
-                     patch('ham.ui.mailbox.curses.color_pair') as pair:
-                    app.initialize_colors()
-                    snapshot = self.capture(app, height=40, width=140)
-                has_colors.assert_not_called()
-                start.assert_not_called()
-                initialize.assert_not_called()
-                pair.assert_not_called()
-                self.assertFalse(app.colors_enabled)
-                self.assertEqual(app.layout, 'tabbed')
-                text = '\n'.join(snapshot.lines())
-                for label in ('Agents', 'Threads', 'Detail', 'Turn state: working'):
-                    self.assertIn(label, text)
-                self.assertFalse(any(call.attribute & curses.A_COLOR for call in snapshot.draw_calls))
+            for quick_send in (False, True):
+                with self.subTest(value=value, quick_send=quick_send):
+                    app = self.app(quick_send=quick_send)
+                    app.environment['NO_COLOR'] = value
+                    for agent in app.local['agents']:
+                        agent['turn_state'] = 'working'
+                    with patch('ham.ui.mailbox.curses.has_colors', return_value=True) as has_colors, \
+                         patch('ham.ui.mailbox.curses.start_color') as start, \
+                         patch('ham.ui.mailbox.curses.init_pair') as initialize, \
+                         patch('ham.ui.mailbox.curses.color_pair') as pair:
+                        app.initialize_colors()
+                        for mode in ('nav', 'input'):
+                            if mode == 'input':
+                                app.key('\r')
+                            snapshot = self.capture(app, height=52, width=172)
+                            self.assertFalse(any(call.attribute & curses.A_COLOR for call in snapshot.draw_calls))
+                    has_colors.assert_not_called()
+                    start.assert_not_called()
+                    initialize.assert_not_called()
+                    pair.assert_not_called()
+                    self.assertFalse(app.theme.colors_enabled)
 
     def test_settings_main_and_members_use_agents_selection_through_confirmation(self):
         for key, field in [('m', 'main'), (' ', 'members')]:

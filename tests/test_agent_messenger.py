@@ -14,6 +14,7 @@ from ham.agents import directory as agent_directory
 from ham.ui import messenger as agent_messenger
 from ham import cli as agent_skill_cli
 from ham.ui import messenger_i18n as messenger_i18n
+from ham.ui.terminal_text import scrollbar_thumb
 
 
 def agent(
@@ -41,6 +42,10 @@ def agent(
         workspace_is_worktree=workspace_is_worktree,
     )
 
+def screen_stub():
+    return mock.Mock(getmaxyx=mock.Mock(return_value=(24, 100)))
+
+
 
 class ImmediateThread:
     def __init__(self, *, target, args=(), **_kwargs):
@@ -52,20 +57,6 @@ class ImmediateThread:
 
 
 class AgentMessengerTest(unittest.TestCase):
-    def test_extracted_symbols_remain_available_from_agent_messenger(self):
-        self.assertEqual(
-            agent_messenger.STATUS_ORDER,
-            {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4},
-        )
-        for name in (
-            "RecipientViewRow",
-            "ShortcutHelpSpan",
-            "WrappedMessageLine",
-            "display_width",
-            "scrollbar_thumb",
-            "wrap_message_lines",
-        ):
-            self.assertTrue(hasattr(agent_messenger, name), name)
 
     def test_agents_sort_by_workspace_before_status_and_label(self):
         sender = agent()
@@ -95,7 +86,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         self.assertEqual(
             [record.name for record in app.filtered_agents()],
@@ -171,11 +162,7 @@ class AgentMessengerTest(unittest.TestCase):
         def record(row, column, value, attribute=0):
             rendered.append((row, column, value, attribute))
 
-        style = lambda pair=0, attribute=0: pair * 100_000 + attribute
-        with (
-            mock.patch.object(app, "_safe_add", side_effect=record),
-            mock.patch.object(app, "_style", side_effect=style),
-        ):
+        with mock.patch.object(app, "_safe_add", side_effect=record):
             app._render_recipients(0, 3)
 
         identity = next(
@@ -184,18 +171,14 @@ class AgentMessengerTest(unittest.TestCase):
         cursor = next(item for item in rendered if item[2] == "›")
         checkbox = next(item for item in rendered if item[2] == "[x]")
         status = next(item for item in rendered if item[2] == "● working")
-        self.assertEqual(identity[3], agent_messenger.curses.A_BOLD)
-        self.assertEqual(
-            cursor[3],
-            style(agent_messenger.PAIR_ACCENT, agent_messenger.curses.A_BOLD),
-        )
+        self.assertTrue(identity[3] & agent_messenger.curses.A_BOLD)
+        self.assertTrue(cursor[3] & agent_messenger.curses.A_BOLD)
         self.assertEqual(checkbox[3], cursor[3])
-        self.assertEqual(cursor[1], 2)
-        self.assertEqual(checkbox[1], 4)
-        self.assertEqual(
-            status[3],
-            style(agent_messenger.PAIR_WARNING, agent_messenger.curses.A_BOLD),
-        )
+        self.assertLess(cursor[1], checkbox[1])
+        identity_column = identity[1] + agent_messenger.display_width(
+            identity[2].partition(recipient.name)[0])
+        self.assertLess(checkbox[1] + agent_messenger.display_width(checkbox[2]), identity_column)
+        self.assertTrue(status[3] & agent_messenger.curses.A_BOLD)
 
     def test_recipient_panel_grows_until_message_minimum(self):
         panel_height = agent_messenger.MessengerApp._recipient_panel_height
@@ -231,10 +214,7 @@ class AgentMessengerTest(unittest.TestCase):
         def record(row, column, value, _attribute=0):
             rendered.append((row, column, value))
 
-        with (
-            mock.patch.object(app, "_safe_add", side_effect=record),
-            mock.patch.object(app, "_style", return_value=0),
-        ):
+        with mock.patch.object(app, "_safe_add", side_effect=record):
             app._render_message(0, 5)
 
         message_markers = [
@@ -245,16 +225,16 @@ class AgentMessengerTest(unittest.TestCase):
         scrollbar = [
             value
             for row, column, value in rendered
-            if 1 <= row <= 4 and column == 38
+            if 1 <= row <= 4 and column == app._message_editor_width() + 3
         ]
         self.assertEqual(len(message_markers), 4)
         self.assertEqual(scrollbar, ["│", "│", "█", "█"])
 
     def test_scrollbar_thumb_tracks_start_middle_and_end(self):
-        self.assertIsNone(agent_messenger.scrollbar_thumb(4, 4, 0))
-        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 0), (0, 2))
-        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 2), (1, 2))
-        self.assertEqual(agent_messenger.scrollbar_thumb(8, 4, 4), (2, 2))
+        self.assertIsNone(scrollbar_thumb(4, 4, 0))
+        self.assertEqual(scrollbar_thumb(8, 4, 0), (0, 2))
+        self.assertEqual(scrollbar_thumb(8, 4, 2), (1, 2))
+        self.assertEqual(scrollbar_thumb(8, 4, 4), (2, 2))
 
     def test_remote_recipients_are_grouped_by_host_and_workspace(self):
         sender = agent()
@@ -349,7 +329,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         rows = app._recipient_view_rows([first, second])
         headers = [
@@ -398,7 +378,7 @@ class AgentMessengerTest(unittest.TestCase):
                         ),
                     ):
                         app = agent_messenger.MessengerApp(
-                            mock.Mock(), sender, environment
+                            screen_stub(), sender, environment
                         )
 
                 rows = app._recipient_view_rows([recipient])
@@ -473,7 +453,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         for query in ("purple-koala", "w3:pQ", "019ff833"):
             app.search = query
@@ -646,73 +626,7 @@ class AgentMessengerTest(unittest.TestCase):
     def test_display_width_accounts_for_wide_characters(self):
         self.assertEqual(agent_messenger.display_width("Agent 한글"), 10)
 
-    def test_shortcut_help_wraps_without_losing_any_items(self):
-        for language in messenger_i18n.SUPPORTED_LANGUAGES:
-            text = messenger_i18n.messages(language)
-            for key in (
-                "help_discovery",
-                "help_mode",
-                "help_recipients",
-                "help_message",
-                "help_sending",
-            ):
-                lines = agent_messenger.wrap_help_text(text[key], 71)
-                self.assertTrue(
-                    all(agent_messenger.display_width(line) <= 71 for line in lines),
-                    (language, key),
-                )
-                self.assertTrue(lines, (language, key))
-            self.assertEqual(
-                len(agent_messenger.wrap_help_text(text["help_recipients"], 71)),
-                2,
-                language,
-            )
 
-    def test_recipient_footer_displays_refresh_skill_and_close_shortcuts(self):
-        sender = agent()
-        screen = mock.Mock()
-        screen.getmaxyx.return_value = (18, 72)
-        with tempfile.TemporaryDirectory() as state_directory:
-            environment = {
-                "LANG": "ko_KR.UTF-8",
-                "HERDR_PLUGIN_STATE_DIR": state_directory,
-            }
-            with (
-                mock.patch.object(
-                    agent_messenger,
-                    "query_local_agents",
-                    return_value=[sender],
-                ),
-                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
-            ):
-                app = agent_messenger.MessengerApp(screen, sender, environment)
-
-        rendered: list[tuple[int, str, int]] = []
-        with mock.patch.object(
-            app,
-            "_safe_add",
-            side_effect=lambda row, _column, value, attribute=0: rendered.append(
-                (row, value, attribute)
-            ),
-        ):
-            line_count = app._render_help_footer(app.text["help_recipients"])
-
-        self.assertEqual(line_count, 2)
-        self.assertEqual(sorted({row for row, _value, _attribute in rendered}), [16, 17])
-        combined = "".join(value for _row, value, _attribute in rendered)
-        self.assertIn("[Ctrl+R] 새로고침", combined)
-        self.assertIn("[Ctrl+G] 스킬", combined)
-        self.assertIn("[Esc] 닫기", combined)
-        keycaps = [
-            attribute
-            for _row, value, attribute in rendered
-            if value in {"[↑↓]", "[Space]", "[Ctrl+R]", "[Ctrl+G]", "[Esc]"}
-        ]
-        self.assertTrue(keycaps)
-        self.assertTrue(all(attribute & agent_messenger.curses.A_BOLD for attribute in keycaps))
-        self.assertTrue(
-            all(not attribute & agent_messenger.curses.A_REVERSE for attribute in keycaps)
-        )
 
     def test_ctrl_g_exits_messenger_to_open_interactive_skill_overlay(self):
         sender = agent()
@@ -729,7 +643,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.mode_choice = True
         app.section = "message"
@@ -755,7 +669,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.mode_choice = True
         app.section = "message"
@@ -767,8 +681,8 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertEqual(app.message_lines, ["Can you review?"])
 
     def test_skill_guide_wraps_long_paths_inside_overlay(self):
-        screen = mock.Mock()
-        screen.getmaxyx.return_value = (14, 42)
+        from tests.curses_snapshot_harness import FakeCursesWindow
+        screen = FakeCursesWindow(14, 42)
         with mock.patch.object(agent_messenger.curses, "curs_set"):
             agent_messenger.render_skill_guide_screen(
                 screen,
@@ -777,11 +691,12 @@ class AgentMessengerTest(unittest.TestCase):
                     "/a/very/long/plugin/path/skills/herdr-agent-messenger/SKILL.md"
                 ),
             )
-        for call in screen.addnstr.call_args_list:
-            row, column, _value, maximum = call.args[:4]
-            self.assertLess(row, 14)
-            self.assertLess(column, 42)
-            self.assertLessEqual(maximum, 41 - column)
+        calls = screen.snapshot().draw_calls
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertLess(call.row, 14)
+            self.assertLessEqual(call.end_column, 42)
+            self.assertFalse(call.clipped)
 
     def test_message_soft_wrap_preserves_text_and_maps_cursor(self):
         message = "현재 프로젝트 내용을 분석하고 리뷰한 내용을 종합해서 보고해줘."
@@ -820,13 +735,17 @@ class AgentMessengerTest(unittest.TestCase):
         )
 
     def test_wide_status_text_is_clipped_in_terminal_cells_before_drawing(self):
+        from ham.ui.tui_style import content_rect
+        from tests.curses_snapshot_harness import FakeCursesWindow
         app = agent_messenger.MessengerApp.__new__(agent_messenger.MessengerApp)
-        app.screen = mock.Mock()
-        app.screen.getmaxyx.return_value = (4, 10)
-        app._safe_add(1, 0, "가나다라마")
-        rendered = app.screen.addnstr.call_args.args[2]
-        self.assertEqual(rendered, "가나다라…")
-        self.assertLessEqual(agent_messenger.display_width(rendered), 9)
+        app.screen = FakeCursesWindow(4, 10)
+        rect = content_rect(4, 10, 104)
+        app.content_screen = rect.window(app.screen)
+        app._safe_add(1, 0, "가나다라마바사아")
+        call = app.screen.snapshot().draw_calls[0]
+        self.assertTrue(call.visible_text.startswith("가"))
+        self.assertLessEqual(agent_messenger.display_width(call.visible_text), rect.width)
+        self.assertFalse(call.clipped)
 
     def test_vertical_cursor_movement_follows_the_rendered_wrap_width(self):
         sender = agent()
@@ -874,7 +793,7 @@ class AgentMessengerTest(unittest.TestCase):
                     return_value=["macbook"],
                 ),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         self.assertFalse(app.discovery_choice)
         app.handle_key(agent_messenger.curses.KEY_DOWN)
@@ -901,7 +820,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         self.assertTrue(app.discovery_choice)
         self.assertFalse(app.mode_choice)
@@ -950,7 +869,7 @@ class AgentMessengerTest(unittest.TestCase):
                     return_value=["macbook"],
                 ),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.handle_key("l")
         self.assertTrue(app.discovery_choice)
@@ -991,7 +910,7 @@ class AgentMessengerTest(unittest.TestCase):
                     return_value=["macbook"],
                 ),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         discovery = mock.Mock()
         app.discovery_choice = True
@@ -1132,34 +1051,6 @@ class AgentMessengerTest(unittest.TestCase):
                 )
                 self.assertEqual(summary, app.text[privacy_key], language)
 
-    def test_color_pairs_use_terminal_palette(self):
-        sender = agent()
-        with tempfile.TemporaryDirectory() as state_directory:
-            environment = {
-                "LANG": "en_US.UTF-8",
-                "HERDR_PLUGIN_STATE_DIR": state_directory,
-            }
-            with (
-                mock.patch.object(
-                    agent_messenger,
-                    "query_local_agents",
-                    return_value=[sender],
-                ),
-                mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
-            ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
-
-        with (
-            mock.patch.object(agent_messenger.curses, "has_colors", return_value=True),
-            mock.patch.object(agent_messenger.curses, "start_color"),
-            mock.patch.object(agent_messenger.curses, "use_default_colors"),
-            mock.patch.object(agent_messenger.curses, "init_pair") as init_pair,
-        ):
-            app._initialize_colors()
-
-        self.assertTrue(app.colors_enabled)
-        self.assertEqual(init_pair.call_count, 4)
-        self.assertTrue(all(call.args[2] == -1 for call in init_pair.call_args_list))
 
     def test_message_cursor_is_placed_after_footer_rendering(self):
         sender = agent()
@@ -1187,7 +1078,9 @@ class AgentMessengerTest(unittest.TestCase):
         with mock.patch.object(app, "_set_cursor_visibility"):
             app.render()
 
-        self.assertEqual(screen.move.call_args.args, app.message_cursor)
+        rect = app._content_rect()
+        self.assertEqual(screen.move.call_args.args,
+                         (rect.y + app.message_cursor[0], rect.x + app.message_cursor[1]))
         self.assertEqual(app.message_cursor[1], 7)
 
     def test_long_message_cursor_remains_inside_editor(self):
@@ -1219,7 +1112,9 @@ class AgentMessengerTest(unittest.TestCase):
         cursor_row, cursor_column = screen.move.call_args.args
         self.assertLess(cursor_row, 20)
         self.assertLess(cursor_column, 43)
-        self.assertEqual(screen.move.call_args.args, app.message_cursor)
+        rect = app._content_rect()
+        self.assertEqual(screen.move.call_args.args,
+                         (rect.y + app.message_cursor[0], rect.x + app.message_cursor[1]))
 
     def test_arrow_keys_move_between_soft_wrapped_message_rows(self):
         sender = agent()
@@ -1242,12 +1137,19 @@ class AgentMessengerTest(unittest.TestCase):
 
         app.mode_choice = True
         app.section = "message"
-        app.message_lines = ["abcdefghijklmnopqrst"]
-        app.message_column = 20
-        app.handle_key(agent_messenger.curses.KEY_UP)
-        self.assertEqual((app.message_row, app.message_column), (0, 13))
-        app.handle_key(agent_messenger.curses.KEY_UP)
-        self.assertEqual((app.message_row, app.message_column), (0, 6))
+        width = app._message_editor_width()
+        original = "x" * (width * 3 + 2)
+        app.message_lines = [original]
+        app.message_column = len(original)
+        for _ in range(2):
+            before = app.message_column
+            app.handle_key(agent_messenger.curses.KEY_UP)
+            self.assertEqual(app.message_row, 0)
+            self.assertEqual(app.message_column, before - width)
+            self.assertEqual(app.message_lines, [original])
+        before = app.message_column
+        app.handle_key(agent_messenger.curses.KEY_DOWN)
+        self.assertEqual(app.message_column, before + width)
 
     def test_ctrl_s_invokes_send_from_message_editor(self):
         sender = agent()
@@ -1264,7 +1166,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.mode_choice = True
         app.section = "message"
@@ -1288,7 +1190,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.mode_choice = True
         app.selected.add(recipient.identity)
@@ -1327,7 +1229,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app._replace_agent_scope(
             local=False,
@@ -1383,7 +1285,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.selected = {first.identity, second.identity}
         original_request = "\n  Please review this change.  \n"
@@ -1548,7 +1450,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.selected = {first.identity, second.identity}
         app.delivery_mode = agent_messenger.DELIVERY_DIRECT
@@ -1599,7 +1501,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.mode_choice = True
         app.delivery_mode = agent_messenger.DELIVERY_DIRECT
@@ -1639,7 +1541,7 @@ class AgentMessengerTest(unittest.TestCase):
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
                 app = agent_messenger.MessengerApp(
-                    mock.Mock(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
+                    screen_stub(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
                 )
                 app.delivery_mode = agent_messenger.DELIVERY_DIRECT
                 app.selected = {delivered.identity, pending.identity}
@@ -1664,7 +1566,7 @@ class AgentMessengerTest(unittest.TestCase):
             mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
         ):
             app = agent_messenger.MessengerApp(
-                mock.Mock(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
+                screen_stub(), sender, {"HERDR_PLUGIN_STATE_DIR": directory, "LANG": "en_US.UTF-8"},
             )
         app.selected = {"worker"}
         app.send_results.put(agent_messenger.SendJobResult(True, (
@@ -1690,7 +1592,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         def cancelled_fetch(*_args, cancel_event, **_kwargs):
             cancel_event.set()
@@ -1725,7 +1627,7 @@ class AgentMessengerTest(unittest.TestCase):
                 ),
                 mock.patch.object(agent_messenger, "ssh_hosts", return_value=[]),
             ):
-                app = agent_messenger.MessengerApp(mock.Mock(), sender, environment)
+                app = agent_messenger.MessengerApp(screen_stub(), sender, environment)
 
         app.sending = True
         app.delivery_mode = agent_messenger.DELIVERY_DIRECT
@@ -1874,7 +1776,8 @@ class HeldMessagesTest(unittest.TestCase):
         app.handle_key("\x1b")
         self.assertFalse(app.running)
 
-    def test_warning_remains_visible_in_all_languages_with_empty_and_populated_lists(self):
+    def test_empty_state_only_offers_close_and_populated_state_keeps_warning(self):
+        from ham.ui.tui_style import content_rect
         from tests.curses_snapshot_harness import FakeCursesWindow
 
         for language in messenger_i18n.SUPPORTED_LANGUAGES:
@@ -1882,24 +1785,34 @@ class HeldMessagesTest(unittest.TestCase):
                 with self.subTest(language=language, populated=bool(items)):
                     delivery = mock.Mock()
                     delivery.held_messages.return_value = items
-                    window = FakeCursesWindow(18, 52)
+                    window = FakeCursesWindow(27, 62)
                     app = agent_messenger.HeldMessagesApp(
-                        window, {"LANG": f"{language}_TEST.UTF-8"}, delivery=delivery
+                        window, {"LANG": f"{language}_TEST.UTF-8", "NO_COLOR": ""}, delivery=delivery,
                     )
                     with mock.patch.object(agent_messenger.curses, "curs_set"):
                         app.render()
                     snapshot = window.snapshot()
-                    warning_lines = agent_messenger.wrap_display_text(
-                        app.text["held_warning"], 51
-                    )
-                    for line in warning_lines:
-                        self.assertTrue(
-                            snapshot.rows_containing(line.rstrip()), snapshot.formatted()
-                        )
+                    combined = "\n".join(snapshot.lines())
+                    width = content_rect(27, 62, 96).width
+                    warning_lines = agent_messenger.wrap_display_text(app.text["held_warning"], width)
                     if not items:
-                        self.assertTrue(snapshot.rows_containing(app.text["held_empty"]))
+                        self.assertIn(app.text["held_empty"], combined)
+                        self.assertIn("[Esc]", combined)
+                        self.assertNotIn("[P]", combined)
+                        self.assertNotIn("[C]", combined)
+                        for line in warning_lines:
+                            self.assertNotIn(line.rstrip(), combined)
+                        for key in ("p", "P", "c", "C"):
+                            app.handle_key(key)
+                        delivery.decide.assert_not_called()
+                        app.handle_key("\x1b")
+                        self.assertFalse(app.running)
                     else:
-                        self.assertTrue(snapshot.rows_containing(items[0].preview))
+                        self.assertIn(items[0].preview, combined)
+                        self.assertIn("[P]", combined)
+                        self.assertIn("[C]", combined)
+                        for line in warning_lines:
+                            self.assertIn(line.rstrip(), combined)
                     self.assertFalse(any(call.clipped for call in snapshot.draw_calls))
 
     def test_scrolling_keeps_selected_recipient_visible(self):

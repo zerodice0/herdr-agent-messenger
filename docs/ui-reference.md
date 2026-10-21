@@ -50,6 +50,26 @@ project root, or mailbox repository and opener pane/terminal identity as applica
 The overlay's own pane ID never replaces that context. Held Messages remains
 host-wide and does not require an agent in the opener.
 
+HAM centers a top-anchored content area inside that overlay, without drawing
+another outer frame. Quick send is capped at 120 columns, Send Prompt at 104,
+Held at 96, and Skill at 80. Below 80 columns, the side gutters shrink to one
+cell. These are content limits, not requested Herdr pane sizes; split and tab
+mailboxes retain their existing geometry.
+
+The four surfaces share semantic colors and `[Key] Action` hints. Hints stay
+together, use at most two rows, and prioritize close/help and essential editing
+actions over secondary shortcuts. `NO_COLOR`, including an empty value,
+disables color-pair initialization everywhere while preserving bold, reverse
+selection, glyphs and state names.
+
+Quick send gives INPUT at least eight content rows when space permits and caps
+Detail at nine outer rows. In INPUT, only the compose frame/title is accented;
+in NAV, `›` marks the active region title. Held places its selected preview,
+dates and push warning immediately after the list. Its empty state shows only
+`No held messages.` and `[Esc] Close`. Skill puts each status name two cells
+after the longest client name and highlights only the selected name/status row;
+long paths appear on a separate detail line.
+
 ### Responsive regions and navigation
 
 The body contains **Agents**, **Threads**, and **Detail**. Detail is always below
@@ -259,11 +279,11 @@ payload's mail kind. Detail repeats state/kind/transport cues and preserves
 operator-vs-native evidence; direct acceptance never means native delivered or
 handled. The `?` help overlay includes this legend.
 
-State colors are redundant cues: **working is yellow**, **idle green**,
-**done cyan**, and **blocked red**; **unknown/stale states are dim**.
+State colors are redundant cues: **working is yellow**, **idle neutral**,
+**done green**, and **blocked red**; **unknown/stale states are dim**.
 Glyphs and words remain visible (`● working`, `○ idle`, `✓ done`, `! blocked`,
 `? unknown`, `~ stale`). The presence of `NO_COLOR` (even an empty value) disables
-color but preserves glyphs, words, bold, underline, dim and reverse-video selection.
+color but preserves glyphs, words, bold, dim and reverse-video selection.
 
 Detail and other plain-text panels leave one column of inner padding on the left.
 
@@ -360,8 +380,11 @@ wakes can include younger FYI; FYI alone needs a reply only if it changes work.
   returns to the same input afterwards.
 
 Success closes input and shows a result tag on the agent row; quick-send mode
-also closes the overlay. Only the submitted, unchanged draft is cleared: edits
-made while a send is pending are retained. Failure leaves the text open with an error.
+also closes the overlay. A mailbox enqueue posts a best-effort, nonblocking
+Herdr notification, `Queued · recipient · ACTION|FYI`; it does not claim delivery.
+Notification failure cannot turn a successful enqueue into an error. Only the
+submitted, unchanged draft is cleared: edits made while a send is pending are
+retained. Failure leaves the text open with an error.
 
 ### Settings overlay
 
@@ -591,13 +614,17 @@ see each alias and its latest error.
 ## Message editor and layout
 
 The overlay uses Herdr's available pane area; HAM does not request a fixed size.
-Discovered recipients receive most of the available space while at least four
+Its centered content area is capped at 104 columns, with recipient pane/status
+information aligned inside that area. The editor wraps at no more than 88 cells.
+Discovered recipients receive most of the available height while at least four
 soft-wrapped message rows remain visible when possible. Long messages follow the
 text cursor and display a viewport scrollbar.
 
-Shortcut hints wrap instead of clipping on narrow terminals. The overlay inherits
-Herdr's terminal palette. Lifecycle colors remain reserved for working, done,
-blocked, and warning states.
+Discovery and route hints follow their short choice blocks instead of sitting
+at the screen bottom. Reopening the route choice from compose shows the selected
+count and that the draft is kept. Normal coordinator/recommended information is
+neutral; discovery completion is successful, not a warning. Shared shortcut hints
+wrap as whole actions to at most two rows.
 
 The UI follows `LC_ALL`, `LC_MESSAGES`, or `LANG` and supports English, Japanese,
 and Korean. Unsupported locales fall back to English.

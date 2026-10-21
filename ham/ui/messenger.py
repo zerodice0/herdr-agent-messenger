@@ -45,13 +45,8 @@ from ham.ui.messenger_i18n import detect_language, messages
 from ham.ui.messenger_render import (
     DELIVERY_DELEGATE,
     DELIVERY_DIRECT,
-    MESSAGE_MIN_VISIBLE_ROWS,
-    PAIR_ACCENT,
-    PAIR_ERROR,
-    PAIR_SUCCESS,
-    PAIR_WARNING,
-    STATUS_GLYPHS,
     MessengerRenderMixin,
+    _help_hints,
 )
 from ham.ui.recipient_view import (
     STATUS_ORDER,
@@ -67,18 +62,14 @@ from ham.ui.recipient_view import (
     workspace_display,
 )
 from ham.ui.terminal_text import (
-    ShortcutHelpSpan,
     WrappedMessageLine,
     character_index_at_display_column,
     display_width,
-    pad_display_text,
-    scrollbar_thumb,
-    shortcut_help_spans,
     truncate_display_text,
     wrap_display_text,
-    wrap_help_text,
     wrap_message_lines,
 )
+from ham.ui.tui_style import Theme, content_rect, draw_empty, draw_footer, draw_status, footer_lines
 
 
 PLUGIN_ID = "herdr.agent-messenger"
@@ -362,30 +353,37 @@ def render_skill_guide_screen(
     text: Mapping[str, str],
     skill_path: Path,
 ) -> None:
+    theme = Theme()
     screen.erase()
-    height, width = screen.getmaxyx()
+    content = content_rect(*screen.getmaxyx(), 80).window(screen)
+    height, width = content.getmaxyx()
 
     def add(row: int, column: int, value: str, attribute: int = 0) -> None:
         if row < 0 or row >= height or column < 0 or column >= width:
             return
         try:
-            available = max(0, width - column - 1)
-            screen.addnstr(row, column, truncate_display_text(value, available), available, attribute)
+            available = width - column
+            content.addnstr(row, column, truncate_display_text(value, available), available, attribute)
         except curses.error:
             pass
 
-    add(0, 0, text["skill_guide_title"], curses.A_BOLD)
+    add(0, 0, text["skill_guide_title"], theme.style("accent", bold=True))
+    hints = _help_hints(text["skill_guide_close"])
+    footer_rows = len(footer_lines(hints, width, max_rows=2))
     row = 2
     for value in skill_guide_lines(text, skill_path):
         if not value:
             row += 1
             continue
-        for line in wrap_display_text(value, max(1, width - 4)):
-            if row >= height - 1:
+        for line in wrap_display_text(value, max(1, min(76, width - 4))):
+            if row >= height - footer_rows:
                 break
             add(row, 2, line)
             row += 1
-    add(height - 1, 0, text["skill_guide_close"], curses.A_DIM)
+    draw_footer(
+        content, min(row + 1, max(0, height - footer_rows)), 0, width, hints, theme,
+        max_rows=2,
+    )
     try:
         curses.curs_set(0)
     except curses.error:
@@ -426,6 +424,8 @@ class MessengerApp(MessengerRenderMixin):
         environment: Mapping[str, str],
     ) -> None:
         self.screen = screen
+        self.theme = Theme(environment)
+        self.content_screen = self._content_rect().window(screen)
         self.sender = sender
         self.environment = environment
         self.text = messages(detect_language(environment))
@@ -446,6 +446,7 @@ class MessengerApp(MessengerRenderMixin):
         self.message_row = 0
         self.message_column = 0
         self.status = self.text["no_ssh_hosts"] if not self.hosts else ""
+        self.status_kind = "info"
         self.discovery_choice = bool(not self.hosts)
         self.discovery_option = 0
         self.mode_choice = False
@@ -459,7 +460,6 @@ class MessengerApp(MessengerRenderMixin):
         self.host_errors: dict[str, str] = {}
         self.skipped_hosts = 0
         self.running = True
-        self.colors_enabled = False
         self.message_cursor: tuple[int, int] | None = None
         self.sending = False
         self.send_results: queue.Queue[SendJobResult] = queue.Queue()
@@ -518,7 +518,7 @@ class MessengerApp(MessengerRenderMixin):
         focused: bool = False,
         indent: int = 0,
     ) -> str:
-        _height, width = self.screen.getmaxyx()
+        _height, width = self._content_size()
         return format_recipient_line(
             agent,
             marker,
@@ -595,10 +595,12 @@ class MessengerApp(MessengerRenderMixin):
         if not hosts_to_probe:
             self.discovery = None
             self.status = self._discovery_summary()
+            self.status_kind = "warning" if self.skipped_hosts else "success"
             return
         self.discovery = RemoteDiscovery(hosts_to_probe, config_path=self.config_path)
         self.discovery.start()
         self.status = self.text["discovering"]
+        self.status_kind = "progress"
 
     def _discovery_summary(self) -> str:
         summary = self.text["discovery_complete"]
@@ -636,6 +638,7 @@ class MessengerApp(MessengerRenderMixin):
             self.cache.save()
             self.discovery = None
             self.status = self._discovery_summary()
+            self.status_kind = "warning" if self.skipped_hosts else "success"
             return
         if time.monotonic() >= self.discovery.deadline:
             self.discovery.cancel()
@@ -649,6 +652,7 @@ class MessengerApp(MessengerRenderMixin):
             self.cache.save()
             self.discovery = None
             self.status = self._discovery_summary()
+            self.status_kind = "warning"
 
     def _cancel_discovery(self) -> None:
         if self.discovery:
@@ -656,6 +660,7 @@ class MessengerApp(MessengerRenderMixin):
             self.discovery = None
         self.pending_hosts.clear()
         self.status = self.text["discovery_cancelled"]
+        self.status_kind = "info"
 
     def _use_local_only(self) -> None:
         if self.discovery:
@@ -674,6 +679,7 @@ class MessengerApp(MessengerRenderMixin):
         self.skipped_hosts = 0
         self.remote_enabled = False
         self.status = ""
+        self.status_kind = "info"
         self._clamp_cursor()
 
     def _remote_counts(self) -> tuple[int, int, int]:
@@ -836,15 +842,18 @@ class MessengerApp(MessengerRenderMixin):
         original_message = "\n".join(self.message_lines)
         if not recipients:
             self.status = self.text["no_recipients"]
+            self.status_kind = "warning"
             return
         if not original_message.strip():
             self.status = self.text["empty_message"]
+            self.status_kind = "warning"
             return
         self.status = (
             self.text["delegating"]
             if self.delivery_mode == DELIVERY_DELEGATE
             else self.text["sending"]
         )
+        self.status_kind = "progress"
         self.sending = True
         self.send_cancel.clear()
         threading.Thread(
@@ -911,17 +920,21 @@ class MessengerApp(MessengerRenderMixin):
         if job.cancelled:
             if unknown:
                 self.status = self.text["delivery_unknown"].format(count=len(unknown))
+                self.status_kind = "warning"
             elif succeeded:
                 self.status = (
                     self.text["delegated"]
                     if self.delivery_mode == DELIVERY_DELEGATE
                     else self.text["sent"].format(count=len(succeeded))
                 ) + " " + self.text["send_cancelled"]
+                self.status_kind = "success"
             else:
                 self.status = self.text["send_cancelled"]
+                self.status_kind = "info"
             return
         if not job.sender_available:
             self.status = self.text["sender_unavailable"]
+            self.status_kind = "error"
             return
         if job.error:
             self.status = (
@@ -929,6 +942,7 @@ class MessengerApp(MessengerRenderMixin):
                 if self.delivery_mode == DELIVERY_DELEGATE
                 else self.text["all_failed"]
             )
+            self.status_kind = "error"
             return
         if not results:
             self.status = (
@@ -936,11 +950,13 @@ class MessengerApp(MessengerRenderMixin):
                 if self.delivery_mode == DELIVERY_DELEGATE
                 else self.text["all_failed"]
             )
+            self.status_kind = "error"
             return
         if unknown:
             if self.delivery_mode == DELIVERY_DIRECT:
                 self.selected = {result.agent.identity for result in failed}
             self.status = self.text["delivery_unknown"].format(count=len(unknown))
+            self.status_kind = "warning"
             return
         if not failed:
             if self.delivery_mode == DELIVERY_DELEGATE:
@@ -952,6 +968,7 @@ class MessengerApp(MessengerRenderMixin):
             return
         if self.delivery_mode == DELIVERY_DELEGATE:
             self.status = self.text["delegate_failed"]
+            self.status_kind = "error"
             return
         self.selected = {result.agent.identity for result in failed}
         if succeeded:
@@ -959,14 +976,17 @@ class MessengerApp(MessengerRenderMixin):
                 sent=len(succeeded),
                 failed=len(failed),
             )
+            self.status_kind = "warning"
         else:
             self.status = self.text["all_failed"]
+            self.status_kind = "error"
 
     def handle_key(self, key: str | int) -> None:
         if self.remote_details_visible:
             failures = self._unavailable_hosts()
-            height, _width = self.screen.getmaxyx()
-            maximum_offset = max(0, len(failures) - max(1, height - 4))
+            height, _width = self._content_size()
+            footer_rows = len(self._help_lines(self.text["remote_details_help"]))
+            maximum_offset = max(0, len(failures) - max(1, height - 3 - footer_rows))
             if key == curses.KEY_UP:
                 self.remote_details_offset = max(0, self.remote_details_offset - 1)
             elif key == curses.KEY_DOWN:
@@ -1047,6 +1067,7 @@ class MessengerApp(MessengerRenderMixin):
             if key == "\x1b":
                 self.send_cancel.set()
                 self.status = self.text["cancelling_send"]
+                self.status_kind = "progress"
             return
 
         if key == "\x1b":
@@ -1066,7 +1087,6 @@ class MessengerApp(MessengerRenderMixin):
             self._handle_message_key(key)
 
     def run(self) -> int:
-        self._initialize_colors()
         self.screen.keypad(True)
         self.screen.timeout(100)
         while self.running:
@@ -1148,11 +1168,13 @@ class HeldMessagesApp:
 
             delivery = agent_delivery
         self.screen = screen
+        self.theme = Theme(environment)
         self.environment = environment
         self.delivery = delivery
         self.text = messages(detect_language(environment))
         self.items: list[Any] = []
         self.cursor = 0
+        self.offset = 0
         self.error = ""
         self.running = True
         self.refresh()
@@ -1198,50 +1220,85 @@ class HeldMessagesApp:
 
     def render(self) -> None:
         self.screen.erase()
-        height, width = self.screen.getmaxyx()
+        content = content_rect(*self.screen.getmaxyx(), 96).window(self.screen)
+        height, width = content.getmaxyx()
 
         def add(row: int, value: str, attribute: int = 0) -> None:
             if not 0 <= row < height:
                 return
             try:
-                self.screen.addnstr(
-                    row, 0, truncate_display_text(value, width - 1), width - 1, attribute
+                content.addnstr(
+                    row, 0, truncate_display_text(value, width), width, attribute,
                 )
             except curses.error:
                 pass
 
-        add(0, self.text["held_title"], curses.A_BOLD)
-        add(height - 1, self.text["held_help"], curses.A_DIM)
-        bottom = height - 1
-        if self.error:
-            bottom -= 1
-            add(bottom, self.error, curses.A_BOLD)
-        warning_lines = wrap_display_text(self.text["held_warning"], max(1, width - 1))
-        bottom -= len(warning_lines)
-        for row, line in enumerate(warning_lines, start=bottom):
-            add(row, line, curses.A_BOLD)
-        list_end = bottom
-        if self.items and bottom >= 5:
-            item = self.items[self.cursor]
-            list_end -= 2
-            add(list_end, item.preview)
-            add(list_end + 1, self.text["held_since"].format(
-                since=item.since, deadline=item.deadline
-            ), curses.A_DIM)
+        hints = _help_hints(self.text["held_help"])
         if not self.items:
-            if list_end > 2:
-                add(2, self.text["held_empty"])
+            close_hints = [hint for hint in hints if hint.key == "Esc"]
+            row = draw_empty(
+                content, 0, 0, width, self.text["held_empty"], self.theme,
+                hints=close_hints,
+            )
+            if self.error:
+                draw_status(content, row, 0, width, self.error, self.theme, kind="error")
         else:
-            visible_count = max(0, list_end - 2)
-            start = max(0, self.cursor - visible_count + 1)
-            for row, index in enumerate(
-                range(start, min(len(self.items), start + visible_count)), start=2
-            ):
+            item = self.items[self.cursor]
+            footer_rows = len(footer_lines(hints, width, max_rows=2))
+            preview_lines = wrap_display_text(item.preview, width)[:4]
+            # Reserve two preview rows even when the selected message is short.
+            preview_rows = max(2, len(preview_lines))
+            date_lines = wrap_display_text(
+                self.text["held_since"].format(since=item.since, deadline=item.deadline),
+                width,
+            )
+            warning_lines = wrap_display_text(self.text["held_warning"], width)
+            details_rows = (
+                1 + preview_rows + len(date_lines) + len(warning_lines)
+                + bool(self.error) + footer_rows
+            )
+            list_rows = max(1, height - 2 - details_rows)
+            visible_count = min(len(self.items), list_rows)
+            self.offset = min(
+                max(0, len(self.items) - visible_count),
+                max(min(self.offset, self.cursor), self.cursor - visible_count + 1),
+            )
+            first = self.offset + 1
+            last = min(len(self.items), self.offset + visible_count)
+            position = f"{'↑' if self.offset else ''}{first}-{last}/{len(self.items)}"
+            if last < len(self.items):
+                position += "↓"
+            context = self.text["held_context"].format(count=len(self.items))
+            add(0, f"{context} · {position}", self.theme.style(bold=True))
+            row = 2
+            for index in range(self.offset, last):
                 item = self.items[index]
                 state = self.text[f"held_{item.state}"]
-                add(row, self.text["held_item"].format(
-                    sender=item.sender, recipient=item.recipient, state=state
-                ), curses.A_REVERSE if index == self.cursor else 0)
+                marker = "›" if index == self.cursor else " "
+                add(
+                    row,
+                    f"{marker} " + self.text["held_item"].format(
+                        sender=item.sender, recipient=item.recipient, state=state,
+                    ),
+                    self.theme.style(
+                        bold=index == self.cursor, selected=index == self.cursor,
+                    ),
+                )
+                row += 1
+            row += 1
+            for offset, line in enumerate(preview_lines):
+                add(row + offset, line)
+            row += preview_rows
+            for line in date_lines:
+                add(row, line)
+                row += 1
+            for line in warning_lines:
+                add(row, line, self.theme.style("warning"))
+                row += 1
+            if self.error:
+                draw_status(content, row, 0, width, self.error, self.theme, kind="error")
+                row += 1
+            draw_footer(content, row, 0, width, hints, self.theme, max_rows=2)
         try:
             curses.curs_set(0)
         except curses.error:

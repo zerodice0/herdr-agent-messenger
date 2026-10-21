@@ -36,6 +36,7 @@ from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import repository_identity
 from ham.ledger.store import LedgerError, LedgerStore, ledger_directory
 from ham.ledger.views import status_board
+from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, footer_lines
 from ham.ui.terminal_text import (character_index_at_display_column, display_width,
                            pad_display_text, truncate_display_text,
                            wrap_display_text, wrap_message_lines)
@@ -830,7 +831,7 @@ class MailboxApp:
         self.cursor_position: tuple[int, int] | None = None
         self.hit_map: list[tuple[tuple[int, int, int, int], str, Any]] = []
         self.input_scroll: int | None = None
-        self.colors_enabled = False
+        self.theme = Theme({"NO_COLOR": ""})
         self.quick_send, self.running = quick_send, True
 
     def set_status(self, message: str, level: str = "info") -> None:
@@ -1197,7 +1198,8 @@ class MailboxApp:
         self.save_draft()
         if self.start_job("mutation", operation, **request):
             self.submitted = {"key": self.draft_key, "version": self.draft_version,
-                              "identity": self.identity(request["recipient"]), "operation": operation}
+                              "identity": self.identity(request["recipient"]), "operation": operation,
+                              "recipient": self.address(request["recipient"]), "kind": self.mail_kind}
             self.input_error = ""
 
     def finish_send(self, value: Mapping[str, Any], error: Any) -> None:
@@ -1227,8 +1229,24 @@ class MailboxApp:
             self.set_status("Direct acceptance ≠ native delivery." if submitted["operation"] == "direct"
                             else "Message queued in the mailbox.")
             if self.quick_send and cleared and not any(draft["text"].strip() for draft in self.drafts.values()):
+                if submitted["operation"] == "send":
+                    self.notify_queued(submitted)
                 self.running = False
         self.result_tags[submitted["identity"]] = (tag, self.clock() + 10)
+
+    def notify_queued(self, submitted: Mapping[str, Any]) -> None:
+        """Let the existing notification helper finish outside the closing UI."""
+        body = f"Queued · {submitted.get('recipient', 'recipient')} · {submitted.get('kind', 'action').upper()}"
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c",
+                 "import sys; from ham.ui.messenger import show_notification; show_notification(sys.argv[1])",
+                 body],
+                env=self.environment, cwd=str(PLUGIN_ROOT), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except OSError:
+            pass
 
     @staticmethod
     def address(agent: Mapping[str, Any] | None) -> str:
@@ -1795,6 +1813,17 @@ class MailboxApp:
             self.hit_map.append((rect, target, value))
 
     def mouse_key(self, event: key_input.MouseEvent) -> None:
+        root = self.screen
+        if self.quick_send:
+            rect = content_rect(*root.getmaxyx(), 120)
+            self.screen = rect.window(root)
+            event = key_input.MouseEvent(event.row - rect.y, event.column - rect.x, event.action)
+        try:
+            self.mouse_content(event)
+        finally:
+            self.screen = root
+
+    def mouse_content(self, event: key_input.MouseEvent) -> None:
         height, width = self.screen.getmaxyx()
         if self.mode == "viewer":
             if self.environment.get("HAM_MAILBOX_NO_MOUSE"):
@@ -1897,43 +1926,16 @@ class MailboxApp:
                 self.choose_agent() if region == "agents" else self.reply()
 
     def initialize_colors(self) -> None:
-        self.colors_enabled = False
-        if "NO_COLOR" in self.environment:
-            return
-        try:
-            if not curses.has_colors():
-                return
-            curses.start_color()
-            try:
-                curses.use_default_colors()
-                background = -1
-            except curses.error:
-                background = curses.COLOR_BLACK
-            for pair, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN,
-                                                curses.COLOR_YELLOW, curses.COLOR_RED), 1):
-                curses.init_pair(pair, foreground, background)
-            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
-            for pair, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN,
-                                                curses.COLOR_YELLOW, curses.COLOR_RED), 6):
-                curses.init_pair(pair, foreground, curses.COLOR_WHITE)
-            self.colors_enabled = True
-        except curses.error:
-            pass
+        self.theme = Theme(self.environment)
 
-    def style(self, pair: int = 0, attribute: int = 0) -> int:
-        return attribute | (curses.color_pair(pair) if pair and self.colors_enabled else 0)
+    def style(self, role: str = "text", attribute: int = 0) -> int:
+        return self.theme.style(role) | attribute
 
     def selection_style(self) -> int:
-        return self.style(5) if self.colors_enabled else curses.A_REVERSE
+        return self.theme.style("selection")
 
     def state_style(self, state: str, *, stale: bool = False, selected: bool = False) -> int:
-        pair = {"working": 3, "idle": 2, "done": 1, "blocked": 4}.get(state, 0)
-        attribute = curses.A_BOLD if pair and not stale else curses.A_DIM
-        if selected and self.colors_enabled:
-            return self.style(5 + pair if pair and not stale else 5, attribute)
-        if selected:
-            attribute |= curses.A_REVERSE
-        return self.style(0 if stale else pair, attribute)
+        return self.theme.turn_style(state, stale=stale, selected=selected)
 
     def put(self, row: int, column: int, text: str, attribute: int = 0) -> None:
         height, width = self.screen.getmaxyx()
@@ -1952,7 +1954,8 @@ class MailboxApp:
     def box(self, rect: tuple[int, int, int, int], title: str, focused: bool = False,
             warning: bool = False) -> tuple[int, int, int, int]:
         y, x, height, width = rect
-        attr = self.style(3 if warning else 1 if focused else 0, curses.A_BOLD if focused else curses.A_DIM)
+        attr = self.style("warning" if warning else "accent" if focused else "text",
+                          curses.A_BOLD if focused else curses.A_DIM)
         if height < 2 or width < 2:
             return y, x, 0, 0
         self.put(y, x, "┌" + "─" * (width - 2) + "┐", attr)
@@ -1972,29 +1975,34 @@ class MailboxApp:
             return "CHECK" if self.settings_picker["field"] == "members" else "PICK"
         return self.mode.upper()
 
-    def footer_hints(self) -> list[str]:
+    def footer_hints(self) -> list[Hint]:
         if self.mode == "viewer":
-            return ["↑↓ scroll", "t technical", "Esc close"]
+            return [Hint("Esc", "Close", 0), Hint("↑↓", "Scroll"), Hint("t", "Technical")]
         if self.mode == "input":
-            return ["Enter send", "^G action/fyi", "Shift+Enter / Alt+Enter newline",
-                    "Esc keep draft", "^D direct", "F1 help", "^R refresh"]
+            return [Hint("Enter", "Send", 0), Hint("Shift+Enter", "Newline", 1),
+                    Hint("Esc", "Keep draft", 2), Hint("Ctrl+G", "Action/FYI", 3),
+                    Hint("F1", "Help", 4), Hint("Ctrl+D", "Direct"), Hint("Ctrl+R", "Refresh")]
         if self.mode == "confirm":
-            return ["Enter choose", "Tab/←→ select", "Esc cancel", "↑↓ scroll"]
+            return [Hint("Esc", "Cancel", 0), Hint("Enter", "Choose"), Hint("Tab/←→", "Select"), Hint("↑↓", "Scroll")]
         if self.mode == "evidence":
-            return ["Enter review", "Esc cancel", "←→ edit"]
+            return [Hint("Esc", "Cancel", 0), Hint("Enter", "Review"), Hint("←→", "Edit")]
         if self.mode == "settings":
             if self.settings_picker is not None:
-                return ["↑↓ select", "Space toggle", "Enter save", "Esc cancel"] if (
-                    self.settings_picker["field"] == "members") else ["↑↓ select", "Enter save", "Esc cancel"]
+                hints = [Hint("Esc", "Cancel", 0), Hint("↑↓", "Select"), Hint("Enter", "Save")]
+                return hints + ([Hint("Space", "Toggle")] if self.settings_picker["field"] == "members" else [])
             if self.settings_numeric is not None:
-                return ["Digits only", "Enter save", "Esc cancel", "←→ cursor"]
-            return ["↑↓ select", "Enter pick/save", "←→ adjust", "m main", "Space member", "Esc discard/close"]
+                return [Hint("Esc", "Cancel", 0), Hint("Enter", "Save"), Hint("←→", "Cursor"), Hint("", "Digits only")]
+            return [Hint("Esc", "Discard/close", 0), Hint("↑↓", "Select"), Hint("Enter", "Pick/save"),
+                    Hint("←→", "Adjust"), Hint("m", "Main"), Hint("Space", "Member")]
         if self.mode == "help":
-            return ["Esc close", "↑↓ scroll", "PgUp/PgDn", "F1 close"]
-        context = (["Space view", "Enter send"] if self.focus == "agents" else
-                   ["Space view", "Enter reply", "w withdraw", "t retry", "a/n recover"] if self.focus == "threads" else
-                   ["↑↓ scroll", "PgUp/PgDn"] + (["t technical"] if self.technical_supported() else []))
-        return context + ["Tab focus", "? help", "s settings", "r refresh", "e errors", "q close"]
+            return [Hint("Esc", "Close", 0), Hint("F1", "Close", 1), Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")]
+        context = ([Hint("Space", "View"), Hint("Enter", "Send")] if self.focus == "agents" else
+                   [Hint("Space", "View"), Hint("Enter", "Reply"), Hint("w", "Withdraw"),
+                    Hint("t", "Retry"), Hint("a/n", "Recover")] if self.focus == "threads" else
+                   [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")] +
+                   ([Hint("t", "Technical")] if self.technical_supported() else []))
+        return [Hint("q", "Close", 0), Hint("F1", "Help", 1)] + context + [
+            Hint("Tab", "Focus"), Hint("s", "Settings"), Hint("r", "Refresh"), Hint("e", "Errors")]
 
     def side_by_side_width(self) -> int:
         # Each half needs its own two border cells. Use the same full-column
@@ -2009,6 +2017,8 @@ class MailboxApp:
         # Reserve six Detail content rows plus its notice and borders, while
         # keeping at least eight rows in the list after INPUT is reserved.
         detail_height = min(height - 8, max(9, round(height * .4)))
+        if self.quick_send:
+            detail_height = min(detail_height, 9)
         top_height = height - detail_height
         detail = (top + top_height, 0, detail_height, width)
         if width < self.side_by_side_width():
@@ -2029,13 +2039,15 @@ class MailboxApp:
             if index:
                 self.put(y, column, " │ ", curses.A_DIM)
                 column += 3
-            label = region.title()
-            attr = self.style(1, curses.A_BOLD) if region == active else curses.A_DIM
+            label = ("› " if self.quick_send and self.mode == "nav" and region == self.focus else "") + region.title()
+            attr = self.style("accent", curses.A_BOLD) if region == active and not (
+                self.quick_send and self.mode == "input") else curses.A_DIM
             self.put(y, column, label, attr)
             self.add_hit((y, column, 1, len(label)), "list-tab", region)
             column += len(label)
         if detail:
-            self.put(y, column, " · Detail", self.style(1, curses.A_BOLD))
+            self.put(y, column, " · Detail", self.style("accent", curses.A_BOLD) if not (
+                self.quick_send and self.mode == "input") else curses.A_DIM)
 
     def format_time(self, value: float | None, now: float) -> str:
         """Repaint relative ages only when their displayed unit changes."""
@@ -2056,9 +2068,19 @@ class MailboxApp:
             self.render()
 
     def render(self) -> None:
+        root = self.screen
+        root.erase()
+        if self.quick_send:
+            rect = content_rect(*root.getmaxyx(), 120)
+            self.screen = rect.window(root)
+        try:
+            self.render_content()
+        finally:
+            self.screen = root
+
+    def render_content(self) -> None:
         self.dirty = False
         self.next_age_refresh = float("inf")
-        self.screen.erase()
         self.cursor_position = None
         self.hit_map.clear()
         if self.mode == "viewer":
@@ -2072,14 +2094,13 @@ class MailboxApp:
         repo = self.repo_id or "all repositories"
         short_repo = Path(repo).name
         self.put(0, 5, truncate_display_text(short_repo, max(0, right - 6)), curses.A_DIM)
-        self.put(0, right, word, self.style(1, curses.A_BOLD))
-        hints = ""
-        for hint in self.footer_hints():
-            candidate = hints + ("  ·  " if hints else "") + hint
-            if display_width(candidate) <= max(0, width - 1):
-                hints = candidate
-        self.put(height - 1, 0, hints, curses.A_DIM)
-        bottom = height - 1
+        self.put(0, right, word, self.style("accent", curses.A_BOLD))
+        hints = self.footer_hints()
+        max_footer_rows = 2 if self.quick_send else 1
+        footer_rows = len(footer_lines(hints, max(0, width - 1), max_footer_rows))
+        draw_footer(self.screen, height - footer_rows, 0, max(0, width - 1), hints, self.theme,
+                    max_rows=max_footer_rows)
+        bottom = height - footer_rows
         input_visible = self.layout != "tiny" and self.input_active()
         notice = self.receiver_notice()
         status = self.status if not (input_visible and self.status == self.input_error) else ""
@@ -2092,7 +2113,7 @@ class MailboxApp:
             elif notice and display_width(text + " · " + notice) <= max(0, width - 1):
                 text += " · " + notice
             self.put(bottom, 0, text,
-                     self.style(4 if error else 0, curses.A_BOLD if error or notice else 0))
+                     self.style("error" if error else "text", curses.A_BOLD if error or notice else 0))
         if self.layout == "tiny":
             self.put(min(2, height - 2), 0, "Resize terminal", curses.A_BOLD)
         else:
@@ -2105,13 +2126,19 @@ class MailboxApp:
                 rows = min(max(3, body_height // 3), max(3, len(lines)))
                 warning = bool(self.recipient and not self.recipient.get("extension_present"))
                 input_height = rows + 2 + int(warning) + int(bool(self.input_error))
+                if self.quick_send and self.mode == "input":
+                    input_height = max(10, input_height)
                 input_height = min(input_height, max(3 + int(bool(self.input_error)), body_height - 3))
                 bottom -= input_height
                 input_rect = (bottom, 0, input_height, width)
             for region, rect in self.region_rects(1, max(0, bottom - 1), width).items():
                 self.add_hit(rect, "region", region)
                 tabs = self.layout == "single" or (self.layout == "tabbed" and region != "detail")
-                inner = self.box(rect, "" if tabs else region.title(), self.focus == region)
+                title = "" if tabs else region.title()
+                active = self.focus == region and not (self.quick_send and self.mode == "input")
+                if self.quick_send and self.mode == "nav" and active and title:
+                    title = "› " + title
+                inner = self.box(rect, title, active)
                 if tabs:
                     self.render_list_tabs(rect, detail=region == "detail")
                 if region == "agents":
@@ -2267,7 +2294,7 @@ class MailboxApp:
             return
         agents = self.agents()
         columns = self.agent_columns(width, agents)
-        header_style = self.style(1, curses.A_BOLD)
+        header_style = self.style("accent", curses.A_BOLD)
         headers = {"alias": "ALIAS", "turn": "   TURN" if columns[0][1] == 11 else "",
                    "mail": "MAIL", "rx": "RX", "role": "ROLE", "phone": "PHN",
                    "emu": "EMU", "server": "SRV", "summary": "PHASE · SUMMARY"}
@@ -2308,7 +2335,7 @@ class MailboxApp:
             if group:
                 lines.append((self.column_text(headers, columns), -3, header_style, False))
             if host in self.remote_errors:
-                lines.append((self.remote_errors[host], -1, self.style(3, curses.A_DIM), False))
+                lines.append((self.remote_errors[host], -1, self.style("warning"), False))
             previous_group: Any = object()
             previous_workspace: Any = object()
             for index, agent in group:
@@ -2325,7 +2352,7 @@ class MailboxApp:
                     name = (Path(group_key).name if other_repos else
                             self.workspace_label(host, anchor, members))
                     label = "  " + truncate_display_text(name, max(0, width - 2 - display_width(suffix))) + suffix
-                    lines.append((label, -4, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
+                    lines.append((label, -4, self.style("accent", curses.A_BOLD) if current else curses.A_DIM, False))
                     previous_group = group_key
                     previous_workspace = object()
                 if not other_repos and workspace != anchor and workspace != previous_workspace:
@@ -2335,12 +2362,12 @@ class MailboxApp:
                     suffix = f" (worktree) · {len(members)}" + (" · current" if current else "")
                     name = self.workspace_label(host, workspace, members)
                     label = "    " + truncate_display_text(name, max(0, width - 4 - display_width(suffix))) + suffix
-                    lines.append((label, -5, self.style(1, curses.A_BOLD) if current else curses.A_DIM, False))
+                    lines.append((label, -5, self.style("accent", curses.A_BOLD) if current else curses.A_DIM, False))
                 previous_workspace = workspace
                 chosen = index == self.selections["agents"]
                 marker = "▌" if chosen and self.focus == "agents" else " "
                 turn = agent.get("turn_state") or "unknown"
-                glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
+                glyph = self.theme.turn_label(turn).split()[0]
                 receiver = agent.get("extension_present")
                 rx = "?" if agent.get("stale") or receiver is None else "✓" if receiver else "⚠"
                 values = {"alias": agent.get("alias") or agent["terminal_id"],
@@ -2370,7 +2397,7 @@ class MailboxApp:
             if _index >= 0:
                 agent = agents[_index]
                 turn = agent.get("turn_state") or "unknown"
-                glyph = {"working": "●", "done": "✓", "idle": "○", "blocked": "!"}.get(turn, "?")
+                glyph = self.theme.turn_label(turn).split()[0]
                 chosen = _index == self.selections["agents"]
                 offset = 0
                 counts = {"mail": "?" if agent.get("stale") else str(agent.get("unread", "?")),
@@ -2398,25 +2425,25 @@ class MailboxApp:
     def thread_state(self, state: str, *, direct: bool = False) -> tuple[str, str]:
         """Use one-cell ASCII cues; direct acceptance is never a native receipt."""
         glyph, palette = {
-            "pending": (".", "working"), "queued": (".", "working"),
-            "submitting": (">", "working"),
-            "delivering": ("?", "working"), "unknown": ("?", "working"),
-            "accepted": ("+", "idle"), "delivered": ("+", "idle"),
-            "handled": ("=", "done"),
-            "failed": ("!", "blocked"), "undeliverable": ("!", "blocked"),
-            "withdrawn": ("-", "unknown"),
-        }.get(state, ("?", "unknown"))
+            "pending": (".", "activity"), "queued": (".", "activity"),
+            "submitting": (">", "activity"),
+            "delivering": ("?", "warning"), "unknown": ("?", "warning"),
+            "accepted": ("+", "success"), "delivered": ("+", "success"),
+            "handled": ("=", "accent"),
+            "failed": ("!", "error"), "undeliverable": ("!", "error"),
+            "withdrawn": ("-", "muted"),
+        }.get(state, ("?", "muted"))
         label = "UNCERTAIN delivering" if state == "delivering" else state
         return f"{glyph} {'DIRECT ' if direct else ''}{label}", palette
 
     def thread_kind(self, kind: str) -> tuple[str, str]:
-        return {"fyi": ("i fyi", "done"), "action": ("! action", "working")}.get(
-            kind, (f"? {kind}", "unknown"))
+        return {"fyi": ("i fyi", "accent"), "action": ("! action", "activity")}.get(
+            kind, (f"? {kind}", "muted"))
 
     def outbox_operation(self, kind: str) -> tuple[str, str]:
         """Outbox kinds describe transport operations, not FYI/action mail kinds."""
         glyph = {"message": ">", "receipt": "<", "setting": "#", "withdraw": "-"}.get(kind, "?")
-        return f"{glyph} {kind}", "done" if kind in {"message", "receipt", "setting", "withdraw"} else "unknown"
+        return f"{glyph} {kind}", "accent" if kind in {"message", "receipt", "setting", "withdraw"} else "muted"
 
     def message_sender(self, message: Mapping[str, Any]) -> str:
         sender = str(message.get("sender_label") or "—")
@@ -2460,7 +2487,7 @@ class MailboxApp:
                 metadata = f"{kind} · {participants} · {state}"
             elif item["type"] == "direct":
                 state, palette = self.thread_state(item["acceptance"], direct=True)
-                kind, kind_palette = "> direct", "done"
+                kind, kind_palette = "> direct", "accent"
                 title = item.get("subject") or (item.get("body") or "Terminal input").splitlines()[0]
                 metadata = f"{kind} · user → {self.address(item.get('target'))} · acceptance ≠ native delivery"
             else:
@@ -2481,11 +2508,11 @@ class MailboxApp:
                 state, palette, kind, kind_palette = accents[_index]
                 label, tone = (state, palette) if _primary else (kind, kind_palette)
                 chosen = _index == self.selections["threads"]
-                label_style = (self.selection_style() | curses.A_BOLD if chosen and self.colors_enabled
-                               else self.state_style(tone, selected=chosen))
+                label_style = (self.selection_style() | curses.A_BOLD if chosen
+                               else self.style(tone, curses.A_BOLD))
                 if self.thread_handled(items[_index]):
                     label_style = ((self.selection_style() | curses.A_BOLD) if chosen else
-                                   (self.state_style(tone) & ~curses.A_BOLD) | curses.A_DIM)
+                                   self.style(tone) | curses.A_DIM)
                 self.put(row, x + 2, clip(label, width - 2), label_style)
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", self.identity(items[_index]))
@@ -2539,7 +2566,7 @@ class MailboxApp:
                     (header(message, index, len(messages), self.message_sender(message),
                             str(message.get("recipient_address") or "—")), curses.A_BOLD),
                     (summary,
-                     self.state_style("working" if message.get("confirmation_source") == "operator" else palette)
+                     self.style("warning" if message.get("confirmation_source") == "operator" else palette)
                      | curses.A_BOLD),
                     (message["body"], 0)])
                 if self.detail_technical:
@@ -2554,14 +2581,14 @@ class MailboxApp:
                 (header(item, 1, 1, str(item.get("sender") or "—"), self.address(item.get("target"))),
                  curses.A_BOLD),
                 (state + " · acceptance ≠ native delivery/handled",
-                 self.state_style(palette) | curses.A_BOLD),
+                 self.style(palette) | curses.A_BOLD),
                 (item.get("body") or "", 0)]
         elif item.get("type") == "outbox":
             state, palette = self.thread_state(item["state"])
             kind, _ = self.outbox_operation(item["kind"])
             result = [
                 (f"OUTBOX {state} · Transport operation: {kind}",
-                 self.state_style(palette) | curses.A_BOLD),
+                 self.style(palette) | curses.A_BOLD),
                 (f"→ {item.get('target_host') or '—'} · transport, NOT native ACK",
                  curses.A_BOLD)]
             # Outbox stores a JSON string: only accept's nested immutable message is mail.
@@ -2799,17 +2826,17 @@ class MailboxApp:
         if direct:
             title = "DIRECT · " + title + " · may interrupt; acceptance ≠ native delivery"
         else:
-            title = f"[{self.mail_kind.upper()} ^G] " + title
+            title = f"[{self.mail_kind.upper()} Ctrl+G] " + title
         y, x, height, width = self.box(rect, title, True, direct)
         x, width = x + 1, width - 1
         if height <= 0 or width <= 0:
             return
         if self.recipient and not self.recipient.get("extension_present") and height - int(bool(self.input_error)) > 1:
             self.put(y, x, truncate_display_text(
-                "⚠ native receiver absent — message will wait in the mailbox", width), self.style(3))
+                "⚠ native receiver absent — message will wait in the mailbox", width), self.style("warning"))
             y, height = y + 1, height - 1
         if self.input_error and height > 1:
-            self.put(y + height - 1, x, truncate_display_text(self.input_error, width), self.style(4))
+            self.put(y + height - 1, x, truncate_display_text(self.input_error, width), self.style("error"))
             height -= 1
         before = self.body[:self.body_cursor]
         logical = self.body.split("\n")
@@ -2887,7 +2914,7 @@ class MailboxApp:
     def render_overlay(self, body: tuple[int, int, int, int]) -> None:
         body_y, body_x, height, width = body
         if self.mode == "help":
-            context = ["INPUT: Enter send · ^G action/fyi · Shift+Enter / Alt+Enter newline · Esc keep draft · ^D direct · ^R refresh"
+            context = ["INPUT: Enter send · Ctrl+G action/fyi · Shift+Enter / Alt+Enter newline · Esc keep draft · Ctrl+D direct · Ctrl+R refresh"
                        if self.help_return == "input" else " / ".join(self.footer_hints_for_nav())]
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
@@ -2990,7 +3017,7 @@ class MailboxApp:
             button_row = y + rows - (2 if self.mode == "evidence" else 1)
             if button_row >= y:
                 self.put(button_row, x, truncate_display_text(cancel + "   " + accept, columns),
-                         self.style(1, curses.A_BOLD))
+                         self.style("accent", curses.A_BOLD))
                 self.add_hit((button_row, x, 1, min(columns, display_width(cancel))), "button", 0)
                 button_x = x + display_width(cancel) + 3
                 self.add_hit((button_row, button_x, 1,

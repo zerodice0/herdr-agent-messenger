@@ -109,6 +109,11 @@ class FakeCursesWindow:
             raise curses.error("cursor outside fake window")
         self.move_calls.append((row, column))
 
+    def addstr(
+        self, row: int, column: int, value: str, attribute: int = 0
+    ) -> None:
+        self.addnstr(row, column, value, len(value), attribute)
+
     def addnstr(
         self,
         row: int,
