@@ -38,7 +38,7 @@ The last command prints the packaged canonical skill path. Project installs are 
 
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
-- **OMP adapter:** native receiving and eligible automatic action wake.
+- **OMP adapter:** native receiving and eligible action/flagged turn-end FYI wake.
 - **Claude hooks:** native receiving at turn boundaries, with no idle wake.
 - **Codex:** skill-guided inbox pull; no adapter is needed.
 
@@ -140,9 +140,9 @@ not evidence of a missing skill or a general Claude authentication failure.
 ## Mailbox commands and identity
 
 Use the mailbox to leave durable messages without injecting a prompt into a busy
-agent. Receiving runtimes may admit them at a natural user boundary; only eligible
-OMP action mail can cause an automatic turn under the rules below. Run from a
-registered Herdr agent pane:
+agent. Receiving runtimes may admit them at a natural user boundary; eligible
+OMP action mail or flagged turn-end FYI can cause an automatic turn under the
+rules below. Run from a registered Herdr agent pane:
 
 ```bash
 HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
@@ -993,3 +993,20 @@ herdr agent rename <pane-id> yellow-falcon
 ```
 
 Herdr must be installed and running locally and on every selected SSH host. Remote hosts must be concrete aliases in configured SSH config (normally `~/.ssh/config`).
+
+## Test isolation
+
+Run the local Python suite from the checkout root:
+
+```bash
+python3 -m unittest -v
+```
+
+Each Python test module imports `ham_test_support` before product modules. Its
+test-only tripwire rejects attempts to bootstrap the runner's default ledger
+(including HOME, XDG state, an inherited ledger override, and the account's real
+home), before any directory or schema is created. Even a caught tripwire fails
+the responsible test. Fixtures must supply a private ledger directory or private
+HOME/XDG environment to every code path they exercise; an explicit private
+`LedgerStore` alone does not isolate incidental stores opened by other helpers.
+The guard is not imported by production commands.

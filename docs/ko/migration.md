@@ -2,6 +2,12 @@
 
 한국어 · [English](../migration.md) · [README](../../README.ko.md)
 
+## 요구 사항
+
+- 참여하는 모든 호스트에 Herdr 0.8.0 이상이 필요합니다.
+- Herdr 호스트에는 Python 3.10 이상이 필요합니다.
+- 선택 사항인 SSH 배포 도구 `rollout_plugin.py`는 Python 3.11 이상을 사용합니다.
+
 ## 새로 설치
 
 공개 GitHub 저장소에서 HAM을 설치하고 활성화합니다.
@@ -16,8 +22,11 @@ herdr plugin install zerodice0/herdr-agent-messenger --yes
 herdr plugin link "$PWD" --enabled
 ```
 
+플러그인 표시 이름은 **HAM**이며 ID는 `herdr.agent-messenger`입니다.
 기존 이름 없는 에이전트는 **Assign Agent Label** 액션으로 라벨을 지정할 수
-있습니다. 설치 후 감지되는 에이전트에는 자동으로 라벨이 붙습니다.
+있습니다. 설치 후 감지되는 이름 없는 에이전트에는 `blue-otter` 같은
+`color-animal` 라벨과 그에 맞는 색상 표시를 자동으로 붙입니다.
+사용자가 직접 붙인 에이전트 이름은 변경하지 않습니다.
 
 ### 수신 의존성
 

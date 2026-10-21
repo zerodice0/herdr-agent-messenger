@@ -2,6 +2,12 @@
 
 [한국어](ko/migration.md) · English · [README](../README.md)
 
+## Requirements
+
+- Herdr 0.8.0 or newer on every participating host.
+- Python 3.10 or newer on Herdr hosts.
+- Python 3.11 or newer to run the optional `rollout_plugin.py` SSH deployment helper.
+
 ## New installation
 
 Install and enable HAM from the public GitHub repository:
@@ -16,8 +22,10 @@ For local development, link a checkout instead:
 herdr plugin link "$PWD" --enabled
 ```
 
-Existing unnamed agents can be labeled with **Assign Agent Label**. Agents
-detected after installation are labeled automatically.
+The plugin's display name is **HAM** and its ID is `herdr.agent-messenger`.
+Existing unnamed agents can be labeled with **Assign Agent Label**. Unnamed
+agents detected after installation receive `color-animal` labels such as
+`blue-otter`, with matching color markers. Manually named agents are left unchanged.
 
 ### Receiving dependency
 
