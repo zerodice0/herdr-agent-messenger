@@ -536,7 +536,7 @@ on `status list`. Legacy `status --address HOST/LABEL` remains a recipient read.
 
 Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)** or **HAM: Mailbox
 (quick send)** from the command palette (`mailbox-split` / `mailbox-tab` /
-`mailbox-popup`, plugin `herdr.agent-messenger`). The popup closes after a
+`mailbox-popup`, plugin `herdr.agent-messenger`). The quick-send overlay closes after a
 successful send result; failed sends keep input open. Actions do not change
 global `prefix+m`; optionally bind one only after upgrading all hosts.
 Reuse checks stable pane/terminal IDs, not display labels. The split action reuses
@@ -544,7 +544,11 @@ the registered mailbox only in the opener's tab; otherwise it opens and register
 a right split, closing the old mailbox only if its visible first line contains
 `NAV ·`. The tab action still reuses the workspace's mailbox across tabs.
 `q` closes only the owned view, confirming before discarding nonempty drafts.
-At top level, Esc closes only a popup; in input/overlays it backs out.
+At top level, Esc closes only the quick-send overlay; in input/dialogs it backs out.
+Quick send, messenger, Held Messages, and HAM Skill use Herdr's temporary zoom
+overlay, restoring prior focus/zoom on close. HAM sets no width/height or layout
+probe; the minimum stays Herdr 0.8.0. Existing `mailbox-popup` IDs are unchanged.
+See [placement rationale and upstream sources](ui-reference.md#herdr-overlay-placement).
 
 Responsive **Agents**, **Threads**, and read-only **Detail** regions replace
 exclusive screens. Below 80 columns or 18 rows only the focused region appears;
@@ -873,7 +877,7 @@ Compact spawn results contain `address`, palette `marker`, `created` (`pane`/`ta
 
 ### GUI routes
 
-The popup's coordinator prompt supplies an absolute CLI path and host-qualified addresses, so it works even without a globally installed skill. For GUI selections supplied as opaque route tokens, follow the supplied `--route` commands directly; do not decode or modify tokens or replace them with guessed Herdr commands. Compact results use addresses rather than exposing routes; `--verbose` includes routes for diagnostic/GUI-style routing. If `route_refreshed: true`, retain the returned token. Refresh is allowed only when conservative continuity checks identify one safe current occupant; otherwise report `route_expired`. See [route safety](ssh-and-routing.md#route-safety).
+The overlay's coordinator prompt supplies an absolute CLI path and host-qualified addresses, so it works even without a globally installed skill. For GUI selections supplied as opaque route tokens, follow the supplied `--route` commands directly; do not decode or modify tokens or replace them with guessed Herdr commands. Compact results use addresses rather than exposing routes; `--verbose` includes routes for diagnostic/GUI-style routing. If `route_refreshed: true`, retain the returned token. Refresh is allowed only when conservative continuity checks identify one safe current occupant; otherwise report `route_expired`. See [route safety](ssh-and-routing.md#route-safety).
 
 ## Legacy request lifecycle and exit codes
 
@@ -883,11 +887,11 @@ For policy-permitted existing-agent prompt traffic, prefer `request` to lower-le
 
 Agent-initiated CLI `request`, `send`, and `batch` deliveries are held when the recipient pane is focused in Herdr. Self-send fails immediately with `recipient_is_sender` before any focus check, even when the sender pane is focused; it is never held. HAM cannot inspect the input box: focus is a safeguard, not typing detection. The request is `deferred`, with `submitted: false`, until focus leaves before the defer deadline. A background worker then delivers it, even if the original CLI wait has ended. A held `send` returns immediately with a `request_id` and exit 3, regardless of `--wait`.
 
-If the pane stays focused for `--defer-timeout` (default `180000` milliseconds, or 3 minutes), the request becomes `awaiting_decision` and HAM sends a Herdr notification. Open **HAM: Held Messages** from the command palette, select a request with Up/Down, and choose **Push** (`p`) or **Cancel** (`c`); `q` or Esc closes the popup. Push can combine the message with unsent text in that pane. Cancel ends the request as `submission_failed`, with phase and `error_code` `delivery_cancelled` and `submitted: false`. **After the timeout, held messages never auto-push, even when focus later leaves.** You must choose Push or Cancel.
+If the pane stays focused for `--defer-timeout` (default `180000` milliseconds, or 3 minutes), the request becomes `awaiting_decision` and HAM sends a Herdr notification. Open **HAM: Held Messages** from the command palette, select a request with Up/Down, and choose **Push** (`p`) or **Cancel** (`c`); `q` or Esc closes the overlay. Push can combine the message with unsent text in that pane. Cancel ends the request as `submission_failed`, with phase and `error_code` `delivery_cancelled` and `submitted: false`. **After the timeout, held messages never auto-push, even when focus later leaves.** You must choose Push or Cancel.
 
 After deferred delivery or Push, the worker observes the submitted request about every 0.5 seconds until it becomes terminal or 30 minutes have passed since submission. Use `request-status` to read the saved result; after that limit, the command can still advance observation. The worker exits only when no deferred, awaiting-decision, or watched requests remain.
 
-HAM popup direct sends and coordinator delegation are user-initiated and are never held. Known limitation: typing a draft and then switching panes without submitting can still merge that draft with an incoming message.
+HAM overlay direct sends and coordinator delegation are user-initiated and are never held. Known limitation: typing a draft and then switching panes without submitting can still merge that draft with an incoming message.
 
 For SSH recipients, HAM checks focus on the recipient's host. The hold queue, worker, and **HAM: Held Messages** live on the **sender host**. Timeout notifications are sent to both hosts; the recipient-side notification names the sender host so you know where to decide. If the recipient disappears or is replaced before delivery, HAM fails the undelivered request rather than sending to the replacement.
 
@@ -1007,7 +1011,7 @@ Update the source-backed installation with:
 git -C "$HOME/.local/share/ham" pull --ff-only
 ```
 
-Plugin-free HAM retains address/label request, wait, read, batch, and `spawn` routing; `spawn` chooses and registers its new session's label. It does not supply the popup, command-palette installer, automatic labeling of unrelated detected agents, or the agent-detected hook. Existing unnamed agents may be assigned unique names explicitly:
+Plugin-free HAM retains address/label request, wait, read, batch, and `spawn` routing; `spawn` chooses and registers its new session's label. It does not supply the overlays, command-palette installer, automatic labeling of unrelated detected agents, or the agent-detected hook. Existing unnamed agents may be assigned unique names explicitly:
 
 ```bash
 herdr api snapshot

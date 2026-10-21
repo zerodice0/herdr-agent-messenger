@@ -479,66 +479,6 @@ class AgentMessengerTest(unittest.TestCase):
             app.search = query
             self.assertEqual(app.filtered_agents(), [recipient])
 
-    def test_estimated_recipient_counts_include_remote_cache_groups(self):
-        sender = agent()
-        local = agent(name="white-bison", pane_id="w1:p2", session_id="local-2")
-        cache = mock.Mock()
-        remote = {
-            "macbook-pro": [
-                agent_directory.replace(
-                    agent(
-                        name="purple-koala",
-                        pane_id="w2:p1",
-                        session_id="remote-1",
-                        workspace_id="w2",
-                    ),
-                    host="macbook-pro",
-                    local=False,
-                ),
-                agent_directory.replace(
-                    agent(
-                        name="brown-fox",
-                        pane_id="w2:p2",
-                        session_id="remote-2",
-                        workspace_id="w2",
-                    ),
-                    host="macbook-pro",
-                    local=False,
-                ),
-            ],
-            "winmini": [
-                agent_directory.replace(
-                    agent(
-                        name="orange-lemur",
-                        pane_id="w3:p1",
-                        session_id="remote-3",
-                        workspace_id="w3",
-                    ),
-                    host="winmini",
-                    local=False,
-                )
-            ],
-        }
-        cache.agents.side_effect = remote.get
-        with (
-            mock.patch.object(
-                agent_messenger.AgentCache,
-                "from_environment",
-                return_value=cache,
-            ),
-            mock.patch.object(
-                agent_messenger,
-                "ssh_hosts",
-                return_value=["macbook-pro", "winmini"],
-            ),
-        ):
-            counts = agent_messenger.estimated_recipient_counts(
-                [sender, local],
-                sender,
-                {},
-            )
-        self.assertEqual(counts, (4, 6))
-
     def test_focused_pane_id_prefers_plugin_context(self):
         environment = {
             "HERDR_PLUGIN_CONTEXT_JSON": '{"focused_pane_id":"w2:p3"}',
@@ -551,13 +491,13 @@ class AgentMessengerTest(unittest.TestCase):
         with (
             mock.patch.object(agent_messenger, "query_local_agents", return_value=[]),
             mock.patch.object(agent_messenger, "show_notification", return_value=True) as notify,
-            mock.patch.object(agent_messenger, "launch_popup") as popup,
+            mock.patch.object(agent_messenger, "launch_overlay") as overlay,
         ):
             self.assertEqual(agent_messenger.launch(environment), 0)
         self.assertIn("No agent is running", notify.call_args.args[0])
-        popup.assert_not_called()
+        overlay.assert_not_called()
 
-    def test_launch_opens_popup_for_focused_agent(self):
+    def test_launch_opens_overlay_for_focused_agent(self):
         environment = {"HERDR_PANE_ID": "w1:p1", "LANG": "en_US.UTF-8"}
         sender = agent()
         recipient = agent(name="white-bison", pane_id="w1:p2", session_id="session-2")
@@ -567,88 +507,95 @@ class AgentMessengerTest(unittest.TestCase):
                 "query_local_agents",
                 return_value=[sender, recipient],
             ),
-            mock.patch.object(agent_messenger, "launch_popup", return_value=True) as popup,
-            mock.patch.object(
-                agent_messenger,
-                "estimated_recipient_counts",
-                return_value=(1, 0),
-            ),
+            mock.patch.object(agent_messenger, "launch_overlay", return_value=True) as overlay,
         ):
             self.assertEqual(agent_messenger.launch(environment), 0)
-        popup.assert_called_once_with(
-            "w1:p1",
+        overlay.assert_called_once_with("w1:p1", environment)
+
+    def test_launch_overlay_opens_messenger_without_sizing_or_layout_query(self):
+        environment = {"HERDR_PANE_ID": "w1:p1"}
+        with mock.patch.object(agent_messenger, "run_herdr",
+                               return_value=mock.Mock(returncode=0)) as run:
+            self.assertTrue(agent_messenger.launch_overlay("w1:p1", environment))
+        run.assert_called_once_with(
+            ["plugin", "pane", "open", "--plugin", agent_messenger.PLUGIN_ID,
+             "--entrypoint", "messenger", "--placement", "overlay", "--focus",
+             "--env", f"{agent_messenger.SENDER_PANE_ENV}=w1:p1"],
             environment,
-            recipient_count=1,
-            group_count=0,
         )
 
-    def test_launch_popup_height_scales_with_known_recipients(self):
-        completed = mock.Mock(returncode=0)
-        with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
-            self.assertTrue(
-                agent_messenger.launch_popup("w1:p1", {}, recipient_count=4)
-            )
-        arguments = run.call_args.args[0]
-        self.assertEqual(arguments[arguments.index("--width") + 1], "120")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "17")
-        self.assertEqual(agent_messenger.desired_popup_height(0), 15)
-        self.assertEqual(agent_messenger.desired_popup_height(50), 32)
+    def test_overlay_keeps_original_sender_when_it_gets_its_own_pane_id(self):
+        sender = agent()
+        environment = {
+            "HERDR_PANE_ID": "w1:overlay",
+            "HERDR_ACTIVE_PANE_ID": "w1:overlay",
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"pane_id":"w1:overlay"}',
+            agent_messenger.SENDER_PANE_ENV: sender.pane_id,
+        }
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender) as fetch,
+            mock.patch.object(agent_messenger.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(agent_messenger.sys.stdout, "isatty", return_value=True),
+            mock.patch.object(agent_messenger, "terminal_flow_control_disabled"),
+            mock.patch.object(agent_messenger.curses, "wrapper", side_effect=lambda run: run(mock.Mock())),
+            mock.patch.object(agent_messenger, "MessengerApp") as app,
+        ):
+            app.return_value.run.return_value = 0
+            app.return_value.open_skill_installer = False
+            self.assertEqual(agent_messenger.overlay(environment), 0)
+        fetch.assert_called_once_with(sender.pane_id, environment)
+        self.assertEqual(app.call_args.args[1:], (sender, environment))
 
-    def test_popup_expands_for_large_viewport(self):
-        layout = mock.Mock(
-            returncode=0,
-            stdout=(
-                '{"result":{"layout":{"area":{"width":293,"height":84}}}}'
-            ),
-        )
-        opened = mock.Mock(returncode=0, stdout="")
-        with mock.patch.object(
-            agent_messenger,
-            "run_herdr",
-            side_effect=[layout, opened],
-        ) as run:
-            self.assertTrue(
-                agent_messenger.launch_popup("w1:p1", {}, recipient_count=25)
-            )
-        arguments = run.call_args_list[-1].args[0]
-        self.assertEqual(arguments[arguments.index("--width") + 1], "120")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "32")
-
-    def test_popup_dimensions_fit_small_viewport(self):
-        layout = mock.Mock(
-            returncode=0,
-            stdout=(
-                '{"result":{"layout":{"area":{"width":80,"height":29}}}}'
-            ),
-        )
-        opened = mock.Mock(returncode=0, stdout="")
-        with mock.patch.object(
-            agent_messenger,
-            "run_herdr",
-            side_effect=[layout, opened],
-        ) as run:
-            self.assertTrue(
-                agent_messenger.launch_popup("w1:p1", {}, recipient_count=50)
-            )
-        arguments = run.call_args_list[-1].args[0]
-        self.assertEqual(arguments[arguments.index("--width") + 1], "72")
-        self.assertEqual(arguments[arguments.index("--height") + 1], "23")
-
-    def test_legacy_skill_guide_action_opens_interactive_skill_popup(self):
-        completed = mock.Mock(returncode=0)
-        with mock.patch.object(agent_messenger, "run_herdr", return_value=completed) as run:
-            self.assertEqual(agent_messenger.launch_skill_guide({}), 0)
-        arguments = run.call_args.args[0]
-        self.assertEqual(
-            arguments[arguments.index("--entrypoint") + 1],
+    def test_overlay_ctrl_g_handoff_preserves_sender_project(self):
+        sender = agent_directory.replace(agent(), cwd="/work/opener")
+        environment = {
+            "HERDR_PANE_ID": "w1:overlay",
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"workspace":{"cwd":"/plugin/root"}}',
+            agent_messenger.SENDER_PANE_ENV: sender.pane_id,
+        }
+        with (
+            mock.patch.object(agent_messenger, "fetch_local_agent", return_value=sender),
+            mock.patch.object(agent_messenger.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(agent_messenger.sys.stdout, "isatty", return_value=True),
+            mock.patch.object(agent_messenger, "terminal_flow_control_disabled"),
+            mock.patch.object(agent_messenger.curses, "wrapper", side_effect=lambda run: run(mock.Mock())),
+            mock.patch.object(agent_messenger, "MessengerApp") as app,
+            mock.patch.object(agent_messenger, "launch_plugin_overlay", return_value=True) as launch_overlay,
+        ):
+            app.return_value.run.return_value = 0
+            app.return_value.open_skill_installer = True
+            self.assertEqual(agent_messenger.overlay(environment), 0)
+        launch_overlay.assert_called_once_with(
             agent_messenger.SKILL_INSTALLER_ENTRYPOINT,
+            environment={**environment, agent_messenger.SKILL_PROJECT_ROOT_ENV: sender.cwd},
+            extra_arguments=("--env", f"{agent_messenger.SKILL_PROJECT_ROOT_ENV}={sender.cwd}"),
         )
-        self.assertEqual(arguments[arguments.index("--width") + 1], "60")
-        self.assertEqual(
-            arguments[arguments.index("--height") + 1],
-            str(agent_messenger.SKILL_INSTALLER_HEIGHT),
+
+    def test_legacy_skill_guide_action_opens_installer_overlay_with_project_context(self):
+        environment = {
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"workspace":{"cwd":"/work/opener"}}',
+        }
+        with mock.patch.object(agent_messenger, "run_herdr",
+                               return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(agent_messenger.launch_skill_guide(environment), 0)
+        run.assert_called_once_with(
+            ["plugin", "pane", "open", "--plugin", agent_messenger.PLUGIN_ID,
+             "--entrypoint", "skill-installer", "--placement", "overlay", "--focus",
+             "--env", f"{agent_messenger.SKILL_PROJECT_ROOT_ENV}=/work/opener"],
+            environment,
         )
         self.assertTrue(agent_messenger.bundled_skill_path().is_file())
+
+    def test_launch_held_opens_overlay_without_sizing_or_agent_requirement(self):
+        environment = {"HERDR_PANE_ID": "w1:shell"}
+        with mock.patch.object(agent_messenger, "run_herdr",
+                               return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(agent_messenger.launch_held(environment), 0)
+        run.assert_called_once_with(
+            ["plugin", "pane", "open", "--plugin", agent_messenger.PLUGIN_ID,
+             "--entrypoint", "held", "--placement", "overlay", "--focus"],
+            environment,
+        )
 
     def test_language_detection_supports_three_locales(self):
         self.assertEqual(messenger_i18n.detect_language({"LANG": "en_US.UTF-8"}), "en")
@@ -767,7 +714,7 @@ class AgentMessengerTest(unittest.TestCase):
             all(not attribute & agent_messenger.curses.A_REVERSE for attribute in keycaps)
         )
 
-    def test_ctrl_g_exits_messenger_to_open_interactive_skill_popup(self):
+    def test_ctrl_g_exits_messenger_to_open_interactive_skill_overlay(self):
         sender = agent()
         with tempfile.TemporaryDirectory() as state_directory:
             environment = {
@@ -819,7 +766,7 @@ class AgentMessengerTest(unittest.TestCase):
         self.assertFalse(app.open_skill_installer)
         self.assertEqual(app.message_lines, ["Can you review?"])
 
-    def test_skill_guide_wraps_long_paths_inside_popup(self):
+    def test_skill_guide_wraps_long_paths_inside_overlay(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (14, 42)
         with mock.patch.object(agent_messenger.curses, "curs_set"):
@@ -1989,7 +1936,7 @@ class HeldMessagesTest(unittest.TestCase):
         self.assertFalse(app.running)
         delivery.decide.assert_not_called()
 
-    def test_popup_does_not_require_a_focused_agent(self):
+    def test_overlay_does_not_require_a_focused_agent(self):
         delivery = mock.Mock()
         delivery.held_messages.return_value = []
         screen = mock.Mock()
@@ -2003,7 +1950,7 @@ class HeldMessagesTest(unittest.TestCase):
             mock.patch.object(agent_messenger.curses, "curs_set"),
             mock.patch.object(agent_messenger, "fetch_local_agent") as fetch,
         ):
-            self.assertEqual(agent_messenger.popup_held({"LANG": "en_US.UTF-8"}), 0)
+            self.assertEqual(agent_messenger.overlay_held({"LANG": "en_US.UTF-8"}), 0)
         fetch.assert_not_called()
 
 

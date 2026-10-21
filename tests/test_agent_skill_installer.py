@@ -412,23 +412,41 @@ class AgentSkillInstallerTest(unittest.TestCase):
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "mine")
 
-    def test_launch_opens_a_responsive_installer_popup(self):
+    def test_launch_opens_installer_overlay(self):
         with mock.patch.object(
             agent_skill_installer,
-            "launch_plugin_popup",
+            "launch_plugin_overlay",
             return_value=True,
-        ) as launch_popup:
+        ) as launch_overlay:
             self.assertEqual(agent_skill_installer.launch({"LANG": "ko_KR.UTF-8"}), 0)
 
-        launch_popup.assert_called_once_with(
+        launch_overlay.assert_called_once_with(
             agent_skill_installer.SKILL_INSTALLER_ENTRYPOINT,
-            width=60,
-            height=22,
             environment={"LANG": "ko_KR.UTF-8"},
             extra_arguments=(),
         )
 
-    def test_popup_arrow_selection_installs_the_highlighted_target(self):
+    def test_overlay_launcher_preserves_project_when_child_context_changes(self):
+        environment = {
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"workspace":{"cwd":"/work/opener"}}',
+        }
+        with mock.patch.object(agent_skill_installer, "launch_plugin_overlay",
+                               return_value=True) as launch_overlay:
+            self.assertEqual(agent_skill_installer.launch(environment), 0)
+        root = Path("/work/opener").resolve()
+        launch_overlay.assert_called_once_with(
+            agent_skill_installer.SKILL_INSTALLER_ENTRYPOINT,
+            environment=environment,
+            extra_arguments=("--env", f"{agent_skill_installer.SKILL_PROJECT_ROOT_ENV}={root}"),
+        )
+        child = {
+            "HERDR_PANE_ID": "w1:overlay",
+            "HERDR_PLUGIN_CONTEXT_JSON": '{"workspace":{"cwd":"/plugin/root"}}',
+            agent_skill_installer.SKILL_PROJECT_ROOT_ENV: str(root),
+        }
+        self.assertEqual(agent_skill_installer.project_root(child), root)
+
+    def test_overlay_arrow_selection_installs_the_highlighted_target(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (22, 60)
         screen.get_wch.side_effect = [curses.KEY_DOWN] * 5 + ["\n", "\x1b", "\x1b"]
@@ -447,7 +465,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
             mock.patch.object(agent_skill_installer, "install_target") as install,
         ):
             self.assertEqual(
-                agent_skill_installer.popup(
+                agent_skill_installer.overlay(
                     {"HOME": "/tmp/example-home", "LANG": "en_US.UTF-8"}
                 ),
                 0,
@@ -471,7 +489,7 @@ class AgentSkillInstallerTest(unittest.TestCase):
             mock.patch.object(agent_skill_installer.curses, "has_colors", return_value=False),
         ):
             self.assertEqual(
-                agent_skill_installer.popup(
+                agent_skill_installer.overlay(
                     {"HOME": "/tmp/example-home", "LANG": "en_US.UTF-8"}
                 ),
                 0,
@@ -584,7 +602,7 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
                 if key == "already_current":
                     self.assertNotIn("Skill installed", self.rendered(screen))
 
-    def test_popup_passes_accurate_skill_result_to_runtime_offer(self):
+    def test_overlay_passes_accurate_skill_result_to_runtime_offer(self):
         for current in (True, False):
             with self.subTest(current=current):
                 screen = self.screen(["\n", "\n", "\x1b"], size=(40, 160))
@@ -596,7 +614,7 @@ class ReceivingRuntimeConsentTest(unittest.TestCase):
                         mock.patch.object(agent_skill_installer.curses, "has_colors", return_value=False), \
                         mock.patch.object(agent_skill_installer, "installation_status", return_value=status), \
                         mock.patch.object(agent_skill_installer, "install_target") as install:
-                    self.assertEqual(agent_skill_installer.popup(self.environment), 0)
+                    self.assertEqual(agent_skill_installer.overlay(self.environment), 0)
                 rendered = self.rendered(screen)
                 if current:
                     install.assert_not_called()

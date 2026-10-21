@@ -589,10 +589,26 @@ The split action reuses the registered mailbox only in the opener's tab.
 Otherwise it opens and registers a right split, closing the old mailbox only
 when its visible first line contains `NAV ·`; active drafts and overlays stay open.
 The tab action still reuses the workspace's live mailbox across tabs.
-The **HAM: Mailbox (quick send)**
-popup closes after a successful send result. `q` closes only the owned pane or
-popup, confirming before discarding nonempty drafts (default Cancel). Top-level
-Esc closes only popup mode; Esc leaves input/overlays without discarding drafts.
+The **HAM: Mailbox (quick send)** overlay closes after a successful send result.
+`q` closes only the owned pane or overlay, confirming before discarding nonempty
+drafts (default Cancel). Top-level Esc closes only quick-send mode; Esc leaves
+input/dialogs without discarding drafts.
+
+Quick send, messenger, Held Messages, and HAM Skill use official Herdr `overlay`
+placement: temporary zoom that restores the prior focus and zoom when closed.
+HAM sets no manifest width/height, sends no sizing flags, and does not query
+`pane layout --current`. Persistent split/tab mailboxes are unchanged, as are
+the public `mailbox-popup` action and entrypoint IDs. The messenger retains its
+original sender; the installer retains its project root; the mailbox retains
+its repository and opener pane/terminal IDs despite the overlay's own pane ID.
+Held Messages remains host-wide and requires no opener agent.
+
+This follows the [official Panes contract](https://herdr.dev/docs/plugins/#panes)
+and [v0.9.5 overlay implementation](https://github.com/herdrdev/herdr/blob/v0.9.5/src/app/api/plugins/panes.rs);
+[manifest validation](https://github.com/herdrdev/herdr/blob/v0.9.5/src/app/api/plugins/manifest.rs)
+allows dimensions only for `popup`. The minimum remains Herdr **0.8.0** because
+the [v0.8.0 schema](https://github.com/herdrdev/herdr/blob/v0.8.0/src/api/schema/plugins.rs)
+already supports `Overlay`.
 
 Responsive **Agents**, **Threads**, **Detail** regions use stacked lists above
 full-width Detail with at least 80 columns and 18 available body rows. Lists
@@ -1184,13 +1200,13 @@ Creates a labeled interactive session. Optional initial messaging is a single pe
 
 ### Focus-held delivery
 
-Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM popup sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead requires Herdr `turn_state` of `idle` or `done` plus runtime idle/editor/quiet-time admission and ignores pane focus.
+Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM overlay sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead requires Herdr `turn_state` of `idle` or `done` plus runtime idle/editor/quiet-time admission and ignores pane focus.
 
 Self-send fails immediately with `recipient_is_sender`, before any focus check; the sender's focused pane never causes a self-addressed message to be deferred.
 
 The default `--defer-timeout` is 180000 ms. Focus leaving before the deadline permits delivery; expiry while still focused changes to `awaiting_decision`. HAM notifies the sender host and, for remote recipients, the recipient host. The remote notification names the sender host, where **HAM: Held Messages** is available. Notification delivery is not proof that a user has read or decided.
 
-In **HAM: Held Messages**, Up/Down selects, `p` pushes, `c` cancels, and `q`/Esc closes. Push can combine the message with unsent text already in that pane; the popup warns the user. Cancel produces terminal `submission_failed`, phase/error code `delivery_cancelled`, `submitted: false`. The agent must not automatically retry a user cancellation. A vanished/replaced recipient fails before held delivery with its resolver error or `recipient_changed`.
+In **HAM: Held Messages**, Up/Down selects, `p` pushes, `c` cancels, and `q`/Esc closes. Push can combine the message with unsent text already in that pane; the overlay warns the user. Cancel produces terminal `submission_failed`, phase/error code `delivery_cancelled`, `submitted: false`. The agent must not automatically retry a user cancellation. A vanished/replaced recipient fails before held delivery with its resolver error or `recipient_changed`.
 
 After deferred delivery or Push, the worker observes the submitted request about every 0.5 seconds until it is terminal or 30 minutes have passed since submission. Read the saved result with `request-status`; after the worker's observation limit, this command can still advance the request. The worker stays alive while any deferred, awaiting-decision, or watched request remains.
 
@@ -1309,7 +1325,7 @@ python3 -m ham skill-installer install omp --runtime omp
 python3 -m ham skill-installer install all --runtime all
 ```
 
-`all` installs all three user-scope targets. The popup also offers project-scope installs when a project workspace is available. Canonical `SKILL.md`, this `reference.md`, scripts, and agent metadata belong together; do not copy only SKILL.md. The checkout's Claude skill is a pointer to the canonical `.agents` skill; read canonical SKILL.md fully, this reference only on demand. Installed client copies contain the complete canonical bundle.
+`all` installs all three user-scope targets. The overlay also offers project-scope installs when a project workspace is available. Canonical `SKILL.md`, this `reference.md`, scripts, and agent metadata belong together; do not copy only SKILL.md. The checkout's Claude skill is a pointer to the canonical `.agents` skill; read canonical SKILL.md fully, this reference only on demand. Installed client copies contain the complete canonical bundle.
 
 After a successful interactive skill install, the installer shows OMP/Claude
 runtime installation states and offers an explicit missing-runtime choice with

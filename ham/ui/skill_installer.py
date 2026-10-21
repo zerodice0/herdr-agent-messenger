@@ -19,10 +19,8 @@ from ham.ui.messenger import (
     bundled_skill_path,
     decode_json_object,
     display_width,
-    launch_plugin_popup,
+    launch_plugin_overlay,
     SKILL_INSTALLER_ENTRYPOINT,
-    SKILL_INSTALLER_HEIGHT,
-    SKILL_INSTALLER_WIDTH,
     SKILL_PROJECT_ROOT_ENV,
     shortcut_help_spans,
     show_notification,
@@ -463,10 +461,8 @@ def launch(environment: Mapping[str, str] | None = None) -> int:
     extra_arguments: tuple[str, ...] = ()
     if root is not None:
         extra_arguments = ("--env", f"{SKILL_PROJECT_ROOT_ENV}={root}")
-    if launch_plugin_popup(
+    if launch_plugin_overlay(
         SKILL_INSTALLER_ENTRYPOINT,
-        width=SKILL_INSTALLER_WIDTH,
-        height=SKILL_INSTALLER_HEIGHT,
         environment=environment,
         extra_arguments=extra_arguments,
     ):
@@ -476,7 +472,7 @@ def launch(environment: Mapping[str, str] | None = None) -> int:
     return 1
 
 
-def popup(environment: Mapping[str, str] | None = None) -> int:
+def overlay(environment: Mapping[str, str] | None = None) -> int:
     values = dict(os.environ if environment is None else environment)
     text = COPY[detect_language(values)]
     targets = installation_targets(values)
@@ -660,7 +656,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     parser = argparse.ArgumentParser(description="Install the Agent Messenger skill.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("launch")
-    subparsers.add_parser("popup")
+    subparsers.add_parser("overlay")
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("target", choices=("codex", "claude", "omp", "all"))
     install_parser.add_argument("--runtime", choices=("omp", "claude", "all"),
@@ -672,8 +668,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_cli_arguments(argv)
     if arguments.command == "launch":
         return launch()
-    if arguments.command == "popup":
-        return popup()
+    if arguments.command == "overlay":
+        return overlay()
     text = COPY[detect_language()]
     try:
         install_selected(arguments.target)

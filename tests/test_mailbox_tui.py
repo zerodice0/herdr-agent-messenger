@@ -1874,12 +1874,12 @@ class MailboxUiTest(unittest.TestCase):
                 # The next subcase uses the newly reconciled live generation.
                 self.recipient = next(agent for agent in self.registry.list() if agent['terminal_id'] == 'term-b')
 
-    def test_popup_success_closes_and_failed_send_keeps_text(self):
+    def test_quick_send_success_closes_and_failed_send_keeps_text(self):
         for result, successful in [({'state': 'queued'}, True),
                                    ({'acceptance': 'failed', 'evidence': 'Transport rejected'}, False),
                                    ({'error': {'code': 'offline', 'message': 'Peer unavailable'}}, False)]:
             with self.subTest(result=result):
-                app = self.app(popup=True)
+                app = self.app(quick_send=True)
                 app.key('\r')
                 self.type_text(app, 'keep on failure')
                 app.key('\r')
@@ -1892,10 +1892,10 @@ class MailboxUiTest(unittest.TestCase):
                 if successful:
                     self.assertFalse(app.drafts)
 
-    def test_popup_success_preserves_other_nonblank_drafts(self):
+    def test_quick_send_success_preserves_other_nonblank_drafts(self):
         for other_text in ('other draft', ' \n '):
             with self.subTest(other_text=other_text):
-                app = self.app(popup=True)
+                app = self.app(quick_send=True)
                 self.select_agent(app, 'term-a')
                 app.key('\r')
                 self.type_text(app, other_text)
@@ -1910,10 +1910,10 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(app.mode, 'nav')
                 self.assertEqual(app.result_tags[app.identity(app.recipient)][0], 'queued')
 
-    def test_success_keeps_newer_draft_in_input_and_popup_open(self):
-        for popup in (False, True):
-            with self.subTest(popup=popup):
-                app = self.app(popup=popup)
+    def test_success_keeps_newer_draft_in_input_and_quick_send_open(self):
+        for quick_send in (False, True):
+            with self.subTest(quick_send=quick_send):
+                app = self.app(quick_send=quick_send)
                 app.key('\r')
                 self.type_text(app, 'submitted')
                 app.key('\r')
@@ -1978,7 +1978,7 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(app.body, 'pending draft')
                 self.assertEqual(app.input_error, 'Send failed')
 
-    def test_popup_launch_inherits_opener_repository_scope(self):
+    def test_overlay_launch_inherits_opener_repository_scope(self):
         from ham.ui.mailbox import main
         opener = {'pane_id': 'w1:p1', 'terminal_id': 'opener', 'cwd': str(self.root)}
         values = {**self.environment, 'HERDR_PANE_ID': 'w1:p1'}
@@ -1986,13 +1986,40 @@ class MailboxUiTest(unittest.TestCase):
              patch('ham.ui.mailbox.focused_pane_id', return_value='w1:p1'), \
              patch('ham.ui.mailbox.pane_record', return_value=opener), \
              patch('ham.ui.mailbox.repository_identity', return_value={'repo_id': 'opener-repo'}) as identity, \
-             patch('ham.ui.mailbox.agent_messenger.launch_plugin_popup', return_value=True) as popup:
-            self.assertEqual(main(['popup']), 0)
+             patch('ham.ui.mailbox.agent_messenger.launch_plugin_overlay', return_value=True) as overlay:
+            self.assertEqual(main(['overlay']), 0)
         self.assertEqual(identity.call_args.args, (str(self.root), self.store.host))
-        self.assertEqual(popup.call_args.kwargs['extra_arguments'],
-                         ['--env', f'{REPO_ENV}=opener-repo',
-                          '--env', f'{OPENER_PANE}=w1:p1',
-                          '--env', f'{OPENER_TERMINAL}=opener'])
+        overlay.assert_called_once_with(
+            'mailbox-popup', environment=values,
+            extra_arguments=['--env', f'{REPO_ENV}=opener-repo',
+                             '--env', f'{OPENER_PANE}=w1:p1',
+                             '--env', f'{OPENER_TERMINAL}=opener'])
+
+    def test_overlay_pane_keeps_opener_scope_and_skips_persistent_cleanup(self):
+        from ham.ui.mailbox import main
+        values = {
+            **self.environment,
+            'HERDR_PANE_ID': 'overlay:p9',
+            'HERDR_WORKSPACE_ID': 'overlay',
+            'HERDR_PLUGIN_CONTEXT_JSON': '{"pane_id":"overlay:p9"}',
+        }
+        screen = Screen()
+        with patch.dict(os.environ, values, clear=True), \
+             patch('ham.ui.mailbox.sys.stdin.isatty', return_value=True), \
+             patch('ham.ui.mailbox.sys.stdout.isatty', return_value=True), \
+             patch('ham.ui.mailbox.terminal_flow_control_disabled'), \
+             patch('ham.ui.mailbox.curses.wrapper', side_effect=lambda run: run(screen)), \
+             patch('ham.ui.mailbox.MailboxApp') as app, \
+             patch('ham.ui.mailbox.close_owned') as close:
+            app.return_value.run.return_value = 0
+            self.assertEqual(main(['overlay-pane']), 0)
+        app.assert_called_once_with(screen, values, quick_send=True)
+        close.assert_not_called()
+        child = MailboxApp(screen, values, job_factory=PendingJob, quick_send=True)
+        self.assertEqual(child.repo_id, self.repo_id)
+        self.assertEqual(child.settings_context['workspace_id'], 'w1')
+        self.assertEqual(child.environment[OPENER_PANE], 'w1:p1')
+        self.assertEqual(child.environment[OPENER_TERMINAL], 'term-a')
 
     def test_cross_repo_input_preserves_opener_scope_and_pending_snapshot(self):
         app = self.app()
@@ -2515,8 +2542,8 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(snapshot.cells[call.row][0].text, '│')
                 self.assertEqual(snapshot.cells[call.row][1].text, ' ')
 
-    def test_popup_success_does_not_spawn_refresh_jobs_after_exit(self):
-        app = self.app(popup=True)
+    def test_quick_send_success_does_not_spawn_refresh_jobs_after_exit(self):
+        app = self.app(quick_send=True)
         app.local['peers'] = [{'canonical_name': 'peer', 'uuid': 'peer-uuid'}]
         app.key('\r')
         self.type_text(app, 'submitted')
@@ -2657,9 +2684,9 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertEqual(max(y + rows for y, _, rows, _ in regions), bottom)
 
     def test_input_stays_full_width_below_detail_and_can_force_single(self):
-        for popup in (False, True):
-            with self.subTest(popup=popup):
-                app = self.app(popup=popup)
+        for quick_send in (False, True):
+            with self.subTest(quick_send=quick_send):
+                app = self.app(quick_send=quick_send)
                 app.open_input({**self.recipient, 'extension_present': True})
                 self.type_text(app, 'draft')
                 with patch.object(app, 'render_input', wraps=app.render_input) as render_input:
@@ -2735,7 +2762,7 @@ class MailboxUiTest(unittest.TestCase):
                 else:
                     self.assertIn(unittest.mock.call(4), pair.call_args_list)
 
-    def test_nonpopup_success_stays_open_and_marks_recipient_row(self):
+    def test_persistent_view_success_stays_open_and_marks_recipient_row(self):
         app = self.app()
         target = self.select_agent(app)
         app.key('\r')
@@ -2793,12 +2820,12 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(app.mode, 'input')
                     self.assertEqual(app.body, 'retain this draft')
 
-    def test_top_level_escape_only_quits_popup(self):
-        for popup in (False, True):
-            with self.subTest(popup=popup):
-                app = self.app(popup=popup)
+    def test_top_level_escape_only_quits_quick_send(self):
+        for quick_send in (False, True):
+            with self.subTest(quick_send=quick_send):
+                app = self.app(quick_send=quick_send)
                 app.key(ESCAPE)
-                self.assertEqual(app.running, not popup)
+                self.assertEqual(app.running, not quick_send)
 
     def test_quit_with_nonempty_draft_confirms_and_cancel_is_default(self):
         app = self.app()

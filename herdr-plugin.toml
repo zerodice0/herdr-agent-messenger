@@ -22,9 +22,9 @@ command = ["python3", "-m", "ham", "mailbox", "tab"]
 [[actions]]
 id = "mailbox-popup"
 title = "HAM Mailbox (quick send)"
-description = "Quick-send a user FYI from a popup that closes after a successful send."
+description = "Quick-send a user FYI from an overlay that closes after a successful send."
 contexts = ["workspace", "pane"]
-command = ["python3", "-m", "ham", "mailbox", "popup"]
+command = ["python3", "-m", "ham", "mailbox", "overlay"]
 
 [[actions]]
 id = "label-current"
@@ -82,20 +82,20 @@ command = ["python3", "-m", "ham", "cli", "ledger", "event"]
 [[panes]]
 id = "messenger"
 title = "HAM"
-placement = "popup"
-command = ["python3", "-m", "ham", "messenger", "popup"]
+placement = "overlay"
+command = ["python3", "-m", "ham", "messenger", "overlay"]
 
 [[panes]]
 id = "skill-installer"
 title = "HAM Skill"
-placement = "popup"
-command = ["python3", "-m", "ham", "skill-installer", "popup"]
+placement = "overlay"
+command = ["python3", "-m", "ham", "skill-installer", "overlay"]
 
 [[panes]]
 id = "held"
 title = "HAM: Held Messages"
-placement = "popup"
-command = ["python3", "-m", "ham", "messenger", "popup-held"]
+placement = "overlay"
+command = ["python3", "-m", "ham", "messenger", "overlay-held"]
 
 [[panes]]
 id = "mailbox"
@@ -106,5 +106,5 @@ command = ["python3", "-m", "ham", "mailbox", "pane"]
 [[panes]]
 id = "mailbox-popup"
 title = "HAM Mailbox (quick send)"
-placement = "popup"
-command = ["python3", "-m", "ham", "mailbox", "popup-pane"]
+placement = "overlay"
+command = ["python3", "-m", "ham", "mailbox", "overlay-pane"]

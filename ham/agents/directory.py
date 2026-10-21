@@ -831,7 +831,7 @@ class AgentCache:
 
 
 class RemoteDiscovery:
-    """Run bounded SSH probes without blocking the popup input loop."""
+    """Run bounded SSH probes without blocking the overlay input loop."""
 
     def __init__(
         self,

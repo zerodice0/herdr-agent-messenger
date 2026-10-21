@@ -104,6 +104,11 @@ from Herdr's command palette. Only the user changes mode, main, members, and
 wake thresholds in Settings. New repositories default to `auto`; existing
 settings are preserved. See [roles and participation](docs/skill-guide.md#modes-roles-and-public-status).
 
+Quick send, **Send Prompt to Agents**, **Held Messages**, and **HAM Skill** use
+Herdr overlays: temporary zoomed panes that restore the previous focus and zoom
+when closed. HAM does not set their width or height; Herdr 0.8.0+ remains supported.
+See the [overlay behavior and source references](docs/ui-reference.md#herdr-overlay-placement).
+
 ## Mailbox TUI
 
 Select an agent to compose mail or a thread to reply. Each new compose starts

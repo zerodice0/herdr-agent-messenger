@@ -78,22 +78,6 @@ def recipient_workspace_key(agent: AgentRecord) -> tuple[bool, str, str]:
     return agent.local, agent.host, workspace_key
 
 
-def hierarchy_counts(records: Sequence[AgentRecord]) -> tuple[int, int]:
-    """Return agent and hierarchy-header row counts."""
-
-    if not records:
-        return 0, 0
-    host_keys = {recipient_host_key(record) for record in records}
-    workspace_keys = {recipient_workspace_key(record) for record in records}
-    show_host_headers = len(host_keys) > 1 or any(
-        not record.local for record in records
-    )
-    header_count = len(workspace_keys)
-    if show_host_headers:
-        header_count += len(host_keys)
-    return len(records), header_count
-
-
 def build_recipient_view_rows(
     records: Sequence[AgentRecord],
     *,

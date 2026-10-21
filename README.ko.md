@@ -103,6 +103,11 @@ Herdr 명령 팔레트의 **HAM: Mailbox (Right Split)** 또는 **HAM: Mailbox (
 새 저장소의 기본 모드는 `auto`이며 기존 설정은 유지합니다.
 [역할과 참여 설정](docs/ko/skill-guide.md#모드-역할-공개-상태)을 참고하세요.
 
+빠른 전송, **Send Prompt to Agents**, **Held Messages**, **HAM Skill**은 Herdr
+오버레이로 엽니다. 화면을 임시로 확대하고 닫으면 이전 포커스와 확대 상태를
+복원합니다. HAM은 너비·높이를 지정하지 않으며 Herdr 0.8.0 이상을 계속 지원합니다.
+[오버레이 동작과 근거](docs/ko/ui-reference.md#herdr-오버레이-배치)를 참고하세요.
+
 ## Mailbox TUI
 
 에이전트를 선택하면 메일을 작성하고, 대화를 선택하면 답장합니다. 새 작성창은

@@ -778,7 +778,7 @@ class MailboxApp:
     SETTINGS = ("mode", "main", "members", *DEFAULT_THRESHOLDS)
 
     def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job,
-                 clock=time.monotonic, wall_clock=time.time, popup: bool = False):
+                 clock=time.monotonic, wall_clock=time.time, quick_send: bool = False):
         self.screen, self.environment = screen, dict(environment)
         self.repo_id = self.environment.get(REPO_ENV) or None
         self.store = LedgerStore(environment=environment)
@@ -831,7 +831,7 @@ class MailboxApp:
         self.hit_map: list[tuple[tuple[int, int, int, int], str, Any]] = []
         self.input_scroll: int | None = None
         self.colors_enabled = False
-        self.popup, self.running = popup, True
+        self.quick_send, self.running = quick_send, True
 
     def set_status(self, message: str, level: str = "info") -> None:
         self.status, self.status_level = message, level
@@ -1226,7 +1226,7 @@ class MailboxApp:
                    if submitted["operation"] == "direct" else value.get("state") or "queued")
             self.set_status("Direct acceptance ≠ native delivery." if submitted["operation"] == "direct"
                             else "Message queued in the mailbox.")
-            if self.popup and cleared and not any(draft["text"].strip() for draft in self.drafts.values()):
+            if self.quick_send and cleared and not any(draft["text"].strip() for draft in self.drafts.values()):
                 self.running = False
         self.result_tags[submitted["identity"]] = (tag, self.clock() + 10)
 
@@ -1734,7 +1734,7 @@ class MailboxApp:
             if self.diagnostics:
                 self.diagnostics = False
                 self.refresh_detail()
-            elif self.popup:
+            elif self.quick_send:
                 self.request_quit()
         elif key == "q":
             self.request_quit()
@@ -2917,7 +2917,7 @@ class MailboxApp:
                     "If already installed, restart only the selected sessions to register their receiver.",
                     "Mouse: click focus/select; click selected row to send/reply. Wheel scrolls.",
                     "Shift+drag selects terminal text. HAM_MAILBOX_NO_MOUSE=1 disables mouse.",
-                    "Esc closes overlays. Top-level Esc closes popups only."]
+                    "Esc closes dialogs. Top-level Esc closes the quick-send overlay only."]
         elif self.mode == "settings":
             lines = self.settings_lines()
         elif self.mode == "confirm":
@@ -3069,7 +3069,7 @@ class MailboxApp:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HAM mailbox: agents, threads and quick send.")
-    parser.add_argument("command", choices=("split", "tab", "popup", "pane", "popup-pane", "job", "snapshot-worker"))
+    parser.add_argument("command", choices=("split", "tab", "overlay", "pane", "overlay-pane", "job", "snapshot-worker"))
     arguments = parser.parse_args(argv)
     values = dict(os.environ)
     try:
@@ -3078,7 +3078,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command in {"split", "tab"}:
             print(json.dumps(launch(arguments.command, values), ensure_ascii=False))
             return 0
-        if arguments.command == "popup":
+        if arguments.command == "overlay":
             opener_id = focused_pane_id(values)
             if not opener_id:
                 raise LedgerError("opener_unavailable", "Open HAM from a live workspace pane (an agent is not required).")
@@ -3086,8 +3086,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             store = LedgerStore(environment=values)
             cwd = str(opener.get("cwd") or values.get("PWD") or os.getcwd())
             repo_id = repository_identity(cwd, store.host)["repo_id"]
-            return 0 if agent_messenger.launch_plugin_popup(
-                "mailbox-popup", width=120, height=36, environment=values,
+            return 0 if agent_messenger.launch_plugin_overlay(
+                "mailbox-popup", environment=values,
                 extra_arguments=["--env", f"{REPO_ENV}={repo_id}",
                                  "--env", f"{OPENER_PANE}={opener_id}",
                                  "--env", f"{OPENER_TERMINAL}={opener['terminal_id']}"]) else 1
@@ -3103,8 +3103,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
         with terminal_flow_control_disabled(sys.stdin):
             result = curses.wrapper(lambda screen: MailboxApp(
-                screen, values, popup=arguments.command == "popup-pane").run())
-        if arguments.command != "popup-pane":
+                screen, values, quick_send=arguments.command == "overlay-pane").run())
+        if arguments.command != "overlay-pane":
             close_owned(values)
         return result
     except (LedgerError, OSError, ValueError) as error:

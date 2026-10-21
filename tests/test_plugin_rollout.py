@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from unittest import mock
 
 try:
-    import tomllib  # noqa: F401
+    import tomllib
 except ModuleNotFoundError:  # Python 3.10 Herdr hosts run the plugin, not rollout.
     raise unittest.SkipTest("python3 -m ham rollout requires Python 3.11 (tomllib)")
 
@@ -254,6 +254,34 @@ class LegacyMigrationRunner:
 
 
 class PluginRolloutTest(unittest.TestCase):
+    def test_manifest_uses_unsized_overlays_and_keeps_public_actions(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = tomllib.loads((root / "herdr-plugin.toml").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["min_herdr_version"], "0.8.0")
+        panes = {pane["id"]: pane for pane in manifest["panes"]}
+        commands = {
+            "messenger": ["messenger", "overlay"],
+            "skill-installer": ["skill-installer", "overlay"],
+            "held": ["messenger", "overlay-held"],
+            "mailbox-popup": ["mailbox", "overlay-pane"],
+        }
+        for entrypoint, command in commands.items():
+            with self.subTest(entrypoint=entrypoint):
+                pane = panes[entrypoint]
+                self.assertEqual(pane["placement"], "overlay")
+                self.assertEqual(pane["command"], ["python3", "-m", "ham", *command])
+                self.assertNotIn("width", pane)
+                self.assertNotIn("height", pane)
+        self.assertEqual(panes["mailbox"]["placement"], "split")
+        self.assertEqual(panes["mailbox"]["command"], ["python3", "-m", "ham", "mailbox", "pane"])
+        actions = {action["id"]: action for action in manifest["actions"]}
+        self.assertEqual(actions["mailbox-popup"]["command"],
+                         ["python3", "-m", "ham", "mailbox", "overlay"])
+        self.assertEqual(actions["mailbox-split"]["command"],
+                         ["python3", "-m", "ham", "mailbox", "split"])
+        self.assertEqual(actions["mailbox-tab"]["command"],
+                         ["python3", "-m", "ham", "mailbox", "tab"])
+
     def test_selected_hosts_are_explicit_concrete_authorized_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

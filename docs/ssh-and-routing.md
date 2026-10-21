@@ -7,7 +7,7 @@
 HAM shows local agents immediately. When concrete `Host` aliases exist in
 `~/.ssh/config`, remote discovery queries them asynchronously. Only hosts that
 return a valid Herdr snapshot within five seconds are included. Results are
-cached briefly so reopening the popup does not contact every host again.
+cached briefly so reopening the overlay does not contact every host again.
 
 Recursive SSH `Include` files are supported. Probes use non-interactive
 authentication and disable SSH forwarding, agent forwarding, X11 forwarding,

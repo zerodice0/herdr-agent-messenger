@@ -1,4 +1,4 @@
-# HAM mailbox and popup UI reference
+# HAM mailbox and overlay UI reference
 
 [한국어](ko/ui-reference.md) · English · [README](../README.md)
 
@@ -9,8 +9,8 @@ Three command-palette actions are available:
 - **HAM: Mailbox (Right Split)** (`herdr.agent-messenger.mailbox-split`) opens a
   plugin-owned pane to the right of the opener.
 - **HAM: Mailbox (Tab)** (`herdr.agent-messenger.mailbox-tab`) opens that view in a tab.
-- **HAM: Mailbox (quick send)** (`herdr.agent-messenger.mailbox-popup`) opens a
-  popup that closes after a successful send result. A failed send keeps the input open.
+- **HAM: Mailbox (quick send)** (`herdr.agent-messenger.mailbox-popup`) opens an
+  overlay that closes after a successful send result. A failed send keeps the input open.
 
 A shell pane can open any action; the opener does not need to contain an agent.
 These actions do not change keybindings or install a runtime. The right-split
@@ -20,9 +20,35 @@ and registers it instead. The previous mailbox closes only when its visible firs
 line contains `NAV ·`; drafts, confirmations, pickers, and unreadable panes stay open.
 The tab action still focuses the workspace's registered live mailbox in any tab.
 Reuse checks pane/terminal IDs, not display labels.
-`q` closes only the owned mailbox pane or popup. Nonempty drafts require a
+`q` closes only the owned mailbox pane or overlay. Nonempty drafts require a
 discard confirmation, with Cancel selected by default. At top level, `Esc`
-closes a popup but does nothing in split/tab mode; in input or overlays it backs out.
+closes the quick-send overlay but does nothing in split/tab mode; in input or dialogs it backs out.
+
+### Herdr overlay placement
+
+Quick send, **Send Prompt to Agents**, **Held Messages**, and **HAM Skill** use
+the official `overlay` placement. Herdr temporarily zooms the overlay pane and
+restores the previous focus and zoom when it closes. The persistent mailbox's
+right-split/tab placement and reuse behavior are unchanged. The public
+`mailbox-popup` action and pane entrypoint IDs remain stable for existing bindings.
+Unlike the old centered, bounded popup, the overlay fills the active tab's entire
+content area across its split panes, while the sidebar and tab bar remain visible.
+
+HAM sends one `plugin pane open --placement overlay --focus` command without a
+`pane layout --current` probe or `--width`/`--height` flags. No manifest pane
+sizes are set: overlays use Herdr's available pane area, not a floating rectangle
+with HAM-selected dimensions. This matches the public CLI and avoids unsupported
+size configuration. See the official [Panes documentation](https://herdr.dev/docs/plugins/#panes),
+the [v0.9.5 overlay implementation](https://github.com/herdrdev/herdr/blob/v0.9.5/src/app/api/plugins/panes.rs),
+and [manifest size validation](https://github.com/herdrdev/herdr/blob/v0.9.5/src/app/api/plugins/manifest.rs),
+which permits width/height only for `popup`. The minimum stays **Herdr 0.8.0**:
+the [v0.8.0 plugin schema](https://github.com/herdrdev/herdr/blob/v0.8.0/src/api/schema/plugins.rs)
+already defines `Overlay`.
+
+Before opening an overlay, HAM captures the original messenger sender, installer
+project root, or mailbox repository and opener pane/terminal identity as applicable.
+The overlay's own pane ID never replaces that context. Held Messages remains
+host-wide and does not require an agent in the opener.
 
 ### Responsive regions and navigation
 
@@ -102,7 +128,7 @@ CONFIRM/Settings picker bindings.
 | `e` | Show diagnostics (connection errors and pending operations) in Detail. |
 | `r` | Refresh. |
 | `q` | Quit, confirming before discarding nonempty drafts. |
-| `Esc` | Close help/diagnostics/overlays; at top level, quit only in popup mode. |
+| `Esc` | Close help/diagnostics/dialogs; at top level, quit only the quick-send overlay. |
 
 ### Mouse
 
@@ -333,8 +359,8 @@ wakes can include younger FYI; FYI alone needs a reply only if it changes work.
   `Ctrl+R` refreshes without leaving input; `F1` opens help while typing and
   returns to the same input afterwards.
 
-Success closes input and shows a result tag on the agent row; in popup mode it
-also closes the popup. Only the submitted, unchanged draft is cleared: edits
+Success closes input and shows a result tag on the agent row; quick-send mode
+also closes the overlay. Only the submitted, unchanged draft is cleared: edits
 made while a send is pending are retained. Failure leaves the text open with an error.
 
 ### Settings overlay
@@ -519,16 +545,16 @@ value. A differing user rename is preserved. The old `user:pane-recap` token is
 cleared only when the new status/role feature is invoked; this UI does not
 deploy or remove global recap rules.
 
-## Legacy direct-prompt popup
+## Legacy direct-prompt overlay
 
 The existing **Send Prompt to Agents** and **Held Messages** actions remain
-available. The sections below describe that older popup, not mailbox delivery.
+available. The sections below describe that older prompt UI, not mailbox delivery.
 
 ## Open the messenger
 
 Run **Send Prompt to Agents** from a pane containing an agent. The focused agent
 becomes the fixed sender. If no agent is running in the focused pane, HAM shows
-an error notification instead of opening the popup.
+an error notification instead of opening the overlay.
 
 Local agents appear immediately, sorted by Herdr workspace label. Unicode labels
 are preserved and worktree-backed workspaces use a `WT:` prefix. Remote agents
@@ -564,12 +590,12 @@ see each alias and its latest error.
 
 ## Message editor and layout
 
-The popup grows up to 120 columns by 32 rows and shrinks to fit compact
-terminals. Discovered recipients receive most of the available space while at
-least four soft-wrapped message rows remain visible when possible. Long messages
-follow the text cursor and display a viewport scrollbar.
+The overlay uses Herdr's available pane area; HAM does not request a fixed size.
+Discovered recipients receive most of the available space while at least four
+soft-wrapped message rows remain visible when possible. Long messages follow the
+text cursor and display a viewport scrollbar.
 
-Shortcut hints wrap instead of clipping on narrow terminals. The popup inherits
+Shortcut hints wrap instead of clipping on narrow terminals. The overlay inherits
 Herdr's terminal palette. Lifecycle colors remain reserved for working, done,
 blocked, and warning states.
 
@@ -582,7 +608,7 @@ Japanese text cannot spill into the next row.
 
 Cancelling a send preserves confirmed deliveries. Recipients that already
 received the prompt, or whose acceptance is uncertain after an interrupted
-connection, are deselected. The popup identifies uncertain delivery so recipients
+connection, are deselected. The overlay identifies uncertain delivery so recipients
 can be checked before another send. Pending and definitely failed recipients
 remain selected in direct mode.
 
@@ -601,4 +627,4 @@ remain selected in direct mode.
 - `Ctrl+U`: show unavailable remote hosts and their latest errors
 - `Ctrl+G`: open the HAM skill installer and guide
 - `Ctrl+S`: send the prompt
-- `Esc`: go back, cancel pending discovery or sends, then close the popup
+- `Esc`: go back, cancel pending discovery or sends, then close the overlay

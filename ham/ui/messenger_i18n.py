@@ -1,4 +1,4 @@
-"""Localized strings for the Agent Messenger popup."""
+"""Localized strings for the Agent Messenger overlay."""
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_unknown": "unknown",
         "current_agent": "Current agent",
         "no_focused_agent": "No agent is running in the focused pane.",
-        "popup_open_failed": "Could not open Agent Messenger.",
+        "overlay_open_failed": "Could not open Agent Messenger.",
         "sender_unavailable": "The sending agent is no longer available.",
         "no_recipients": "Select at least one recipient.",
         "empty_message": "Enter a message before sending.",
@@ -97,7 +97,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "skill_guide_title": "Agent Skill Guide",
         "skill_guide_intro": (
             "Use the bundled skill to route requests by host and agent label without "
-            "opening this popup."
+            "opening this overlay."
         ),
         "skill_guide_install": (
             "Run 'HAM Skill' from the command palette, or load this file:"
@@ -178,7 +178,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_unknown": "알 수 없음",
         "current_agent": "현재 에이전트",
         "no_focused_agent": "현재 포커스된 창에서 실행 중인 에이전트가 없습니다.",
-        "popup_open_failed": "에이전트 메신저를 열 수 없습니다.",
+        "overlay_open_failed": "에이전트 메신저를 열 수 없습니다.",
         "sender_unavailable": "메시지를 보내는 에이전트를 더 이상 사용할 수 없습니다.",
         "no_recipients": "수신자를 한 명 이상 선택하세요.",
         "empty_message": "전송할 메시지를 입력하세요.",
@@ -278,7 +278,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_unknown": "不明",
         "current_agent": "現在のエージェント",
         "no_focused_agent": "フォーカス中のペインで実行中のエージェントがありません。",
-        "popup_open_failed": "エージェントメッセンジャーを開けませんでした。",
+        "overlay_open_failed": "エージェントメッセンジャーを開けませんでした。",
         "sender_unavailable": "送信元のエージェントは利用できなくなりました。",
         "no_recipients": "送信先を1件以上選択してください。",
         "empty_message": "送信するメッセージを入力してください。",

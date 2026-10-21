@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keyboard-first popup for sending prompts to local and SSH-hosted agents."""
+"""Keyboard-first overlay for sending prompts to local and SSH-hosted agents."""
 
 from __future__ import annotations
 
@@ -60,7 +60,6 @@ from ham.ui.recipient_view import (
     filter_and_sort_agents,
     format_recipient_line,
     group_header_parts,
-    hierarchy_counts,
     recipient_host_key,
     recipient_workspace_key,
     sticky_headers_before,
@@ -83,14 +82,9 @@ from ham.ui.terminal_text import (
 
 
 PLUGIN_ID = "herdr.agent-messenger"
-POPUP_ENTRYPOINT = "messenger"
-POPUP_WIDTH = 120
-POPUP_HEIGHT = 32
+MESSENGER_ENTRYPOINT = "messenger"
 HELD_ENTRYPOINT = "held"
-POPUP_MIN_HEIGHT = 15
 SKILL_INSTALLER_ENTRYPOINT = "skill-installer"
-SKILL_INSTALLER_WIDTH = 60
-SKILL_INSTALLER_HEIGHT = 22
 SKILL_PROJECT_ROOT_ENV = "HERDR_AGENT_SKILL_PROJECT_ROOT"
 SKILL_RELATIVE_PATH = Path(".agents/skills/herdr-agent-messenger/SKILL.md")
 SENDER_PANE_ENV = "HERDR_AGENT_MESSENGER_SENDER_PANE_ID"
@@ -253,19 +247,12 @@ def bundled_skill_path() -> Path:
     return PLUGIN_ROOT / SKILL_RELATIVE_PATH
 
 
-def launch_plugin_popup(
+def launch_plugin_overlay(
     entrypoint: str,
     *,
-    width: int,
-    height: int,
     environment: Mapping[str, str] | None = None,
     extra_arguments: Sequence[str] = (),
 ) -> bool:
-    popup_width, popup_height = responsive_popup_size(
-        width,
-        height,
-        environment,
-    )
     result = run_herdr(
         [
             "plugin",
@@ -276,11 +263,7 @@ def launch_plugin_popup(
             "--entrypoint",
             entrypoint,
             "--placement",
-            "popup",
-            "--width",
-            str(popup_width),
-            "--height",
-            str(popup_height),
+            "overlay",
             "--focus",
             *extra_arguments,
         ],
@@ -289,76 +272,18 @@ def launch_plugin_popup(
     return result.returncode == 0
 
 
-def responsive_popup_size(
-    maximum_width: int,
-    maximum_height: int,
-    environment: Mapping[str, str] | None = None,
-) -> tuple[int, int]:
-    """Fit a popup inside the active Herdr viewport while retaining margins."""
-
-    result = run_herdr(["pane", "layout", "--current"], environment)
-    payload = decode_json_object(result.stdout)
-    result_data = payload.get("result")
-    layout = result_data.get("layout") if isinstance(result_data, dict) else None
-    area = layout.get("area") if isinstance(layout, dict) else None
-    if not isinstance(area, dict):
-        return maximum_width, maximum_height
-    try:
-        available_width = int(area.get("width") or 0)
-        available_height = int(area.get("height") or 0)
-    except (TypeError, ValueError):
-        return maximum_width, maximum_height
-    if available_width <= 0 or available_height <= 0:
-        return maximum_width, maximum_height
-    return (
-        min(maximum_width, max(32, available_width - 8)),
-        min(maximum_height, max(12, available_height - 6)),
-    )
-
-
-def launch_popup(
+def launch_overlay(
     pane_id: str,
     environment: Mapping[str, str] | None = None,
-    *,
-    recipient_count: int = 0,
-    group_count: int = 0,
 ) -> bool:
-    return launch_plugin_popup(
-        POPUP_ENTRYPOINT,
-        width=POPUP_WIDTH,
-        height=desired_popup_height(recipient_count, group_count),
+    return launch_plugin_overlay(
+        MESSENGER_ENTRYPOINT,
         environment=environment,
         extra_arguments=(
             "--env",
             f"{SENDER_PANE_ENV}={pane_id}",
         ),
     )
-
-
-def desired_popup_height(recipient_count: int, group_count: int = 0) -> int:
-    """Size the editor for known local recipients without growing unbounded."""
-
-    visible_rows = min(19, max(2, recipient_count + group_count))
-    return min(POPUP_HEIGHT, max(POPUP_MIN_HEIGHT, 13 + visible_rows))
-
-
-def estimated_recipient_counts(
-    local_agents: Sequence[AgentRecord],
-    sender: AgentRecord,
-    environment: Mapping[str, str],
-) -> tuple[int, int]:
-    """Estimate agent and hierarchy-header rows from current and cached records."""
-
-    records = [
-        record for record in local_agents if record.identity != sender.identity
-    ]
-    cache = AgentCache.from_environment(environment)
-    for host in ssh_hosts(environment):
-        records.extend(cache.agents(host))
-    if not records:
-        return 0, 0
-
-    return hierarchy_counts(records)
 
 
 def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
@@ -371,16 +296,14 @@ def launch_skill_guide(environment: Mapping[str, str] | None = None) -> int:
     extra_arguments: tuple[str, ...] = ()
     if isinstance(project_root, str) and project_root.strip():
         extra_arguments = ("--env", f"{SKILL_PROJECT_ROOT_ENV}={project_root}")
-    if launch_plugin_popup(
+    if launch_plugin_overlay(
         SKILL_INSTALLER_ENTRYPOINT,
-        width=SKILL_INSTALLER_WIDTH,
-        height=SKILL_INSTALLER_HEIGHT,
         environment=environment,
         extra_arguments=extra_arguments,
     ):
         return 0
-    if not show_notification(text["popup_open_failed"], environment):
-        print(text["popup_open_failed"], file=sys.stderr)
+    if not show_notification(text["overlay_open_failed"], environment):
+        print(text["overlay_open_failed"], file=sys.stderr)
     return 1
 
 
@@ -397,19 +320,9 @@ def launch(environment: Mapping[str, str] | None = None) -> int:
         if not show_notification(text["no_focused_agent"], values):
             print(text["no_focused_agent"], file=sys.stderr)
         return 0
-    recipient_count, group_count = estimated_recipient_counts(
-        local_agents,
-        sender,
-        values,
-    )
-    if not launch_popup(
-        pane_id,
-        values,
-        recipient_count=recipient_count,
-        group_count=group_count,
-    ):
-        if not show_notification(text["popup_open_failed"], values):
-            print(text["popup_open_failed"], file=sys.stderr)
+    if not launch_overlay(pane_id, values):
+        if not show_notification(text["overlay_open_failed"], values):
+            print(text["overlay_open_failed"], file=sys.stderr)
         return 1
     return 0
 
@@ -1170,7 +1083,7 @@ class MessengerApp(MessengerRenderMixin):
         return 0
 
 
-def popup(environment: Mapping[str, str] | None = None) -> int:
+def overlay(environment: Mapping[str, str] | None = None) -> int:
     values = dict(os.environ if environment is None else environment)
     text = messages(detect_language(values))
     pane_id = values.get(SENDER_PANE_ENV, "")
@@ -1199,10 +1112,8 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
         installer_values = dict(values)
         if sender.cwd:
             installer_values[SKILL_PROJECT_ROOT_ENV] = sender.cwd
-        if not launch_plugin_popup(
+        if not launch_plugin_overlay(
             SKILL_INSTALLER_ENTRYPOINT,
-            width=SKILL_INSTALLER_WIDTH,
-            height=SKILL_INSTALLER_HEIGHT,
             environment=installer_values,
             extra_arguments=(
                 "--env",
@@ -1216,10 +1127,8 @@ def popup(environment: Mapping[str, str] | None = None) -> int:
 
 
 def launch_held(environment: Mapping[str, str] | None = None) -> int:
-    return 0 if launch_plugin_popup(
+    return 0 if launch_plugin_overlay(
         HELD_ENTRYPOINT,
-        width=POPUP_WIDTH,
-        height=POPUP_HEIGHT,
         environment=environment,
     ) else 1
 
@@ -1353,7 +1262,7 @@ class HeldMessagesApp:
         return 0
 
 
-def popup_held(environment: Mapping[str, str] | None = None) -> int:
+def overlay_held(environment: Mapping[str, str] | None = None) -> int:
     values = dict(os.environ if environment is None else environment)
     text = messages(detect_language(values))
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1400,10 +1309,10 @@ def skill_guide(environment: Mapping[str, str] | None = None) -> int:
 def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send prompts to Herdr agents.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("launch", help="Validate the focused agent and open the popup.")
-    subparsers.add_parser("popup", help="Run the interactive popup.")
+    subparsers.add_parser("launch", help="Validate the focused agent and open the overlay.")
+    subparsers.add_parser("overlay", help="Run the interactive overlay.")
     subparsers.add_parser("held-launch", help="Open held messages.")
-    subparsers.add_parser("popup-held", help="Run the held messages popup.")
+    subparsers.add_parser("overlay-held", help="Run the held messages overlay.")
     subparsers.add_parser("guide-launch", help="Open the bundled agent skill guide.")
     subparsers.add_parser("guide", help="Run the interactive agent skill guide.")
     subparsers.add_parser("skill-path", help="Print the bundled SKILL.md path.")
@@ -1414,12 +1323,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_cli_arguments(argv)
     if arguments.command == "launch":
         return launch()
-    if arguments.command == "popup":
-        return popup()
+    if arguments.command == "overlay":
+        return overlay()
     if arguments.command == "held-launch":
         return launch_held()
-    if arguments.command == "popup-held":
-        return popup_held()
+    if arguments.command == "overlay-held":
+        return overlay_held()
     if arguments.command == "guide-launch":
         return launch_skill_guide()
     if arguments.command == "guide":

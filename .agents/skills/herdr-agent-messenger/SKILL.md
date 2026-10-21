@@ -81,6 +81,8 @@ python3 scripts/herdr_agent_messenger.py spawn \
 
 On each selected host, install/update plugin + skill, then run read-only `runtime status`. Explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude` (or installer `--runtime`). Never overwrite foreign/modified files; restart only user-selected sessions. Confirm `extension_present=1` or report **installed, activation pending**. Plugin/skill files alone do not prove readiness; Codex pull-only absence is normal. Checklist: reference **Client onboarding and installation**; health/ownership: **Receiving runtimes**.
 
+The quick-send mailbox, messenger, held-message view, and HAM Skill installer use Herdr overlays (temporary zoom, restoring prior focus/zoom on close), without width/height settings; minimum Herdr remains 0.8.0. `mailbox-popup` stays the public action ID. Preserve the opener's sender/project/repository context, not the overlay's own pane ID. Reference **Mailbox TUI and operator recovery**.
+
 ## Legacy requests where policy permits
 
 ```bash
