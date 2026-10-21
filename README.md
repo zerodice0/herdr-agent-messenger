@@ -49,8 +49,8 @@ herdr plugin install zerodice0/herdr-agent-messenger --yes
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 ```
 
-Select the client skill and installation scope in **HAM Skill**. From a source
-checkout, `python3 agent_skill_installer.py install all` installs all user-scope
+Select the client skill and installation scope in **HAM Skill**. From the plugin
+root, `python3 -m ham skill-installer install all` installs all user-scope
 skills. Plugin and skill installation alone do not activate native receiving.
 
 Run `runtime status` with the installed skill's CLI on every selected host.
@@ -60,18 +60,17 @@ See [receiving setup](docs/skill-guide.md#receiving-dependency).
 
 For local links, the former repository name, or upgrades from the old
 `herdr.agent-labels` plugin ID, follow [installation and migration](docs/migration.md).
-The current ledger schema is **v10**; upgrade hosts and copied skills together.
+The ledger schema is **v10**; the [package cutover](docs/migration.md#python-package-layout) requires all five hosts together.
 
 ## Quick start
 
-Run these from the plugin checkout in a registered Herdr agent pane. For an
-installed skill, use its absolute `scripts/herdr_agent_messenger.py` path instead.
-Copy a verified address from the board; the names below are examples.
+The module examples deliberately use plugin-root cwd in a registered Herdr pane.
+For caller-relative spawn/file/destination paths, use the absolute copied/bundled `scripts/herdr_agent_messenger.py` launcher from your project cwd instead.
+Copy a verified board address; see [cwd guidance](docs/migration.md#python-package-layout).
 
 ```bash
-HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
-python3 "$HAM_CLI" status board
-python3 "$HAM_CLI" mail send \
+python3 -m ham cli status board
+python3 -m ham cli mail send \
   --to local/purple-deer --kind action --subject 'Review' \
   --body 'Review the authentication change and report concrete findings.'
 ```
@@ -80,9 +79,9 @@ At the recipient's work boundary, read the message and do the relevant work.
 A read does not acknowledge or handle mail.
 
 ```bash
-python3 "$HAM_CLI" inbox read
-python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
-python3 "$HAM_CLI" mail send \
+python3 -m ham cli inbox read
+python3 -m ham cli inbox handle --message MESSAGE_UUID
+python3 -m ham cli mail send \
   --to local/blue-otter --reply-to MESSAGE_UUID --kind fyi \
   --body 'Review complete: no blocking findings.'
 ```
@@ -174,7 +173,8 @@ also supports Herdr without enabling the plugin, with documented limitations.
 ## Test
 
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -s tests -t .
+bun test tests/omp_mailbox_runtime.test.ts
 ```
 
 Tests use private HOME/XDG or ledger fixtures; see

@@ -1,6 +1,6 @@
 # HAM — on-demand reference
 
-Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloads, recovery, and installation. Paths to `scripts/herdr_agent_messenger.py` are relative to this skill directory; use an absolute path when working elsewhere. Messaging runs from the coordinator's active Herdr agent pane (`HERDR_PANE_ID`).
+Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloads, recovery, and installation. Use the absolute copied/bundled `scripts/herdr_agent_messenger.py` launcher from your project cwd: it loads the pinned package from plugin-root cwd, then restores caller cwd with `python3 -m ham --cwd <CALLER_DIRECTORY> cli ...`, preserving local `spawn` defaults and relative `--message-file`, `--body-file`, and `--destination`. The examples' relative launcher paths are relative to this skill directory; do not change cwd just to run them. Messaging runs from the coordinator's active Herdr agent pane (`HERDR_PANE_ID`).
 
 ## Command and flag reference
 
@@ -265,18 +265,17 @@ for both OMP and Claude ownership rules, commands and acceptance limits.
 Use the same protocol-capable checkout on both hosts and retain the existing
 HAM concrete SSH-host allowlist. A peer is a canonical name+UUID with an SSH
 alias and absolute checkout root; aliases remain valid addresses but never
-become canonical host fields. Registration is bidirectional:
+become canonical host fields. Registration is bidirectional; run with cwd set to the plugin root:
 
 ```bash
-HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
-python3 "$HAM_CLI" ledger setup --name alpha
-python3 "$HAM_CLI" ledger doctor
-python3 "$HAM_CLI" ledger peer add --ssh-alias beta-ssh --canonical-name beta
-python3 "$HAM_CLI" ledger peer list
-python3 "$HAM_CLI" mail send --to beta-ssh/blue-owl --body 'Inspect when ready.'
-python3 "$HAM_CLI" ledger outbox --limit 100
-python3 "$HAM_CLI" ledger worker status
-python3 "$HAM_CLI" ledger retry --item OUTBOX_ITEM_UUID
+python3 -m ham cli ledger setup --name alpha
+python3 -m ham cli ledger doctor
+python3 -m ham cli ledger peer add --ssh-alias beta-ssh --canonical-name beta
+python3 -m ham cli ledger peer list
+python3 -m ham cli mail send --to beta-ssh/blue-owl --body 'Inspect when ready.'
+python3 -m ham cli ledger outbox --limit 100
+python3 -m ham cli ledger worker status
+python3 -m ham cli ledger retry --item OUTBOX_ITEM_UUID
 ```
 
 Run the corresponding `setup --name beta` and reverse `peer add` on beta first.
@@ -335,7 +334,7 @@ Installed-but-unregistered sessions and Codex do not trigger this startup notice
 
 #### Wire and settings service
 
-SSH executes `python3 /ABS/CHECKOUT/ledger_cli.py ledger COMMAND`, sending one
+SSH executes `cd /ABS/CHECKOUT && python3 -m ham cli ledger COMMAND`, sending one
 JSON envelope on stdin (1 MiB limit):
 
 ```json
@@ -743,9 +742,26 @@ prefix/header bytes. The review's fixed marker/prefix fixture is now 415 bytes
 for same-repo messages; the example's ` (repo monitor_mobile)` adds 22 UTF-8
 bytes within the same bundle limit.
 
-This source change does not alter the OMP extension or Claude hook; it does not
-require receiver reinstall or session restart. Upgrade the plugin/skill on all
-participating hosts together for the v8 wire support described above.
+The schema-only change above did not require receiver reinstall or restart.
+The Python package cutover does: upgrade **all five hosts together** with traffic
+paused. Protocol **1** is unchanged, but mixed old/new peer executable paths fail.
+Product code is under `ham/`, with integrations in `ham/integrations/{omp,claude}/`;
+the root markers are `ham/__init__.py` and `herdr-plugin.toml`.
+`ham/paths.py` defines `PLUGIN_ROOT`. Herdr manifest actions, receivers, and SSH use
+`cd /ABS/PLUGIN_ROOT && python3 -m ham <dispatch> ...`. External launchers start
+from that root too, passing caller context via `--cwd` before the dispatch name.
+Direct caller-context use:
+`cd /ABS/PLUGIN_ROOT && python3 -m ham --cwd /ABS/CALLER cli ...`.
+Without `--cwd`, relative arguments are plugin-root-relative. Do not use
+`PYTHONPATH` to launch from arbitrary cwd; it permits current-directory shadowing.
+Dispatch names: `cli`, `labels`, `delivery`, `mailbox`, `messenger`,
+`skill-installer`, `worker`, `display`, `rollout`; ledger uses `cli ledger`.
+The public copied skill launcher remains `scripts/herdr_agent_messenger.py`.
+Refresh copied skills and, with operator consent, reinstall `runtime install omp`
+and/or `runtime install claude` on each host where enabled. Restart OMP sessions
+loading the receiver, Claude sessions loading the hook, and HAM workers/TUIs.
+After all hosts upgrade, use `ledger retry --item OUTBOX_ITEM_UUID` for failed
+outbox mail, preserving its IDs; never send a replacement message.
 
 #### Runtime installation and health
 
@@ -1285,12 +1301,12 @@ default. Installation files alone do not prove active receiving.
 From the plugin/source checkout root:
 
 ```bash
-python3 agent_skill_installer.py install all
-python3 agent_skill_installer.py install codex
-python3 agent_skill_installer.py install claude
-python3 agent_skill_installer.py install omp
-python3 agent_skill_installer.py install omp --runtime omp
-python3 agent_skill_installer.py install all --runtime all
+python3 -m ham skill-installer install all
+python3 -m ham skill-installer install codex
+python3 -m ham skill-installer install claude
+python3 -m ham skill-installer install omp
+python3 -m ham skill-installer install omp --runtime omp
+python3 -m ham skill-installer install all --runtime all
 ```
 
 `all` installs all three user-scope targets. The popup also offers project-scope installs when a project workspace is available. Canonical `SKILL.md`, this `reference.md`, scripts, and agent metadata belong together; do not copy only SKILL.md. The checkout's Claude skill is a pointer to the canonical `.agents` skill; read canonical SKILL.md fully, this reference only on demand. Installed client copies contain the complete canonical bundle.

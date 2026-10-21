@@ -6,7 +6,37 @@
 
 - Herdr 0.8.0 or newer on every participating host.
 - Python 3.10 or newer on Herdr hosts.
-- Python 3.11 or newer to run the optional `rollout_plugin.py` SSH deployment helper.
+- Python 3.11 or newer to run the optional `python3 -m ham rollout` SSH deployment helper.
+
+## Python package layout
+
+Product Python code lives under `ham/`: `agents/`, `ledger/`, `ui/`, `ops/`,
+and `integrations/{omp,claude}/`. `ham/paths.py` defines `PLUGIN_ROOT`; the root
+contains both `ham/__init__.py` and `herdr-plugin.toml`. Herdr manifest actions,
+receivers, and SSH execute with plugin-root cwd:
+`cd /ABS/PLUGIN_ROOT && python3 -m ham <dispatch> ...`.
+Dispatch names are `cli`, `labels`, `delivery`, `mailbox`, `messenger`,
+`skill-installer`, `worker`, `display`, and `rollout`; ledger commands use
+`python3 -m ham cli ledger ...`. For caller-relative `spawn`, `--message-file`,
+`--body-file`, or `--destination`, prefer the absolute copied/bundled
+`scripts/herdr_agent_messenger.py` launcher: it discovers the plugin root and
+preserves caller context. It starts `python3 -m ham --cwd <CALLER_DIRECTORY> cli ...`
+with process cwd at the discovered plugin root, so the pinned package loads before
+the dispatcher restores caller cwd. Direct equivalent:
+`cd /ABS/PLUGIN_ROOT && python3 -m ham --cwd /ABS/CALLER cli ...`.
+Without `--cwd`, module execution at the plugin root makes relative arguments
+root-relative. Do not use `PYTHONPATH` to launch from an arbitrary cwd.
+
+This is a **flag-day cutover across all five hosts together**, not a rolling
+upgrade. Protocol **1** and the ledger schema remain unchanged, but mixed old/new
+peer executable paths fail. Stop cross-host traffic and old HAM workers/TUIs,
+upgrade every host, refresh copied skills, and, with operator consent, reinstall
+`runtime install omp` / `runtime install claude` on every host where that runtime
+is enabled. Restart OMP sessions loading the receiver, Claude sessions loading
+the hook, and HAM workers/TUIs before resuming traffic. Retry failed outbox items
+with `python3 -m ham cli ledger retry --item OUTBOX_ITEM_UUID` after every host
+has upgraded; do not send replacement messages. The older schema-only notes
+below do not waive this package cutover's reinstall/restart requirements.
 
 ## New installation
 
@@ -36,17 +66,17 @@ agents detected after installation receive `color-animal` labels such as
 - **Codex:** skill-guided inbox pull, with no adapter required.
 
 For new installs and upgrades, install/update the [client skill](skill-guide.md#install-with-the-plugin),
-then run the read-only summary on **every selected host**:
+then run the read-only summary on **every selected host**, with cwd set to its plugin root:
 
 ```bash
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+python3 -m ham cli runtime status
 # Only with user consent, for each used client (omp or claude):
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+python3 -m ham cli runtime install omp
 ```
 
 Plugin and skill installation alone are not proof of native receiving readiness.
 Missing runtimes require explicit consent: the interactive installer defaults to
-**Not now**, and `agent_skill_installer.py install all --runtime omp|claude|all`
+**Not now**, and `python3 -m ham skill-installer install all --runtime omp|claude|all`
 opts in explicitly. Never replace foreign or modified files. Tell the user which
 sessions need restarting; restart only the sessions they select. After restart,
 confirm `extension_present=1`, or report **installed, activation pending**.
@@ -125,7 +155,7 @@ with mains give `main_ambiguous`. Named `HOST/LABEL` addressing is unchanged.
    deploy the same upgraded code and refresh copied skills together on that host.
    Do not let old and new processes share the upgraded ledger.
 2. From the updated HAM checkout on each host, run
-   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`.
+   `python3 -m ham cli ledger reconcile`.
    Writable reconciliation upgrades older storage to the current schema
    (v10, including v9 workspace metadata). Read-only commands never migrate.
 3. Restart the host's HAM processes with the upgraded code. The OMP extension
@@ -193,7 +223,7 @@ The historical schema-v7 deployment sequence was:
 1. Update the HAM code and copied skills on every host; replace old Mailbox
    panes and restart receiving runtimes/workers with the upgraded code.
 2. On **every host**, run the upgraded skill's command:
-   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`
+   `python3 -m ham cli ledger reconcile`
    from the HAM checkout. This explicit writable step upgrades that host's
    ledger before read-only status or peer exports are used.
 3. Only after every host is upgraded and reconciled, resume cross-host

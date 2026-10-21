@@ -2,14 +2,14 @@
 
 [한국어](ko/rollout.md) · English · [README](../README.md)
 
-`rollout_plugin.py` installs, migrates, or updates HAM on explicitly selected
+`python3 -m ham rollout` installs, migrates, or updates HAM on explicitly selected
 remote Herdr hosts. It accepts only full 40-character commit SHAs and concrete
 SSH aliases authorized by the same SSH config and optional `ssh-hosts` allowlist
 used by Agent Messenger. It never discovers or adds rollout targets itself.
 
 ## Preview
 
-Review the exact commands without opening an SSH connection:
+From the plugin root (cwd), review the exact commands without opening an SSH connection:
 
 The preview includes conditional migration steps. `legacy-disable` runs before
 the new plugin is enabled; legacy removal and its verification run after the new
@@ -17,7 +17,7 @@ plugin passes validation. Those steps execute only when preflight finds the
 legacy installation.
 
 ```bash
-python3 rollout_plugin.py \
+python3 -m ham rollout \
   --host macbook-pro \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --dry-run \
@@ -30,7 +30,7 @@ python3 rollout_plugin.py \
 listed hosts:
 
 ```bash
-python3 rollout_plugin.py \
+python3 -m ham rollout \
   --host macbook-pro \
   --host winmini \
   --ref 0123456789abcdef0123456789abcdef01234567 \
@@ -77,9 +77,10 @@ are:
 - `1`: at least one host rollout or validation failed
 - `2`: approval was missing or preflight input was invalid
 
-The helper updates the Herdr plugin registration, not separately copied Codex or
-Claude skill directories. After a rollout, open **HAM Skill** on that host and
-update any project- or system-installed skill copy.
+The helper updates the Herdr plugin registration, not separately copied skills
+or installed client runtimes. The [package cutover](migration.md#python-package-layout)
+requires all five hosts together, refreshed skills, enabled-runtime reinstalls,
+and receiver/hook session plus HAM worker/TUI restarts before traffic resumes.
 
 For schema v10, upgrade ledger code and CLI/copied skills together before
 resuming enqueue: older CLI code misses the turn-end FYI flag. Existing v9

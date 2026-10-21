@@ -4,6 +4,14 @@
 
 HAM lets Codex, Claude Code, and omp exchange durable mail across repositories, inspect coordination status, and **start new labeled interactive Herdr sessions**. Existing-agent prompt routing remains available where legacy policy permits. The canonical skill name is `herdr-agent-messenger`; **HAM** is its shorter user-facing name.
 
+For caller-relative `spawn`, `--message-file`, `--body-file`, and `--destination`,
+invoke the absolute copied/bundled `scripts/herdr_agent_messenger.py` from your
+project cwd. It loads the pinned package from plugin-root cwd, then restores caller
+cwd through `python3 -m ham --cwd <CALLER_DIRECTORY> cli ...`. For direct use:
+`cd /ABS/PLUGIN_ROOT && python3 -m ham --cwd /ABS/CALLER cli ...`.
+Module examples below deliberately run from the plugin root; relative arguments
+then refer to that root. See [package layout and cwd](migration.md#python-package-layout).
+
 ## Install with the plugin
 
 Open **HAM Skill** from Herdr's command palette, or press `Ctrl+G` in Agent Messenger. Select Codex, Claude, or omp at **System** (user-wide) or **Project** (active Herdr workspace) scope. Press `?` for the invocation guide.
@@ -27,9 +35,9 @@ herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 From the plugin/checkout root, the noninteractive installer accepts `codex`, `claude`, `omp`, or `all` and installs the selected user-scope targets:
 
 ```bash
-python3 agent_skill_installer.py install omp
-python3 agent_skill_installer.py install all
-python3 agent_messenger.py skill-path
+python3 -m ham skill-installer install omp
+python3 -m ham skill-installer install all
+python3 -m ham messenger skill-path
 ```
 
 The last command prints the packaged canonical skill path. Project installs are selected in the interactive installer and use the active Herdr workspace root.
@@ -43,12 +51,12 @@ The last command prints the packaged canonical skill path. Project installs are 
 - **Codex:** skill-guided inbox pull; no adapter is needed.
 
 On **every selected host**, run the read-only health summary after installing or
-updating the plugin and skill:
+updating the plugin and skill, with cwd set to the plugin root:
 
 ```bash
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+python3 -m ham cli runtime status
 # Only after user consent, for each client actually used (omp or claude):
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+python3 -m ham cli runtime install omp
 ```
 
 The summary reports runtime ownership/conflicts in `clients`, active local
@@ -65,8 +73,8 @@ install command, without contaminating stdout. The optional flag is explicit
 consent to install the selected runtime(s), independently of the skill target:
 
 ```bash
-python3 agent_skill_installer.py install omp --runtime omp
-python3 agent_skill_installer.py install all --runtime all
+python3 -m ham skill-installer install omp --runtime omp
+python3 -m ham skill-installer install all --runtime all
 ```
 
 `--runtime` accepts `omp`, `claude`, or `all`; omitting it never installs a
@@ -110,7 +118,7 @@ recipe or native runtime acceptance.
 
 | Check | Observed result |
 | --- | --- |
-| User install | `python3 agent_skill_installer.py install claude`; `/herdr-agent-messenger` appeared as `(user)` outside the checkout. |
+| User install | The user-scope installer (now `python3 -m ham skill-installer install claude` from the plugin root) made `/herdr-agent-messenger` appear as `(user)` outside the checkout. |
 | Project install | **HAM Skill** → **Project / Claude** copied the complete bundle; the command appeared as `(project)` in that project before user installation. |
 | Checkout bridge | With no user copy installed, Claude followed `.claude/skills/herdr-agent-messenger/SKILL.md` and read the canonical `.agents/skills/herdr-agent-messenger/SKILL.md`. |
 | Invocation | User, project, and checkout runs executed the bundled CLI's `list --host local` with exit 0. |
@@ -142,14 +150,13 @@ not evidence of a missing skill or a general Claude authentication failure.
 Use the mailbox to leave durable messages without injecting a prompt into a busy
 agent. Receiving runtimes may admit them at a natural user boundary; eligible
 OMP action or FYI mail can cause an automatic turn under the
-rules below. Run from a registered Herdr agent pane:
+rules below. Run with cwd set to the plugin root in a registered Herdr agent pane:
 
 ```bash
-HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
-python3 "$HAM_CLI" mail send --to local/blue-owl --kind action --body 'Review the boundary.'
-python3 "$HAM_CLI" inbox read
-python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
-python3 "$HAM_CLI" mail show --thread THREAD_UUID
+python3 -m ham cli mail send --to local/blue-owl --kind action --body 'Review the boundary.'
+python3 -m ham cli inbox read
+python3 -m ham cli inbox handle --message MESSAGE_UUID
+python3 -m ham cli mail show --thread THREAD_UUID
 ```
 
 `mail send` requires `--to` and exactly one of `--body` / `--body-file` (UTF-8,
@@ -491,7 +498,7 @@ are superseded.
 Schema v10 adds `deliveries.fyi_turn_end` with default 0. Existing v9 deliveries
 stay conservatively unflagged. Upgrade ledger and CLI/copied skills together;
 older enqueue code can miss the flag. The extension contract is unchanged and
-this policy needs no extension restart. See [turn-end FYI migration](migration.md#turn-end-fyi-schema-v10).
+this schema-only policy needs no extension restart. The [package cutover](migration.md#python-package-layout) separately requires enabled-runtime reinstalls and receiver/hook session plus HAM worker/TUI restarts on all five hosts.
 Delayed idle FYI uses the existing local delivery timestamp: queued FYI becomes
 wake-eligible 300 seconds after local recipient enqueue, including mail already
 queued before the update. No new schema, setting, or data migration is needed.
@@ -1011,13 +1018,14 @@ Herdr must be installed and running locally and on every selected SSH host. Remo
 
 ## Test isolation
 
-Run the local Python suite from the checkout root:
+Run the local Python and Bun suites with cwd set to the plugin checkout root:
 
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -s tests -t .
+bun test tests/omp_mailbox_runtime.test.ts
 ```
 
-Each Python test module imports `ham_test_support` before product modules. Its
+Each Python test module imports `tests.ham_test_support as ham_test_support` before product modules. Its
 test-only tripwire rejects attempts to bootstrap the runner's default ledger
 (including HOME, XDG state, an inherited ledger override, and the account's real
 home), before any directory or schema is created. Even a caught tripwire fails

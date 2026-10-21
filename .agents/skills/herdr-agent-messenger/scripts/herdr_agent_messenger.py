@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import subprocess
@@ -21,7 +20,8 @@ def find_plugin_root(
 ) -> Path:
     source_path = Path(__file__) if script_path is None else script_path
     for bundled_root in source_path.resolve().parents:
-        if (bundled_root / "agent_skill_cli.py").is_file():
+        if ((bundled_root / "ham" / "__init__.py").is_file()
+                and (bundled_root / "herdr-plugin.toml").is_file()):
             return bundled_root
 
     values = os.environ if environment is None else environment
@@ -67,7 +67,8 @@ def find_plugin_root(
         ) as error:
             last_error = error
             continue
-        if (installed_root / "agent_skill_cli.py").is_file():
+        if ((installed_root / "ham" / "__init__.py").is_file()
+                and (installed_root / "herdr-plugin.toml").is_file()):
             return installed_root
 
     if command_error:
@@ -85,9 +86,10 @@ def find_plugin_root(
     raise SystemExit(1) from last_error
 
 
-PLUGIN_ROOT = find_plugin_root()
-sys.path.insert(0, str(PLUGIN_ROOT))
-main = importlib.import_module("agent_skill_cli").main
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    return subprocess.call([sys.executable, "-m", "ham", "--cwd", os.getcwd(), "cli", *arguments],
+                           cwd=find_plugin_root())
 
 
 if __name__ == "__main__":

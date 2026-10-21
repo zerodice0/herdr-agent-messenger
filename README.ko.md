@@ -48,8 +48,8 @@ herdr plugin install zerodice0/herdr-agent-messenger --yes
 herdr plugin action invoke agent-skill-guide --plugin herdr.agent-messenger
 ```
 
-**HAM Skill**에서 클라이언트 스킬과 설치 범위를 고릅니다. 소스 체크아웃에서는
-`python3 agent_skill_installer.py install all`로 사용자 범위의 모든 스킬을 설치합니다.
+**HAM Skill**에서 클라이언트 스킬과 설치 범위를 고릅니다. 플러그인 루트에서는
+`python3 -m ham skill-installer install all`로 사용자 범위의 모든 스킬을 설치합니다.
 플러그인과 스킬만 설치해서는 네이티브 수신이 활성화되지 않습니다.
 
 선택한 각 호스트에서 설치된 스킬의 CLI로 `runtime status`를 실행하세요.
@@ -59,18 +59,17 @@ OMP·Claude 런타임은 **사용자가 동의한 경우에만** 설치하고, �
 
 로컬 체크아웃 연결, 이전 저장소 이름, 구 `herdr.agent-labels` 플러그인 ID에서의
 업그레이드는 [설치 및 마이그레이션](docs/ko/migration.md)을 따르세요.
-현재 원장 스키마는 **v10**입니다. 각 호스트와 복사한 스킬을 함께 갱신하세요.
+원장 스키마는 **v10**이며, [패키지 전환](docs/ko/migration.md#python-패키지-구조)은 다섯 호스트에서 함께 진행해야 합니다.
 
 ## 빠른 시작
 
-등록된 Herdr 에이전트 pane에서 플러그인 체크아웃을 기준으로 실행합니다.
-설치된 스킬을 사용한다면 `scripts/herdr_agent_messenger.py`의 절대 경로로 바꾸세요.
-아래 이름은 예시입니다. 실제 주소는 보드에서 확인한 값을 그대로 사용합니다.
+아래 모듈 예제는 등록된 Herdr pane에서 플러그인 루트를 cwd로 지정해 실행합니다.
+호출자 기준 spawn·파일·설치 경로에는 프로젝트 cwd에서 복사본이나 번들의 `scripts/herdr_agent_messenger.py` 절대 경로를 사용하세요.
+실제 주소는 보드에서 복사하세요. [cwd 안내](docs/ko/migration.md#python-패키지-구조)를 참고하세요.
 
 ```bash
-HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
-python3 "$HAM_CLI" status board
-python3 "$HAM_CLI" mail send \
+python3 -m ham cli status board
+python3 -m ham cli mail send \
   --to local/purple-deer --kind action --subject '검토' \
   --body '인증 변경 사항을 검토하고 구체적인 문제를 알려 주세요.'
 ```
@@ -79,9 +78,9 @@ python3 "$HAM_CLI" mail send \
 조회만으로 메일을 수신 확인하거나 처리하지는 않습니다.
 
 ```bash
-python3 "$HAM_CLI" inbox read
-python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
-python3 "$HAM_CLI" mail send \
+python3 -m ham cli inbox read
+python3 -m ham cli inbox handle --message MESSAGE_UUID
+python3 -m ham cli mail send \
   --to local/blue-otter --reply-to MESSAGE_UUID --kind fyi \
   --body '검토를 마쳤으며, 진행을 막는 문제는 없습니다.'
 ```
@@ -173,7 +172,8 @@ python3 "$HAM_CLI" status board --repo --host local
 ## 테스트
 
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -s tests -t .
+bun test tests/omp_mailbox_runtime.test.ts
 ```
 
 테스트는 전용 HOME/XDG 또는 원장 fixture를 사용합니다.

@@ -10,101 +10,101 @@ id = "mailbox-split"
 title = "HAM: Mailbox (Right Split)"
 description = "Inspect agents, mailbox threads and repository settings, or send a quick FYI."
 contexts = ["workspace", "pane"]
-command = ["python3", "mailbox_tui.py", "split"]
+command = ["python3", "-m", "ham", "mailbox", "split"]
 
 [[actions]]
 id = "mailbox-tab"
 title = "HAM: Mailbox (Tab)"
 description = "Open the workspace's HAM mailbox in a plugin-owned tab."
 contexts = ["workspace", "pane"]
-command = ["python3", "mailbox_tui.py", "tab"]
+command = ["python3", "-m", "ham", "mailbox", "tab"]
 
 [[actions]]
 id = "mailbox-popup"
 title = "HAM Mailbox (quick send)"
 description = "Quick-send a user FYI from a popup that closes after a successful send."
 contexts = ["workspace", "pane"]
-command = ["python3", "mailbox_tui.py", "popup"]
+command = ["python3", "-m", "ham", "mailbox", "popup"]
 
 [[actions]]
 id = "label-current"
 title = "Assign Agent Label"
 description = "Assign a color-animal name to the agent in the focused pane."
 contexts = ["pane"]
-command = ["python3", "agent_labels.py", "label"]
+command = ["python3", "-m", "ham", "labels", "label"]
 
 [[actions]]
 id = "message-agents"
 title = "HAM: Send Prompt to Agents"
 description = "Select agents, then delegate through the coordinator or send directly."
 contexts = ["pane"]
-command = ["python3", "agent_messenger.py", "launch"]
+command = ["python3", "-m", "ham", "messenger", "launch"]
 
 [[actions]]
 id = "held-messages"
 title = "HAM: Held Messages"
 description = "Push or cancel messages held while their recipient was focused."
 contexts = ["workspace", "pane"]
-command = ["python3", "agent_messenger.py", "held-launch"]
+command = ["python3", "-m", "ham", "messenger", "held-launch"]
 
 [[actions]]
 id = "agent-skill-guide"
 title = "HAM Skill"
 description = "Install, update, or learn how to use HAM."
 contexts = ["workspace", "pane"]
-command = ["python3", "agent_skill_installer.py", "launch"]
+command = ["python3", "-m", "ham", "skill-installer", "launch"]
 
 [[startup]]
-command = ["python3", "agent_labels.py", "reconcile"]
+command = ["python3", "-m", "ham", "labels", "reconcile"]
 
 [[startup]]
-command = ["python3", "agent_delivery.py", "reconcile"]
+command = ["python3", "-m", "ham", "delivery", "reconcile"]
 
 [[startup]]
-command = ["python3", "ledger_cli.py", "ledger", "reconcile"]
+command = ["python3", "-m", "ham", "cli", "ledger", "reconcile"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["python3", "agent_labels.py", "event"]
+command = ["python3", "-m", "ham", "labels", "event"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["python3", "agent_labels.py", "event"]
+command = ["python3", "-m", "ham", "labels", "event"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["python3", "ledger_cli.py", "ledger", "event"]
+command = ["python3", "-m", "ham", "cli", "ledger", "event"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["python3", "ledger_cli.py", "ledger", "event"]
+command = ["python3", "-m", "ham", "cli", "ledger", "event"]
 
 [[panes]]
 id = "messenger"
 title = "HAM"
 placement = "popup"
-command = ["python3", "agent_messenger.py", "popup"]
+command = ["python3", "-m", "ham", "messenger", "popup"]
 
 [[panes]]
 id = "skill-installer"
 title = "HAM Skill"
 placement = "popup"
-command = ["python3", "agent_skill_installer.py", "popup"]
+command = ["python3", "-m", "ham", "skill-installer", "popup"]
 
 [[panes]]
 id = "held"
 title = "HAM: Held Messages"
 placement = "popup"
-command = ["python3", "agent_messenger.py", "popup-held"]
+command = ["python3", "-m", "ham", "messenger", "popup-held"]
 
 [[panes]]
 id = "mailbox"
 title = "HAM Mailbox"
 placement = "split"
-command = ["python3", "mailbox_tui.py", "pane"]
+command = ["python3", "-m", "ham", "mailbox", "pane"]
 
 [[panes]]
 id = "mailbox-popup"
 title = "HAM Mailbox (quick send)"
 placement = "popup"
-command = ["python3", "mailbox_tui.py", "popup-pane"]
+command = ["python3", "-m", "ham", "mailbox", "popup-pane"]

@@ -2,14 +2,14 @@
 
 한국어 · [English](../rollout.md) · [README](../../README.ko.md)
 
-`rollout_plugin.py`는 사용자가 명시적으로 선택한 원격 Herdr 호스트에 HAM을
+`python3 -m ham rollout`은 사용자가 명시적으로 선택한 원격 Herdr 호스트에 HAM을
 설치·마이그레이션·갱신합니다. 전체 40자 commit SHA와 Agent Messenger가 사용하는
 SSH 설정 및 선택적 `ssh-hosts` 허용 목록에 등록된 명시적 별칭만 받습니다.
 배포 대상을 자동으로 탐색하거나 추가하지 않습니다.
 
 ## 미리 보기
 
-SSH 연결 없이 실행할 정확한 명령을 먼저 확인합니다.
+cwd를 플러그인 루트로 지정하고 SSH 연결 없이 실행할 정확한 명령을 먼저 확인합니다.
 
 미리 보기에는 조건부 마이그레이션 단계도 포함됩니다. 구 플러그인의 비활성화는
 새 플러그인을 활성화하기 전에 수행하고, 구 플러그인의 제거와 제거 여부 확인은
@@ -17,7 +17,7 @@ SSH 연결 없이 실행할 정확한 명령을 먼저 확인합니다.
 플러그인이 발견된 경우에만 실행됩니다.
 
 ```bash
-python3 rollout_plugin.py \
+python3 -m ham rollout \
   --host macbook-pro \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --dry-run \
@@ -30,7 +30,7 @@ python3 rollout_plugin.py \
 승인합니다.
 
 ```bash
-python3 rollout_plugin.py \
+python3 -m ham rollout \
   --host macbook-pro \
   --host winmini \
   --ref 0123456789abcdef0123456789abcdef01234567 \
@@ -74,9 +74,10 @@ rollback을 수행합니다. 이전에 HAM이 없었다면 실패한 설치를 �
 - `1`: 하나 이상의 호스트 배포 또는 검증 실패
 - `2`: 승인 누락 또는 잘못된 사전 입력
 
-도우미는 Herdr 플러그인 등록만 갱신하며 별도로 복사한 Codex·Claude 스킬
-디렉터리는 갱신하지 않습니다. 배포 후 해당 호스트에서 **HAM Skill**을 열어
-프로젝트·시스템 범위에 설치한 스킬도 갱신하세요.
+도우미는 Herdr 플러그인 등록만 갱신하며 별도로 복사한 스킬이나 설치된 런타임은
+갱신하지 않습니다. [패키지 전환](migration.md#python-패키지-구조)은 다섯 호스트에서
+함께 진행해야 합니다. 전송을 재개하기 전에 스킬 갱신, 활성 런타임 재설치,
+수신기·hook을 불러온 세션과 HAM worker·TUI의 재시작을 마치세요.
 
 스키마 v10에서는 enqueue를 다시 시작하기 전에 원장 코드와 CLI·복사한 스킬을
 함께 갱신하세요. 이전 CLI 코드는 턴 종료 후 FYI 표시를 누락합니다. 기존 v9 전달은

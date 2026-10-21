@@ -12,6 +12,14 @@ HAM은 저장소 간 영속 메일과 조정 상태를 관리하고, `spawn`으�
 [reference.md](../../.agents/skills/herdr-agent-messenger/reference.md#command-and-flag-reference)로
 나뉩니다. 전체 옵션과 오류 코드 표는 `reference.md`에 있습니다.
 
+호출자 기준 `spawn`, `--message-file`, `--body-file`, `--destination`에는
+프로젝트 cwd에서 복사본이나 번들의 `scripts/herdr_agent_messenger.py` 절대 경로를
+사용하세요. 실행기는 플러그인 루트에서 고정된 패키지를 불러온 뒤
+`python3 -m ham --cwd <CALLER_DIRECTORY> cli ...`로 호출자 cwd를 복원합니다.
+직접 실행하려면 `cd /ABS/PLUGIN_ROOT && python3 -m ham --cwd /ABS/CALLER cli ...`를 사용하세요.
+아래 모듈 예제는 의도적으로 플러그인 루트에서 실행하므로 상대 경로도 그 루트를
+기준으로 합니다. [패키지 구조와 cwd](migration.md#python-패키지-구조)를 참고하세요.
+
 ## 설치와 클라이언트별 호출
 
 플러그인에는 Codex용 `.agents/skills/herdr-agent-messenger`와 Claude Code용
@@ -54,9 +62,9 @@ System 범위로 설치할 수 있습니다. 설치 대상은 `codex`, `claude`,
 `all`은 세 클라이언트 모두를 설치합니다.
 
 ```bash
-python3 agent_messenger.py skill-path
-python3 agent_skill_installer.py install omp
-python3 agent_skill_installer.py install all
+python3 -m ham messenger skill-path
+python3 -m ham skill-installer install omp
+python3 -m ham skill-installer install all
 ```
 
 설치기는 스킬 파일을 복사합니다. 플러그인이 Herdr에 등록되어 있지 않다면 복사한
@@ -72,12 +80,12 @@ python3 agent_skill_installer.py install all
 - **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
 
 플러그인과 스킬을 설치·갱신한 뒤 **선택한 모든 호스트**에서 읽기 전용 상태
-요약을 확인하세요.
+요약을 확인하세요. cwd는 플러그인 루트로 지정합니다.
 
 ```bash
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+python3 -m ham cli runtime status
 # 사용자가 동의한 경우에만, 실제로 쓰는 클라이언트(omp 또는 claude)에 설치합니다.
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+python3 -m ham cli runtime install omp
 ```
 
 요약의 `clients`는 런타임 소유권과 충돌, `sessions`는 활성 로컬 세션의 수신기
@@ -94,8 +102,8 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ru
 동의한다는 뜻입니다.
 
 ```bash
-python3 agent_skill_installer.py install omp --runtime omp
-python3 agent_skill_installer.py install all --runtime all
+python3 -m ham skill-installer install omp --runtime omp
+python3 -m ham skill-installer install all --runtime all
 ```
 
 `--runtime`은 `omp`, `claude`, `all`을 받습니다. 생략하면 런타임을 자동 설치하지
@@ -133,7 +141,7 @@ $ham local/yellow-falcon에게 현재 변경을 검토해달라고 요청해.
 
 | 확인 항목 | 관찰한 결과 |
 | --- | --- |
-| 사용자 설치 | `python3 agent_skill_installer.py install claude`로 설치한 뒤 체크아웃 밖에서 `/herdr-agent-messenger`가 `(user)`로 표시되었습니다. |
+| 사용자 설치 | 사용자 범위 설치기(현재는 플러그인 루트의 `python3 -m ham skill-installer install claude`)로 설치한 뒤 체크아웃 밖에서 `/herdr-agent-messenger`가 `(user)`로 표시되었습니다. |
 | 프로젝트 설치 | **HAM Skill** → **Project / Claude**에서 전체 번들을 복사했습니다. 사용자 설치 전 해당 프로젝트에서는 명령이 `(project)`로 표시되었습니다. |
 | 체크아웃 브리지 | 사용자 사본이 없을 때 `.claude/skills/herdr-agent-messenger/SKILL.md`를 따라 정본인 `.agents/skills/herdr-agent-messenger/SKILL.md`를 읽었습니다. |
 | 명령 실행 | 사용자·프로젝트·체크아웃 범위 모두 번들 CLI의 `list --host local`이 종료 코드 0으로 실행되었습니다. |
@@ -165,14 +173,13 @@ HAM `spawn --kind claude`의 준비 상태 확인을 막을 수 있습니다.
 작업 중인 에이전트의 프롬프트를 방해하지 않고 메시지를 남기려면 메일함을 사용하세요.
 수신 런타임은 자연스러운 사용자 입력 경계에서 메시지를 받을 수 있습니다. 아래
 조건을 만족하는 OMP action 메일이나 FYI는 자동으로
-턴을 시작할 수 있습니다. 등록된 Herdr 에이전트 pane에서 다음 명령을 실행합니다.
+턴을 시작할 수 있습니다. 등록된 Herdr 에이전트 pane에서 cwd를 플러그인 루트로 지정해 실행합니다.
 
 ```bash
-HAM_CLI="$PWD/.agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
-python3 "$HAM_CLI" mail send --to local/blue-owl --kind action --body '경계 조건을 검토해 주세요.'
-python3 "$HAM_CLI" inbox read
-python3 "$HAM_CLI" inbox handle --message MESSAGE_UUID
-python3 "$HAM_CLI" mail show --thread THREAD_UUID
+python3 -m ham cli mail send --to local/blue-owl --kind action --body '경계 조건을 검토해 주세요.'
+python3 -m ham cli inbox read
+python3 -m ham cli inbox handle --message MESSAGE_UUID
+python3 -m ham cli mail show --thread THREAD_UUID
 ```
 
 `mail send`는 `--to local/LABEL`, 등록된 canonical 호스트나 SSH 별칭의 주소,
@@ -519,7 +526,7 @@ v7 절은 과거 기록이며 연결된 workspace의 독립 역할 규칙은 v9�
 스키마 v10은 기본값이 0인 `deliveries.fyi_turn_end`를 추가합니다. 기존 v9 전달은
 보수적으로 표시하지 않습니다. 이전 enqueue 코드가 표시를 누락하지 않도록 원장과
 CLI·복사한 스킬을 함께 갱신하세요. 확장 계약은 바뀌지 않으며 이 정책 때문에
-확장을 다시 시작할 필요는 없습니다.
+확장을 다시 시작할 필요는 없습니다. 다만 [패키지 전환](migration.md#python-패키지-구조)에는 다섯 호스트 모두에서 활성 런타임 재설치와 수신기·hook 세션 및 HAM worker·TUI 재시작이 필요합니다.
 [턴 종료 후 FYI 마이그레이션](migration.md#턴-종료-후-fyi스키마-v10)을 참고하세요.
 유휴 FYI의 지연 깨우기는 기존 로컬 전달 시각을 사용합니다. 갱신 전에 queued였던
 메일도 수신자 호스트의 로컬 enqueue 시각으로부터 300초 뒤 깨우기 대상이 됩니다.
@@ -1385,13 +1392,14 @@ herdr agent rename <pane-id> yellow-falcon
 
 ## 테스트 격리
 
-체크아웃 루트에서 로컬 Python 테스트를 실행합니다.
+cwd를 플러그인 체크아웃 루트로 지정하고 로컬 Python·Bun 테스트를 실행합니다.
 
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -s tests -t .
+bun test tests/omp_mailbox_runtime.test.ts
 ```
 
-모든 Python 테스트 모듈은 제품 모듈보다 먼저 `ham_test_support`를 가져옵니다.
+모든 Python 테스트 모듈은 제품 모듈보다 먼저 `tests.ham_test_support as ham_test_support`를 가져옵니다.
 이 테스트 전용 보호 장치는 실행자의 기본 원장을 초기화하려는 시도를 디렉터리나
 스키마가 생성되기 전에 거부합니다. HOME, XDG 상태 경로, 상속된 원장 경로 재정의와
 계정의 실제 홈 경로를 모두 보호하며, 테스트가 이 오류를 잡아도 해당 테스트는 실패합니다.

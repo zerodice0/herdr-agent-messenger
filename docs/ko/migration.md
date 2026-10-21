@@ -6,7 +6,38 @@
 
 - 참여하는 모든 호스트에 Herdr 0.8.0 이상이 필요합니다.
 - Herdr 호스트에는 Python 3.10 이상이 필요합니다.
-- 선택 사항인 SSH 배포 도구 `rollout_plugin.py`는 Python 3.11 이상을 사용합니다.
+- 선택 사항인 SSH 배포 명령 `python3 -m ham rollout`은 Python 3.11 이상을 사용합니다.
+
+## Python 패키지 구조
+
+제품 Python 코드는 `ham/` 아래의 `agents/`, `ledger/`, `ui/`, `ops/`,
+`integrations/{omp,claude}/`에 있습니다. `ham/paths.py`가 `PLUGIN_ROOT`를
+정의하며 루트에는 `ham/__init__.py`와 `herdr-plugin.toml`이 모두 있습니다.
+Herdr manifest 액션, 수신기, SSH는 플러그인 루트를 cwd로 지정합니다:
+`cd /ABS/PLUGIN_ROOT && python3 -m ham <dispatch> ...`.
+dispatch는 `cli`, `labels`, `delivery`, `mailbox`, `messenger`,
+`skill-installer`, `worker`, `display`, `rollout`이며, 원장 명령은
+`python3 -m ham cli ledger ...`로 실행합니다. 호출자 기준의 `spawn`,
+`--message-file`, `--body-file`, `--destination`에는 복사한 스킬이나 번들의
+`scripts/herdr_agent_messenger.py` 절대 경로를 권장합니다. 이 실행기는 플러그인
+루트를 찾고 호출자 기준을 유지합니다. 발견한 플러그인 루트를 프로세스 cwd로
+지정해 `python3 -m ham --cwd <CALLER_DIRECTORY> cli ...`를 실행하고,
+고정된 패키지를 불러온 뒤 dispatcher가 호출자 cwd를 복원합니다. 직접 실행하려면
+`cd /ABS/PLUGIN_ROOT && python3 -m ham --cwd /ABS/CALLER cli ...`를 사용하세요.
+`--cwd` 없이 플러그인 루트에서 모듈을 실행하면 상대 인수도 해당 루트를 기준으로
+합니다. 임의의 cwd에서 실행하기 위해 `PYTHONPATH`를 지정하지 마세요.
+
+이번 전환은 순차 업그레이드가 아니라 **다섯 호스트 전체에서 함께 진행하는
+일괄 전환**입니다. 프로토콜 **1**과 원장 스키마는 그대로지만, 이전·새 버전이
+섞이면 peer 실행 경로가 달라 실패합니다. 호스트 간 전송과 이전 HAM worker·TUI를
+멈추고 모든 호스트의 코드를 갱신한 뒤 복사한 스킬도 갱신하세요. 운영자 동의를
+받아 각 호스트에서 활성화된 런타임의 `runtime install omp` /
+`runtime install claude`를 다시 실행합니다. 수신기를 불러온 OMP 세션, hook을
+불러온 Claude 세션, HAM worker·TUI를 모두 다시 시작한 뒤 전송을 재개하세요.
+모든 호스트의 업그레이드가 끝나면 실패한 outbox 항목을
+`python3 -m ham cli ledger retry --item OUTBOX_ITEM_UUID`로 재시도합니다.
+대체 메시지를 새로 보내지 마세요. 아래의 과거 스키마별 안내와 관계없이 이번
+패키지 전환에는 런타임 재설치와 세션 재시작이 필요합니다.
 
 ## 새로 설치
 
@@ -37,17 +68,17 @@ herdr plugin link "$PWD" --enabled
 - **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
 
 새로 설치하거나 업그레이드할 때는 [클라이언트 스킬](skill-guide.md#설치와-클라이언트별-호출)을
-설치·갱신하고 **선택한 모든 호스트**에서 읽기 전용 요약을 확인합니다.
+설치·갱신하고 **선택한 모든 호스트**에서 cwd를 플러그인 루트로 지정해 읽기 전용 요약을 확인합니다.
 
 ```bash
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime status
+python3 -m ham cli runtime status
 # 사용자가 동의한 경우에만, 실제로 쓰는 클라이언트(omp 또는 claude)에 설치합니다.
-python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py runtime install omp
+python3 -m ham cli runtime install omp
 ```
 
 플러그인과 스킬 설치만으로 네이티브 수신 준비가 완료됐다고 판단하지 마세요.
 누락된 런타임은 명시적 동의를 받아 설치합니다. 대화형 설치기의 기본 선택은
-**Not now(나중에)**이며, `agent_skill_installer.py install all --runtime omp|claude|all`은
+**Not now(나중에)**이며, `python3 -m ham skill-installer install all --runtime omp|claude|all`은
 명시적 동의입니다. 관련 없는 파일이나 수정된 파일을 덮어쓰지 마세요.
 다시 시작해야 할 세션을 알리고 사용자가 선택한 세션만 다시 시작합니다.
 이후 `extension_present=1`을 확인하거나 **설치됨, 활성화 대기**로 보고합니다.
@@ -124,7 +155,7 @@ home으로 대체하지 않습니다. `[HOST/]main@REPO`는 연결된 workspace 
    프로세스와 HAM 코드를 불러온 수신 세션을 멈추고, 해당 호스트의 코드와 복사한 스킬을
    함께 갱신합니다. 이전 프로세스와 새 프로세스가 업그레이드된 원장을 함께 쓰면 안 됩니다.
 2. 각 호스트의 갱신된 HAM 체크아웃에서
-   `python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py ledger reconcile`을
+   `python3 -m ham cli ledger reconcile`을
    실행합니다. 이 쓰기 단계에서 이전 저장소를 현재 스키마인 v10으로 업그레이드하며
    v9의 workspace 메타데이터도 포함합니다. 읽기 전용 명령은 마이그레이션하지 않습니다.
 3. 업그레이드한 코드로 해당 호스트의 HAM 프로세스를 다시 시작합니다. OMP 확장과

@@ -13,7 +13,7 @@ description: Use HAM (Herdr Agent Messenger) for durable cross-repository agent 
 - **Several collaborators:** verify recipients; send tailored, non-overlapping assignments. HAM neither splits work nor verifies answers.
 - **Legacy:** `request` / `send` / `batch` only where permitted. Participating manual/auto same-repo pairs get `use_mailbox`; never bypass it. Batch preflights all targets before submission.
 
-Use bundled `scripts/herdr_agent_messenger.py` relative to this skill directory, or its absolute path, not reconstructed SSH. Operations verify stable terminal/session identity, not inherited pane IDs alone. Copy addresses/IDs; never guess labels or edit opaque handles. Legacy hosts: literal `local` or configured SSH aliases; mail also accepts registered canonical hosts. Details: reference **Recipient selectors**.
+Use the absolute bundled/copied `scripts/herdr_agent_messenger.py` from caller cwd; its pinned-root `-m ham --cwd CALLER cli` preserves local spawn defaults and relative file/destination paths. No reconstructed SSH. Operations verify stable terminal/session identity, not inherited pane IDs alone. Copy addresses/IDs; never guess labels or edit opaque handles. Legacy hosts: literal `local` or configured SSH aliases; mail also accepts registered canonical hosts. Details: reference **Recipient selectors**.
 
 ## Common mailbox and status commands
 
@@ -51,7 +51,7 @@ Cross-repo wakes retain recipient repo settings/role and all gates. Occupancy ho
 
 Schema v9 adds open-workspace metadata, including no-agent anchors, without moving existing settings. Protocol 1 stays unchanged; optional scope export metadata lets old peers consume computed roles. Old code cannot open v9 storage: upgrade/restart all host HAM processes and copied skills together; downgrade needs the backed-up database. OMP extension/Claude hook contracts are unchanged. Reference **Workspace role migration**.
 
-Schema v10 adds local `deliveries.fyi_turn_end` (default 0); existing v9 deliveries stay unflagged. Queued FYI becomes wake-eligible 300s after local enqueue without migration. Upgrade ledger and CLI/copied skills together; OMP extension unchanged, no restart needed.
+Schema v10 adds local `deliveries.fyi_turn_end` (default 0); existing v9 deliveries stay unflagged. Queued FYI becomes wake-eligible 300s after local enqueue without migration. Package cutover: all five hosts together, protocol 1 unchanged; refresh skills, reinstall enabled OMP/Claude runtimes, restart receiver/hook sessions and HAM workers/TUIs. Mixed peer paths fail; retry outbox after upgrade. Reference **Receiving runtimes**.
 
 - **OMP:** opt-in root receiver; action or eligible FYI wake needs Herdr `turn_state` of `idle` or `done`, empty supported TUI editor, quiet/idle input, no pending work, eligible membership and rate/hop guards. Uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves same-session active-branch journal acceptance, not provider success.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. ACK needs exact SDK context + fresh request correlation or typed hook bytes/hash + causal journal witness. The latter proves host-context application, not provider-wire bytes/understanding. Stdout alone is not delivery. Limits: reference **Receiving runtimes**.
