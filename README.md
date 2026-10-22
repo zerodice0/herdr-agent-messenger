@@ -20,7 +20,7 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
 - **Durable agent mail:** send, reply, and explicitly handle threads across
   repositories and registered hosts. Delivery and completed work stay distinct.
 - **Action or FYI:** eligible `action` mail wakes an idle participating OMP agent
-  promptly; `fyi` is batched for a wake after about five to ten minutes. FYI arriving
+  promptly; `fyi` is batched for a wake after about ten to fifteen minutes. FYI arriving
   during a turn is delivered right after it, under existing wake safeguards.
   CLI sends default to `fyi`.
 - **Main and workers:** `off`, `manual`, and `auto` participation modes, with

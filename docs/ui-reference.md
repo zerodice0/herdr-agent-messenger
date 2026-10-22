@@ -381,8 +381,8 @@ Every new compose, including replies and reopened drafts, resets to `action`.
 `Ctrl+G` toggles `action` / `fyi` for that compose, and the selected kind is sent
 explicitly; the CLI default remains `fyi`. Use action when the recipient must
 act, answer, or continue; eligible action wakes promptly. FYI is batched for
-an idle participating OMP wake after about five to ten minutes. The minimum is
-300 seconds from local recipient enqueue; natural events or five-minute safety
+an idle participating OMP wake after about ten to fifteen minutes. The minimum is
+600 seconds from local recipient enqueue; natural events or five-minute safety
 checks determine the actual wake, subject to existing gates. Already queued mail
 needs no migration. FYI arriving
 during a turn is delivered right after that turn when local enqueue observes

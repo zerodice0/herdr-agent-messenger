@@ -457,18 +457,18 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(self.claim(wake=True)['reason'],'coalescing')
         self.assertIsNotNone(self.claim()['claim_id'])
 
-    def test_idle_fyi_deadline_and_atomic_wake_claim_at_exact_300_seconds(self):
+    def test_idle_fyi_deadline_and_atomic_wake_claim_at_exact_delay(self):
         self.set_turn_state('idle')
         enqueued = time.time()
         with mock.patch('ham.ledger.mail.time.time', return_value=enqueued):
             sent = self.send()
-        self.assertEqual(FYI_WAKE_DELAY_SECONDS, 300)
+        self.assertEqual(FYI_WAKE_DELAY_SECONDS, 600)
         self.assertEqual(self.turn_end_flag(sent['message_id']), 0)
-        for age in (0, 299.999, 300):
+        for age in (0, 599.999, 600):
             with self.subTest(age=age), mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+age):
                 inspected = self.receiver.inspect(**self.identity)
                 claim = self.claim(wake=True)
-                if age < 300:
+                if age < 600:
                     self.assertFalse(inspected['has_action'])
                     self.assertEqual(inspected['coalesce_until'], 0)
                     self.assertEqual(claim['reason'], 'coalescing')
@@ -476,7 +476,7 @@ class NativeReceiverTest(unittest.TestCase):
                     self.assertEqual(self.states()[sent['message_id']], 'queued')
                 else:
                     self.assertTrue(inspected['has_action'])
-                    self.assertEqual(inspected['coalesce_until'], enqueued+300)
+                    self.assertEqual(inspected['coalesce_until'], enqueued+600)
                     self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
                     self.assertIn('FYI only: read and continue;', claim['message']['content'])
                     self.assertEqual(self.receiver.inspect(**self.identity)['wake_count'], 1)
@@ -491,20 +491,20 @@ class NativeReceiverTest(unittest.TestCase):
                                (enqueued-3600, sent['message_id']))
             connection.execute('UPDATE deliveries SET updated_at=? WHERE message_id=?',
                                (enqueued, sent['message_id']))
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+299):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS-1):
             self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+301):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS+1):
             self.assertIsNotNone(self.claim(wake=True)['claim_id'])
 
     def test_oldest_idle_fyi_deadline_batches_younger_fyi_without_restarting_delay(self):
         enqueued = time.time()
         with mock.patch('ham.ledger.mail.time.time', return_value=enqueued):
             first = self.send()
-        with mock.patch('ham.ledger.mail.time.time', return_value=enqueued+250):
+        with mock.patch('ham.ledger.mail.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS-50):
             second = self.send()
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+300):
-            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+300)
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS):
+            self.assertEqual(self.receiver.inspect(**self.identity)['coalesce_until'], enqueued+FYI_WAKE_DELAY_SECONDS)
             claim = self.claim(wake=True)
         self.assertEqual([message['message_id'] for message in claim['messages']],
                          [first['message_id'], second['message_id']])
@@ -514,7 +514,7 @@ class NativeReceiverTest(unittest.TestCase):
         enqueued = time.time()
         with mock.patch('ham.ledger.mail.time.time', return_value=enqueued):
             first = self.send()
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+300):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS):
             for mode in ('off', 'manual'):
                 self.settings.mutate(self.recipient['repo_id'], 'mode', mode)
                 self.assertIsNone(self.receiver.inspect(**self.identity)['role'])
@@ -522,7 +522,7 @@ class NativeReceiverTest(unittest.TestCase):
             self.settings.mutate(self.recipient['repo_id'], 'mode', 'auto')
             first_claim = self.claim(wake=True)
             second = self.send()
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+600):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+2*FYI_WAKE_DELAY_SECONDS):
             self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
             self.applied(first_claim)
             self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
@@ -531,7 +531,7 @@ class NativeReceiverTest(unittest.TestCase):
         self.applied(natural)
         self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'max_hop':0})
         reply = self.send(reply_to=first['message_id'])
-        with mock.patch('ham.ledger.runtime.time.time', return_value=time.time()+301):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=time.time()+FYI_WAKE_DELAY_SECONDS+1):
             self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
             self.assertEqual(self.states()[reply['message_id']], 'queued')
@@ -542,7 +542,7 @@ class NativeReceiverTest(unittest.TestCase):
             for index in range(BUNDLE_MESSAGES+2):
                 self.send(body='older FYI '+str(index))
         action = self.send(kind='action')
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+300):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS):
             claim = self.claim(wake=True)
         self.assertIn(action['message_id'], [message['message_id'] for message in claim['messages']])
         self.assertNotIn('FYI only:', claim['message']['content'])
@@ -552,7 +552,7 @@ class NativeReceiverTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("UPDATE deliveries SET hold_reason='recipient_changed' WHERE message_id=?",
                                (sent['message_id'],))
-        with mock.patch('ham.ledger.runtime.time.time', return_value=time.time()+301):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=time.time()+FYI_WAKE_DELAY_SECONDS+1):
             self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'no_action')
             action = self.send(kind='action')
@@ -568,7 +568,7 @@ class NativeReceiverTest(unittest.TestCase):
         ready = self.send(body='Already queued FYI')
         with self.store.transaction() as connection:
             connection.execute('UPDATE deliveries SET updated_at=? WHERE message_id=?',
-                               (enqueued-301, ready['message_id']))
+                               (enqueued-FYI_WAKE_DELAY_SECONDS-1, ready['message_id']))
         for index in range(BUNDLE_MESSAGES+2):
             sent = self.send(body='young FYI '+str(index))
             with self.store.transaction() as connection:
@@ -589,15 +589,15 @@ class NativeReceiverTest(unittest.TestCase):
         enqueued = time.time()
         with mock.patch('ham.ledger.mail.time.time', return_value=enqueued):
             sent = self.send()
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+300):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+FYI_WAKE_DELAY_SECONDS):
             claim = self.claim(wake=True)
             self.mail.release(claim_id=claim['claim_id'], agent_id=self.recipient['agent_id'],
                               generation=self.recipient['generation'], disposition='not_applied',
                               evidence='not submitted')
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+599):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+2*FYI_WAKE_DELAY_SECONDS-1):
             self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
             self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
-        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+600):
+        with mock.patch('ham.ledger.runtime.time.time', return_value=enqueued+2*FYI_WAKE_DELAY_SECONDS):
             self.assertEqual([message['message_id'] for message in self.claim(wake=True)['messages']],
                              [sent['message_id']])
 

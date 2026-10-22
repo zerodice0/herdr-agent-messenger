@@ -418,7 +418,7 @@ class LedgerCoreTest(unittest.TestCase):
                                        (state, recipient["agent_id"]))
                 sent = self.mail.send(self.sender, recipient, kind=kind, body="Decision enables work")
                 if delayed:
-                    self.assertEqual(sent["fyi_wake_after_seconds"], 300)
+                    self.assertEqual(sent["fyi_wake_after_seconds"], 600)
                 else:
                     self.assertNotIn("fyi_wake_after_seconds", sent)
                 self.assertEqual(sent["state"], "queued")
@@ -458,7 +458,7 @@ class LedgerCoreTest(unittest.TestCase):
                 reply = self.mail.send(self.sender, recipient, reply_to=parent["message_id"],
                                        body="Use the approved option")
                 if delayed:
-                    self.assertEqual(reply["fyi_wake_after_seconds"], 300)
+                    self.assertEqual(reply["fyi_wake_after_seconds"], 600)
                 else:
                     self.assertNotIn("fyi_wake_after_seconds", reply)
                 self.assertEqual(self.mail.read(recipient)["messages"][-1]["kind"], "fyi")

@@ -344,7 +344,7 @@ test("idle action atomically bundles FYI and nextTurn trigger; no premature deli
   view = await f.view(); expect(view.messages.map(m => m.state)).toEqual(["delivered", "delivered"]); expect(view.wakes).toBe(1);
 });
 
-test("idle-arrived FYI waits without polling then wakes through the 300-second safety callback", async () => {
+test("idle-arrived FYI waits without polling then wakes through the second 300-second safety callback", async () => {
   const now = Date.UTC(2026, 9, 21, 12);
   setSystemTime(now);
   const f = new Fixture();
@@ -365,11 +365,23 @@ test("idle-arrived FYI waits without polling then wakes through the 300-second s
   expect(f.sent).toHaveLength(0);
   expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
 
-  // advanceTo invokes the actual registered interval; no explicit kick or fresh event.
+  // The first safety callback fires before the 600-second FYI delay: it only inspects.
   await f.advanceTo(now + 300000);
-  expect(f.operations).toEqual(["inspect", "register", "inspect", "claim"]);
-  expect(f.inspections).toHaveLength(2);
-  expect(f.inspections[1]).toMatchObject({ has_action: true, coalesce_until: now / 1000 + 300 });
+  expect(f.operations).toEqual(["inspect", "register", "inspect"]);
+  expect(f.inspections[1]).toMatchObject({ has_action: false, coalesce_until: 0 });
+  expect(f.sent).toHaveLength(0);
+
+  await f.advanceTo(now + 599999);
+  expect(f.operations).not.toContain("claim");
+  expect(f.inspections.length).toBeLessThanOrEqual(3);
+  expect(f.inspections.at(-1)).toMatchObject({ has_action: false, coalesce_until: 0 });
+  expect(f.sent).toHaveLength(0);
+  expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
+
+  // advanceTo invokes the actual registered interval; no explicit kick or fresh event.
+  await f.advanceTo(now + 600000);
+  expect(f.operations.slice(-3)).toEqual(["register", "inspect", "claim"]);
+  expect(f.inspections.at(-1)).toMatchObject({ has_action: true, coalesce_until: now / 1000 + 600 });
   expect(wakeClaim).toBe(true);
   expect(f.sent).toHaveLength(1);
   expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
@@ -400,16 +412,16 @@ test("young FYI avoids one-second draft and nonready polling: old versus conserv
       // The old response differs solely in advertising future FYI as actionable.
       f.cacheRegistrations = true;
       f.transformInspection = state => f.cachedInspection = {
-        ...state, has_action: encoding === "old", coalesce_until: encoding === "old" ? now / 1000 + 300 : 0,
+        ...state, has_action: encoding === "old", coalesce_until: encoding === "old" ? now / 1000 + 600 : 0,
       };
       f.beforeRegister = async () => {
-        if (Date.now() >= now + 300000) {
+        if (Date.now() >= now + 600000) {
           // Safety refresh observes the real ledger's now-eligible response.
           f.cacheRegistrations = false;
           f.cachedInspection = undefined; f.transformInspection = undefined;
         }
       };
-      await f.advanceTo(now + 299999);
+      await f.advanceTo(now + 599999);
       counts[encoding] = f.inspections.length;
       expect(f.sent).toHaveLength(0);
       expect(f.operations).not.toContain("claim");
@@ -417,15 +429,16 @@ test("young FYI avoids one-second draft and nonready polling: old versus conserv
         expect(f.inspections[0]).toMatchObject({ has_action: false, coalesce_until: 0 });
         expect(f.timeoutTokens.size).toBe(0);
       }
-      await f.advanceTo(now + 300000);
+      await f.advanceTo(now + 600000);
       boundaryCounts[encoding] = f.inspections.length - counts[encoding];
       expect(f.sent).toHaveLength(0);
       expect(f.operations).not.toContain("claim");
       expect(f.inspections.at(-1)).toMatchObject({ has_action: true });
       expect(f.warnings).toEqual([]);
     }
-    // Count the initial inspection plus timers in [0, 300s); report the boundary separately.
-    expect(counts).toEqual({ old: 300, conservative: 1 });
+    // Count the initial inspection plus timers in [0, 600s) (conservative: initial + the first
+    // 300 s safety callback); report the boundary separately.
+    expect(counts).toEqual({ old: 601, conservative: 2 });
     expect(boundaryCounts).toEqual({ old: 1, conservative: 1 });
   }
 });

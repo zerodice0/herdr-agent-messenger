@@ -94,7 +94,8 @@ def compact_board_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             if key in row:
                 agent[key] = len(row[key])
         agents.append(agent)
-    compact = {key: value for key, value in payload.items() if key not in {"agents", "hosts"}}
+    compact = {key: value for key, value in payload.items()
+               if key not in {"agents", "hosts", "workspaces"}}
     compact["agents"] = agents
     if "hosts" in payload:
         hosts = []
@@ -114,6 +115,17 @@ def compact_board_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return compact
 
 
+DISMISSAL_FIELDS = ("message_id", "actor_alias", "actor_terminal_id", "reason", "dismissed_at")
+
+
+def compact_dismissal(audit: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Keep the stable sender-resolution fields, not the retained failure evidence."""
+
+    if audit is None:
+        return None
+    return {key: audit[key] for key in DISMISSAL_FIELDS if key in audit}
+
+
 def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Keep readable mail and safe reply context, not delivery diagnostics."""
 
@@ -122,9 +134,11 @@ def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         message = {
             key: row[key]
             for key in ("message_id", "thread_id", "kind", "priority", "state", "body",
-                        "reply_to", "hop", "truncated", "body_truncated", "body_omitted", "dismissal")
+                        "reply_to", "hop", "truncated", "body_truncated", "body_omitted")
             if row.get(key) is not None
         }
+        if row.get("dismissal") is not None:
+            message["dismissal"] = compact_dismissal(row["dismissal"])
         message["sender"] = f"{row['origin_host']}/{row['sender_label']}"
         for key in ("hold_reason", "withdraw_requested"):
             if row.get(key):
@@ -133,6 +147,82 @@ def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {**{key: value for key, value in payload.items()
                if key not in {"terminal_id", "messages"} and value is not None},
             "messages": messages}
+
+
+def compact_dismiss_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return sender-resolution audits without retained failure or identity evidence."""
+
+    return {**{key: value for key, value in payload.items() if key != "dismissals"},
+            "dismissals": [compact_dismissal(audit) for audit in payload["dismissals"]]}
+
+
+def _compact_receipt(receipt: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    """Keep the identity, current state and nonempty hold/withdraw evidence of a receipt."""
+
+    compact = {key: receipt[key] for key in keys if key in receipt}
+    compact["state"] = receipt["state"]
+    for key in ("hold_reason", "withdraw_requested"):
+        if receipt.get(key):
+            compact[key] = receipt[key]
+    return compact
+
+
+def compact_send_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the queued message's identity, resolved recipient and advisory fields."""
+
+    compact = _compact_receipt(payload, ("message_id", "thread_id", "recipient_address"))
+    if payload.get("fyi_turn_end"):
+        compact["fyi_turn_end"] = True
+    for key in ("fyi_wake_after_seconds", "warnings"):
+        if payload.get(key):
+            compact[key] = payload[key]
+    return compact
+
+
+def compact_handle_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only each handled message's identity and final state."""
+
+    return {**{key: value for key, value in payload.items() if key != "receipts"},
+            "receipts": [_compact_receipt(receipt, ("message_id",)) for receipt in payload["receipts"]]}
+
+
+def compact_status_set_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Report display refresh only when it failed; success is the unremarkable default."""
+
+    compact = {key: value for key, value in payload.items() if key != "display"}
+    display = payload.get("display")
+    if isinstance(display, Mapping) and display.get("failed"):
+        compact["display"] = {"failed": display["failed"]}
+    return compact
+
+
+def compact_repo_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Brief repository participation and current agents; settings keep only their values."""
+
+    compact = {key: payload[key] for key in ("repo_id", "host", "workspace_id", "mode")}
+    if payload.get("requested_workspace_id") != payload["workspace_id"]:
+        compact["requested_workspace_id"] = payload.get("requested_workspace_id")
+    for key in ("home_host", "main", "main_source", "members", "computed_main",
+                "conflicts", "propagation_pending"):
+        if payload.get(key):
+            compact[key] = payload[key]
+    extra = {name: setting["value"] for name, setting in payload["settings"].items()
+             if name not in {"home", "mode", "main", "members"}}
+    if extra:
+        compact["settings"] = extra
+    agents = []
+    for row in payload["agents"]:
+        agent = {"address": f"{row['host']}/{row.get('alias') or row['terminal_id']}",
+                 "workspace": row["workspace_id"]}
+        for key in ("client", "role", "turn_state", "extension_present", "stale"):
+            if row.get(key) is not None:
+                agent[key] = row[key]
+        for key in ("phase", "summary"):
+            if row.get(key):
+                agent[key] = row[key]
+        agents.append(agent)
+    compact["agents"] = agents
+    return compact
 
 
 def _box_rule(line: str) -> bool:

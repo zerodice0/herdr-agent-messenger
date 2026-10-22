@@ -45,6 +45,7 @@ def add_parsers(subparsers: Any) -> None:
     send.add_argument("--kind", choices=("fyi", "action"), default="fyi")
     send.add_argument("--reply-to", help="Retained message UUID; reply also marks an addressed parent handled.")
     send.add_argument("--subject", default="", help="New thread subject (up to 1024 UTF-8 bytes).")
+    send.add_argument("--verbose", action="store_true", help="Include the full delivery receipt fields.")
     body = send.add_mutually_exclusive_group(required=True)
     body.add_argument("--body", help="Message body, at most 16 KiB UTF-8.")
     body.add_argument("--body-file", help="Read the body from this UTF-8 file.")
@@ -53,6 +54,7 @@ def add_parsers(subparsers: Any) -> None:
     dismiss = mail_commands.add_parser("dismiss", help="Audit local sender resolution of undeliverable mail; not recipient handling.")
     dismiss.add_argument("--message", required=True, action="append", help="Message UUID; repeat for atomic batch dismissal.")
     dismiss.add_argument("--reason", required=True, help="Nonblank audit reason; repeats preserve the first reason.")
+    dismiss.add_argument("--verbose", action="store_true", help="Include the full dismissal audit and retained failure evidence.")
     show = mail_commands.add_parser("show", help="View a thread without changing delivery state.")
     show.add_argument("--thread", required=True, help="Thread UUID (first message ID).")
     for operation, description in (
@@ -74,9 +76,12 @@ def add_parsers(subparsers: Any) -> None:
                       help="Include full message and delivery diagnostic fields.")
     handle = inbox_commands.add_parser("handle", help="Explicitly mark messages handled, without inventing delivered_at.")
     handle.add_argument("--message", required=True, action="append", help="Message UUID; repeat for atomic batch handling.")
+    handle.add_argument("--verbose", action="store_true", help="Include the full delivery receipt fields.")
 
     repo = subparsers.add_parser("repo", help="Read coordination repository settings.")
-    repo.add_subparsers(dest="repo_command", required=True).add_parser("show", help="Show this agent's repository and settings.")
+    repo_show = repo.add_subparsers(dest="repo_command", required=True).add_parser(
+        "show", help="Show this agent's repository and settings.")
+    repo_show.add_argument("--verbose", action="store_true", help="Include full setting stamps and registry rows.")
 
     ledger = subparsers.add_parser("ledger", help="Internal Python-owned mailbox services (JSON stdin where needed).")
     commands = ledger.add_subparsers(dest="ledger_command", required=True)

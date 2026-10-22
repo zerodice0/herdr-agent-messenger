@@ -4,7 +4,7 @@ Read `SKILL.md` first. This reference covers the complete CLI, diagnostic payloa
 
 ## Command and flag reference
 
-All commands accept `-h` / `--help`. Legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`), `status board|list` and `inbox read` accept `--verbose` (full diagnostic JSON; default off); other mailbox/ledger/runtime/device/status commands, including `mail threads` and `mail direct-list`, do not. Numeric arguments are integers; optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
+All commands accept `-h` / `--help`. Legacy prompt-routing commands (`list`, recipient `status`, `send`, `batch`, `read`, `request`, `request-status`, `spawn`), `status board|list|set|clear`, `inbox read|handle`, `mail send|dismiss` and `repo show` accept `--verbose` (full diagnostic JSON; default off); other mailbox/ledger/runtime/device/status commands, including `mail show`, `mail threads`, `mail direct-list` and `mail withdraw`, do not. Numeric arguments are integers; optional flags are unset unless a default is listed. Milliseconds are denoted `MS`.
 
 ### Recipient selectors
 
@@ -77,13 +77,13 @@ python3 scripts/herdr_agent_messenger.py repo show
 | --- | --- |
 | `mail send` | Required `--to local/LABEL`, `CANONICAL_HOST/LABEL`, registered `SSH_ALIAS/LABEL`, `main`, or `[HOST/]main@REPO`. `--kind fyi\|action`, default `fyi`; optional `--reply-to UUID`, `--subject TEXT` (1024 UTF-8 bytes); exactly one of `--body TEXT` / `--body-file PATH` (UTF-8, nonblank, at most 16 KiB). Replies keep the thread and increment hop; replying to addressed queued/delivered local mail also marks that parent handled atomically. Remote targets are selected from a fresh all-repository status export. |
 | `inbox read` | Optional `--message UUID`, `--all`, `--limit N` (default 100, range 1–1000), `--verbose`. Without `--all`, shows queued, uncertain delivering, and delivered mail. Compact IDs/sender/body/state/reply context by default; verbose restores delivery diagnostics (see Compact versus verbose payloads). Reads never change delivery, logs, or bells, even from subagents. |
-| `inbox handle` | Required repeatable `--message UUID`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. |
+| `inbox handle` | Required repeatable `--message UUID`, optional `--verbose`. The entire batch is validated before changing any row. A queued pull-only message becomes handled with no fabricated delivered timestamp. Returns `{receipts:[{message_id,state}]}`; verbose returns full receipts. |
 | `mail show` | Required `--thread UUID`; reads a known retained thread, including sent mail, without caller-recipient filtering. Returns retained bodies and delivery state from this ledger. |
 | `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; retained threads originating in or involving that repo as sender/recipient, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
 | `mail direct-list` | Same `--repo REPO_ID`, `--limit N`, `--cursor TOKEN`; retained `via=direct` user-input submissions, not `spawn_initial`. Returns `{repo_id,submissions,next_cursor}`. Read-only, not a direct-send command. |
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
-| `mail dismiss` | Required repeatable `--message UUID` and nonblank `--reason TEXT`; atomic, deduplicated, local sender-side resolution of `undeliverable` mail only. Returns `{dismissals:[audit,...]}`. Repeats preserve the first audit, including its actor/time/reason. See **Sender dismissal** below. |
-| `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
+| `mail dismiss` | Required repeatable `--message UUID` and nonblank `--reason TEXT`; atomic, deduplicated, local sender-side resolution of `undeliverable` mail only. Optional `--verbose`. Returns `{dismissals:[audit,...]}` with only the stable audit fields by default (verbose adds sender/actor identity and the retained `failure` snapshot). Repeats preserve the first audit, including its actor/time/reason. See **Sender dismissal** below. |
+| `repo show` | Optional `--verbose`. Read-only repository identity, current settings, and local agents; compact output keeps participation (`mode`, nonempty `main`/`members`/`conflicts`), non-default setting values and agent address/role/status rows, while verbose adds setting stamps and full registry rows. No public setting mutation command. |
 
 Successful `mail send` may include advisory `warnings` entries:
 
@@ -100,10 +100,10 @@ For replies, use `mail send --reply-to UUID --kind action` when the recipient
 must act, answer, or continue (for example, on an answer to a question or a decision);
 use `fyi` otherwise. Eligible action wakes promptly under existing safeguards.
 
-Queued FYI becomes wake-eligible 300 seconds after local recipient enqueue.
+Queued FYI becomes wake-eligible 600 seconds after local recipient enqueue.
 This is a minimum, not a scheduled delivery guarantee: natural events and the
 five-minute safety scan normally wake an idle participating OMP after about
-five to ten minutes, subject to all other gates. Send-result `fyi_wake_after_seconds`
+ten to fifteen minutes, subject to all other gates. Send-result `fyi_wake_after_seconds`
 reports the minimum delay, not a promised delivery time. Existing queued
 FYI uses its local delivery timestamp without migration, not the sender's message
 creation time. Queue age uses `deliveries.updated_at` for the current queued
@@ -111,7 +111,7 @@ interval: a proven `not_applied` release or operator requeue restarts the delay.
 At local enqueue, the ledger also sets `delivery.fyi_turn_end`
 when its locally reconciled `agents.last_seen` is within 15 seconds and
 `turn_state=working`; that FYI can wake right after the turn without waiting
-300 seconds. Later status updates do not retroactively set the flag. Both paths
+600 seconds. Later status updates do not retroactively set the flag. Both paths
 retain all runtime/admission gates. The flag is local delivery metadata, never
 a new kind or immutable wire field.
 
@@ -232,7 +232,8 @@ its original retention deadline.
 `inbox read` (compact and verbose), `mail show`, and `mail threads` expose
 `dismissal`: null before resolution, an audit object afterward. Stable fields
 are `message_id`, `actor_alias`, `actor_terminal_id`, `reason`, `dismissed_at`;
-additional sender/actor identity and `failure` snapshot fields are diagnostic.
+additional sender/actor identity and `failure` snapshot fields are diagnostic and
+appear only in `--verbose`, `mail show` and `mail threads`.
 The raw state remains `undeliverable`; hold reason, evidence, native receipt
 fields and original delivery/final/update timestamps remain unchanged. Thread
 ordering still uses delivery update timestamps, not dismissal time.
@@ -260,14 +261,14 @@ claim). `ledger runtime register|inspect|claim|applied` is the root OMP receiver
 boundary: registration requires the full supported session-file path; `claim` is
 one atomic bounded bundle (8 messages, 8 KiB, 2 KiB per body, every claimed ID
 present). A wake claim needs a hop-eligible `action`, turn-end-flagged FYI,
-or FYI queued locally for at least 300 seconds. Young FYI or mail still awaiting
+or FYI queued locally for at least 600 seconds. Young FYI or mail still awaiting
 coalescing returns `coalescing`; no eligible queued row returns `no_action`.
 Neither result claims mail. An eligible action, aged FYI, or turn-end FYI wake
 can bundle younger unheld FYI within the existing batch limits.
 For young ordinary FYI, `inspect.has_action=false` until `wake_ready_at<=now`;
 the unchanged extension does not schedule a future FYI deadline. Natural
 events or its existing five-minute safety scan discover eligibility, trading
-about five to ten minutes of latency for no pre-eligibility one-second
+about ten to fifteen minutes of latency for no pre-eligibility one-second
 draft/status polling. The persisted kind remains `fyi`.
 FYI-only bundles say to read and continue, replying only if it changes the
 recipient's work. `applied` ACKs only the exact session,
@@ -408,7 +409,7 @@ Settings UI, with **no agent mutation CLI**. `main` and `members` mutations
 require an explicit local host/workspace request, resolve its anchor role group,
 and reject inactive or out-of-group targets. `main` is `null` or `{host,terminal_id}`; `members` is a
 unique list of those targets. `mode` (`off|manual|auto`) and `thresholds`
-(`idle_minutes:3,coalesce_seconds:30,wakes_per_hour:6,max_hop:10` defaults)
+(`idle_minutes:3,coalesce_seconds:60,wakes_per_hour:4,max_hop:10` defaults for repos with no saved thresholds)
 remain repo-wide, as does read-only `home`.
 
 `fields(connection,repo_id)` contains only repo-wide fields.
@@ -484,7 +485,7 @@ skills together so old enqueue code cannot omit the flag; run upgraded
 `ledger reconcile` before read-only opens. The OMP extension is unchanged and
 needs no restart for this policy. See [turn-end FYI migration](../../../docs/migration.md#turn-end-fyi-schema-v10).
 Delayed idle FYI adds no schema or settings: existing queued FYI becomes eligible
-300 seconds after its local recipient enqueue timestamp, without migration.
+600 seconds after its local recipient enqueue timestamp, without migration.
 See [current migration and rollout](../../../docs/migration.md#worktree-role-grouping-schema-v9).
 
 Schema v11 adds `mail_dismissals` and nullable local `messages.sender_context`,
@@ -752,9 +753,13 @@ Settings (`s`) has exactly seven editable rows:
 | `main` | JSON `{"host":"CANONICAL","terminal_id":"term_…"}` or `null`; null removes the explicit designation. |
 | `members` | Unique JSON array of canonical-host/terminal targets; default empty. |
 | `idle_minutes` | Integer 0–10000, default 3 minutes after input. |
-| `coalesce_seconds` | Integer 0–10000, default 30 seconds to collect mail. |
-| `wakes_per_hour` | Integer 0–10000, default 6 per agent/hour. |
+| `coalesce_seconds` | Integer 0–10000, default 60 seconds to collect mail. |
+| `wakes_per_hour` | Integer 0–10000, default 4 per agent/hour. |
 | `max_hop` | Integer 0–10000, default 10; action above the cap cannot wake. |
+
+The defaults apply only while a repo has no saved `thresholds` field. Saving any
+threshold writes all four values together, so a repo with saved thresholds keeps
+them regardless of later default changes.
 
 Mode and thresholds apply repository-wide. Main/Members rows identify the
 Mailbox opener's workspace on its canonical host, resolved from
@@ -904,7 +909,7 @@ the current structured plugin root (or explicitly configured absolute
 `HERDR_AGENT_MESSENGER_ROOT`) and calls Python asynchronously; it never opens
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
 nonmembers. Eligible action wakes promptly; FYI is batched for an idle wake
-after about five to ten minutes (300 seconds is minimum eligibility), or right
+after about ten to fifteen minutes (600 seconds is minimum eligibility), or right
 after a turn when locally flagged
 at fresh `working` enqueue. Automatic action or FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
@@ -1043,12 +1048,12 @@ python3 scripts/herdr_agent_messenger.py status board --repo 'git:host/stable/re
 
 | Subcommand | Arguments / result |
 | --- | --- |
-| `status set` | Required positional `phase` and `--summary TEXT`; no `--phase` flag. Reports the current agent's public phase/summary. |
-| `status clear` | No extra arguments; clear current phase/summary. |
+| `status set` | Required positional `phase` and `--summary TEXT`; no `--phase` flag; optional `--verbose`. Reports the current agent's public phase/summary; `display` appears only with failed pane IDs unless verbose. |
+| `status clear` | Optional `--verbose`; clear current phase/summary. |
 | `status list` | Optional `--repo [ID]`, `--verbose`: absent repo lists all local repository statuses, bare `--repo` selects caller's repo, explicit ID filters. Brief rows/counts by default; verbose restores full rows. |
 | `status board` | Optional `--repo [ID]`, `--host local\|CANONICAL\|REGISTERED_SSH_ALIAS`, `--verbose`. No repo flag selects all repositories; bare `--repo` resolves caller's repository; explicit ID filters without fetching Herdr caller identity. No host flag selects local plus all registered peers; explicit host selects only that ledger. Returns `{repo_id,agents,hosts}`. |
 
-These subcommands accept `-h` / `--help`; board/list also accept `--verbose` after the subcommand or on parent `status`. `status board`
+These subcommands accept `-h` / `--help`; board/list/set/clear also accept `--verbose` after the subcommand or on parent `status`. `status board`
 has its own host selector; do not treat legacy `status --host HOST list` as
 remote board syntax. Legacy `list` and stored local `status list` remain
 available with narrower semantics.
@@ -1284,12 +1289,17 @@ Focus is not a draft-text detector: a person who leaves a pane containing unsent
 
 ### Compact versus verbose payloads
 
-`--verbose` is available on legacy prompt-routing commands, `status board|list` and `inbox read`. Compact responses omit bulky identities/routes and optional null/absent fields; verbose preserves full public diagnostics, never private fields. Do not rely on compact output for routes. All launcher/ledger CLI JSON uses whitespace-free separators and UTF-8 characters (`ensure_ascii=False`), including verbose; parse JSON rather than whitespace/escaped spelling.
+`--verbose` is available on legacy prompt-routing commands, `status board|list|set|clear`, `inbox read|handle`, `mail send|dismiss` and `repo show`. Compact responses omit bulky identities/routes and optional null/absent fields; verbose preserves full public diagnostics, never private fields. Do not rely on compact output for routes. All launcher/ledger CLI JSON uses whitespace-free separators and UTF-8 characters (`ensure_ascii=False`), including verbose; parse JSON rather than whitespace/escaped spelling.
 
 | Operation | Compact fields | Additional/full `--verbose` fields |
 | --- | --- | --- |
-| `status board`, `status list` | Brief address/host/workspace/repo/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents` and full host metadata. See Status board output and fields. |
+| `status board`, `status list` | Brief address/host/workspace/repo/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows and no `workspaces` list | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents`, `workspaces` and full host metadata. See Status board output and fields. |
 | `inbox read` | `{messages,...warnings}`; nonnull `message_id`, `thread_id`, `sender` (`origin_host/sender_label`), `kind`, `priority` if provided, `state`, `body`, `reply_to`, `hop`, truncation/omission flags; nonempty `hold_reason`, true `withdraw_requested` | Full original message/delivery fields including hashes, routing, claim/recipient identity and timestamps/nulls. Priority is not synthesized if absent. Python `Mailbox.read()` is unchanged. |
+| `mail send` | `message_id`, `thread_id`, `recipient_address`, `state`; nonempty `hold_reason`/`withdraw_requested`, true `fyi_turn_end`, `fyi_wake_after_seconds`, `warnings` | Full receipt: `origin_host`, `payload_hash`, recipient host/terminal, `via`, delivery timestamps, `authoritative*`, `confirmation_source`, `evidence`. |
+| `inbox handle` | `{receipts:[{message_id,state}]}` | Full receipts as for `mail send`. |
+| `mail dismiss` | `{dismissals:[{message_id,actor_alias,actor_terminal_id,reason,dismissed_at}]}` | Sender/actor identity and repository fields plus the retained `failure` receipt. |
+| `repo show` | `repo_id`, `host`, `workspace_id`, `mode`, `requested_workspace_id` when different, nonempty `home_host`/`main`/`main_source`/`members`/`computed_main`/`conflicts`/`propagation_pending`, `settings` (name→value for fields beyond home/mode/main/members), `agents` rows with `address`, `workspace`, `client`, `role`, `turn_state`, `extension_present`, nonempty `phase`/`summary` | Full `settings` stamps (version/origin/changed_by/changed_at) and complete registry rows with IDs, generations and timestamps. |
+| `status set`, `status clear` | `agent_id`, `phase`, `summary`; `display:{failed:[pane...]}` only when a display refresh failed | `display:{updated,failed}` always. |
 | `list` | `host`, `agents` with `address`, `status`, `workspace` | Full agent records with the fields listed below. |
 | `status` | `address`, `status`; `stale: true` only if stale | `agent` full record, `route`, `route_refreshed`. |
 | `spawn` | `address`, `marker`, `created`, `pane_id`, optional `tab_id`, `workspace_id`; metadata flags only when false; optional `initial_prompt` operation/submission/acceptance/evidence when requested | `label`, `color`, `host`, `kind`, `cwd`, `route`, `agent`, both metadata flags even on success, plus compact fields. `created` is `pane`, `tab`, or `workspace`. |
@@ -1428,3 +1438,35 @@ on plugin/skill installation or owned runtime files.
 An installed copy without the current reference is outdated, not a reason to bypass the CLI. Update through the installer. Unrelated skill directories and symlink conflicts are not overwritten. The bundled launcher needs access to the HAM plugin/source CLI; `cli_not_found` means repair that installation rather than invent a replacement transport.
 
 For expanded client setup, see `docs/skill-guide.md` in the plugin/source checkout.
+
+
+## Upgrade, migration, and role-election details (moved from SKILL.md)
+
+Ordinary mail work does not need this section; read it for upgrades, schema questions, role-election questions, or legacy requests.
+
+### Upgrades and schema migrations
+
+- **Cross-repo and v8 receivers:** Cross-repo wakes retain recipient repo settings/role and all gates. Occupancy holds compare the current recipient repo to its send-time delivery snapshot, not thread origin. Replies require participation. Upgrade hosts together: old receivers reject v8; failed outbox mail stays for manual retry after upgrade, not new sends.
+- **Schema v9 (workspace metadata):** Schema v9 adds open-workspace metadata, including no-agent anchors, without moving existing settings. Protocol 1 stays unchanged; optional scope export metadata lets old peers consume computed roles. Old code cannot open v9 storage: upgrade/restart all host HAM processes and copied skills together; downgrade needs the backed-up database. OMP extension/Claude hook contracts are unchanged. Reference **Workspace role migration**.
+- **Schema v10 (FYI turn-end flag):** Schema v10 adds local `deliveries.fyi_turn_end` (default 0); existing v9 deliveries stay unflagged. Queued FYI becomes wake-eligible 600s after local enqueue (the FYI wake delay) without migration. Package cutover: all five hosts together, protocol 1 unchanged; refresh skills, reinstall enabled OMP/Claude runtimes, restart receiver/hook sessions and HAM workers/TUIs. Mixed peer paths fail; retry outbox after upgrade. Reference **Receiving runtimes**.
+- **Schema v11 (sender dismissal audit):** Schema v11 adds a durable local audit for `mail dismiss`; upgrade/restart host HAM processes together, with no protocol/runtime contract change. New v11 sends snapshot local sender identity/anchor scope, surviving closed agents/workspaces without entering message hashes or wire payloads. Legacy mail without this snapshot allows a main override only while recorded workspace metadata still proves the scope; otherwise it fails closed. See **Sender dismissal**.
+- **Schema v12 (auto-main incumbents):** Schema v12 adds local-only `auto_main_incumbents`, not user settings or peer data; v10/v11 upgrade directly without rewriting existing mail/settings. Back up, upgrade code/copied skills, reconcile, restart host HAM processes together. Read-only opens never migrate or elect persistently; old code cannot open v12. Protocol 1 and runtime contracts stay unchanged. Reference **Workspace role migration**.
+
+### Role-election internals
+
+Mode/home/thresholds are repo-wide; roles use `(repo_id, canonical host, anchor_workspace_id)`. Linked workspaces join a deterministic open nonlinked workspace with matching Herdr `worktree.repo_key` on the same host. Missing metadata/anchor => own scope; no git-common-dir fallback. Anchor main/members apply; linked settings stay unchanged, ignored until ungrouped. `manual`: active group explicit main + chosen workers except main; nonmembers cannot wake. `auto`: active explicit main wins, then a valid anchor incumbent, then sole group agent or unique active main-checkout agent in the anchor. A sibling opening never demotes the incumbent; same-terminal session restarts preserve it. Empty anchor => no auto main even with one linked agent; others remain workers. Only registry reconciliation records/clears incumbents; reads never write. Clearing a pin allows auto election again; manual/off ignore incumbency. `repo show`: `workspace_id`=anchor, `requested_workspace_id`=original, `main_source`=`pinned`/`auto`/null. Inactive/out-of-group targets are ignored, not rewritten; home never elects mains. Reference **Modes, roles, settings and status**; **Workspace role migration**.
+
+### Legacy request handling
+
+`request` / `request-status` / `request-cancel` only where policy permits; `request-status --wait MS` is preferred to repeated status/board polling.
+
+Keep `request_id`; prefer bounded `request-status --wait` to repeated status/board polling. It stops on state/phase/error change, terminal state or deadline. Unchanged/nonterminal is no resend permission. `deferred`/`awaiting_decision`: HAM owns delivery; never resend/unfocus. Push requires explicit user action. Observe `submitted_working|submitted_unknown`, never replay. Exit 3: nonsettled owned work; exit 1: not proof of non-delivery; settled/exit 0: not proof of correctness. Terminal text is not a structured assistant API. Never bypass SSH host-key checks.
+`request-cancel --request-id ID` cancels only your held, unsubmitted request; verifies local sender, never contacts recipient. No CLI push; reference **`request-cancel`**.
+
+### Installing and updating (summary)
+
+On each selected host, install/update plugin + skill, then run read-only `runtime status`. Explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude` (or installer `--runtime`). Never overwrite foreign/modified files; restart only user-selected sessions. Confirm `extension_present=1` or report **installed, activation pending**. Plugin/skill files alone do not prove readiness; Codex pull-only absence is normal. Checklist: reference **Client onboarding and installation**; health/ownership: **Receiving runtimes**.
+
+### Overlays
+
+The quick-send mailbox, messenger, held-message view, and HAM Skill installer use Herdr overlays (temporary zoom, restoring prior focus/zoom on close), without width/height settings; minimum Herdr remains 0.8.0. `mailbox-popup` stays the public action ID. Preserve the opener's sender/project/repository context, not the overlay's own pane ID. Reference **Mailbox TUI and operator recovery**.

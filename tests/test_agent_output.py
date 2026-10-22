@@ -128,6 +128,73 @@ class LedgerProjectionTest(unittest.TestCase):
                                  [row["repo_id"] if count > 1 else None for row in selected])
                 self.assertTrue(all("repo" not in row for row in selected))
 
+    def test_board_omits_workspace_metadata_without_touching_the_source_payload(self):
+        workspaces = [{"host": "peer", "workspace_id": "w1", "label": "Workspace"}]
+        payload = {"repo_id": None, "agents": [], "hosts": [], "workspaces": workspaces}
+        compact = agent_output.compact_board_payload(payload)
+        self.assertEqual(set(compact), {"repo_id", "agents", "hosts"})
+        self.assertIs(payload["workspaces"], workspaces)
+
+    def test_status_set_reports_display_only_when_it_failed(self):
+        base = {"agent_id": "agent", "phase": "review", "summary": "Working"}
+        self.assertEqual(agent_output.compact_status_set_payload(
+            {**base, "display": {"updated": ["p1"], "failed": []}}), base)
+        self.assertEqual(agent_output.compact_status_set_payload(
+            {**base, "display": {"updated": [], "failed": ["p1"]}, "warnings": [{"code": "w"}]}),
+            {**base, "display": {"failed": ["p1"]}, "warnings": [{"code": "w"}]})
+
+    def test_receipts_keep_identity_state_and_actionable_advisories(self):
+        receipt = {"message_id": "m", "thread_id": "t", "origin_host": "alpha", "payload_hash": "h",
+                   "recipient_address": "alpha/owl", "recipient_host": "alpha",
+                   "recipient_terminal_id": "term", "state": "queued", "hold_reason": None,
+                   "via": None, "delivered_at": None, "updated_at": 1.0, "withdraw_requested": 0,
+                   "authoritative": 1, "evidence": None, "fyi_turn_end": False}
+        self.assertEqual(agent_output.compact_send_payload(receipt),
+                         {"message_id": "m", "thread_id": "t", "recipient_address": "alpha/owl",
+                          "state": "queued"})
+        advised = {**receipt, "state": "pending", "hold_reason": "held", "fyi_turn_end": True,
+                   "fyi_wake_after_seconds": 600, "warnings": [{"code": "recipient_no_receiver"}]}
+        self.assertEqual(agent_output.compact_send_payload(advised), {
+            "message_id": "m", "thread_id": "t", "recipient_address": "alpha/owl", "state": "pending",
+            "hold_reason": "held", "fyi_turn_end": True, "fyi_wake_after_seconds": 600,
+            "warnings": [{"code": "recipient_no_receiver"}]})
+        self.assertEqual(agent_output.compact_handle_payload(
+            {"receipts": [receipt, {**receipt, "message_id": "n", "state": "handled"}]}),
+            {"receipts": [{"message_id": "m", "state": "queued"}, {"message_id": "n", "state": "handled"}]})
+
+    def test_dismissals_keep_only_documented_audit_fields(self):
+        audit = {"message_id": "m", "actor_alias": "owl", "actor_terminal_id": "term",
+                 "reason": "Closed", "dismissed_at": 1.5, "actor_agent_id": "private",
+                 "failure": {"state": "undeliverable"}}
+        expected = {key: audit[key] for key in agent_output.DISMISSAL_FIELDS}
+        self.assertEqual(agent_output.compact_dismiss_payload(
+            {"dismissals": [audit], "warnings": [{"code": "w"}]}),
+            {"dismissals": [expected], "warnings": [{"code": "w"}]})
+        row = {"message_id": "m", "origin_host": "alpha", "sender_label": "owl",
+               "state": "undeliverable", "dismissal": audit}
+        self.assertEqual(agent_output.compact_inbox_payload({"messages": [row]})["messages"][0]["dismissal"],
+                         expected)
+
+    def test_repo_show_keeps_participation_and_agent_addresses_without_setting_stamps(self):
+        stamp = {"repo_id": "repo", "field": "thresholds", "value": {"idle_minutes": 3},
+                 "version": 2, "origin_host": "alpha", "changed_by": "user", "changed_at": 1.0}
+        payload = {"repo_id": "repo", "host": "alpha", "workspace_id": "w1", "requested_workspace_id": "w2",
+                   "home_host": "alpha", "mode": "auto", "settings": {
+                       "home": {**stamp, "field": "home", "value": "alpha"},
+                       "mode": {**stamp, "field": "mode", "value": "auto"}, "thresholds": stamp},
+                   "main": {"host": "alpha", "terminal_id": "t1"}, "main_source": "auto", "members": [],
+                   "computed_main": None, "conflicts": [], "propagation_pending": 0, "agents": [
+                       {"agent_id": "private", "host": "alpha", "terminal_id": "t1", "workspace_id": "w1",
+                        "alias": "owl", "client": "omp", "role": "main", "turn_state": "idle",
+                        "extension_present": 1, "phase": "", "summary": "Reviewing", "generation": 4}]}
+        self.assertEqual(agent_output.compact_repo_payload(payload), {
+            "repo_id": "repo", "host": "alpha", "workspace_id": "w1", "mode": "auto",
+            "requested_workspace_id": "w2", "home_host": "alpha",
+            "main": {"host": "alpha", "terminal_id": "t1"}, "main_source": "auto",
+            "settings": {"thresholds": {"idle_minutes": 3}},
+            "agents": [{"address": "alpha/owl", "workspace": "w1", "client": "omp", "role": "main",
+                        "turn_state": "idle", "extension_present": 1, "summary": "Reviewing"}]})
+
     def test_inbox_keeps_priority_reply_and_truncation_without_delivery_internals(self):
         row = {"message_id": "message", "thread_id": "thread", "reply_to": "parent", "hop": 2,
                "origin_host": "peer", "sender_label": "main", "sender": "private",

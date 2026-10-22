@@ -478,7 +478,7 @@ class RemoteLedgerTest(unittest.TestCase):
                 # the recipient starts that delay on acceptance and wakes on a
                 # later receiver safety probe, subject to existing wake gates.
                 if state in {"idle", "done"}:
-                    self.assertEqual(sent["fyi_wake_after_seconds"], 300)
+                    self.assertEqual(sent["fyi_wake_after_seconds"], 600)
                 else:
                     self.assertNotIn("fyi_wake_after_seconds", sent)
         recipient = {**recipient, "turn_state": "idle"}
@@ -523,7 +523,7 @@ class RemoteLedgerTest(unittest.TestCase):
                                 if item['message_id'] == sent['message_id']))
         self.assertEqual(route['message']['created_at'], created_at)
         envelope = self.services['alpha'].envelope(route)
-        deadline = enqueued_at + 300
+        deadline = enqueued_at + 600
         with mock.patch('ham.ledger.mail.time.time', return_value=enqueued_at):
             accepted = self.services['beta'].receive('accept', envelope)
             self.assertEqual(accepted['state'], 'queued')

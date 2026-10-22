@@ -19,7 +19,7 @@ MESSAGE_BYTES = 2048
 BUNDLE_BYTES = 8192
 BUNDLE_MESSAGES = 8
 WAKE_READY_STATES = frozenset({'idle', 'done'})
-FYI_WAKE_DELAY_SECONDS = 300
+FYI_WAKE_DELAY_SECONDS = 600
 
 
 def truncate_utf8(value: str, maximum: int) -> str:

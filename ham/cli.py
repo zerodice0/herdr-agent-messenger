@@ -62,7 +62,12 @@ from ham.agents.output import (
     clean_agent_text,
     compact_batch_item,
     compact_board_payload,
+    compact_dismiss_payload,
+    compact_handle_payload,
     compact_inbox_payload,
+    compact_repo_payload,
+    compact_send_payload,
+    compact_status_set_payload,
     compact_read_payload,
     compact_request_payload,
     compact_status_payload,
@@ -1298,7 +1303,7 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
     status_set = status_operations.add_parser("set", help="Set this agent's public status.")
     status_set.add_argument("phase")
     status_set.add_argument("--summary", required=True)
-    status_operations.add_parser("clear", help="Clear this agent's public status.")
+    status_clear = status_operations.add_parser("clear", help="Clear this agent's public status.")
     status_list = status_operations.add_parser("list", help="List current status by repository.")
     status_list.add_argument("--repo", nargs="?", const="", default=None)
     status_board = status_operations.add_parser("board", help="Read local and registered-peer rich status without refreshing registry state.")
@@ -1310,6 +1315,11 @@ def parse_cli_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace
         command_parser.add_argument(
             "--verbose", action="store_true", default=argparse.SUPPRESS,
             help="Include full registry and diagnostic fields instead of compact output.",
+        )
+    for command_parser in (status_set, status_clear):
+        command_parser.add_argument(
+            "--verbose", action="store_true", default=argparse.SUPPRESS,
+            help="Include the display refresh result even when it succeeded.",
         )
 
     send_parser = subparsers.add_parser(
@@ -1587,10 +1597,20 @@ def main(
                 "awaiting_decision": 3,
             }[payload["state"]]
         if not getattr(arguments, "verbose", False):
-            if command == "status" and getattr(arguments, "status_operation", None) in {"list", "board"}:
+            operation = getattr(arguments, "status_operation", None)
+            if command == "status" and operation in {"list", "board"}:
                 payload = compact_board_payload(payload)
-            elif command == "inbox" and arguments.inbox_command == "read":
-                payload = compact_inbox_payload(payload)
+            elif command == "status" and operation in {"set", "clear"}:
+                payload = compact_status_set_payload(payload)
+            elif command == "inbox":
+                payload = (compact_inbox_payload if arguments.inbox_command == "read"
+                           else compact_handle_payload)(payload)
+            elif command == "mail" and arguments.mail_command == "send":
+                payload = compact_send_payload(payload)
+            elif command == "mail" and arguments.mail_command == "dismiss":
+                payload = compact_dismiss_payload(payload)
+            elif command == "repo":
+                payload = compact_repo_payload(payload)
         _write_json(payload)
         if reports:
             sys.stdout.flush()

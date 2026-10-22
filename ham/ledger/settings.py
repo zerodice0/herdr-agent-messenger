@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from ham.ledger.store import LedgerError, LedgerStore, json_text, queue_outbox
 
-DEFAULT_THRESHOLDS = {"idle_minutes": 3, "coalesce_seconds": 30, "wakes_per_hour": 6, "max_hop": 10}
+DEFAULT_THRESHOLDS = {"idle_minutes": 3, "coalesce_seconds": 60, "wakes_per_hour": 4, "max_hop": 10}
 REPO_FIELDS = frozenset({"home", "mode", "thresholds"})
 WORKSPACE_FIELDS = frozenset({"main", "members"})
 LEGACY_FIELDS = WORKSPACE_FIELDS | {"computed_main"}

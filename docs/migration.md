@@ -150,16 +150,21 @@ Existing v9 deliveries stay conservatively unflagged: old records cannot prove
 the recipient was working when they arrived.
 
 Eligible action wakes an idle participating OMP promptly. Queued FYI becomes
-wake-eligible 300 seconds after local recipient enqueue for batched idle wakes,
+wake-eligible 600 seconds after local recipient enqueue for batched idle wakes,
 under the same safeguards. This is a minimum, not a scheduled wake: natural
-events or the five-minute safety check normally yield about five to ten minutes.
+events or the five-minute safety check normally yield about ten to fifteen minutes.
 This delayed path adds no schema or settings: existing queued FYI uses its
 local delivery timestamp without migration.
+
+The default thresholds are now `coalesce_seconds` 60 and `wakes_per_hour` 4
+(`idle_minutes` 3 and `max_hop` 10 are unchanged). They apply only to repos with
+no saved `thresholds`; repos that already saved thresholds keep their saved
+values, and no setting or schema changes are needed.
 
 During local recipient enqueue, a locally reconciled `working` state with
 `agents.last_seen` within 15 seconds sets the turn-end flag (normal local
 reconciliation sweeps run every five seconds). Flagged FYI is delivered right
-after that turn under existing wake gates, without waiting 300 seconds.
+after that turn under existing wake gates, without waiting 600 seconds.
 Idle, unknown or stale enqueue state does not set the flag but still permits
 the delayed path once eligible. Remote wire payloads do not carry this flag;
 the final recipient's ledger decides locally.

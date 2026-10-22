@@ -185,7 +185,7 @@ max-hop gates are unchanged. Legacy collaboration policy is also unchanged:
 Choose `--kind action` when the recipient must act, answer, or continue (for
 example, on an answer/decision); use `fyi` for reference information. Eligible
 action wakes promptly; FYI is batched for an idle participating OMP wake after
-about five to ten minutes, or delivered right after a turn when it arrives mid-turn.
+about ten to fifteen minutes, or delivered right after a turn when it arrives mid-turn.
 Existing wake safeguards apply.
 
 Successful sends can return advisory warnings without changing the default
@@ -196,7 +196,10 @@ for `recipient_no_receiver` and the advisory contract.
 1–1000), and `--verbose`. Defaults retain IDs/sender/body/state/reply context;
 verbose restores full delivery diagnostics. It never changes state/logs/bells, including when a task agent shares
 the calling pane. `inbox handle --message UUID` is repeatable and all-or-nothing;
-queued→handled does not invent a native delivered timestamp.
+queued→handled does not invent a native delivered timestamp. By default `mail send`,
+`mail dismiss`, `inbox handle`, `repo show` and `status set|clear` return brief receipts
+(identity, state, resolved recipient, warnings/failures); `--verbose` restores the full
+receipt, dismissal audit, setting stamps and display refresh result.
 `mail withdraw --message UUID` competes atomically with delivery claim and
 returns `withdrawn:false` if a claim or another non-withdrawn final result wins.
 Repeating a successful withdrawal returns `withdrawn:true` and preserves its
@@ -531,11 +534,11 @@ stay conservatively unflagged. Upgrade ledger and CLI/copied skills together;
 older enqueue code can miss the flag. The extension contract is unchanged and
 this schema-only policy needs no extension restart. The [package cutover](migration.md#python-package-layout) separately requires enabled-runtime reinstalls and receiver/hook session plus HAM worker/TUI restarts on all five hosts.
 Delayed idle FYI uses the existing local delivery timestamp: queued FYI becomes
-wake-eligible 300 seconds after local recipient enqueue, including mail already
+wake-eligible 600 seconds after local recipient enqueue, including mail already
 queued before the update. No new schema, setting, or data migration is needed.
-The 300 seconds is minimum eligibility, not a scheduled delivery guarantee;
+The 600 seconds is minimum eligibility, not a scheduled delivery guarantee;
 idle-only FYI normally wakes on a natural event or the next five-minute safety
-check, about five to ten minutes after enqueue if other gates permit.
+check, about ten to fifteen minutes after enqueue if other gates permit.
 
 Schema v11 adds local `mail_dismissals` and nullable `messages.sender_context`,
 preserving existing v10 payloads and settings. Upgrade/restart all HAM processes sharing a host ledger together;
@@ -618,9 +621,15 @@ The Settings overlay has exactly **seven mutable rows**:
 | `main` | `{"host":"canonical","terminal_id":"term_…"}` or `null` |
 | `members` | Unique array of those targets; default empty |
 | `idle_minutes` | `3` minutes |
-| `coalesce_seconds` | `30` seconds |
-| `wakes_per_hour` | `6` wakes per hour |
+| `coalesce_seconds` | `60` seconds |
+| `wakes_per_hour` | `4` wakes per hour |
 | `max_hop` | `10` hops |
+
+The listed threshold defaults apply only to a repository with no saved
+`thresholds` field; the Mailbox settings editor shows them in that case, and the
+receiver uses them for wake gating. Editing any one threshold saves all four
+displayed values together, so a repository with saved thresholds keeps those
+values and does not follow later default changes.
 
 Mode and the four thresholds apply to the repository. Main and Members rows
 identify the Mailbox opener's host-qualified workspace (`Main (workspace …)` /
@@ -701,21 +710,21 @@ retry window and clears its own status on success; exhaustion shows unavailable.
 HAM never publishes that path itself. Conflicting reported paths remain
 `stale_session`.
 
-Eligible action wakes promptly. Queued FYI becomes wake-eligible 300 seconds
+Eligible action wakes promptly. Queued FYI becomes wake-eligible 600 seconds
 after local recipient enqueue, not guaranteed to wake at that instant. Natural
 events and the five-minute safety scan normally trigger a batched idle wake
-after about five to ten minutes. Existing queued mail uses its local delivery
+after about ten to fifteen minutes. Existing queued mail uses its local delivery
 timestamp, not the sender's message creation time.
 FYI arriving during a turn is delivered right after that turn under existing
 wake gates: local enqueue records `delivery.fyi_turn_end` only for fresh
 `working` state (local reconciliation's `agents.last_seen` within 15 seconds),
-bypassing the 300-second delay. Later state changes do not retroactively set
+bypassing the 600-second delay. Later state changes do not retroactively set
 the flag. All wake gates still apply, including participation and idle state.
 The flag is local delivery metadata, not a change of mail kind or wire payload.
 Natural user turns can receive both kinds even in off mode or for manual
 nonmembers. Wakes use the same bounded bundle: at most eight messages / 8 KiB
 total, each body bounded to 2 KiB with exact-message-ID read instructions for
-truncation. Action wakes can also bundle FYI younger than 300 seconds.
+truncation. Action wakes can also bundle FYI younger than 600 seconds.
 FYI-only bundles ask the recipient to read and continue, replying only if the
 information changes its work.
 The runtime watches the local bell with `fs.watch` and has a five-minute

@@ -158,7 +158,8 @@ class ReadCliTest(unittest.TestCase):
             messages = view["messages"] if "messages" in view else [
                 message for thread in view["threads"] for message in thread["messages"]]
             found = next(message for message in messages if message["message_id"] == first["message_id"])
-            self.assertEqual(found["dismissal"], audit)
+            self.assertEqual({key: found["dismissal"][key] for key in audit}, audit)
+            self.assertIn("failure", found["dismissal"])
             self.assertEqual(found["state"], "undeliverable")
 
     def test_mail_dismiss_cli_reason_usage_and_domain_exit_codes(self):
@@ -586,6 +587,78 @@ class ReadCliTest(unittest.TestCase):
         self.assertTrue(all(row["host"] == "alpha" for row in failed["agents"]))
         self.assertEqual([self.database_state(store) for store in (self.store, self.peer_store)], before)
         self.assertFalse(self.herdr_calls.exists(), "Stored-board reads must not inspect or mutate Herdr")
+
+    def test_board_compact_omits_workspace_metadata_that_verbose_and_api_keep(self):
+        self.snapshot["workspaces"] = [{"workspace_id": "w1", "label": "main-workspace",
+                                        "worktree": {"repo_key": "shared", "is_linked_worktree": False}}]
+        self.snapshot_path.write_text(json.dumps({"result": self.snapshot}))
+        AgentRegistry(self.store).reconcile(self.snapshot, refresh_display=False)
+        expected = ledger_cli.status_operation("board", environment=self.environment)
+        self.assertEqual([row["workspace_id"] for row in expected["workspaces"]], ["w1"])
+        completed, compact = self.cli("status", "board")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(set(compact), {"repo_id", "agents", "hosts"})
+        completed, verbose = self.cli("status", "board", "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(verbose["workspaces"], expected["workspaces"])
+
+    def test_mutation_receipts_are_compact_by_default_and_full_with_verbose(self):
+        full_receipt = {"payload_hash", "origin_host", "authoritative", "updated_at"}
+        completed, sent = self.cli("mail", "send", "--to", "local/" + self.other["alias"], "--body", "Compact receipt")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(set(sent), {"message_id", "thread_id", "recipient_address", "state"})
+        self.assertEqual((sent["state"], sent["recipient_address"]), ("queued", "alpha/" + self.other["alias"]))
+        completed, verbose = self.cli("mail", "send", "--to", "local/" + self.other["alias"],
+                                      "--body", "Full receipt", "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(full_receipt <= verbose.keys())
+
+        inbound = [self.mail.send(self.other, self.sender, body="Handle " + name) for name in ("compact", "full")]
+        completed, handled = self.cli("inbox", "handle", "--message", inbound[0]["message_id"])
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(handled, {"receipts": [{"message_id": inbound[0]["message_id"], "state": "handled"}]})
+        completed, again = self.cli("inbox", "handle", "--message", inbound[1]["message_id"], "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(full_receipt <= again["receipts"][0].keys())
+
+        completed, repo = self.cli("repo", "show")
+        self.assertEqual(completed.returncode, 0)
+        completed, repo_full = self.cli("repo", "show", "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue({"settings", "requested_workspace_id", "conflicts"} <= repo_full.keys())
+        self.assertEqual((repo["repo_id"], repo["mode"]), (self.repo_id, "auto"))
+        self.assertNotIn("settings", repo)
+        self.assertTrue({"agent_id", "generation", "session_ref"}.isdisjoint(repo["agents"][0]))
+        self.assertEqual({row["address"] for row in repo["agents"]},
+                         {"alpha/" + row["alias"] for row in (self.sender, self.recipient)})
+        self.assertIn("agent_id", repo_full["agents"][0])
+
+        completed, status = self.cli("status", "set", "review", "--summary", "Compact status")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual((status["phase"], status["summary"]), ("review", "Compact status"))
+        self.assertEqual(status["display"], {"failed": ["w1:p1"]}, "Failures stay visible")
+        completed, status_full = self.cli("status", "set", "review", "--summary", "Compact status", "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(status_full["display"], {"updated": [], "failed": ["w1:p1"]})
+
+    def test_dismiss_compact_keeps_stable_audit_fields_and_verbose_keeps_failure_evidence(self):
+        first = self.mail.send(self.sender, self.recipient, body="Closed terminal")
+        self.snapshot["agents"] = [raw for raw in self.snapshot["agents"] if raw["terminal_id"] != "term-b"]
+        self.snapshot["panes"] = [raw for raw in self.snapshot["panes"] if raw["terminal_id"] != "term-b"]
+        self.snapshot_path.write_text(json.dumps({"result": self.snapshot}))
+        AgentRegistry(self.store).reconcile(self.snapshot, refresh_display=False)
+        completed, compact = self.cli("mail", "dismiss", "--message", first["message_id"], "--reason", "Closed")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(set(compact["dismissals"][0]),
+                         {"message_id", "actor_alias", "actor_terminal_id", "reason", "dismissed_at"})
+        completed, verbose = self.cli("mail", "dismiss", "--message", first["message_id"],
+                                      "--reason", "Ignored", "--verbose")
+        self.assertEqual(completed.returncode, 0)
+        audit = verbose["dismissals"][0]
+        self.assertEqual(audit["failure"]["state"], "undeliverable")
+        self.assertEqual({key: audit[key] for key in compact["dismissals"][0]}, compact["dismissals"][0])
+        completed, view = self.cli("mail", "show", "--thread", first["thread_id"])
+        self.assertEqual(view["messages"][0]["dismissal"], audit)
 
     def test_wire_read_only_export_validates_mode_and_keeps_status_unchanged(self):
         peer_id = str(uuid.uuid4())
