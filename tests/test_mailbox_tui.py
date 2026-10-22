@@ -4265,6 +4265,36 @@ class MailboxUiTest(unittest.TestCase):
         self.assertIn('Recorded delivery: undeliverable · failure: terminal_closed', text)
         self.assertEqual(thread['messages'][0]['state'], 'undeliverable')
 
+    def test_sender_dismissal_removes_current_hold_cue_but_preserves_failure_history(self):
+        app = self.app()
+        thread = self.thread_fixture('failed', 'undeliverable')
+        message = thread['messages'][0]
+        message['hold_reason'] = 'terminal_closed'
+
+        def summary(record, technical=False):
+            app.detail = {'type': 'thread', **thread, 'messages': [record]}
+            app.detail_technical = technical
+            return [line for line, _ in app.thread_detail(100)]
+
+        no_hold = {**message, 'hold_reason': None}
+        active_header = summary(message)[1]
+        queued = {**message, 'state': 'queued', 'hold_reason': 'recipient_changed'}
+        self.assertNotEqual(summary(queued)[1], summary({**queued, 'hold_reason': None})[1])
+        self.assertNotEqual(active_header, summary(no_hold)[1])
+        active_diagnostic_cue = describe_message(message).removeprefix(describe_message(no_hold))
+        self.assertTrue(active_diagnostic_cue)
+        self.dismiss_fixture(thread)
+        dismissed = thread['messages'][0]
+        self.assertEqual(summary(dismissed)[1], summary({**dismissed, 'hold_reason': None})[1])
+        self.assertNotIn(active_diagnostic_cue, describe_message(dismissed))
+        self.assertIn(message['hold_reason'], describe_message(dismissed))
+        for technical in (False, True):
+            lines = summary(dismissed, technical)
+            self.assertTrue(any(message['state'] in line and message['hold_reason'] in line
+                                for line in lines))
+        self.assertEqual(dismissed['hold_reason'], 'terminal_closed')
+        self.assertEqual(dismissed['state'], 'undeliverable')
+
     def test_dismissal_repartition_and_new_reply_preserve_selection_navigation_and_identity(self):
         app = self.app()
         failed = self.thread_fixture('failed', 'undeliverable')

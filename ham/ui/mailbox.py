@@ -709,7 +709,10 @@ def edit_buffer(text: str, cursor: int, key: Any, *, multiline: bool) -> tuple[s
 
 def describe_message(message: Mapping[str, Any]) -> str:
     state = "UNCERTAIN claim" if message["state"] == "delivering" else message["state"]
-    suffix = f" HOLD:{message['hold_reason']}" if message.get("hold_reason") else ""
+    suffix = ""
+    if message.get("hold_reason"):
+        label = "recorded failure" if message.get("dismissal") else "HOLD"
+        suffix = f" {label}:{message['hold_reason']}"
     if message.get("withdraw_requested"):
         suffix += " withdrawal requested"
     if message.get("confirmation_source") == "operator":
@@ -2582,7 +2585,7 @@ class MailboxApp:
                     summary += " · native confirmation"
                 if message.get("withdraw_requested"):
                     summary += " · withdrawal requested"
-                if message.get("hold_reason"):
+                if message.get("hold_reason") and not message.get("dismissal"):
                     summary += " · HOLD"
                 if index > 1:
                     result.append(("", 0))

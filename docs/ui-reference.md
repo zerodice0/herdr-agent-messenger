@@ -297,6 +297,8 @@ handled. The `?` help overlay includes this legend.
 Dismissed message Detail always shows actor alias/terminal, dismissal time and
 reason, plus the preserved delivery state and former failure reason; technical
 mode is not required. Mixed handled+dismissed threads retain a dismissed list cue.
+Its old failure is historical, not a current HOLD cue; genuinely held,
+undismissed messages retain their current HOLD indicator.
 This is a local origin-ledger resolution, not a recipient receipt or replicated
 handling event. Use `mail dismiss --message UUID --reason TEXT` from an authorized
 sender/main CLI context; the TUI adds no dismissal shortcut or mutation.
