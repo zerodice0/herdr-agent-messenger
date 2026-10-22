@@ -123,12 +123,17 @@ as `action`; the `[ACTION ^G]` chip shows the current kind.
 | `Shift+Enter` / `Alt+Enter` | Insert a newline; use Alt+Enter on Moshi/mosh. |
 | `Tab` / `Shift+Tab` | Move between regions in navigation mode. |
 | `m` | Agents: confirm pinning the selected live local role-group agent as main, or clear its explicit pin. |
+| `f` | Agents: deliver the selected local agent's queued FYI now instead of after the FYI delay (no prompt typed). |
 | `s` | Open Settings in navigation mode. |
 | `?` / `F1` | Open help in navigation mode / while typing. |
 | `Esc` | Leave input while retaining the draft. |
 
 Shift+Enter uses the requested kitty keyboard protocol in compatible terminals;
 Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the request.
+
+The pane action **HAM: Deliver queued FYI now** (`herdr.agent-messenger.fyi-now`) does the
+same for the focused agent pane; bind it yourself, for example `prefix+f` (and `prefix+ㄹ` on
+hangul layouts). All wake gates still apply. See [Deliver FYI now](docs/ui-reference.md#deliver-fyi-now).
 
 Threads keep the question and replies together. Viewing them never ACKs mail.
 

@@ -65,6 +65,7 @@ elif op=='send': result=mail.send(sender,recipient,**data)
 elif op=='view':
  with store.read() as c:
   result={'messages':[dict(r) for r in c.execute('SELECT m.message_id,m.kind,d.state,d.claim_id,d.hold_reason,d.claimed_generation FROM messages m JOIN deliveries d USING(message_id) ORDER BY m.created_at,m.message_id')], 'wakes':c.execute('SELECT count(*) FROM wake_log').fetchone()[0]}
+elif op=='fyi_now': result=NativeReceiver(store).fyi_now(terminal_id=recipient['terminal_id'],agent_id=recipient['agent_id'],generation=recipient['generation'])
 else: raise Exception(op)
 print(json.dumps(result))
 `;
@@ -104,11 +105,12 @@ class Fixture {
   beforeRegister?: (data: Record<string, unknown>) => Promise<void>;
   afterRegister?: (data: Record<string, unknown>) => Promise<void>;
   throwSend = false;
+  onTimeout?: () => void;
 
   constructor() {
     const timeout = (callback: () => unknown, delay: number) => {
       const token = {}; this.timers.set(token, callback); this.timeoutTokens.add(token);
-      this.timerDueAt.set(token, Date.now() + delay); return token;
+      this.timerDueAt.set(token, Date.now() + delay); this.onTimeout?.(); return token;
     };
     const interval = (callback: () => unknown, delay: number) => {
       const token = {}; this.timers.set(token, callback);
@@ -464,6 +466,50 @@ test("working Herdr state never claims a wake despite quiet empty editor", async
   const view = await f.view();
   expect(view.messages[0].state).toBe("queued"); expect(view.messages[0].claim_id).toBeNull();
   expect(view.wakes).toBe(0);
+});
+
+// The real fs.watch bell makes the extension schedule its debounced inspection through the host timer.
+function nextScheduledTimer(f: Fixture): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  f.onTimeout = () => { f.onTimeout = undefined; resolve(); };
+  return promise;
+}
+
+test("user FYI-now request wakes an idle agent through the unchanged extension right after the bell", async () => {
+  const f = new Fixture(); await f.setup(); await f.send();
+  while (f.timeoutTokens.size) await f.runNextTimeout();
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0);
+  expect((await f.view()).messages[0].state).toBe("queued");
+  while (f.timeoutTokens.size) await f.runNextTimeout();
+  f.operations.length = 0;
+
+  const scheduled = nextScheduledTimer(f);
+  const result = await f.fixture("fyi_now") as { outcome: string; flagged: number };
+  expect(result).toMatchObject({ outcome: "requested", flagged: 1 });
+  await scheduled;  // only the user's bell can schedule this inspection
+  await f.runNextTimeout();
+  expect(f.operations.slice(-2)).toEqual(["inspect", "claim"]);
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+  expect(f.sent[0].message.content).toContain("Real isolated body / fyi");
+  expect(f.sent[0].message.content).toContain("FYI only: read and continue; reply only if it changes your work.\n");
+  const view = await f.view();
+  expect(view.messages[0].state).toBe("delivering"); expect(view.wakes).toBe(0);
+  expect(f.warnings).toEqual([]);
+});
+
+test("user FYI-now request on a working agent still waits for the turn to end", async () => {
+  const f = new Fixture(); await f.setup(); await f.send();  // enqueued while idle: not flagged
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "working" });
+  const result = await f.fixture("fyi_now") as { outcome: string; flagged: number };
+  expect(result).toMatchObject({ outcome: "after_turn", flagged: 1 });
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0); expect(f.operations).not.toContain("claim");
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "done" });
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].message.content).toContain("Real isolated body / fyi");
 });
 
 test("young FYI waits for eligibility; task agents never register or consume", async () => {

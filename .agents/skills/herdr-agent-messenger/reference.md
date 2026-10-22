@@ -115,6 +115,19 @@ when its locally reconciled `agents.last_seen` is within 15 seconds and
 retain all runtime/admission gates. The flag is local delivery metadata, never
 a new kind or immutable wire field.
 
+A user can also set the flag on demand: Mailbox Agents `f` or the pane action
+`herdr.agent-messenger.fyi-now` (`python3 -m ham mailbox fyi-now`, **HAM: Deliver
+queued FYI now**) run `NativeReceiver.fyi_now`, which sets `fyi_turn_end=1` on the
+local active agent's queued, unheld `kind='fyi'` deliveries (hop within limit),
+appends a `status_log` row with `field='fyi_now'` and the flagged message IDs, and
+rings the agent's bell. The flag therefore means "deliver without the FYI delay:
+turn end or user request". Action, held, handled, and other agents' mail is untouched;
+no schema, protocol, or receiver-extension change. Every gate (role, idle/done turn,
+`wakes_per_hour`, hop, hold, quiet editor, coalescing) still applies; `wake_log` is
+not written. Result outcomes: `requested`, `after_turn`, `hourly_limit` (with
+`limit_frees_at`), `nothing_queued`, `only_held`, `not_participating`, `no_receiver`,
+`not_agent`. Local only; agents never trigger it.
+
 #### History and cursor paging
 
 `mail threads` and `mail direct-list` default to the verified caller's repository.
@@ -665,6 +678,13 @@ The **HAM: Mailbox (quick send)** overlay closes after a successful send result.
 drafts (default Cancel). Top-level Esc closes only quick-send mode; Esc leaves
 input/dialogs without discarding drafts.
 
+`herdr plugin action invoke fyi-now --plugin herdr.agent-messenger` (context `pane`)
+delivers the focused agent's queued FYI now and reports through a Herdr
+notification. Suggested binding: `prefix+f` (free in Herdr 0.9.5 defaults), with
+`prefix+ㄹ` for hangul layouts, as `[[keys.command]] type = "plugin_action"
+command = "herdr.agent-messenger.fyi-now"`. In the Mailbox, `f` on an Agents row does
+the same for a local agent; remote rows show a local-only reason.
+
 Quick send, messenger, Held Messages, and HAM Skill use official Herdr `overlay`
 placement: temporary zoom that restores the prior focus and zoom when closed.
 HAM sets no manifest width/height, sends no sizing flags, and does not query
@@ -910,8 +930,8 @@ the current structured plugin root (or explicitly configured absolute
 SQLite. Natural turn boundaries can receive both kinds, including off/manual
 nonmembers. Eligible action wakes promptly; FYI is batched for an idle wake
 after about ten to fifteen minutes (600 seconds is minimum eligibility), or right
-after a turn when locally flagged
-at fresh `working` enqueue. Automatic action or FYI wake requires a
+after a turn when locally flagged at fresh `working` enqueue or by user request (`fyi-now`).
+Automatic action or FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
 evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
 retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.

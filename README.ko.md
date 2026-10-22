@@ -122,12 +122,17 @@ Herdr 명령 팔레트의 **HAM: Mailbox (Right Split)** 또는 **HAM: Mailbox (
 | `Shift+Enter` / `Alt+Enter` | 줄을 바꿉니다. Moshi/mosh에서는 Alt+Enter를 사용합니다. |
 | `Tab` / `Shift+Tab` | 탐색 모드에서 영역을 옮깁니다. |
 | `m` | Agents에서 선택한 로컬 역할 그룹의 활성 에이전트를 main으로 고정하거나 고정을 해제합니다. 확인을 거쳐 저장합니다. |
+| `f` | Agents에서 선택한 로컬 에이전트의 대기 중인 FYI를 FYI 지연 없이 지금 전달합니다(입력 없음). |
 | `s` | 탐색 모드에서 Settings를 엽니다. |
 | `?` / `F1` | 탐색 모드 / 입력 중에 도움말을 엽니다. |
 | `Esc` | 초안을 보존하고 입력창에서 나옵니다. |
 
 Shift+Enter는 호환 터미널에서 요청한 kitty 키보드 프로토콜을 사용합니다.
 Ctrl+J는 줄바꿈 키가 아닙니다. `HAM_MAILBOX_NO_KITTY=1`로 프로토콜 요청을 끕니다.
+
+pane action **HAM: Deliver queued FYI now**(`herdr.agent-messenger.fyi-now`)는 포커스된
+에이전트 pane에 같은 동작을 합니다. 직접 `prefix+f`(한글 자판은 `prefix+ㄹ`) 같은 키에
+연결하세요. 깨우기 조건은 모두 그대로 적용합니다. [FYI 즉시 전달](docs/ko/ui-reference.md#fyi-즉시-전달)을 참고하세요.
 
 Threads는 질문과 답장을 한 대화로 보여 줍니다. 조회만으로 메일에 ACK하지 않습니다.
 

@@ -27,6 +27,13 @@ contexts = ["workspace", "pane"]
 command = ["python3", "-m", "ham", "mailbox", "overlay"]
 
 [[actions]]
+id = "fyi-now"
+title = "HAM: Deliver queued FYI now"
+description = "Deliver the focused agent's queued FYI now instead of after the FYI delay; no prompt, no model tokens."
+contexts = ["pane"]
+command = ["python3", "-m", "ham", "mailbox", "fyi-now"]
+
+[[actions]]
 id = "label-current"
 title = "Assign Agent Label"
 description = "Assign a color-animal name to the agent in the focused pane."

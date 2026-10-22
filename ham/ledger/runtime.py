@@ -172,6 +172,97 @@ class NativeReceiver:
         return {**state,'queued_count':len(rows),'has_action':bool(triggers),
                 'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0)}
 
+    def fyi_now(self,*,terminal_id: str,agent_id: str | None = None,generation: int | None = None) -> dict[str, Any]:
+        """User request: let this agent's queued ordinary FYI skip the FYI delay.
+
+        ``deliveries.fyi_turn_end`` therefore means "deliver without the FYI
+        delay": set at enqueue while the recipient was working, or by this
+        user request. The unchanged receiver extension then sees ``has_action``
+        from its normal inspect and every wake gate still applies (role, idle
+        turn, hourly limit, hop, holds, input quiet, coalescing).
+        The request is local-only, never touches wake_log, and is audited in status_log.
+        """
+        now = time.time()
+        with self.store.transaction((terminal_id,)) as connection:
+            row = connection.execute('SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1',
+                                     (self.store.host,terminal_id)).fetchone()
+            if row is None:
+                return {'outcome':'not_agent','terminal_id':terminal_id}
+            agent = dict(row)
+            if agent_id is not None and (agent['agent_id']!=agent_id or agent['generation']!=generation):
+                raise LedgerError('stale_session','The agent session/generation has changed.')
+            state = self._state(connection,agent,now)
+            thresholds = state['thresholds']
+            result: dict[str, Any] = {
+                'agent':{key:agent[key] for key in ('agent_id','terminal_id','alias','client','generation')},
+                'role':state['role'],'turn_state':state['turn_state'],'wake_count':state['wake_count'],
+                'wakes_per_hour':thresholds['wakes_per_hour'],'idle_minutes':thresholds['idle_minutes'],
+                'queued_fyi':0,'queued_action':0,'held':0,'over_hop':0,'flagged':0,'eligible':0,
+                'bundle':0,'remaining':0,'ready_in':0,'limit_frees_at':None}
+            queued = connection.execute(
+                "SELECT m.message_id,m.kind,m.hop,d.hold_reason,d.fyi_turn_end FROM messages m "
+                "JOIN deliveries d USING(message_id) WHERE d.recipient_host=? AND d.recipient_terminal_id=? "
+                "AND d.recipient_repo_id=? AND d.state='queued' ORDER BY m.created_at,m.message_id",
+                (self.store.host,terminal_id,agent['repo_id'])).fetchall()
+            fresh: list[str] = []
+            for item in queued:
+                if item['kind']=='action':
+                    result['queued_action'] += 1
+                elif item['hold_reason'] is not None:
+                    result['held'] += 1
+                elif item['hop']>thresholds['max_hop']:
+                    result['over_hop'] += 1
+                else:
+                    result['queued_fyi'] += 1
+                    if item['fyi_turn_end']:
+                        result['eligible'] += 1
+                    else:
+                        fresh.append(item['message_id'])
+            if agent['client']!='omp' or not agent['extension_present']:
+                return {**result,'outcome':'no_receiver'}
+            if state['role'] is None:
+                return {**result,'outcome':'not_participating'}
+            if not result['queued_fyi']:
+                return {**result,'outcome':'only_held' if result['held'] else 'nothing_queued'}
+            if fresh:
+                connection.execute('UPDATE deliveries SET fyi_turn_end=1 WHERE message_id IN (%s) '
+                                   "AND state='queued' AND fyi_turn_end=0 AND hold_reason IS NULL"
+                                   % ','.join('?' for _ in fresh),fresh)
+                connection.execute("INSERT INTO status_log(agent_id,field,value,at) VALUES (?,'fyi_now',?,?)",
+                                   (agent['agent_id'],json.dumps(fresh),now))
+            result['flagged'] = len(fresh)
+            result['eligible'] += len(fresh)
+            rows = self._eligible(connection,agent,thresholds['max_hop'],wake=True,
+                                  coalesce_seconds=thresholds['coalesce_seconds'],now=now)
+            trigger = min(rows,key=lambda item:(
+                not (item['kind']=='action' and wake_ready_at(item,thresholds['coalesce_seconds'])<=now),
+                wake_ready_at(item,thresholds['coalesce_seconds'])))
+            result['bundle'] = len(fit_claim_rows(rows,wake_trigger=trigger['message_id']))
+            result['remaining'] = connection.execute(
+                "SELECT count(*) FROM messages m JOIN deliveries d USING(message_id) WHERE d.recipient_host=? "
+                "AND d.recipient_terminal_id=? AND d.recipient_repo_id=? AND d.state='queued' AND m.hop<=? "
+                "AND (m.kind='action' OR d.hold_reason IS NULL)",
+                (self.store.host,terminal_id,agent['repo_id'],thresholds['max_hop'])).fetchone()[0]-result['bundle']
+            result['ready_in'] = max(0,wake_ready_at(trigger,thresholds['coalesce_seconds'])-now)
+            limit = thresholds['wakes_per_hour']
+            if state['wake_count']>=limit:
+                log = [item[0] for item in connection.execute(
+                    'SELECT at FROM wake_log WHERE agent_id=? AND at>? ORDER BY at',(agent['agent_id'],now-3600))]
+                if limit>0 and len(log)>=limit:
+                    result['limit_frees_at'] = log[len(log)-limit]+3600
+                result['outcome'] = 'hourly_limit'
+            elif state['turn_state'] not in WAKE_READY_STATES:
+                result['outcome'] = 'after_turn'
+            else:
+                result['outcome'] = 'requested'
+        if not result['flagged']:
+            # A repeat request changed nothing, so the transaction rang no bell.
+            try:
+                self.store.ring((terminal_id,))
+            except OSError as error:
+                self.store.notification_errors.append({'code':'notification_failed','message':str(error),'committed':True})
+        return self.store.annotate(result)
+
     def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False) -> dict[str, Any]:
         now = time.time()
         with self.store.transaction((terminal_id,)) as connection:

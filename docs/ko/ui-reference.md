@@ -24,6 +24,9 @@
 폐기 확인을 거치며 기본 선택은 Cancel입니다. 최상위에서 `Esc`는 빠른 전송 오버레이만
 닫고 분할·탭에서는 아무 동작도 하지 않습니다. 입력창이나 대화상자에서는 빠져나옵니다.
 
+별도의 pane 동작인 **HAM: Deliver queued FYI now**(`herdr.agent-messenger.fyi-now`)는
+메일함을 열지 않습니다. [FYI 즉시 전달](#fyi-즉시-전달)을 참고하세요.
+
 ### Herdr 오버레이 배치
 
 빠른 전송, **Send Prompt to Agents**, **Held Messages**, **HAM Skill**은 공식
@@ -148,6 +151,7 @@ INPUT에서 Space는 문자로 입력되고, CONFIRM·Settings 선택 목록의 
 | `↑` / `↓`, `j` / `k` | 목록의 선택 항목을 옮깁니다. Detail에 포커스가 있으면 방향키로 스크롤합니다. |
 | `PgUp` / `PgDn`, `Home` / `End` | 포커스가 있는 영역에서 페이지를 넘기거나 처음·끝으로 이동합니다. Detail은 실제로 보이는 본문 행 수를 기준으로 한 행씩 겹치게 페이지를 넘기며, Home/End는 첫 페이지와 마지막 페이지로 이동합니다. |
 | `Enter` | Agents에서는 입력창을, Threads에서는 답장 입력창을 엽니다. Detail에서는 동작하지 않습니다. |
+| `f` | Agents에서 선택한 로컬 에이전트의 대기 중인 일반 FYI를 지금 전달합니다. 입력이나 확인 없이 실행하며 자세한 내용은 [FYI 즉시 전달](#fyi-즉시-전달)을 참고하세요. 원격·비활성 행에서는 아무것도 바꾸지 않고 이유를 표시합니다. |
 | `m` | Agents에서 같은 호스트·저장소·역할 그룹의 활성 에이전트를 main으로 고정합니다. 이미 명시적으로 고정된 행에서는 고정을 해제합니다. 확인을 거치며, 원격·비활성·다른 그룹의 행에서는 설정을 바꾸지 않고 이유를 표시합니다. |
 | `t` | Detail에서는 native 스레드·DIRECT·OUTBOX의 기술 정보를 펼치거나 접고 최신 native 메시지로 돌아갑니다. 단일 항목은 맨 위로 이동합니다. Threads에서는 기존 OUTBOX 재시도 확인창을 엽니다. 에이전트 상세·진단 화면에서는 토글하지 않으며 INPUT에서는 문자로 입력합니다. |
 | `s` | Settings를 엽니다. |
@@ -406,6 +410,60 @@ terminal을 함께 보내며, 저장 전에 다른 Mailbox가 고정을 바꿨�
 모드는 꺼지지 않습니다. `auto`에서는 기존 자동 main이나 유일한 후보가 main이 될 수
 있습니다. 자동으로 선출된 main은 명시적인 고정이 아니므로 `m`을 누르면 고정합니다.
 Settings의 선택 목록과 `m` 단축키 동작은 그대로 유지됩니다. 설정 변경 CLI는 없습니다.
+
+### FYI 즉시 전달
+
+대기 중인 일반 FYI는 보통 FYI 지연(약 10~15분)을 기다립니다. 다음 두 방법으로 메일을 쓰거나
+에이전트에 입력하지 않고 이 대기를 건너뛸 수 있으므로 요청 자체는 모델 토큰을 쓰지 않습니다.
+모델이 하는 일은 전달된 묶음을 읽는 에이전트 자신의 턴뿐입니다.
+
+- **메일함:** NAV의 Agents에서 로컬 에이전트를 선택하고 `f`를 누릅니다. 결과는 상태 줄과
+  행의 짧은 태그로 표시합니다.
+- **Pane 동작:** **HAM: Deliver queued FYI now**(`herdr.agent-messenger.fyi-now`, context
+  `pane`)는 포커스된 pane을 대상으로 하며 Herdr 알림으로 결과를 알립니다.
+  `~/.config/herdr/config.toml`에 연결하세요. `prefix+f`는 Herdr 0.9.5 기본 키와 겹치지 않습니다.
+  두 번째 항목은 다른 HAM 바인딩처럼 한글 자판용입니다.
+
+  ```toml
+  [[keys.command]]
+  key = "prefix+f"
+  type = "plugin_action"
+  command = "herdr.agent-messenger.fyi-now"
+  description = "HAM: deliver queued FYI now"
+
+  [[keys.command]]
+  key = "prefix+ㄹ"
+  type = "plugin_action"
+  command = "herdr.agent-messenger.fyi-now"
+  description = "HAM: deliver queued FYI now (hangul)"
+  ```
+
+  추가하기 전에 사용 중인 설정에 `prefix+f`가 이미 있는지 확인하세요. 두 방법 모두 로컬
+  전용이므로 다른 호스트의 에이전트에는 그 호스트의 메일함을 사용하세요.
+
+요청은 해당 에이전트의 대기 중이고 보류되지 않은 일반 FYI 전달 건에 로컬
+`deliveries.fyi_turn_end` 플래그를 설정해 깨우기 대상으로 만듭니다. 이 플래그는 이제
+「FYI 지연 없이 전달: 턴 종료 또는 사용자 요청」을 뜻합니다. 상태 로그에 `fyi_now` 행을
+추가하고 에이전트의 로컬 벨을 울려 수신기가 바로 확인하게 합니다. action 메일, 보류된 메일,
+처리된 메일, 다른 에이전트는 건드리지 않습니다. 스키마, 프로토콜, runtime은 바뀌지 않으며
+OMP 확장을 다시 시작할 필요도 없습니다.
+
+깨우기 조건은 수신기가 계속 적용합니다. 에이전트가 참여 중(모드와 역할)이어야 하고, 턴이
+idle 또는 done이어야 하며, 시간당 깨우기 한도에 여유가 있어야 합니다. hop 한도도 유지되고,
+프롬프트는 비어 있으며 idle 기준 시간 동안 입력이 없어야 합니다. 작업 중인 에이전트는 그 턴
+직후 FYI를 받습니다. 한 번의 깨우기에는 최대 8개 메시지와 8 KiB까지 담으며 나머지는 다음
+깨우기에서 전달합니다. 상태 줄은 실제로 적용되는 상황을 구체적으로 알려 줍니다.
+
+| 결과 | 메시지(형태) |
+| --- | --- |
+| `requested` | `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min` |
+| `after_turn` | `agent is working: N FYI delivered right after its turn` |
+| `hourly_limit` | `N FYI marked, wake limit reached (4/4 this hour); next wake possible HH:MM` |
+| `nothing_queued` / `only_held` | 전달할 FYI가 없으며 대기 중인 action 수나 보류 수를 함께 표시 |
+| `not_participating` | 모드가 off이거나 manual 비구성원이면 HAM이 깨우지 않고 FYI는 다음 턴까지 대기 |
+| `no_receiver` | OMP 확장 미등록, Claude(다음 턴 시작 때 주입), 그 밖의 클라이언트(`inbox read`만 가능) |
+| `not_agent` | 포커스된 pane이 HAM 에이전트가 아님(pane 동작에서만) |
+| 원격 에이전트 | 로컬 전용이므로 그 에이전트 호스트의 메일함 사용 |
 
 ### Settings
 

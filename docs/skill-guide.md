@@ -585,6 +585,8 @@ Open **HAM: Mailbox (Right Split)**, **HAM: Mailbox (Tab)** or **HAM: Mailbox
 `mailbox-popup`, plugin `herdr.agent-messenger`). The quick-send overlay closes after a
 successful send result; failed sends keep input open. Actions do not change
 global `prefix+m`; optionally bind one only after upgrading all hosts.
+The pane action **HAM: Deliver queued FYI now** (`fyi-now`) is separate: it acts on the
+focused agent pane without opening the mailbox.
 Reuse checks stable pane/terminal IDs, not display labels. The split action reuses
 the registered mailbox only in the opener's tab; otherwise it opens and registers
 a right split, closing the old mailbox only if its visible first line contains
@@ -721,6 +723,14 @@ wake gates: local enqueue records `delivery.fyi_turn_end` only for fresh
 bypassing the 600-second delay. Later state changes do not retroactively set
 the flag. All wake gates still apply, including participation and idle state.
 The flag is local delivery metadata, not a change of mail kind or wire payload.
+A user can also skip the FYI delay for one agent: Mailbox Agents `f`, or the pane
+action `fyi-now` (`herdr.agent-messenger.fyi-now`, **HAM: Deliver queued FYI now**,
+bound by the user to a key such as `prefix+f`). Either sets `delivery.fyi_turn_end` on that
+agent's queued, unheld ordinary FYI, appends a `fyi_now` status-log row, and rings
+the local bell. The flag therefore means "deliver without the FYI delay: turn end or user
+request". All wake gates, the hourly wake limit and the unchanged OMP extension's
+idle-prompt checks still apply; nothing is typed into the agent. Local only. See
+[Deliver FYI now](ui-reference.md#deliver-fyi-now).
 Natural user turns can receive both kinds even in off mode or for manual
 nonmembers. Wakes use the same bounded bundle: at most eight messages / 8 KiB
 total, each body bounded to 2 KiB with exact-message-ID read instructions for

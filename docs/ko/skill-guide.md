@@ -615,6 +615,8 @@ python3 "$HAM_CLI" repo show
 action은 `mailbox-split` / `mailbox-tab` / `mailbox-popup`입니다.
 빠른 전송 오버레이는 전송 성공 결과가 오면 닫히고 실패하면 입력창을 유지합니다. 전역
 `prefix+m`은 바꾸지 않으므로, 모든 호스트를 갱신한 뒤 원할 때 연결하세요.
+pane action **HAM: Deliver queued FYI now**(`fyi-now`)는 별개이며 메일함을 열지 않고
+포커스된 에이전트 pane에 적용합니다.
 기존 메일함은 표시 이름이 아닌 안정적인 pane/terminal ID로 확인합니다.
 분할 동작은 등록된 메일함이 현재 탭에 있을 때만 재사용합니다. 다른 탭에 있으면
 오른쪽에 새 메일함을 열고 등록을 교체하며, 이전 메일함은 화면 첫 줄에 `NAV ·`가
@@ -750,6 +752,14 @@ enqueue 시각으로부터 600초 뒤 깨우기 대상이 되지만 그 순간�
 생략합니다. 나중에 상태가 바뀌어도 표시하지 않습니다. 참여 여부와 유휴 상태를
 비롯한 모든 깨우기 조건은 그대로 적용합니다. 이 표시는 로컬 전달 메타데이터이며
 메일 종류나 wire payload를 바꾸지 않습니다.
+사용자는 한 에이전트의 FYI 지연을 건너뛸 수도 있습니다. Mailbox Agents의 `f` 또는 pane
+action `fyi-now`(`herdr.agent-messenger.fyi-now`, **HAM: Deliver queued FYI now**,
+사용자가 `prefix+f` 같은 키에 직접 연결)를 사용합니다. 어느 쪽이든 해당 에이전트의 대기 중이고
+보류되지 않은 일반 FYI에 `delivery.fyi_turn_end`를 설정하고 상태 로그에 `fyi_now` 행을
+추가한 뒤 로컬 초인종을 울립니다. 따라서 이 표시는 「FYI 지연 없이 전달: 턴 종료 또는
+사용자 요청」을 뜻합니다. 모든 깨우기 조건, 시간당 깨우기 한도, 변경되지 않은 OMP 확장의
+유휴 프롬프트 검사도 그대로 적용하며 에이전트에는 아무것도 입력하지 않습니다. 로컬 전용입니다.
+[FYI 즉시 전달](ui-reference.md#fyi-즉시-전달)을 참고하세요.
 자연스러운 사용자 turn에서는 off나 manual 비회원도 두 종류를 모두 수신합니다.
 action의 깨우기는 아직 600초가 지나지 않은 FYI도 같은 묶음에 포함할 수 있습니다.
 묶음은 최대 8개 메시지/8 KiB이며 각 본문은 2 KiB로 제한하고, 잘린 부분에는

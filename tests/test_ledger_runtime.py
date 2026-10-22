@@ -864,6 +864,150 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(claim['message']['attribution'],'agent')
         self.assertEqual(self.states()[claim['messages'][0]['message_id']],'delivering')
 
+    def fyi_now(self, **options):
+        return self.receiver.fyi_now(terminal_id=self.recipient['terminal_id'], agent_id=self.recipient['agent_id'],
+                                     generation=self.recipient['generation'], **options)
+
+    def bell_path(self):
+        from urllib.parse import quote
+        return self.store.bell_directory / quote(self.recipient['terminal_id'], safe='._-:')
+
+    def status_log_rows(self):
+        with self.store.read() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT agent_id,field,value FROM status_log WHERE field='fyi_now' ORDER BY seq")]
+
+    def test_fyi_now_flags_only_the_targets_queued_unheld_fyi_and_rings_the_bell(self):
+        self.set_turn_state('idle')
+        handled = self.send()
+        self.applied(self.claim())
+        first, second = self.send(), self.send()
+        action = self.send(kind='action')
+        held = self.send()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_changed' WHERE message_id=?",
+                               (held['message_id'],))
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agent_status SET turn_state='idle' WHERE agent_id=?", (self.sender['agent_id'],))
+        other = self.mail.send(self.recipient, self.sender, kind='fyi', body='for the other agent')
+        os.utime(self.bell_path(), (1, 1))
+        other_flag = self.turn_end_flag(other['message_id'])
+        self.assertEqual(other_flag, 0)
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['flagged'], result['eligible']), ('requested', 2, 2))
+        self.assertEqual((result['queued_fyi'], result['queued_action'], result['held']), (2, 1, 1))
+        self.assertEqual((result['bundle'], result['remaining']), (3, 0))
+        for message, expected in ((first, 1), (second, 1), (action, 0), (held, 0), (other, other_flag), (handled, 0)):
+            self.assertEqual(self.turn_end_flag(message['message_id']), expected, message['message_id'])
+        rows = self.status_log_rows()
+        self.assertEqual([(row['agent_id'], json.loads(row['value'])) for row in rows],
+                         [(self.recipient['agent_id'], [first['message_id'], second['message_id']])])
+        self.assertGreater(self.bell_path().stat().st_mtime, time.time()-60)
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM wake_log').fetchone()[0], 0)
+
+    def test_fyi_now_makes_fyi_alone_a_trigger_and_the_unchanged_wake_claim_delivers_it(self):
+        self.set_turn_state('idle')
+        sent = self.send()
+        self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
+        result = self.fyi_now()
+        self.assertEqual(result['outcome'], 'requested')
+        inspected = self.receiver.inspect(**self.identity)
+        self.assertTrue(inspected['has_action'])
+        self.assertLessEqual(inspected['coalesce_until'], time.time())
+        claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
+        self.applied(claim)
+        self.assertEqual(self.states()[sent['message_id']], 'delivered')
+        self.assertEqual(self.fyi_now()['outcome'], 'nothing_queued')
+
+    def test_fyi_now_is_idempotent_and_still_rings_the_bell_without_a_second_audit_row(self):
+        self.set_turn_state('idle')
+        sent = self.send()
+        self.fyi_now()
+        os.utime(self.bell_path(), (1, 1))
+        again = self.fyi_now()
+        self.assertEqual((again['outcome'], again['flagged'], again['eligible']), ('requested', 0, 1))
+        self.assertEqual(len(self.status_log_rows()), 1)
+        self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+        self.assertGreater(self.bell_path().stat().st_mtime, time.time()-60)
+
+    def test_fyi_now_waits_for_the_turn_to_end_and_never_bypasses_the_working_gate(self):
+        self.set_turn_state('working')
+        sent = self.send()
+        self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+        self.set_turn_state('working', age=60)  # stale working: no enqueue-time flag
+        stale = self.send()
+        self.assertEqual(self.turn_end_flag(stale['message_id']), 0)
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['flagged'], result['turn_state']), ('after_turn', 1, 'working'))
+        self.assertEqual(self.claim(wake=True)['reason'], 'not_idle')
+        self.set_turn_state('done')
+        claim = self.claim(wake=True)
+        self.assertEqual({message['message_id'] for message in claim['messages']},
+                         {sent['message_id'], stale['message_id']})
+
+    def test_fyi_now_reports_the_hourly_limit_with_the_time_it_frees_up(self):
+        self.set_turn_state('idle')
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', {**self.thresholds, 'wakes_per_hour': 1})
+        self.send(kind='action')
+        self.applied(self.claim(wake=True))
+        with self.store.read() as connection:
+            woke_at = connection.execute('SELECT at FROM wake_log').fetchone()[0]
+        sent = self.send()
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['flagged'], result['wake_count'], result['wakes_per_hour']),
+                         ('hourly_limit', 1, 1, 1))
+        self.assertAlmostEqual(result['limit_frees_at'], woke_at+3600, places=3)
+        self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+        self.assertEqual(self.claim(wake=True)['reason'], 'hourly_limit')
+        with mock.patch('ham.ledger.runtime.time.time', return_value=woke_at+3601):
+            claim = self.claim(wake=True)
+        self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
+
+    def test_fyi_now_reports_bundle_cap_remainder_for_later_wakes(self):
+        self.set_turn_state('idle')
+        sent = [self.send(body=f'queued {index}') for index in range(BUNDLE_MESSAGES+2)]
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['flagged'], result['bundle'], result['remaining']),
+                         ('requested', len(sent), BUNDLE_MESSAGES, 2))
+        claim = self.claim(wake=True)
+        self.assertEqual(len(claim['messages']), BUNDLE_MESSAGES)
+
+    def test_fyi_now_outcomes_without_a_wake_flag_nothing(self):
+        self.set_turn_state('idle')
+        self.assertEqual(self.fyi_now()['outcome'], 'nothing_queued')
+        action = self.send(kind='action')
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['queued_action']), ('nothing_queued', 1))
+        held = self.send()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_absent' WHERE message_id=?",
+                               (held['message_id'],))
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['held']), ('only_held', 1))
+        queued = self.send()
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'off')
+        result = self.fyi_now()
+        self.assertEqual((result['outcome'], result['queued_fyi']), ('not_participating', 1))
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'auto')
+        for client, extension in (('claude', 1), ('codex', 1), ('omp', 0)):
+            with self.store.transaction() as connection:
+                connection.execute('UPDATE agents SET client=?,extension_present=? WHERE agent_id=?',
+                                   (client, extension, self.recipient['agent_id']))
+            result = self.fyi_now()
+            self.assertEqual((result['outcome'], result['agent']['client']), ('no_receiver', client))
+        for message in (action, held, queued):
+            self.assertEqual(self.turn_end_flag(message['message_id']), 0)
+        self.assertEqual(self.status_log_rows(), [])
+
+    def test_fyi_now_rejects_unknown_terminals_and_stale_generations(self):
+        self.assertEqual(self.receiver.fyi_now(terminal_id='no-such-terminal')['outcome'], 'not_agent')
+        with self.assertRaises(LedgerError) as caught:
+            self.receiver.fyi_now(terminal_id=self.recipient['terminal_id'], agent_id=self.recipient['agent_id'],
+                                  generation=self.recipient['generation']+1)
+        self.assertEqual(caught.exception.code, 'stale_session')
+
 
 if __name__=='__main__':
     unittest.main()

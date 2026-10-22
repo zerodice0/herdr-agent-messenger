@@ -30,6 +30,7 @@ from ham.agents.directory import (dispatch_user_prompts, herdr_executable, query
 from ham.ui import messenger as agent_messenger
 from ham.ui.messenger import focused_pane_id, terminal_flow_control_disabled
 from ham.ui import key_input as key_input
+from ham.ledger.runtime import NativeReceiver
 from ham.ledger.mail import Mailbox
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
@@ -408,6 +409,78 @@ def maintain(store: LedgerStore, result: Any, environment: Mapping[str, str]) ->
     return result
 
 
+def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple[str, str, str]:
+    """Explain exactly what a deliver-FYI-now request did; returns (text, level, row tag)."""
+    outcome = result.get("outcome")
+    agent = result.get("agent") or {}
+    name = agent.get("alias") or agent.get("terminal_id") or "agent"
+    client = agent.get("client") or "unknown"
+    eligible, remaining = result.get("eligible", 0), result.get("remaining", 0)
+    if outcome == "not_agent":
+        return "The focused pane is not a HAM agent.", "error", "not an agent"
+    if outcome == "no_receiver":
+        if client == "omp":
+            detail = "OMP receiver not registered, so no wake. Run runtime status, then restart that session"
+        elif client == "claude":
+            detail = "Claude cannot be woken; its queued FYI is injected when its next turn starts"
+        else:
+            detail = f"{client} has no native receiver; queued FYI is only readable with inbox read"
+        return f"{name}: {detail}.", "error", "no receiver"
+    if outcome == "not_participating":
+        return (f"{name} is not a participant (mode off, or manual non-member): HAM never wakes it, "
+                f"so its queued FYI ({result.get('queued_fyi', 0)}) is left unchanged."), "error", "not participating"
+    if outcome == "only_held":
+        return f"{name}: {result.get('held', 0)} FYI held (reason shown in Threads); none deliverable.", "info", "fyi held"
+    if outcome == "nothing_queued":
+        text = f"{name}: no queued FYI to deliver."
+        if result.get("queued_action"):
+            text += f" {result['queued_action']} queued action mail wakes it by itself."
+        return text, "info", "no fyi"
+    tail = ""
+    if remaining > 0:
+        tail += f" +{remaining} more in later wakes (cap 8 messages / 8 KiB)."
+    if result.get("over_hop"):
+        tail += f" {result['over_hop']} over the hop limit stay queued."
+    if any(warning.get("code") == "notification_failed" for warning in result.get("warnings", [])):
+        tail += " Wake bell failed; the agent rechecks on its next event."
+    quiet = (f"prompt empty and quiet {result['idle_minutes']} min" if result.get("idle_minutes")
+             else "prompt empty")
+    if outcome == "hourly_limit":
+        limit = f"{result.get('wake_count')}/{result.get('wakes_per_hour')} this hour"
+        frees = result.get("limit_frees_at")
+        if frees:
+            when = (f"next wake possible {time.strftime('%H:%M', time.localtime(frees))} "
+                    f"(in {max(1, math.ceil((frees - wall_clock()) / 60))} min)")
+        else:
+            when = ("automatic wakes are off (wakes_per_hour 0)" if not result.get("wakes_per_hour")
+                    else "wait for the hourly window to free up")
+        return f"{name}: {eligible} FYI marked, wake limit reached ({limit}); {when}.{tail}", "error", "fyi limit"
+    if outcome == "after_turn":
+        return (f"{name} is {result.get('turn_state') or 'unknown'}: {eligible} FYI delivered right after "
+                f"its turn ({quiet}).{tail}"), "info", "fyi after turn"
+    wait = f", after {math.ceil(result['ready_in'])} s coalescing" if result.get("ready_in", 0) > 0 else ""
+    return (f"{name}: {eligible} FYI eligible now, wake requested; delivers once {quiet}{wait}.{tail}",
+            "info", "fyi now")
+
+
+def fyi_now_pane(environment: Mapping[str, str]) -> int:
+    """Herdr pane action: deliver the focused agent's queued FYI now, no model tokens involved."""
+    pane_id = focused_pane_id(environment)
+    try:
+        if not pane_id:
+            result: Mapping[str, Any] = {"outcome": "not_agent"}
+        else:
+            terminal_id = pane_record(pane_id, environment)["terminal_id"]
+            result = NativeReceiver(LedgerStore(environment=environment)).fyi_now(terminal_id=terminal_id)
+        text, level, _tag = fyi_now_summary(result)
+    except LedgerError as error:
+        text, level = f"{error.code}: {error}", "error"
+    shown = agent_messenger.show_notification("FYI now · " + text, environment)
+    if not shown:
+        print(text, file=sys.stderr if level == "error" else sys.stdout)
+    return 0 if shown or level == "info" else 1
+
+
 def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> Any:
     store = LedgerStore(environment=environment)
     operation = request["operation"]
@@ -447,6 +520,9 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
         return maintain(store, result, environment)
     if operation == "resolve":
         return maintain(store, mail.resolve_claim(**request["claim"]), environment)
+    if operation == "fyi_now":
+        return NativeReceiver(store).fyi_now(terminal_id=request["terminal_id"],
+                                             agent_id=request["agent_id"], generation=request["generation"])
     if operation == "withdraw":
         return maintain(store, mail.withdraw(request["message_id"]), environment)
     if operation == "retry":
@@ -825,6 +901,7 @@ class MailboxApp:
         self.mail_kind = "action"
         self.recipient: dict[str, Any] | None = None
         self.submitted: dict[str, Any] | None = None
+        self.fyi_pending: tuple[str, str] | None = None
         self.result_tags: dict[tuple[str, str], tuple[str, float]] = {}
         self.confirm: dict[str, Any] | None = None
         self.edit: dict[str, Any] | None = None
@@ -1096,6 +1173,8 @@ class MailboxApp:
                     self.settings_saving = None
                 if job.operation in {"send", "direct"}:
                     self.finish_send(value, error)
+                elif job.operation == "fyi_now":
+                    self.finish_fyi_now(value, error)
                 elif error:
                     self.set_status(f"{error.get('code')}: {error.get('message')}", "error")
                 else:
@@ -1434,6 +1513,32 @@ class MailboxApp:
         self.settings_results[field] = "Saving settings…"
         self.settings_pending.pop(field, None)
         return True
+
+    def agent_fyi_now(self) -> None:
+        """Let the selected local agent's queued FYI skip the 10 min delay; no prompt is typed."""
+        agent = self.selected("agents")
+        if not agent:
+            self.set_status("Choose a live local agent to deliver its queued FYI now.", "error")
+        elif agent.get("host") != self.store.host:
+            self.set_status(f"FYI now is local only: use the Mailbox on {agent['host']} for {self.address(agent)}.", "error")
+        elif agent.get("stale") or not agent.get("active", True):
+            self.set_status("FYI now is unavailable for an inactive agent.", "error")
+        elif "mutation" in self.jobs:
+            self.set_status("An operation is pending; FYI now was not requested.", "error")
+        elif self.start_job("mutation", "fyi_now", terminal_id=agent["terminal_id"],
+                            agent_id=agent["agent_id"], generation=agent["generation"]):
+            self.fyi_pending = self.identity(agent)
+            self.set_status("Requesting FYI now…")
+
+    def finish_fyi_now(self, value: Mapping[str, Any], error: Any) -> None:
+        identity, self.fyi_pending = self.fyi_pending, None
+        if error:
+            self.set_status(f"{error.get('code')}: {error.get('message')}", "error")
+            return
+        text, level, tag = fyi_now_summary(value, wall_clock=self.wall_clock)
+        self.set_status(text, level)
+        if identity is not None:
+            self.result_tags[identity] = (tag, self.clock() + 10)
 
     def agent_main(self) -> None:
         """Pin/unpin the selected local role-group agent through Settings."""
@@ -1840,6 +1945,8 @@ class MailboxApp:
                 self.reply()
         elif key == "m" and self.focus == "agents":
             self.agent_main()
+        elif key == "f" and self.focus == "agents":
+            self.agent_fyi_now()
         elif key == "s":
             agent = self.selected("agents")
             if not self.repo_id and agent:
@@ -2051,7 +2158,8 @@ class MailboxApp:
         if self.mode == "help":
             return [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page"), Hint("F1", "Close", 1), Hint("Esc", "Close", 0)]
         # Dropped before every core hint (priority 100) on narrow footers; F1 help lists it.
-        context = ([Hint("Space", "View"), Hint("Enter", "Send"), Hint("m", "Main", 120)] if self.focus == "agents" else
+        context = ([Hint("Space", "View"), Hint("Enter", "Send"), Hint("m", "Main", 120), Hint("f", "FYI now", 130)]
+                   if self.focus == "agents" else
                    [Hint("Space", "View"), Hint("Enter", "Reply"), Hint("w", "Withdraw"),
                     Hint("t", "Retry"), Hint("a/n", "Recover")] if self.focus == "threads" else
                    [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")] +
@@ -3015,6 +3123,8 @@ class MailboxApp:
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
                     "Agents [m] Main: confirm pin for a live local role-group agent; press again on the pin to clear it.",
                     "Clearing a Main pin may restore the auto incumbent or a uniquely elected main.",
+                    "Agents [f] FYI now: deliver the selected local agent's queued FYI at once, no prompt typed.",
+                    "Every wake gate still applies (participant, idle turn, hourly limit, quiet prompt); a working agent gets it after its turn.",
                     "Agents / Threads Space view: read-only modal; Enter inside does nothing.",
                     "Viewer: ↑↓ / PgUp/PgDn / Home/End / wheel scroll · t technical · Esc/q/Space close.",
                     "Viewer: outside click closes; inside click is inert. Live arrivals follow only at latest.",
@@ -3142,7 +3252,7 @@ class MailboxApp:
 
     def footer_hints_for_nav(self) -> list[str]:
         if self.focus == "agents":
-            return ["Agents: Space view; Enter opens quick send; [m] Main pin/unpin"]
+            return ["Agents: Space view; Enter opens quick send; [f] FYI now; [m] Main pin/unpin"]
         if self.focus == "threads":
             return ["Threads: Space view; Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (
@@ -3194,12 +3304,15 @@ class MailboxApp:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HAM mailbox: agents, threads and quick send.")
-    parser.add_argument("command", choices=("split", "tab", "overlay", "pane", "overlay-pane", "job", "snapshot-worker"))
+    parser.add_argument("command", choices=("split", "tab", "overlay", "pane", "overlay-pane", "job", "snapshot-worker",
+                                            "fyi-now"))
     arguments = parser.parse_args(argv)
     values = dict(os.environ)
     try:
         if arguments.command == "snapshot-worker":
             return snapshot_worker(values)
+        if arguments.command == "fyi-now":
+            return fyi_now_pane(values)
         if arguments.command in {"split", "tab"}:
             print(json.dumps(launch(arguments.command, values), ensure_ascii=False))
             return 0

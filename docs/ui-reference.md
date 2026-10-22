@@ -24,6 +24,9 @@ Reuse checks pane/terminal IDs, not display labels.
 discard confirmation, with Cancel selected by default. At top level, `Esc`
 closes the quick-send overlay but does nothing in split/tab mode; in input or dialogs it backs out.
 
+A separate pane action, **HAM: Deliver queued FYI now** (`herdr.agent-messenger.fyi-now`),
+does not open the mailbox; see [Deliver FYI now](#deliver-fyi-now).
+
 ### Herdr overlay placement
 
 Quick send, **Send Prompt to Agents**, **Held Messages**, and **HAM Skill** use
@@ -154,6 +157,7 @@ CONFIRM/Settings picker bindings.
 | `Space` | Open the selected Agents or Threads item in the read-only viewer. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
+| `f` | Agents only: deliver the selected local agent's queued ordinary FYI now (no prompt typed, no confirmation); see [Deliver FYI now](#deliver-fyi-now). Remote and inactive rows show a reason without changing anything. |
 | `m` | Agents only: confirm pinning the selected live local role-group agent as main; if already explicitly pinned, confirm clearing the pin. Remote, inactive and other-group rows show a reason without changing settings. |
 | `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
 | `s` | Open Settings. |
@@ -424,6 +428,61 @@ roles: in `auto`, the incumbent or a unique candidate may become main again.
 An automatically elected main is not an explicit pin, so `m` pins it rather than
 clearing it. The Settings picker and Settings `m` shortcut keep their existing
 behavior. No mutation CLI is available.
+
+### Deliver FYI now
+
+Queued ordinary FYI normally waits for the FYI delay (about ten to fifteen minutes).
+Two triggers let you skip that wait without composing mail or typing into the agent,
+so the request itself spends no model tokens. The only model work is the agent's
+own turn that reads the delivered bundle.
+
+- **Mailbox:** in NAV, select a local agent in Agents and press `f`. The result appears in
+  the status line and as a short tag on the row.
+- **Pane action:** **HAM: Deliver queued FYI now** (`herdr.agent-messenger.fyi-now`, context
+  `pane`) acts on the focused pane and reports through a Herdr notification. Bind it in
+  `~/.config/herdr/config.toml`. `prefix+f` collides with no Herdr 0.9.5 default; the
+  second entry is the hangul-layout variant, matching other HAM bindings:
+
+  ```toml
+  [[keys.command]]
+  key = "prefix+f"
+  type = "plugin_action"
+  command = "herdr.agent-messenger.fyi-now"
+  description = "HAM: deliver queued FYI now"
+
+  [[keys.command]]
+  key = "prefix+ㄹ"
+  type = "plugin_action"
+  command = "herdr.agent-messenger.fyi-now"
+  description = "HAM: deliver queued FYI now (hangul)"
+  ```
+
+  Check your own config for an existing `prefix+f` before adding it. Both triggers are local
+  only: for an agent on another host, use the Mailbox on that host.
+
+The request marks that agent's queued, unheld, ordinary FYI deliveries wake-eligible by
+setting the local `deliveries.fyi_turn_end` flag, whose meaning is now "deliver without the
+FYI delay: turn end or user request". It appends a `fyi_now` row to the status log, then
+rings the agent's local bell so the receiver inspects at once. Action mail, held mail,
+handled mail, and other agents are untouched. No schema, protocol, or runtime change is
+involved, and the OMP extension needs no restart.
+
+Every wake gate still applies, because the receiver enforces them: the agent must take
+part (mode and role), its turn must be idle or done, the hourly wake limit must have room,
+the hop limit holds, and the prompt must be empty and quiet for the idle threshold. A
+working agent receives the FYI right after its turn. One wake carries at most 8 messages
+and 8 KiB; any remainder follows in later wakes. The status line names exactly what applies:
+
+| Outcome | Message (shape) |
+| --- | --- |
+| `requested` | `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min` |
+| `after_turn` | `agent is working: N FYI delivered right after its turn` |
+| `hourly_limit` | `N FYI marked, wake limit reached (4/4 this hour); next wake possible HH:MM` |
+| `nothing_queued` / `only_held` | no deliverable FYI, with the queued action or held count |
+| `not_participating` | mode off, or manual non-member: HAM never wakes it; FYI wait for its next turn |
+| `no_receiver` | OMP extension not registered, or Claude (injected at its next turn) or another client (`inbox read` only) |
+| `not_agent` | the focused pane is not a HAM agent (pane action only) |
+| remote agent | local only: use the Mailbox on that agent's host |
 
 ### Settings overlay
 

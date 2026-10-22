@@ -1,6 +1,7 @@
 """Consumer-visible quick-send behavior and preserved isolated mailbox services."""
 import tests.ham_test_support as ham_test_support  # Protect the live ledger before product imports.
 import curses
+import io
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ from ham.ledger.store import LedgerError, LedgerStore
 from ham.ui.terminal_text import display_width
 from ham.ui.mailbox import (Job, MailboxApp, OPENER_PANE, OPENER_TERMINAL, REPO_ENV, clip,
                          close_owned, describe_message, dispatch_direct, edit_buffer,
-                         execute_job, launch, local_snapshot, maintain, wrap_summary)
+                         execute_job, fyi_now_summary, launch, local_snapshot, main, maintain, wrap_summary)
 
 
 SCRATCH = Path(tempfile.gettempdir())
@@ -5463,6 +5464,147 @@ class MailboxUiTest(unittest.TestCase):
         text = '\n'.join(self.capture(app, 55, 200).lines())
         self.assertIn('[m] Main', text)
         self.assertIn('pin to clear', text)
+
+    def omp_receiver_with_queued_fyi(self, count=1):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET client='omp',extension_present=1 WHERE terminal_id='term-b'")
+        RepoSettings(self.store).mutate(self.repo_id, 'mode', 'auto')
+        agents = {agent['terminal_id']: agent for agent in self.registry.list()}
+        return [self.mail.send(agents['term-a'], agents['term-b'], kind='fyi', body=f'queued note {index}')
+                for index in range(count)]
+
+    def fyi_flags(self):
+        with self.store.read() as connection:
+            return {row[0]: row[1] for row in connection.execute('SELECT message_id,fyi_turn_end FROM deliveries')}
+
+    def test_agents_fyi_now_shortcut_runs_the_ledger_operation_and_reports_on_the_status_line(self):
+        sent = self.omp_receiver_with_queued_fyi(2)
+        self.assertEqual(set(self.fyi_flags().values()), {0})
+        app = self.app()
+        selected = self.select_agent(app)
+        app.key('f')
+        job = app.jobs['mutation']
+        self.assertEqual({key: job.request[key] for key in ('operation', 'terminal_id', 'agent_id', 'generation')},
+                         {'operation': 'fyi_now', 'terminal_id': 'term-b', 'agent_id': selected['agent_id'],
+                          'generation': selected['generation']})
+        self.assertEqual(app.status, 'Requesting FYI now…')
+        app.key('f')  # single flight while pending
+        self.assertIn('pending', app.status)
+        self.assertIs(app.jobs['mutation'], job)
+        job.result = execute_job(job.request, self.environment)
+        app.tick()
+        self.assertEqual(app.status_level, 'info')
+        self.assertIn('blue-owl: 2 FYI eligible now, wake requested', app.status)
+        self.assertIn('quiet 3 min', app.status)
+        self.assertEqual(app.result_tags[app.identity(selected)][0], 'fyi now')
+        self.assertEqual({self.fyi_flags()[item['message_id']] for item in sent}, {1})
+        text = '\n'.join(self.capture(app, 30, 140).lines())
+        self.assertIn('2 FYI eligible now', text)
+
+    def test_agents_fyi_now_shortcut_names_the_blocker_and_flags_nothing_without_a_receiver(self):
+        self.omp_receiver_with_queued_fyi()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET client='claude',extension_present=0 WHERE terminal_id='term-b'")
+        app = self.app()
+        self.select_agent(app)
+        app.key('f')
+        job = app.jobs['mutation']
+        job.result = execute_job(job.request, self.environment)
+        app.tick()
+        self.assertEqual(app.status_level, 'error')
+        self.assertIn('Claude cannot be woken', app.status)
+        self.assertEqual(set(self.fyi_flags().values()), {0})
+
+    def test_agents_fyi_now_shortcut_rejects_ineligible_rows_with_reason(self):
+        for changes, reason in (({'host': 'remote'}, 'local only'), ({'active': 0}, 'inactive'),
+                                ({'stale': True}, 'inactive')):
+            with self.subTest(changes=changes):
+                app = self.app()
+                self.select_agent(app).update(changes)
+                self.select_agent(app)
+                app.key('f')
+                self.assertIn(reason, app.status)
+                self.assertEqual(app.status_level, 'error')
+                self.assertNotIn('mutation', app.jobs)
+        app = self.app()
+        app.agents = lambda: []
+        app.key('f')
+        self.assertIn('Choose a live local agent', app.status)
+
+    def test_agents_fyi_now_shortcut_is_nav_agents_only_and_listed_in_footer_and_help(self):
+        app = self.app()
+        for focus in ('threads', 'detail'):
+            app.focus = focus
+            app.key('f')
+            self.assertNotIn('mutation', app.jobs)
+        app.focus = 'agents'
+        text = '\n'.join(self.capture(app, 40, 200).lines())
+        self.assertIn('[f] FYI now', text)
+        app.key(F1)
+        text = '\n'.join(self.capture(app, 55, 200).lines())
+        self.assertIn('[f] FYI now', text)
+        self.assertIn('Every wake gate still applies', text)
+
+    def test_fyi_now_summary_covers_every_outcome_with_distinct_reasons(self):
+        agent = {'alias': 'blue-owl', 'client': 'omp', 'terminal_id': 't'}
+        base = {'agent': agent, 'eligible': 3, 'remaining': 0, 'idle_minutes': 3, 'turn_state': 'idle'}
+        cases = {
+            'requested': ({}, 'info', '3 FYI eligible now, wake requested'),
+            'after_turn': ({'turn_state': 'working'}, 'info', 'blue-owl is working: 3 FYI delivered right after'),
+            'hourly_limit': ({'wake_count': 4, 'wakes_per_hour': 4, 'limit_frees_at': 1000+1800}, 'error',
+                             'wake limit reached (4/4 this hour); next wake possible'),
+            'nothing_queued': ({'queued_action': 2}, 'info', '2 queued action mail wakes it by itself'),
+            'only_held': ({'held': 1}, 'info', '1 FYI held'),
+            'not_participating': ({'queued_fyi': 2}, 'error', 'not a participant'),
+            'no_receiver': ({}, 'error', 'OMP receiver not registered'),
+            'not_agent': ({}, 'error', 'not a HAM agent'),
+        }
+        for outcome, (extra, level, fragment) in cases.items():
+            with self.subTest(outcome=outcome):
+                text, got_level, tag = fyi_now_summary({**base, **extra, 'outcome': outcome}, wall_clock=lambda: 1000)
+                self.assertEqual(got_level, level)
+                self.assertIn(fragment, text)
+                self.assertTrue(tag)
+        text, _, _ = fyi_now_summary({**base, 'outcome': 'hourly_limit', 'wake_count': 4, 'wakes_per_hour': 4,
+                                      'limit_frees_at': 1000+1800}, wall_clock=lambda: 1000)
+        self.assertIn('(in 30 min)', text)
+        text, _, _ = fyi_now_summary({**base, 'outcome': 'requested', 'remaining': 4, 'over_hop': 1}, wall_clock=lambda: 0)
+        self.assertIn('+4 more in later wakes (cap 8 messages / 8 KiB)', text)
+        self.assertIn('1 over the hop limit', text)
+        for client, fragment in (('codex', 'codex has no native receiver'), ('claude', 'Claude cannot be woken')):
+            text, _, _ = fyi_now_summary({'outcome': 'no_receiver', 'agent': {**agent, 'client': client}})
+            self.assertIn(fragment, text)
+
+    def test_fyi_now_pane_action_resolves_the_focused_pane_and_notifies_without_a_prompt(self):
+        sent = self.omp_receiver_with_queued_fyi()
+        context = json.dumps({'focused_pane_id': 'w1:p2', 'pane': {'pane_id': 'w9:p9'}})
+        values = {**self.environment, 'HERDR_PLUGIN_CONTEXT_JSON': context, 'HERDR_PANE_ID': 'w1:p1'}
+        with patch.dict(os.environ, values, clear=True), \
+             patch('ham.ui.mailbox.pane_record', return_value={'terminal_id': 'term-b'}) as record, \
+             patch('ham.ui.mailbox.agent_messenger.show_notification', return_value=True) as notify, \
+             patch('ham.ui.mailbox.herdr') as typed:
+            self.assertEqual(main(['fyi-now']), 0)
+        self.assertEqual(record.call_args.args[0], 'w1:p2')
+        typed.assert_not_called()
+        body = notify.call_args.args[0]
+        self.assertTrue(body.startswith('FYI now · blue-owl: 1 FYI eligible now, wake requested'), body)
+        self.assertEqual(self.fyi_flags()[sent[0]['message_id']], 1)
+
+    def test_fyi_now_pane_action_reports_a_non_agent_pane_and_falls_back_to_stderr(self):
+        context = json.dumps({'focused_pane_id': 'w1:p7'})
+        values = {**self.environment, 'HERDR_PLUGIN_CONTEXT_JSON': context}
+        with patch.dict(os.environ, values, clear=True), \
+             patch('ham.ui.mailbox.pane_record', return_value={'terminal_id': 'term-shell'}), \
+             patch('ham.ui.mailbox.agent_messenger.show_notification', return_value=False), \
+             patch('sys.stderr', new_callable=io.StringIO) as error:
+            self.assertEqual(main(['fyi-now']), 1)
+        self.assertIn('not a HAM agent', error.getvalue())
+        with patch.dict(os.environ, {**self.environment}, clear=True), \
+             patch('ham.ui.mailbox.agent_messenger.show_notification', return_value=True) as notify:
+            for key in ('HERDR_PLUGIN_CONTEXT_JSON', 'HERDR_ACTIVE_PANE_ID', 'HERDR_PANE_ID'):
+                os.environ.pop(key, None)
+            self.assertEqual(main(['fyi-now']), 0)
+        self.assertIn('not a HAM agent', notify.call_args.args[0])
 
     def test_agents_main_clear_does_not_erase_a_newer_pin(self):
         app = self.app()
