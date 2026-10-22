@@ -483,11 +483,17 @@ class RemoteLedgerTest(unittest.TestCase):
                     self.assertNotIn("fyi_wake_after_seconds", sent)
         recipient = {**recipient, "turn_state": "idle"}
         cases = ({"stale": True}, {"turn_state": None}, {"active": 0},
-                 {"extension_present": None}, {"client": "claude"}, {"role": None})
+                 {"extension_present": None}, {"client": "claude", "extension_present": 0}, {"role": None})
         for fields in cases:
             with self.subTest(fields=fields):
                 sent = mailbox.send(self.agents["alpha"], {**recipient, **fields}, body="Unknown or ineligible")
                 self.assertNotIn("fyi_wake_after_seconds", sent)
+        # Claude (registered hook) and Codex (no runtime needed) are woken by the receiving host's worker.
+        for fields in ({"client": "claude", "extension_present": 1}, {"client": "codex", "extension_present": 0},
+                       {"client": "codex", "extension_present": None}):
+            with self.subTest(wake_capable=fields):
+                sent = mailbox.send(self.agents["alpha"], {**recipient, **fields}, body="Worker wake")
+                self.assertEqual(sent["fyi_wake_after_seconds"], 600)
         for state in ("idle", "done"):
             with self.subTest(action_state=state):
                 sent = mailbox.send(self.agents["alpha"], {**recipient, "turn_state": state},

@@ -60,8 +60,8 @@ Only the **user** changes mode/main/members/thresholds in Settings. `repo show` 
 Mode/home/thresholds are repo-wide; roles are per `(repo_id, canonical host, anchor_workspace_id)` and linked worktrees use their anchor's main/members. `manual`: explicit main + chosen workers; nonmembers cannot wake. `auto`: explicit main, then valid incumbent, then the sole/unique main-checkout agent; a sibling opening never demotes the incumbent. Cross-repo wakes keep the recipient repo's settings, role and gates; replies require participation. Upgrade all hosts and copied skills together; failed outbox mail stays for manual retry. Reference **Role-election internals**, **Upgrades and schema migrations**, **Modes, roles, settings and status**.
 
 - **OMP:** opt-in root receiver; action or eligible FYI wake needs Herdr `turn_state` `idle`/`done`, empty TUI editor, quiet input, no pending work, eligible membership and rate/hop guards; uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves journal acceptance, not provider success.
-- **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, no idle/Stop wake. ACK proves host-context application, not provider-wire bytes/understanding; stdout alone is not delivery. Reference **Receiving runtimes**.
-- **Codex:** skill-guided pull at work boundaries, then explicit handling; no automatic receiver/wake or invented delivered receipt.
+- **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, plus a worker-driven idle wake (hook registered, idle/done + quiet, peer socket, transcript evidence). ACK proves host-context application or transcript acceptance, not provider-wire bytes/understanding; stdout alone is not delivery. Reference **Receiving runtimes**, **Native idle wake**.
+- **Codex:** worker-driven idle wake (`codex queue`, rollout evidence; no runtime install) plus skill-guided pull at work boundaries, then explicit handling; never an invented delivered receipt. Reference **Native idle wake**.
 
 Native bundles retain IDs/sender/kind/thread/hop; bodies may truncate. Marker/hash proves claimed content, not work. Reference **Native mailbox bundles**.
 
@@ -85,6 +85,6 @@ python3 scripts/herdr_agent_messenger.py spawn \
 
 ## Installing or updating HAM
 
-On each selected host, install/update plugin + skill, run read-only `runtime status`, explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude`. Never overwrite foreign/modified files; restart only user-selected sessions; confirm `extension_present=1` or report **installed, activation pending**. Codex pull-only absence is normal. Reference **Client onboarding and installation**, **Receiving runtimes**.
+On each selected host, install/update plugin + skill, run read-only `runtime status`, explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude`. Never overwrite foreign/modified files; restart only user-selected sessions; confirm `extension_present=1` or report **installed, activation pending**. Codex needs no runtime install; its absence is normal. Reference **Client onboarding and installation**, **Receiving runtimes**.
 
 `mail send|dismiss`, `inbox read|handle`, `repo show`, `status set|clear|board|list` default to brief output; `--verbose` restores full fields/diagnostics. CLI JSON is whitespace-free UTF-8. Reference **Compact versus verbose payloads**; read only needed sections, never the whole reference.

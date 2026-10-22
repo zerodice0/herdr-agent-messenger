@@ -20,6 +20,20 @@ BUNDLE_BYTES = 8192
 BUNDLE_MESSAGES = 8
 WAKE_READY_STATES = frozenset({'idle', 'done'})
 FYI_WAKE_DELAY_SECONDS = 600
+WAKE_CLIENTS = frozenset({'claude','codex'})
+STATUS_RUN_LIMIT = 64
+
+
+def wake_capable(agent: Mapping[str, Any]) -> bool:
+    """Whether HAM can wake this agent when idle (OMP in its extension, others from the worker).
+
+    Claude needs its installed hook (it binds the session UUID and root PID);
+    Codex needs nothing installed. Per-target availability is the adapter's call.
+    """
+    client = agent.get('client')
+    if client in ('omp','claude'):
+        return bool(agent.get('extension_present'))
+    return client=='codex'
 
 
 def truncate_utf8(value: str, maximum: int) -> str:
@@ -103,8 +117,11 @@ def format_context(claim: Mapping[str, Any], agent: Mapping[str, Any], marker: s
 
 
 class NativeReceiver:
-    def __init__(self,store: LedgerStore) -> None:
+    def __init__(self,store: LedgerStore, *, wake_adapters: Mapping[str, Any] | None = None,
+                 environment: Mapping[str, str] | None = None) -> None:
         self.store = store
+        self.wake_adapters = dict(wake_adapters or {})
+        self.environment = os.environ if environment is None else environment
         self._claude_scans: dict[str, dict[str, Any]] = {}
 
     def register(self, agent: Mapping[str, Any], *, session_ref: str, client: str = 'omp') -> dict[str, Any]:
@@ -177,12 +194,24 @@ class NativeReceiver:
 
         ``deliveries.fyi_turn_end`` therefore means "deliver without the FYI
         delay": set at enqueue while the recipient was working, or by this
-        user request. The unchanged receiver extension then sees ``has_action``
-        from its normal inspect and every wake gate still applies (role, idle
-        turn, hourly limit, hop, holds, input quiet, coalescing).
+        user request. OMP's unchanged receiver extension then sees ``has_action``
+        from its normal inspect; Claude/Codex are woken by the ledger worker
+        (``NativeWaker``), which this request makes sure is running. Every wake
+        gate still applies (role, idle turn, quiet, hourly limit, hop, holds,
+        coalescing). A Claude/Codex agent whose wake target cannot be discovered
+        reports ``no_receiver`` with the adapter's reason and flags nothing.
         The request is local-only, never touches wake_log, and is audited in status_log.
         """
         now = time.time()
+        # Wake availability is probed outside the write transaction: discovery
+        # runs subprocesses and must never hold the ledger lock.
+        unavailable = None
+        with self.store.read() as connection:
+            probe = connection.execute('SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1',
+                                       (self.store.host,terminal_id)).fetchone()
+        if probe is not None and probe['client'] in WAKE_CLIENTS and wake_capable(dict(probe)):
+            unavailable = self.wake_unavailable(dict(probe))
+            probe_id = probe['agent_id']
         with self.store.transaction((terminal_id,)) as connection:
             row = connection.execute('SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1',
                                      (self.store.host,terminal_id)).fetchone()
@@ -191,6 +220,8 @@ class NativeReceiver:
             agent = dict(row)
             if agent_id is not None and (agent['agent_id']!=agent_id or agent['generation']!=generation):
                 raise LedgerError('stale_session','The agent session/generation has changed.')
+            if unavailable is not None and probe_id != agent['agent_id']:
+                unavailable = None
             state = self._state(connection,agent,now)
             thresholds = state['thresholds']
             result: dict[str, Any] = {
@@ -218,8 +249,10 @@ class NativeReceiver:
                         result['eligible'] += 1
                     else:
                         fresh.append(item['message_id'])
-            if agent['client']!='omp' or not agent['extension_present']:
+            if not wake_capable(agent):
                 return {**result,'outcome':'no_receiver'}
+            if unavailable is not None:
+                return {**result,'outcome':'no_receiver','reason':unavailable[0],'detail':unavailable[1]}
             if state['role'] is None:
                 return {**result,'outcome':'not_participating'}
             if not result['queued_fyi']:
@@ -261,6 +294,10 @@ class NativeReceiver:
                 self.store.ring((terminal_id,))
             except OSError as error:
                 self.store.notification_errors.append({'code':'notification_failed','message':str(error),'committed':True})
+        if result['agent']['client'] in WAKE_CLIENTS and result.get('queued_fyi'):
+            # Claude/Codex are woken by the ledger worker, not by an extension
+            # watching the bell: make sure that worker is running.
+            result = self._ensure_worker(result)
         return self.store.annotate(result)
 
     def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False) -> dict[str, Any]:
@@ -275,18 +312,7 @@ class NativeReceiver:
             trigger = min(rows,key=lambda row:(
                 not (row['kind']=='action' and wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now),
                 wake_ready_at(row,state['thresholds']['coalesce_seconds'])),default=None) if wake else None
-            reason = None
-            if wake:
-                if state['role'] is None:
-                    reason = 'not_participating'
-                elif state['turn_state'] not in WAKE_READY_STATES:
-                    reason = 'not_idle'
-                elif state['wake_count']>=state['thresholds']['wakes_per_hour']:
-                    reason = 'hourly_limit'
-                elif trigger is None:
-                    reason = 'no_action'
-                elif wake_ready_at(trigger,state['thresholds']['coalesce_seconds'])>now:
-                    reason = 'coalescing'
+            reason = self._wake_reason(state,trigger,now) if wake else None
             if reason or not rows:
                 return {'claim_id':None,'reason':reason or 'empty','messages':[]}
             rows = fit_claim_rows(rows,wake_trigger=trigger['message_id'] if trigger is not None else None)
@@ -313,6 +339,149 @@ class NativeReceiver:
         # not proof of later context/provider transforms or model understanding.
         return Mailbox(self.store).started(claim_id=claim_id,agent_id=agent_id,generation=generation,
                 evidence='omp:accepted-journal:'+session_ref+'#'+entry_id+';sha256='+content_sha256)
+
+    @staticmethod
+    def _wake_reason(state: Mapping[str, Any], trigger: Mapping[str, Any] | None, now: float, *,
+                     external: bool = False, ready_since: float | None = None) -> str | None:
+        """First gate that refuses a wake; ``external`` adds the worker-driven gates.
+
+        OMP evaluates quiet/idle/editor in its own extension, so its claim path
+        never asks for them. A worker-driven wake cannot observe input, so it
+        also requires no pending claim and a continuous ready period of
+        ``idle_minutes`` (the quiet proxy).
+        """
+        thresholds = state['thresholds']
+        if state['role'] is None:
+            return 'not_participating'
+        if state['turn_state'] not in WAKE_READY_STATES:
+            return 'not_idle'
+        if external:
+            if state['pending_claims']:
+                return 'claim_pending'
+            if ready_since is None or now-ready_since<thresholds['idle_minutes']*60:
+                return 'quiet'
+        if state['wake_count']>=thresholds['wakes_per_hour']:
+            return 'hourly_limit'
+        if trigger is None:
+            return 'no_action'
+        if wake_ready_at(trigger,thresholds['coalesce_seconds'])>now:
+            return 'coalescing'
+        return None
+
+    @staticmethod
+    def wake_ready_since(connection: Any, agent_id: str, fallback: float | None) -> float | None:
+        """Latest continuous ready run, read under the caller's ledger snapshot.
+
+        A durable non-ready transition invalidates an older in-memory baseline,
+        even if the agent returned to idle during external target discovery.
+        With no status history, retain the worker's conservative first sighting.
+        """
+        since = None
+        observed = False
+        for value, at in connection.execute(
+                "SELECT value,at FROM status_log WHERE agent_id=? AND field='turn_state' "
+                "ORDER BY seq DESC LIMIT ?", (agent_id, STATUS_RUN_LIMIT)):
+            observed = True
+            if value not in WAKE_READY_STATES:
+                break
+            since = at
+        return since if observed else fallback
+
+    def wake_gate(self,connection: Any,agent: Mapping[str, Any],now: float,
+                  *,ready_since: float | None) -> tuple[dict[str, Any], list[Any], Any, str | None]:
+        """Worker-driven wake admission: (state, eligible rows, trigger row, refusal reason)."""
+        state = self._state(connection,agent,now)
+        thresholds = state['thresholds']
+        rows = self._eligible(connection,agent,thresholds['max_hop'],wake=True,
+                              coalesce_seconds=thresholds['coalesce_seconds'],now=now)
+        trigger = min(rows,key=lambda row:(
+            not (row['kind']=='action' and wake_ready_at(row,thresholds['coalesce_seconds'])<=now),
+            wake_ready_at(row,thresholds['coalesce_seconds'])),default=None)
+        return state,rows,trigger,self._wake_reason(state,trigger,now,external=True,ready_since=ready_since)
+
+    def wake_adapter(self, client: str) -> Any:
+        """Client adapter module (discover/deliver/observe/alive); tests inject fakes."""
+        if client in self.wake_adapters:
+            return self.wake_adapters[client]
+        import importlib
+        return importlib.import_module('ham.ledger.wake_'+client)
+
+    def wake_unavailable(self, agent: Mapping[str, Any]) -> tuple[str, str] | None:
+        """Why a wake-capable agent cannot be woken right now, or None. Read-only probe."""
+        from ham.ledger.wake_clients import WakeUnavailable
+        try:
+            self.wake_adapter(agent['client']).discover(agent,environment=self.environment)
+        except WakeUnavailable as error:
+            return error.code,error.message
+        except (OSError,ValueError,TypeError,KeyError,ImportError) as error:
+            return 'discover_failed',str(error)
+        return None
+
+    def _ensure_worker(self, result: dict[str, Any]) -> dict[str, Any]:
+        if self.environment.get('HERDR_AGENT_LEDGER_AUTOSTART','1')=='0':
+            return result
+        from ham.ledger.worker import ensure_worker
+        try:
+            ensure_worker(self.store,self.environment)
+        except (LedgerError,OSError) as error:
+            return {**result,'warnings':[*result.get('warnings',[]),
+                    {'code':'worker_start_failed','message':str(error),'committed':True}]}
+        return result
+
+    def claim_wake(self, agent: Mapping[str, Any], target: Any, *, ready_since: float | None,
+                   now: float | None = None) -> dict[str, Any]:
+        """Claim the eligible bundle for a worker-driven Claude/Codex wake.
+
+        Every wake gate is re-evaluated in the claiming transaction. The claim
+        is a normal ``via='wake'`` delivery (so ``wake_log`` and the hourly
+        limit count it like OMP) whose native claim binds the journal baseline
+        the client adapter will scan for evidence.
+        """
+        now = time.time() if now is None else now
+        with self.store.transaction((agent['terminal_id'],)) as connection:
+            current = check_generation(connection,self.store.host,agent['terminal_id'],
+                                       agent['agent_id'],agent['generation'])
+            if (current['client'] not in WAKE_CLIENTS or current['client']!=target.client
+                    or not wake_capable(current)
+                    or (current['client']=='claude' and current['session_ref']!=target.session_ref)):
+                return {'claim_id':None,'reason':'stale_target','messages':[]}
+            durable_ready_since = self.wake_ready_since(connection,current['agent_id'],ready_since)
+            ready_since = (max(ready_since,durable_ready_since)
+                           if ready_since is not None and durable_ready_since is not None else None)
+            _state,rows,trigger,reason = self.wake_gate(connection,current,now,ready_since=ready_since)
+            if reason or not rows:
+                return {'claim_id':None,'reason':reason or 'empty','messages':[]}
+            rows = fit_claim_rows(rows,wake_trigger=trigger['message_id'])
+            if not rows:
+                return {'claim_id':None,'reason':'unrepresentable','messages':[]}
+            claim = Mailbox._claim_messages(connection,rows,current['agent_id'],current['generation'],'wake')
+            marker = 'HAM_CLAIM_' + claim['claim_id'] + '_' + uuid.uuid4().hex
+            content = format_context(claim,current,marker)['content']
+            encoded = content.encode('utf-8')
+            digest = hashlib.sha256(encoded).hexdigest()
+            connection.execute('INSERT INTO native_claims '
+                    '(claim_id,client,session_ref,marker,content_sha256,created_at,'
+                    'transcript_path,transcript_start_offset,content_bytes) VALUES (?,?,?,?,?,?,?,?,?)',
+                    (claim['claim_id'],current['client'],target.session_ref,marker,digest,now,
+                     target.journal_path,target.journal_offset,len(encoded)))
+        return {**claim,'session_ref':target.session_ref,'marker':marker,'content':content,
+                'content_sha256':digest,'content_bytes':len(encoded)}
+
+    def claim_content(self, claim: Mapping[str, Any]) -> str | None:
+        """Rebuild a wake claim's exact text from its immutable messages (worker restarts).
+
+        Returns None unless the rebuilt bundle matches the stored hash, so an
+        unverifiable claim is never observed against guessed content.
+        """
+        with self.store.read() as connection:
+            rows = [dict(row) for row in connection.execute(
+                'SELECT m.*,d.recipient_repo_id FROM messages m JOIN deliveries d USING(message_id) '
+                'WHERE d.claim_id=? ORDER BY m.created_at,m.message_id',(claim['claim_id'],))]
+        content = render_bundle(rows,claim['marker']) if rows else None
+        if (content is None or len(content.encode('utf-8'))!=claim['content_bytes']
+                or hashlib.sha256(content.encode('utf-8')).hexdigest()!=claim['content_sha256']):
+            return None
+        return content
 
     def claude_hook(self, agent: Mapping[str, Any], *, hook_event_name: str,
                     session_id: str, transcript_path: str,
@@ -458,7 +627,7 @@ class NativeReceiver:
                     "SELECT DISTINCT n.*,d.claimed_agent_id AS agent_id,d.claimed_generation AS generation,"
                     "d.recipient_terminal_id AS terminal_id FROM native_claims n JOIN deliveries d USING(claim_id) "
                     "JOIN agents a ON a.agent_id=d.claimed_agent_id AND a.generation=d.claimed_generation "
-                    "WHERE n.client='claude' AND d.state='delivering' AND a.active=1 AND a.client='claude' "
+                    "WHERE n.client='claude' AND d.state='delivering' AND d.via='hook' AND a.active=1 AND a.client='claude' "
                     "AND a.session_ref=n.session_ref ORDER BY n.created_at")]
         active = {row['claim_id'] for row in claims}
         self._claude_scans = {key:value for key,value in self._claude_scans.items() if key in active}

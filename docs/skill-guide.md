@@ -47,8 +47,8 @@ The last command prints the packaged canonical skill path. Project installs are 
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
 - **OMP adapter:** native receiving and eligible action/FYI wake.
-- **Claude hooks:** native receiving at turn boundaries, with no idle wake.
-- **Codex:** skill-guided inbox pull; no adapter is needed.
+- **Claude hooks:** native receiving at turn boundaries; the ledger worker adds an idle wake.
+- **Codex:** no runtime installation is needed; the worker can wake discoverable embedded-mode sessions. Default shared-daemon sessions remain unavailable; the skill pulls at work boundaries.
 
 On **every selected host**, run the read-only health summary after installing or
 updating the plugin and skill, with cwd set to the plugin root:
@@ -60,10 +60,18 @@ python3 -m ham cli runtime install omp
 ```
 
 The summary reports runtime ownership/conflicts in `clients`, active local
-receiver counts in `sessions`, ledger availability/errors in `ledger`, and
-suggested `next_steps`. Missing or old ledgers are reported, never created or
-upgraded by this read. `runtime status omp|claude` retains its client-specific
-output. Codex's pull workflow is intentional, not a missing-receiver failure.
+receiver-registration counts in `sessions`, ledger availability/errors in `ledger`,
+and suggested `next_steps`. `native_wake` separately reports Claude/Codex target
+discovery: each session has `discoverable` plus an unavailable `reason`/`detail`,
+and Codex has an independent `binary_available` flag. A present binary or hook
+registration alone never means a session can be woken. Codex needs no runtime
+installation; its default shared app-server daemon mode is not supported because
+the worker cannot safely bind a pane to its thread. Discoverable embedded-mode
+sessions still must pass membership, idle/quiet, coalescing, rate/hop and pending
+claim gates. `wake_limitations` explains these boundaries and the invisible-editor
+quiet proxy. Missing or old ledgers are reported, never created or upgraded by
+this read; per-session discovery is then unknown (`sessions: null`).
+`runtime status omp|claude` retains its client-specific output.
 
 After a successful skill install, the interactive installer shows both runtime
 states and offers missing runtimes with **Not now** selected by default. Review
@@ -746,8 +754,8 @@ same-session active-branch journal, **not** provider-request inclusion, model
 understanding, or handled work.
 
 **Claude Code:** opt-in receiving uses bounded **SessionStart** and
-**UserPromptSubmit** hooks only. There is no Stop hook, idle wake, or worker
-that starts a Claude turn. Outside Herdr, the hook returns before reading input,
+**UserPromptSubmit** hooks only. There is no Stop hook or hook-started turn; idle
+wake is done by the worker (below). Outside Herdr, the hook returns before reading input,
 discovering the plugin, or opening the ledger. Activation environment variables
 are not identity: receiving requires verified foreground-root process ancestry,
 the native transcript UUID and current generation. An unresolved identity
@@ -807,8 +815,49 @@ formats, and stdout alone never acknowledges a claim.
 **Codex:** use the skill at work boundaries: `inbox read`, do the relevant work,
 then explicitly `inbox handle --message UUID`. Reads by any client or subagent
 are view-only. Handling can move queued → handled without a delivered timestamp;
-replying atomically handles an addressed parent. There is no Codex automatic
-receiver/wake adapter, and a pull read must never be reported as native delivery.
+replying atomically handles an addressed parent. Codex has no hook or extension
+receiver, but the worker can wake an idle session (see **Idle wake for Claude Code
+and Codex**), and a pull read must never be reported as native delivery.
+
+### Idle wake for Claude Code and Codex
+
+The ledger worker, not the agent, wakes an idle Claude Code or Codex session. It
+runs only after a fresh registry refresh and adds no schema, protocol or
+integration change; OMP keeps its own extension-driven wake.
+
+**Gates.** All must hold or the mail stays queued: the agent participates (mode
+`auto`, or `manual` member); Herdr `turn_state` is `idle` or `done`; the quiet
+period has passed; `wakes_per_hour` is not reached; no other pending claim (hook or
+wake) exists for the agent; the hop limit is respected; and coalescing has passed
+(ordinary FYI also waits its 600 s delay unless flagged by a turn end or `fyi-now`).
+Claude additionally needs its registered hook (`extension_present=1`).
+
+**Quiet proxy.** The worker cannot see typed prompts. "Quiet" means the agent has
+been continuously `idle`/`done` for `idle_minutes`, measured from the start of the
+current run in the durable status log (worker memory only as a fallback). This is a
+proxy, not typing detection: a user typing in an idle pane is not seen.
+
+**Claude Code.** HAM verifies the pane's foreground process, the session registry
+entry (id, pid, start time, interactive) and a user-owned peer socket plus
+transcript, then writes one peer message line to the socket. Acceptance is the exact
+bundle text in the transcript as a peer user message or an absorbed queued command;
+the socket write alone proves nothing. A session that holds cross-session messages
+(`crossSessionInbound` off, or `bypassPermissions` mode) is reported as not
+wakeable rather than woken.
+
+**Codex.** The thread is derived from the foreground process's open rollout and
+thread-writer lock (embedded mode; a shared app-server daemon is not wakeable).
+HAM runs `codex queue`; exit 0 only proves a row was written. Acceptance is the exact
+bundle text as a user message in the thread's rollout.
+
+**Failure semantics.** An unavailable target creates no claim (30 s retry
+backoff). A definite delivery failure releases the claim back to `queued`
+(`wake:not-delivered:CODE`, 300 s backoff). An uncertain failure keeps the claim
+`delivering` until evidence appears; there is no timeout release and no second wake
+over it. Session death or a changed agent/session ends the claim as `unknown` for
+operator resolution. Accepted evidence marks delivery `delivered` with
+`via=wake` and records one `wake_log` row. `fyi-now` works for these clients and
+explains an unwakeable session with a `reason` and `detail`.
 
 ### Opt-in runtime installation and deployment order
 
@@ -847,7 +896,7 @@ Deploy in this order, separately on every participating host:
    old installed endpoint.
 2. Install/update the matching skill and opt-in receiving runtime. Confirm
    selected receivers' identity/readiness before enabling participating policy.
-   Codex uses the explicit pull workflow rather than an invented runtime.
+   Codex needs no runtime: the ledger worker wakes it when idle.
 3. Enable the intended repository mode/main/members in the user TUI, then
    migrate the user-chosen global action binding and status/recap instructions
    last. These are deployment instructions, not a claim they were executed.

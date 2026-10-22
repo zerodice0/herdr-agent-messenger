@@ -76,8 +76,8 @@ python3 -m ham skill-installer install all
 - **플러그인:** 원장, 메일함, UI와 전송을 담당합니다.
 - **스킬:** 에이전트 지침과 CLI 실행기를 제공하며 수신기는 아닙니다.
 - **OMP 어댑터:** 네이티브 수신과 조건을 충족하는 action·FYI의 자동 깨우기를 제공합니다.
-- **Claude 훅:** 턴 경계에서 네이티브 수신을 제공하며 유휴 깨우기는 없습니다.
-- **Codex:** 스킬에 따라 받은 메일을 직접 조회하므로 어댑터가 필요하지 않습니다.
+- **Claude 훅:** 턴 경계에서 네이티브 수신을 제공하며 원장 워커가 유휴 깨우기를 더합니다.
+- **Codex:** 런타임 설치는 필요 없습니다. 워커는 대상을 확인할 수 있는 임베디드 모드 세션을 깨울 수 있지만 기본 공유 데몬 세션은 지원하지 않습니다. 스킬은 작업 경계에서 직접 조회합니다.
 
 플러그인과 스킬을 설치·갱신한 뒤 **선택한 모든 호스트**에서 읽기 전용 상태
 요약을 확인하세요. cwd는 플러그인 루트로 지정합니다.
@@ -90,9 +90,17 @@ python3 -m ham cli runtime install omp
 
 요약의 `clients`는 런타임 소유권과 충돌, `sessions`는 활성 로컬 세션의 수신기
 등록 수, `ledger`는 원장의 사용 가능 여부와 오류, `next_steps`는 권장 조치를
-보여 줍니다. 원장이 없거나 구버전이어도 읽기 과정에서 생성·업그레이드하지 않고
-그 상태를 보고합니다. `runtime status omp|claude`는 기존 클라이언트별 출력 형식을
-유지합니다. Codex의 직접 조회 방식은 의도된 동작이며 수신기 누락 오류가 아닙니다.
+보여 줍니다. `native_wake`는 Claude/Codex의 대상 탐색 결과를 별도로 제공합니다.
+각 세션의 `discoverable`과 사용 불가 사유인 `reason`·`detail`, Codex 실행 파일의
+존재 여부인 `binary_available`을 구분합니다. 실행 파일이나 훅 등록이 있다고 해서
+해당 세션을 깨울 수 있다는 뜻은 아닙니다. Codex는 런타임 설치가 필요 없지만,
+기본 공유 app-server 데몬 모드에서는 패널과 스레드를 안전하게 연결할 수 없어
+깨우기를 지원하지 않습니다. 탐색 가능한 임베디드 모드 세션도 참여 여부,
+연속 유휴 시간, 묶음 대기, 시간당 횟수·홉 제한과 미확정 claim 조건을 충족해야 합니다.
+`wake_limitations`는 이 조건과 입력창을 관찰할 수 없다는 한계를 설명합니다.
+원장이 없거나 구버전이어도 읽기 과정에서 생성·업그레이드하지 않으며, 이때 세션별
+탐색 결과는 알 수 없음(`sessions: null`)으로 보고합니다.
+`runtime status omp|claude`는 기존 클라이언트별 출력을 유지합니다.
 
 스킬 설치에 성공하면 대화형 설치기는 두 런타임의 상태를 보여 주고 누락된
 런타임의 설치를 제안합니다. 기본 선택은 **Not now(나중에)**입니다. 동의하기 전에
@@ -773,8 +781,8 @@ journal에 정확한 claim 내용과 해시가 있다는 뜻이지, provider 요
 이해, handled를 뜻하지 않습니다.
 
 **Claude Code:** 선택적 수신은 실행 범위가 제한된 **SessionStart**와
-**UserPromptSubmit** hook만 사용합니다. Stop hook, idle 깨우기, Claude turn을
-시작하는 worker는 없습니다. Herdr 밖에서는 입력을 읽거나 플러그인을 찾거나
+**UserPromptSubmit** hook만 사용합니다. Stop hook이나 hook이 시작하는 turn은 없으며
+유휴 깨우기는 워커가 수행합니다(아래). Herdr 밖에서는 입력을 읽거나 플러그인을 찾거나
 원장을 열기 전에 반환합니다. 활성화 환경 변수는 정체성 증거가 아닙니다.
 foreground root의 프로세스 조상, native transcript UUID와 현재 generation을
 검증해야 합니다. 확인하지 못한 정체성은 메일을 queued로 두고 불명 claim은 보류합니다.
@@ -831,7 +839,45 @@ provider/세션 한도 실패도 별도입니다. 실제 OMP와 물리적인 호
 `inbox handle --message UUID`로 명시적으로 처리하세요. 모든 클라이언트와
 서브에이전트의 조회는 읽기 전용입니다. queued → handled에는 delivered 시각을
 만들지 않으며, 자신에게 온 원문에 답장하면 원문을 원자적으로 handled로 바꿉니다.
-Codex 자동 수신/깨우기 adapter는 없으므로 조회를 native delivery로 보고하지 마세요.
+Codex에는 hook이나 확장 수신기가 없지만 워커가 유휴 세션을 깨울 수 있으며
+(**Claude Code·Codex 유휴 깨우기** 참고), 조회를 native delivery로 보고하지 마세요.
+
+### Claude Code·Codex 유휴 깨우기
+
+원장 워커가(에이전트나 hook이 아니라) 유휴 상태의 Claude Code·Codex 세션을 깨웁니다.
+워커는 레지스트리를 새로 갱신한 직후에만 동작하므로 오래된 스냅샷으로는 아무도 깨우지
+않습니다. 스키마, wire 프로토콜, 통합 코드는 바뀌지 않으며 OMP는 기존 확장 방식을 씁니다.
+
+**조건.** 모두 충족하지 않으면 메일은 queued로 남고 아무것도 전송하지 않습니다.
+참여 에이전트(모드 `auto`, 또는 `manual` 구성원), Herdr `turn_state`가 `idle` 또는
+`done`, 조용한 시간 경과, `wakes_per_hour` 미도달, 같은 에이전트에 다른 보류 claim(hook
+또는 wake) 없음, hop 제한 준수, coalescing 경과입니다(일반 FYI는 턴 종료나 `fyi-now`
+표시가 없으면 600초 지연도 기다립니다). Claude는 등록된 hook(`extension_present=1`)도
+필요합니다.
+
+**조용한 시간(근사).** 워커는 입력 중인 프롬프트를 볼 수 없습니다. 「조용함」은 현재
+`idle`/`done` 구간이 영속 상태 로그 기준으로 `idle_minutes` 동안 이어졌다는 뜻입니다
+(로그가 없을 때만 워커 메모리를 보조로 씁니다). 입력 감지가 아닌 근사이므로 유휴 pane에
+사용자가 입력 중이어도 알 수 없습니다.
+
+**Claude Code.** foreground 프로세스, 세션 레지스트리(id·pid·시작 시각·대화형 여부),
+사용자 소유 peer 소켓과 transcript를 검증한 뒤 소켓에 peer 메시지 한 줄을 씁니다.
+수신 확인은 transcript의 peer 사용자 메시지 또는 흡수된 queued command에 정확한 묶음
+텍스트가 있는 경우뿐이며, 소켓 쓰기만으로는 증거가 아닙니다. 교차 세션 메시지를 보류하는
+세션(`crossSessionInbound` 꺼짐 또는 `bypassPermissions` 모드)은 깨우지 않고 깨울 수
+없다고 보고합니다.
+
+**Codex.** foreground 프로세스가 연 rollout과 thread-writer lock에서 thread를 찾습니다
+(embedded 모드이며 공유 app-server 데몬은 깨울 수 없습니다). `codex queue`를 실행하며
+종료 코드 0은 행이 기록됐다는 뜻일 뿐입니다. 수신 확인은 thread rollout의 사용자
+메시지에 정확한 묶음 텍스트가 있는 경우입니다.
+
+**실패 처리.** 대상을 쓸 수 없으면 claim 없이 30초 뒤 다시 시도합니다. 확실한 전달
+실패는 claim을 `queued`로 되돌립니다(`wake:not-delivered:CODE`, 300초 대기). 불확실한
+실패는 증거가 나타날 때까지 `delivering`으로 두며 시간 초과로 해제하거나 그 위에 다시
+깨우지 않습니다. 세션 종료나 에이전트·세션 변경은 운영자가 정리하도록 `unknown`으로
+끝납니다. 수신 확인은 `via=wake`로 `delivered`가 되고 `wake_log` 한 행을 남깁니다.
+`fyi-now`는 이 클라이언트에서도 동작하며, 깨울 수 없으면 `reason`과 `detail`로 알려 줍니다.
 
 ### 호스트별 runtime 설치와 안전한 배포 순서
 
@@ -868,8 +914,8 @@ python3 "$HAM_CLI" runtime uninstall claude
 1. 프로토콜을 지원하는 **플러그인을 먼저** 갱신합니다. 새 peer를 구버전 설치
    endpoint로 연결하지 마세요.
 2. 일치하는 스킬과 선택한 수신 runtime을 설치·갱신하고, 참여 정책을 켜기 전에
-   해당 수신자의 정체성과 준비 상태를 확인합니다. Codex는 없는 runtime 대신
-   명시적 조회·처리 절차를 사용합니다.
+   해당 수신자의 정체성과 준비 상태를 확인합니다. Codex는 runtime이 필요 없으며
+   원장 워커가 유휴 상태일 때 깨웁니다.
 3. 사용자 TUI에서 원하는 저장소 모드/main/members를 활성화합니다. 사용자가
    선택한 전역 action 바인딩과 상태/recap 지침 이전은 마지막에 합니다.
    이는 배포 지침이지 실제로 수행했다는 보고가 아닙니다.

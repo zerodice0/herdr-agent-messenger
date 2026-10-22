@@ -62,8 +62,8 @@ agents detected after installation receive `color-animal` labels such as
 - **Plugin:** ledger, mailbox, UI, and transport.
 - **Skill:** agent instructions and CLI launcher, not a receiver.
 - **OMP adapter:** native receiving and eligible action/FYI wake.
-- **Claude hooks:** native receiving at turn boundaries, with no idle wake.
-- **Codex:** skill-guided inbox pull, with no adapter required.
+- **Claude hooks:** native receiving at turn boundaries; the ledger worker adds an idle wake.
+- **Codex:** no adapter is required; the ledger worker wakes idle sessions and the skill pulls at work boundaries.
 
 For new installs and upgrades, install/update the [client skill](skill-guide.md#install-with-the-plugin),
 then run the read-only summary on **every selected host**, with cwd set to its plugin root:
@@ -155,6 +155,11 @@ under the same safeguards. This is a minimum, not a scheduled wake: natural
 events or the five-minute safety check normally yield about ten to fifteen minutes.
 This delayed path adds no schema or settings: existing queued FYI uses its
 local delivery timestamp without migration.
+
+Claude Code and Codex idle sessions are now woken by the ledger worker, with no
+schema, protocol or integration change and no new runtime to install (Claude still
+needs its registered hook). Both use the same gates as above, with idle time measured
+from the durable status log. See [Idle wake for Claude Code and Codex](skill-guide.md#idle-wake-for-claude-code-and-codex).
 
 The default thresholds are now `coalesce_seconds` 60 and `wakes_per_hour` 4
 (`idle_minutes` 3 and `max_hop` 10 are unchanged). They apply only to repos with

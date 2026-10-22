@@ -421,8 +421,12 @@ def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple
     if outcome == "no_receiver":
         if client == "omp":
             detail = "OMP receiver not registered, so no wake. Run runtime status, then restart that session"
+        elif client in ("claude", "codex") and result.get("reason"):
+            detail = (f"{client.capitalize()} cannot be woken right now ({result['reason']}: "
+                      f"{result.get('detail') or 'no detail'})")
         elif client == "claude":
-            detail = "Claude cannot be woken; its queued FYI is injected when its next turn starts"
+            detail = ("Claude has no registered HAM hook, so it cannot be woken. Run runtime status, "
+                      "then restart that session")
         else:
             detail = f"{client} has no native receiver; queued FYI is only readable with inbox read"
         return f"{name}: {detail}.", "error", "no receiver"
@@ -443,8 +447,14 @@ def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple
         tail += f" {result['over_hop']} over the hop limit stay queued."
     if any(warning.get("code") == "notification_failed" for warning in result.get("warnings", [])):
         tail += " Wake bell failed; the agent rechecks on its next event."
-    quiet = (f"prompt empty and quiet {result['idle_minutes']} min" if result.get("idle_minutes")
-             else "prompt empty")
+    if any(warning.get("code") == "worker_start_failed" for warning in result.get("warnings", [])):
+        tail += " The wake worker could not start; run worker status."
+    if client in ("claude", "codex"):
+        # The ledger worker cannot see a typed prompt: it wakes after the turn has been idle.
+        quiet = (f"idle for {result['idle_minutes']} min" if result.get("idle_minutes") else "idle")
+    else:
+        quiet = (f"prompt empty and quiet {result['idle_minutes']} min" if result.get("idle_minutes")
+                 else "prompt empty")
     if outcome == "hourly_limit":
         limit = f"{result.get('wake_count')}/{result.get('wakes_per_hour')} this hour"
         frees = result.get("limit_frees_at")
@@ -471,7 +481,8 @@ def fyi_now_pane(environment: Mapping[str, str]) -> int:
             result: Mapping[str, Any] = {"outcome": "not_agent"}
         else:
             terminal_id = pane_record(pane_id, environment)["terminal_id"]
-            result = NativeReceiver(LedgerStore(environment=environment)).fyi_now(terminal_id=terminal_id)
+            result = NativeReceiver(LedgerStore(environment=environment),
+                                    environment=environment).fyi_now(terminal_id=terminal_id)
         text, level, _tag = fyi_now_summary(result)
     except LedgerError as error:
         text, level = f"{error.code}: {error}", "error"
@@ -521,8 +532,8 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
     if operation == "resolve":
         return maintain(store, mail.resolve_claim(**request["claim"]), environment)
     if operation == "fyi_now":
-        return NativeReceiver(store).fyi_now(terminal_id=request["terminal_id"],
-                                             agent_id=request["agent_id"], generation=request["generation"])
+        return NativeReceiver(store, environment=environment).fyi_now(
+            terminal_id=request["terminal_id"], agent_id=request["agent_id"], generation=request["generation"])
     if operation == "withdraw":
         return maintain(store, mail.withdraw(request["message_id"]), environment)
     if operation == "retry":

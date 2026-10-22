@@ -430,19 +430,26 @@ class LedgerCoreTest(unittest.TestCase):
                 self.assertIn(sent["message_id"], [item["message_id"] for item in
                               self.mail.read(recipient)["messages"]])
 
-    def test_fyi_delay_requires_participating_registered_omp_receiver(self):
-        cases = (("omp", 0, "auto"), ("claude", 1, "auto"),
-                 ("codex", 1, "auto"), ("omp", 1, "off"), ("omp", 1, "manual"))
+    def test_fyi_delay_requires_participating_wake_capable_receiver(self):
+        # OMP/Claude need their registered runtime; Codex is woken by the worker with none.
+        cases = (("omp", 0, "auto", False), ("claude", 0, "auto", False), ("omp", 1, "off", False),
+                 ("omp", 1, "manual", False), ("claude", 1, "off", False), ("codex", 1, "manual", False),
+                 ("claude", 1, "auto", True), ("codex", 1, "auto", True), ("codex", 0, "auto", True))
         settings = RepoSettings(self.store, display_runner=lambda command:
                                 subprocess.CompletedProcess(command, 0, "{}", ""))
-        for client, present, mode in cases:
+        for client, present, mode, delayed in cases:
             with self.subTest(client=client, present=present, mode=mode):
                 settings.mutate(self.recipient["repo_id"], "mode", mode)
                 with self.store.transaction() as connection:
                     connection.execute("UPDATE agents SET client=?,extension_present=? WHERE agent_id=?",
                                        (client, present, self.recipient["agent_id"]))
-                sent = self.mail.send(self.sender, self.agents()[1], body="No wake-capable receiver")
-                self.assertNotIn("fyi_wake_after_seconds", sent)
+                    connection.execute("UPDATE agent_status SET turn_state='idle' WHERE agent_id=?",
+                                       (self.recipient["agent_id"],))
+                sent = self.mail.send(self.sender, self.agents()[1], body="Wake-capable receiver")
+                if delayed:
+                    self.assertEqual(sent["fyi_wake_after_seconds"], 600)
+                else:
+                    self.assertNotIn("fyi_wake_after_seconds", sent)
 
     def test_fyi_reply_to_action_uses_same_ready_state_rule(self):
         self.registry.agent_session(terminal_id=self.recipient["terminal_id"],

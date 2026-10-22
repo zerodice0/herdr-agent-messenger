@@ -14,6 +14,8 @@ import tempfile
 from typing import Any, Mapping
 
 from ham.ledger.store import LedgerError, LedgerStore
+from ham.ledger.runtime import wake_capable
+from ham.ledger import wake_claude, wake_codex
 
 OWNER = 'herdr.agent-messenger'
 MANIFEST = 'ham-mailbox.install.json'
@@ -50,26 +52,76 @@ def summary(environment: Mapping[str, str] | None = None, *,
     return {'clients': results}
 
 
+def _native_wake_health(environment: Mapping[str, str] | None,
+                        agents: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Read-only target discovery, separate from runtime ownership and wake gates."""
+    binary = wake_codex.find_codex_binary(environment)
+    result: dict[str, Any] = {
+        'claude': {
+            'method': 'ledger_worker', 'runtime_install_required': True,
+            'sessions': None,
+            'limitations': [
+                'Requires an active HAM hook registration, a verified foreground session, '
+                'its peer-message socket and a readable transcript.',
+                'Peer-message permission policy may make a registered session unavailable.',
+            ],
+        },
+        'codex': {
+            'method': 'ledger_worker', 'runtime_install_required': False,
+            'binary_available': binary is not None, 'binary': binary, 'sessions': None,
+            'limitations': [
+                'Requires a foreground TUI holding an attributable thread rollout/writer lock '
+                '(verified in embedded mode).',
+                'Default shared app-server daemon sessions are not supported: no trustworthy '
+                'pane-to-thread binding is available.',
+                'Binary presence alone does not establish session discoverability.',
+            ],
+        },
+    }
+    if agents is None:
+        return result
+    from ham.ledger.wake_clients import WakeUnavailable
+    for client, capability in result.items():
+        discovered = []
+        for agent in agents:
+            if agent['client'] != client:
+                continue
+            reason = detail = None
+            if not wake_capable(agent):
+                reason, detail = 'extension_absent', 'The active session has no HAM hook registration.'
+            else:
+                try:
+                    {'claude':wake_claude,'codex':wake_codex}[client].discover(agent,environment=environment)
+                except WakeUnavailable as error:
+                    reason, detail = error.code, error.message
+                except (OSError,ValueError,TypeError,KeyError,ImportError) as error:
+                    reason, detail = 'discover_failed', str(error)
+            discovered.append({'agent_id':agent['agent_id'],'terminal_id':agent['terminal_id'],
+                               'discoverable':reason is None,'reason':reason,'detail':detail})
+        capability['sessions'] = discovered
+    return result
+
+
 def health_summary(environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Combine installation ownership with read-only, local registration counts."""
+    """Report ownership, registrations and native target discovery, never readiness."""
     result = summary(environment)
     sessions = {client: {'receiver_registered': None, 'receiver_absent': None}
                 for client in ('omp', 'claude', 'codex')}
     ledger: dict[str, Any] = {'available': False, 'error': None}
+    agents = None
     try:
         store = LedgerStore.open_readonly(environment)
         if store is None:
             raise LedgerError('ledger_not_initialized', 'No existing HAM ledger is available to read.')
         with store.read() as connection:
-            rows = connection.execute(
-                "SELECT client,extension_present,COUNT(*) AS count FROM agents "
-                "WHERE active=1 AND host=? AND client IN ('omp','claude','codex') "
-                "GROUP BY client,extension_present", (store.host,)).fetchall()
+            agents = [dict(row) for row in connection.execute(
+                "SELECT * FROM agents WHERE active=1 AND host=? AND client IN ('omp','claude','codex')",
+                (store.host,))]
         sessions = {client: {'receiver_registered': 0, 'receiver_absent': 0}
                     for client in sessions}
-        for row in rows:
-            field = 'receiver_registered' if row['extension_present'] else 'receiver_absent'
-            sessions[row['client']][field] += row['count']
+        for agent in agents:
+            field = 'receiver_registered' if agent['extension_present'] else 'receiver_absent'
+            sessions[agent['client']][field] += 1
         ledger['available'] = True
     except LedgerError as error:
         ledger['error'] = {'code': error.code, 'message': error.message}
@@ -95,7 +147,14 @@ def health_summary(environment: Mapping[str, str] | None = None) -> dict[str, An
         elif absent:
             next_steps.append(prefix + 'runtime installed, activation pending → restart only selected sessions; '
                               'confirm extension_present=1 before reporting receiving ready.')
-    return {**result, 'sessions': sessions, 'ledger': ledger, 'next_steps': next_steps}
+    return {**result, 'sessions': sessions, 'ledger': ledger, 'next_steps': next_steps,
+            'native_wake': _native_wake_health(environment,agents),
+            'wake_limitations': [
+                'Discoverable is not wake-ready: membership, continuous idle time, mail, '
+                'coalescing, hourly/hop limits and pending claims still gate every wake.',
+                'Claude/Codex use continuous idle/done as a quiet proxy; editor input is not observable.',
+                'Delivery is confirmed only by exact acceptance evidence in the native journal.',
+            ]}
 
 
 def _digest(path: Path) -> str:

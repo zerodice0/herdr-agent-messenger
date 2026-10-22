@@ -33,7 +33,8 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
 - **Resource presence:** claim phones or emulators before use and release them
   afterward; inspect discovered servers separately from device ownership.
 - **Three clients:** bundled skills for omp, Claude Code, and Codex. OMP and
-  Claude receiving runtimes are opt-in; Codex pulls mail at work boundaries.
+  Claude receiving runtimes are opt-in; the ledger worker also wakes idle Claude
+  Code and Codex sessions, and Codex needs no runtime and pulls at work boundaries.
 
 ## Requirements
 

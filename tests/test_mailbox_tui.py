@@ -5512,7 +5512,7 @@ class MailboxUiTest(unittest.TestCase):
         job.result = execute_job(job.request, self.environment)
         app.tick()
         self.assertEqual(app.status_level, 'error')
-        self.assertIn('Claude cannot be woken', app.status)
+        self.assertIn('Claude has no registered HAM hook', app.status)
         self.assertEqual(set(self.fyi_flags().values()), {0})
 
     def test_agents_fyi_now_shortcut_rejects_ineligible_rows_with_reason(self):
@@ -5571,9 +5571,19 @@ class MailboxUiTest(unittest.TestCase):
         text, _, _ = fyi_now_summary({**base, 'outcome': 'requested', 'remaining': 4, 'over_hop': 1}, wall_clock=lambda: 0)
         self.assertIn('+4 more in later wakes (cap 8 messages / 8 KiB)', text)
         self.assertIn('1 over the hop limit', text)
-        for client, fragment in (('codex', 'codex has no native receiver'), ('claude', 'Claude cannot be woken')):
+        for client, fragment in (('codex', 'codex has no native receiver'),
+                                 ('claude', 'Claude has no registered HAM hook')):
             text, _, _ = fyi_now_summary({'outcome': 'no_receiver', 'agent': {**agent, 'client': client}})
             self.assertIn(fragment, text)
+        for client in ('codex', 'claude'):
+            text, level, _ = fyi_now_summary({'outcome': 'no_receiver', 'reason': 'x_reason', 'detail': 'why',
+                                              'agent': {**agent, 'client': client}})
+            self.assertEqual(level, 'error')
+            self.assertIn(f'{client.capitalize()} cannot be woken right now (x_reason: why)', text)
+        text, _, _ = fyi_now_summary({**base, 'outcome': 'requested', 'agent': {**agent, 'client': 'codex'}},
+                                     wall_clock=lambda: 0)
+        self.assertIn('delivers once idle for 3 min', text)
+        self.assertNotIn('prompt empty', text)
 
     def test_fyi_now_pane_action_resolves_the_focused_pane_and_notifies_without_a_prompt(self):
         sent = self.omp_receiver_with_queued_fyi()

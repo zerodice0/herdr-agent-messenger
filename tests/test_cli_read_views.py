@@ -19,6 +19,8 @@ from ham.ledger.mail import Mailbox
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import SCHEMA_VERSION, LedgerError, LedgerStore
+from ham.ledger.wake_clients import WakeUnavailable
+from ham.ops import runtime_installer
 from ham.ops.runtime_installer import MANIFEST, RUNTIME, manage
 from tests.test_ledger_core import snapshot
 
@@ -107,6 +109,12 @@ class ReadCliTest(unittest.TestCase):
         with store.read() as connection:
             return hashlib.sha256("\n".join(connection.iterdump()).encode()).hexdigest()
 
+    def assert_native_status_probes_readonly(self):
+        if self.herdr_calls.exists():
+            for line in self.herdr_calls.read_text().splitlines():
+                arguments = json.loads(line)
+                self.assertIn(arguments[:2], (["pane", "get"], ["pane", "process-info"]))
+
     def add_peer_endpoint(self):
         peer_environment = {**self.environment, "HERDR_AGENT_LEDGER_DIR": str(self.root / "peer-ledger"),
                             "HERDR_SOCKET_PATH": str(self.root / "absent-peer-herdr.sock")}
@@ -193,7 +201,6 @@ class ReadCliTest(unittest.TestCase):
         files = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
         completed, result = self.cli("runtime", "status")
         self.assertEqual(completed.returncode, 0)
-        self.assertEqual(set(result), {"clients", "sessions", "ledger", "next_steps"})
         self.assertEqual(result["clients"], [
             {**manage("status", destination, client=client), "error": None}
             for client, destination in destinations.items()
@@ -207,7 +214,7 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(result["next_steps"], [])
         self.assertEqual(self.database_state(self.store), before)
         self.assertEqual({path: path.read_bytes() for path in home.rglob("*") if path.is_file()}, files)
-        self.assertFalse(self.herdr_calls.exists())
+        self.assert_native_status_probes_readonly()
 
     def test_runtime_status_without_ledger_reports_unknown_counts_without_creating_home(self):
         home = self.root / "absent-runtime-home"
@@ -215,7 +222,6 @@ class ReadCliTest(unittest.TestCase):
                        "HERDR_AGENT_LEDGER_DIR": str(home / "ledger")}
         completed, result = self.cli("runtime", "status", environment=environment)
         self.assertEqual(completed.returncode, 0)
-        self.assertEqual(set(result), {"clients", "sessions", "ledger", "next_steps"})
         self.assertEqual(result["clients"], [
             {"client": client, "destination": str(destination), "installed": False,
              "owner": None, "error": None}
@@ -226,6 +232,9 @@ class ReadCliTest(unittest.TestCase):
             client: {"receiver_registered": None, "receiver_absent": None}
             for client in ("omp", "claude", "codex")
         })
+        self.assertIsNone(result["native_wake"]["claude"]["sessions"])
+        self.assertIsNone(result["native_wake"]["codex"]["sessions"])
+        self.assertFalse(result["native_wake"]["codex"]["runtime_install_required"])
         self.assertIs(result["ledger"]["available"], False)
         self.assertEqual(result["ledger"]["error"]["code"], "ledger_not_initialized")
         self.assertTrue(result["ledger"]["error"]["message"])
@@ -311,7 +320,11 @@ class ReadCliTest(unittest.TestCase):
         self.assertIn("restart", claude)
         self.assertFalse(any(step.startswith("codex:") for step in result["next_steps"]))
         self.assertEqual(self.database_state(self.store), before)
-        self.assertFalse(self.herdr_calls.exists())
+        native_sessions = [session for capability in result["native_wake"].values()
+                           for session in capability["sessions"]]
+        self.assertEqual({session["terminal_id"] for session in native_sessions},
+                         {"local-claude-0", "local-claude-1", "local-codex-0", "local-codex-1"})
+        self.assert_native_status_probes_readonly()
 
     def test_runtime_status_next_steps_skip_clients_without_active_local_sessions(self):
         for used in ("omp", "claude", "codex"):
@@ -325,7 +338,74 @@ class ReadCliTest(unittest.TestCase):
                 else:
                     self.assertEqual(len(result["next_steps"]), 1)
                     self.assertIn(f"runtime install {used}", result["next_steps"][0])
-                self.assertFalse(self.herdr_calls.exists())
+                self.assert_native_status_probes_readonly()
+
+    def test_runtime_status_separates_codex_binary_presence_from_session_discovery(self):
+        # Give this test explicit client roles instead of inheriting the mail fixture's
+        # Codex sender and OMP recipient. Include Codex in both repository scopes.
+        with self.store.transaction() as connection:
+            connection.executemany(
+                "UPDATE agents SET client=? WHERE agent_id=?",
+                (("omp", self.sender["agent_id"]),
+                 ("codex", self.recipient["agent_id"]),
+                 ("codex", self.other["agent_id"])))
+        before = self.database_state(self.store)
+        with mock.patch.object(runtime_installer.wake_codex, "find_codex_binary", return_value="/fixture/codex"), \
+             mock.patch.object(runtime_installer.wake_codex, "discover",
+                               side_effect=WakeUnavailable("codex_no_rollout", "Shared daemon has no pane binding")) as discover:
+            result = runtime_installer.health_summary(self.environment)
+        codex = result["native_wake"]["codex"]
+        self.assertTrue(codex["binary_available"])
+        self.assertFalse(codex["runtime_install_required"])
+        self.assertEqual({session["terminal_id"] for session in codex["sessions"]},
+                         {self.recipient["terminal_id"], self.other["terminal_id"]})
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual({call.args[0]["agent_id"] for call in discover.call_args_list},
+                         {self.recipient["agent_id"], self.other["agent_id"]})
+        self.assertTrue(all(not session["discoverable"] and session["reason"] == "codex_no_rollout"
+                            for session in codex["sessions"]))
+        self.assertTrue(any("shared app-server" in limitation for limitation in codex["limitations"]))
+        self.assertFalse(any("codex" in step and "runtime install" in step for step in result["next_steps"]))
+        self.assertEqual(self.database_state(self.store), before)
+
+    def test_runtime_status_reports_codex_missing_and_never_installs_a_runtime(self):
+        with mock.patch.object(runtime_installer.wake_codex, "find_codex_binary", return_value=None), \
+             mock.patch.object(runtime_installer, "manage", wraps=manage) as managed:
+            result = runtime_installer.health_summary(self.environment)
+        codex = result["native_wake"]["codex"]
+        self.assertFalse(codex["binary_available"])
+        self.assertTrue(all(not session["discoverable"] and session["reason"] == "codex_missing"
+                            for session in codex["sessions"]))
+        self.assertTrue(all(call.args[0] == "status" and call.kwargs["client"] in {"omp", "claude"}
+                            for call in managed.call_args_list))
+        self.assertFalse((Path(self.environment["HOME"]) / ".codex").exists())
+        self.assertFalse(self.herdr_calls.exists())
+
+    def test_runtime_status_reports_discoverable_codex_without_hook_as_discovery_not_readiness(self):
+        with mock.patch.object(runtime_installer.wake_codex, "find_codex_binary", return_value="/fixture/codex"), \
+             mock.patch.object(runtime_installer.wake_codex, "discover", return_value=object()):
+            result = runtime_installer.health_summary(self.environment)
+        codex = result["native_wake"]["codex"]
+        self.assertTrue(all(session["discoverable"] and session["reason"] is None
+                            for session in codex["sessions"]))
+        self.assertTrue(any("not wake-ready" in limitation for limitation in result["wake_limitations"]))
+        self.assertTrue(any("editor input is not observable" in limitation
+                            for limitation in result["wake_limitations"]))
+
+    def test_runtime_status_claude_registration_does_not_hide_target_unavailability(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET client='claude',extension_present=0")
+            connection.execute("UPDATE agents SET extension_present=1 WHERE agent_id=?", (self.sender["agent_id"],))
+        with mock.patch.object(runtime_installer.wake_claude, "discover",
+                               side_effect=WakeUnavailable("socket_missing", "Peer socket is absent")) as discover:
+            result = runtime_installer.health_summary(self.environment)
+        claude = result["native_wake"]["claude"]
+        self.assertTrue(claude["runtime_install_required"])
+        sessions = {session["agent_id"]: session for session in claude["sessions"]}
+        self.assertEqual(sessions[self.sender["agent_id"]]["reason"], "socket_missing")
+        self.assertEqual(sessions[self.recipient["agent_id"]]["reason"], "extension_absent")
+        self.assertTrue(all(not session["discoverable"] for session in sessions.values()))
+        discover.assert_called_once()
 
     def test_runtime_status_reports_conflict_without_recommending_replacement_or_hiding_other_client(self):
         home = Path(self.environment["HOME"])
@@ -352,7 +432,7 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(self.database_state(self.store), before)
         self.assertFalse(self.herdr_calls.exists())
 
-    def test_runtime_status_with_client_preserves_existing_status_shape_and_environment_destinations(self):
+    def test_runtime_status_with_client_reports_ownership_at_selected_destinations(self):
         home = Path(self.environment["HOME"])
         claude = self.root / "custom-claude"
         environment = {**self.environment, "CLAUDE_CONFIG_DIR": str(claude)}
@@ -365,14 +445,18 @@ class ReadCliTest(unittest.TestCase):
                         manage("install", destination, client=client)
                     completed, result = self.cli("runtime", "status", client, environment=environment)
                     self.assertEqual(completed.returncode, 0)
-                    self.assertEqual(result, manage("status", destination, client=client))
-                    self.assertNotIn("sessions", result)
-                    self.assertNotIn("clients", result)
+                    self.assertEqual(result["client"], client)
+                    self.assertEqual(result["destination"], str(destination))
+                    self.assertIs(result["installed"], installed)
+                    if installed:
+                        self.assertEqual(result["owner"], runtime_installer.OWNER)
             explicit = self.root / f"explicit-{client}"
             completed, result = self.cli("runtime", "status", client, "--destination", str(explicit),
                                          environment=environment)
             self.assertEqual(completed.returncode, 0)
-            self.assertEqual(result, manage("status", explicit, client=client))
+            self.assertEqual(result["client"], client)
+            self.assertEqual(result["destination"], str(explicit))
+            self.assertFalse(result["installed"])
             self.assertFalse(explicit.exists())
         self.assertFalse((home / ".claude").exists())
         self.assertEqual(self.database_state(self.store), before)
@@ -606,7 +690,8 @@ class ReadCliTest(unittest.TestCase):
         full_receipt = {"payload_hash", "origin_host", "authoritative", "updated_at"}
         completed, sent = self.cli("mail", "send", "--to", "local/" + self.other["alias"], "--body", "Compact receipt")
         self.assertEqual(completed.returncode, 0)
-        self.assertEqual(set(sent), {"message_id", "thread_id", "recipient_address", "state"})
+        # The idle Codex recipient is wake-capable, so the FYI-delay advisory is part of the receipt.
+        self.assertEqual(set(sent), {"message_id", "thread_id", "recipient_address", "state", "fyi_wake_after_seconds"})
         self.assertEqual((sent["state"], sent["recipient_address"]), ("queued", "alpha/" + self.other["alias"]))
         completed, verbose = self.cli("mail", "send", "--to", "local/" + self.other["alias"],
                                       "--body", "Full receipt", "--verbose")

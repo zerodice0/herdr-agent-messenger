@@ -107,8 +107,10 @@ def ensure_worker(store: LedgerStore, environment: Mapping[str, str] | None = No
 
 def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None, *,
                once: bool = False, remote: RemoteLedger | None = None) -> dict[str, Any]:
+    from ham.ledger.native_wake import NativeWaker
     from ham.ledger.runtime import NativeReceiver
-    observer = NativeReceiver(store)
+    observer = NativeReceiver(store, environment=environment)
+    waker = NativeWaker(store, observer, environment=environment)
     service = remote or RemoteLedger(store, environment)
     totals = {"sent": 0, "failed": 0, "deferred": 0}
     last_retention: float | None = None
@@ -128,17 +130,24 @@ def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None,
                     for key, value in service.pump().items():
                         totals[key] += value
                     if maintenance_pending(store):
+                        receipts = []
                         try:
                             AgentRegistry(store).refresh(environment)
-                            observed = observer.observe_claude()
+                            receipts.extend(observer.observe_claude()["receipts"])
                         except (LedgerError, OSError) as error:
                             # An unavailable Herdr or transcript is not terminal-closure evidence.
                             message = error.message if isinstance(error, LedgerError) else str(error)
                             store.note_notification_failure("worker sweep: " + message)
                         else:
-                            if observed["receipts"]:
-                                for key, value in service.pump().items():
-                                    totals[key] += value
+                            # Wake only on a fresh registry; a stale snapshot must never wake anyone.
+                            try:
+                                receipts.extend(waker.sweep()["receipts"])
+                            except (LedgerError, OSError) as error:
+                                message = error.message if isinstance(error, LedgerError) else str(error)
+                                store.note_notification_failure("worker wake: " + message)
+                        if receipts:
+                            for key, value in service.pump().items():
+                                totals[key] += value
                     if once or not maintenance_pending(store):
                         break
                     time.sleep(5)

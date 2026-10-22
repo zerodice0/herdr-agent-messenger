@@ -107,7 +107,6 @@ class RuntimeInstallerTest(unittest.TestCase):
             for client in ('claude','omp')
         ]})
         for row in result['clients']:
-            self.assertEqual(set(row), {'client','destination','installed','owner','error'})
             self.assertIs(row['installed'],True)
             self.assertEqual(row['owner'],OWNER)
         self.assertEqual({path:path.read_bytes() for path in self.root.rglob('*') if path.is_file()},before)

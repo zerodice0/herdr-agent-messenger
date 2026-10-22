@@ -271,12 +271,11 @@ class Mailbox:
                 "message": f"{client} recipient has no registered HAM receiver; the message remains queued. "
                            f"Run runtime status on {recipient['host']}; with user consent install the runtime "
                            "if missing, then restart the selected session."})
-        from ham.ledger.runtime import FYI_WAKE_DELAY_SECONDS, WAKE_READY_STATES
+        from ham.ledger.runtime import FYI_WAKE_DELAY_SECONDS, WAKE_READY_STATES, wake_capable
         if (payload["kind"] == "fyi" and not submission.get("fyi_turn_end") and
                 wake_recipient.get("active") == 1 and
                 not wake_recipient.get("stale") and
-                wake_recipient.get("client") == "omp" and
-                wake_recipient.get("extension_present") == 1 and
+                wake_capable(wake_recipient) and
                 wake_recipient.get("role") in {"main", "worker"} and
                 wake_recipient.get("turn_state") in WAKE_READY_STATES):
             submission["fyi_wake_after_seconds"] = FYI_WAKE_DELAY_SECONDS

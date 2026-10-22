@@ -448,20 +448,24 @@ Settings의 선택 목록과 `m` 단축키 동작은 그대로 유지됩니다. 
 처리된 메일, 다른 에이전트는 건드리지 않습니다. 스키마, 프로토콜, runtime은 바뀌지 않으며
 OMP 확장을 다시 시작할 필요도 없습니다.
 
-깨우기 조건은 수신기가 계속 적용합니다. 에이전트가 참여 중(모드와 역할)이어야 하고, 턴이
-idle 또는 done이어야 하며, 시간당 깨우기 한도에 여유가 있어야 합니다. hop 한도도 유지되고,
-프롬프트는 비어 있으며 idle 기준 시간 동안 입력이 없어야 합니다. 작업 중인 에이전트는 그 턴
+깨우기 조건은 수신기(Claude·Codex는 원장 워커)가 계속 적용합니다. 에이전트가 참여 중(모드와
+역할)이어야 하고, 턴이 idle 또는 done이어야 하며, 시간당 깨우기 한도에 여유가 있어야 합니다.
+hop 한도도 유지되고 조용한 시간이 지나야 합니다. OMP는 프롬프트가 비어 있고 idle 기준
+시간 동안 입력이 없어야 하며, Claude·Codex는 워커가 입력 중인 프롬프트를 볼 수 없으므로
+그 시간 동안 계속 idle이어야 합니다. 이 두 클라이언트에서는 요청이 필요하면 워커도
+시작하고(자동 시작이 꺼져 있지 않은 경우) 먼저 세션을 깨울 수 있는지 확인합니다.
+`worker_start_failed` 안내는 워커를 시작하지 못했다는 뜻입니다. 작업 중인 에이전트는 그 턴
 직후 FYI를 받습니다. 한 번의 깨우기에는 최대 8개 메시지와 8 KiB까지 담으며 나머지는 다음
 깨우기에서 전달합니다. 상태 줄은 실제로 적용되는 상황을 구체적으로 알려 줍니다.
 
 | 결과 | 메시지(형태) |
 | --- | --- |
-| `requested` | `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min` |
+| `requested` | OMP: `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min`. Claude/Codex: `... delivers once idle for M min` |
 | `after_turn` | `agent is working: N FYI delivered right after its turn` |
 | `hourly_limit` | `N FYI marked, wake limit reached (4/4 this hour); next wake possible HH:MM` |
 | `nothing_queued` / `only_held` | 전달할 FYI가 없으며 대기 중인 action 수나 보류 수를 함께 표시 |
 | `not_participating` | 모드가 off이거나 manual 비구성원이면 HAM이 깨우지 않고 FYI는 다음 턴까지 대기 |
-| `no_receiver` | OMP 확장 미등록, Claude(다음 턴 시작 때 주입), 그 밖의 클라이언트(`inbox read`만 가능) |
+| `no_receiver` | OMP 확장 미등록, 등록된 hook이 없는 Claude, 지금 깨울 수 없는 Claude/Codex(`Claude cannot be woken right now (REASON: detail)`, 아무것도 표시하지 않음), 그 밖의 클라이언트(`inbox read`만 가능) |
 | `not_agent` | 포커스된 pane이 HAM 에이전트가 아님(pane 동작에서만) |
 | 원격 에이전트 | 로컬 전용이므로 그 에이전트 호스트의 메일함 사용 |
 

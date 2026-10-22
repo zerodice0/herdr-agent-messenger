@@ -467,20 +467,25 @@ rings the agent's local bell so the receiver inspects at once. Action mail, held
 handled mail, and other agents are untouched. No schema, protocol, or runtime change is
 involved, and the OMP extension needs no restart.
 
-Every wake gate still applies, because the receiver enforces them: the agent must take
-part (mode and role), its turn must be idle or done, the hourly wake limit must have room,
-the hop limit holds, and the prompt must be empty and quiet for the idle threshold. A
+Every wake gate still applies, because the receiver (for Claude and Codex, the ledger
+worker) enforces them: the agent must take part (mode and role), its turn must be idle
+or done, the hourly wake limit must have room, the hop limit holds, and the quiet period
+must have passed. For OMP the prompt must be empty and quiet for the idle threshold; for
+Claude and Codex the agent must have been continuously idle for it, since the worker cannot
+see typed prompts. For these two, the request also starts the worker if needed (unless
+autostart is off) and first checks that the session can be woken; a
+`worker_start_failed` note means the worker could not be started. A
 working agent receives the FYI right after its turn. One wake carries at most 8 messages
 and 8 KiB; any remainder follows in later wakes. The status line names exactly what applies:
 
 | Outcome | Message (shape) |
 | --- | --- |
-| `requested` | `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min` |
+| `requested` | OMP: `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min`. Claude/Codex: `... delivers once idle for M min` |
 | `after_turn` | `agent is working: N FYI delivered right after its turn` |
 | `hourly_limit` | `N FYI marked, wake limit reached (4/4 this hour); next wake possible HH:MM` |
 | `nothing_queued` / `only_held` | no deliverable FYI, with the queued action or held count |
 | `not_participating` | mode off, or manual non-member: HAM never wakes it; FYI wait for its next turn |
-| `no_receiver` | OMP extension not registered, or Claude (injected at its next turn) or another client (`inbox read` only) |
+| `no_receiver` | OMP extension not registered; Claude without a registered hook; Claude/Codex that cannot be woken right now (`Claude cannot be woken right now (REASON: detail)`, nothing flagged); or another client (`inbox read` only) |
 | `not_agent` | the focused pane is not a HAM agent (pane action only) |
 | remote agent | local only: use the Mailbox on that agent's host |
 
