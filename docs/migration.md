@@ -83,6 +83,40 @@ confirm `extension_present=1`, or report **installed, activation pending**.
 Plugin loading never writes client configuration; the new-repository `auto`
 default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
 
+## Sender dismissal (schema v11)
+
+Schema v11 additively creates local `mail_dismissals` and nullable
+`messages.sender_context`; v10 is explicitly accepted as an upgrade source.
+Existing identities, settings, bodies, delivery states, hashes and receipts are
+not rewritten. The audit has no message-body foreign key and keeps
+sender/group identity plus failure snapshots, so body retention cannot erase
+the first dismissal or force a body to be restored on an authorized retry.
+Dismissal does not reset `final_at`, delivery `updated_at`, or retention deadlines.
+
+New agent sends snapshot verified sender identity and anchor scope locally,
+outside immutable payload hashes and peer envelopes. A closed linked workspace
+and deleted sender agent cannot revoke the original anchor main's authority.
+Existing v10 messages receive null context, not an invented historical group.
+For those messages, a main override requires surviving recorded sender identity
+and workspace metadata proving the group; missing linked-workspace/anchor
+evidence fails closed. The original terminal may still dismiss with verified
+sender-repo ownership evidence. No arbitrary same-repo main is inferred.
+
+Before an approved deployment, back up the host database and stop old HAM
+processes sharing it. Upgrade host code and copied skills together, run
+`python3 -m ham cli ledger reconcile` for writable migration, then restart the
+host's HAM workers, TUIs and other processes loading HAM code. Read-only opens
+never migrate. Old code cannot open v11; downgrade requires restoring the
+pre-upgrade database, not changing its version marker. This feature does not
+itself require an OMP/Claude runtime reinstall or change their contracts.
+Deployment and cleanup of real mail still require explicit user authorization.
+
+This is **origin-ledger attention resolution**, not replicated recipient
+handling. Protocol 1, delivery states, outbox kinds and remote receipts remain
+unchanged. No new receipt, native ACK, wake or handled timestamp is generated.
+Recipient-host history stays unchanged. See
+[`mail dismiss`](../.agents/skills/herdr-agent-messenger/reference.md#sender-dismissal).
+
 ## Turn-end FYI (schema v10)
 
 Schema v10 adds local `deliveries.fyi_turn_end INTEGER NOT NULL DEFAULT 0`.
@@ -157,7 +191,7 @@ with mains give `main_ambiguous`. Named `HOST/LABEL` addressing is unchanged.
 2. From the updated HAM checkout on each host, run
    `python3 -m ham cli ledger reconcile`.
    Writable reconciliation upgrades older storage to the current schema
-   (v10, including v9 workspace metadata). Read-only commands never migrate.
+   (v11, including v9 workspace metadata). Read-only commands never migrate.
 3. Restart the host's HAM processes with the upgraded code. The OMP extension
    and Claude hook contracts are unchanged; no new adapter/hook configuration
    is required. Resume group-dependent routing after the participating hosts

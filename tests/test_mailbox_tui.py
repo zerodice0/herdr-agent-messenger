@@ -4194,6 +4194,133 @@ class MailboxUiTest(unittest.TestCase):
                 self.assertIn('…', snapshot.line(y))
                 self.assertNotIn('/', snapshot.line(y))
 
+    def dismiss_fixture(self, thread, *indices):
+        for index in indices or range(len(thread['messages'])):
+            message = thread['messages'][index]
+            message.update(hold_reason='terminal_closed', created_at=1_799_999_900,
+                           dismissal={'message_id': message['message_id'],
+                                      'actor_alias': 'white-beaver', 'actor_terminal_id': 'sender-terminal',
+                                      'reason': '닫힌 세션에 보낸 요청을 확인했고 다시 전달하지 않기로 했습니다. ' * 8,
+                                      'dismissed_at': 1_800_000_000})
+        return thread
+
+    def test_dismissal_grouping_covers_every_unresolved_state_and_mixed_resolution(self):
+        for state in ('pending', 'queued', 'delivering', 'delivered', 'undeliverable', 'withdrawn'):
+            with self.subTest(state=state):
+                app = self.app()
+                dismissed = self.dismiss_fixture(self.thread_fixture('dismissed', 'undeliverable'))
+                mixed = self.dismiss_fixture(self.thread_fixture('mixed', 'handled', 'undeliverable'), 1)
+                live = self.dismiss_fixture(self.thread_fixture('live', state, 'undeliverable'), 1)
+                app.local['threads'] = [dismissed, mixed, live]
+                app.local['submissions'] = [{'submission_id': 'direct', 'acceptance': 'accepted',
+                                             'target': self.recipient, 'body': 'direct'}]
+                app.local['outbox'] = [{'item_id': 'outbox', 'state': 'failed', 'kind': 'receipt',
+                                        'target_host': 'peer', 'last_error': 'offline'}]
+                items = app.items('threads')
+                self.assertEqual([app.identity(item)[1] for item in items],
+                                 ['live', 'direct', 'outbox', 'dismissed', 'mixed'])
+                self.assertEqual([app.thread_resolved(item) for item in items],
+                                 [False, False, False, True, True])
+                app.screen = Screen(20, 110)
+                app.render_threads((0, 0, 20, 110))
+                snapshot = app.screen.snapshot()
+                self.assertIn('Active (3)', snapshot.line(1))
+                self.assertEqual(len(snapshot.rows_containing('Handled (2)')), 1)
+                row = snapshot.rows_containing(' · live')[0]
+                self.assertIn(app.thread_state(state)[0], snapshot.line(row))
+                self.assertIn('1 active · 2 handled/dismissed', app.agent_mail_lines(self.recipient)[1])
+
+    def test_every_handled_and_dismissed_order_uses_a_distinct_dismissed_representative(self):
+        for states in (('undeliverable',), ('undeliverable', 'undeliverable'),
+                       ('handled', 'undeliverable'), ('undeliverable', 'handled')):
+            with self.subTest(states=states):
+                app = self.app()
+                thread = self.thread_fixture('resolved', *states)
+                for index, state in enumerate(states):
+                    if state == 'undeliverable':
+                        self.dismiss_fixture(thread, index)
+                app.local['threads'] = [thread]
+                self.assertTrue(app.thread_resolved(app.items('threads')[0]))
+                app.screen = Screen(8, 100)
+                app.render_threads((0, 0, 8, 100))
+                snapshot = app.screen.snapshot()
+                self.assertIn('Handled (1)', snapshot.line(1))
+                self.assertIn('x dismissed · resolved', snapshot.line(2))
+                self.assertNotIn('= handled', snapshot.line(2))
+
+    def test_dismissed_detail_preserves_delivery_truth_and_audit_without_technical_toggle(self):
+        app = self.app()
+        thread = self.dismiss_fixture(self.thread_fixture('dismissed', 'undeliverable'))
+        app.detail = {'type': 'thread', **thread}
+        app.detail_technical = False
+        lines = [line for line, _ in app.thread_detail(100)]
+        text = '\n'.join(lines)
+        self.assertIn('x dismissed', text)
+        self.assertNotIn('= handled', text)
+        self.assertIn('NOT delivered / recipient handled', text)
+        self.assertIn('white-beaver', text)
+        self.assertIn('sender-terminal', text)
+        self.assertIn(app.format_time(1_800_000_000, app.wall_clock()), text)
+        self.assertIn(thread['messages'][0]['dismissal']['reason'], text)
+        self.assertIn('Recorded delivery: undeliverable · failure: terminal_closed', text)
+        self.assertEqual(thread['messages'][0]['state'], 'undeliverable')
+
+    def test_dismissal_repartition_and_new_reply_preserve_selection_navigation_and_identity(self):
+        app = self.app()
+        failed = self.thread_fixture('failed', 'undeliverable')
+        other = self.thread_fixture('other', 'queued')
+        app.local['threads'] = [failed, other]
+        app.focus = app.preview = 'threads'
+        self.capture(app, 35, 110)
+        app.start_job('snapshot', 'snapshot')
+        resolved = self.dismiss_fixture(self.thread_fixture('failed', 'undeliverable'))
+        app.jobs['snapshot'].result = {**app.local, 'threads': [resolved, other]}
+        app.tick()
+        self.assertEqual(app.identity(app.selected()), ('thread', 'failed'))
+        self.assertEqual(app.selections['threads'], 1)
+        self.assertEqual(app.detail['thread_id'], 'failed')
+        app.key(curses.KEY_UP)
+        self.assertEqual(app.identity(app.selected()), ('thread', 'other'))
+        app.key(curses.KEY_DOWN)
+        self.assertEqual(app.identity(app.selected()), ('thread', 'failed'))
+        reply = self.thread_fixture('failed', 'undeliverable', 'queued')
+        reply['messages'][0] = resolved['messages'][0]
+        reply['messages'][1]['created_at'] = 1_800_000_001
+        app.start_job('snapshot', 'snapshot')
+        app.jobs['snapshot'].result = {**app.local, 'threads': [reply, other]}
+        app.tick()
+        self.assertEqual(app.selections['threads'], 0)
+        self.assertEqual(app.identity(app.selected()), ('thread', 'failed'))
+        self.assertFalse(app.thread_resolved(app.selected()))
+        app.key('\r')
+        self.assertEqual(app.reply_to, 'failed-1')
+
+    def test_dismissed_selection_is_legible_and_clipped_at_narrow_no_color_widths(self):
+        for width in (24, 40, 80, 160):
+            for no_color in (False, True):
+                with self.subTest(width=width, no_color=no_color), \
+                     patch('ham.ui.mailbox.curses.color_pair', side_effect=lambda value: value << 8):
+                    app = self.app()
+                    if no_color:
+                        app.environment['NO_COLOR'] = ''
+                        app.initialize_colors()
+                        self.assertFalse(app.theme.colors_enabled)
+                    else:
+                        app.theme.colors_enabled = True
+                    app.local['threads'] = [self.dismiss_fixture(
+                        self.thread_fixture('dismissed 한국어 제목', 'undeliverable'))]
+                    app.focus = app.preview = 'threads'
+                    self.capture(app, 35, width)
+                    app.screen = Screen(8, width)
+                    app.render_threads((0, 0, 8, width))
+                    snapshot = app.screen.snapshot()
+                    self.assertIn('x dismissed', snapshot.line(2))
+                    self.assertTrue(all(cell.attribute & curses.A_REVERSE for cell in snapshot.cells[2]))
+                    self.assertTrue(all(not cell.attribute & curses.A_DIM for cell in snapshot.cells[2]))
+                    self.assertEqual(app.screen.out_of_bounds, [])
+                    app.key(' ')
+                    self.capture(app, 35, width)
+
     def test_thread_groups_stably_partition_all_handled_below_active_and_transport(self):
         app = self.app()
         app.local['threads'] = [
@@ -4231,17 +4358,17 @@ class MailboxUiTest(unittest.TestCase):
                     self.thread_fixture('unfinished', state, 'handled')]
                 first, last = app.items('threads')
                 self.assertEqual(first['thread_id'], 'unfinished')
-                self.assertFalse(app.thread_handled(first))
-                self.assertTrue(app.thread_handled(last))
+                self.assertFalse(app.thread_resolved(first))
+                self.assertTrue(app.thread_resolved(last))
                 app.screen = Screen(12, 100)
                 app.render_threads((0, 0, 12, 100))
                 row = app.screen.snapshot().rows_containing(' · unfinished')[0]
                 expected, _ = app.thread_state(state)
                 self.assertIn(expected, app.screen.snapshot().line(row))
         app.local['threads'] = [self.thread_fixture('empty')]
-        self.assertFalse(app.thread_handled(app.items('threads')[0]))
+        self.assertFalse(app.thread_resolved(app.items('threads')[0]))
         app.local['threads'] = [{'thread_id': 'missing-state', 'messages': [{}]}]
-        self.assertFalse(app.thread_handled(app.items('threads')[0]))
+        self.assertFalse(app.thread_resolved(app.items('threads')[0]))
 
     def test_claim_audit_evidence_does_not_invent_or_prevent_explicit_handling(self):
         sent = self.mail.send_user(self.repo_id, self.recipient, body='Audited message')
@@ -4256,7 +4383,7 @@ class MailboxUiTest(unittest.TestCase):
         unresolved = app.items('threads')[0]
         self.assertEqual(unresolved['messages'][0]['state'], 'delivering')
         self.assertTrue(unresolved['messages'][0]['evidence'])
-        self.assertFalse(app.thread_handled(unresolved))
+        self.assertFalse(app.thread_resolved(unresolved))
         self.assertEqual(unresolved['messages'][-1]['state'], 'handled')
         app.screen = Screen(12, 100)
         app.render_threads((0, 0, 12, 100))
@@ -4266,14 +4393,14 @@ class MailboxUiTest(unittest.TestCase):
         delivered = app.items('threads')[0]
         self.assertEqual(delivered['messages'][0]['confirmation_source'], 'operator')
         self.assertEqual(delivered['messages'][0]['state'], 'delivered')
-        self.assertFalse(app.thread_handled(delivered))
+        self.assertFalse(app.thread_resolved(delivered))
         self.mail.handle(self.recipient, [sent['message_id']])
         app.local = local_snapshot(self.store, self.repo_id, self.environment)
         handled = app.items('threads')[0]
         self.assertEqual(handled['messages'][0]['claim_id'], claim['claim_id'])
         self.assertEqual(handled['messages'][0]['confirmation_source'], 'operator')
         self.assertTrue(handled['messages'][0]['evidence'])
-        self.assertTrue(app.thread_handled(handled))
+        self.assertTrue(app.thread_resolved(handled))
         app.focus = app.preview = 'threads'
         self.capture(app, 35, 110)
         self.assertIn('Handled (1)', '\n'.join(app.screen.snapshot().lines()))
@@ -4327,7 +4454,7 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.identity(app.selected()), ('thread', handled['thread_id']))
         self.assertEqual(app.detail['thread_id'], handled['thread_id'])
         self.assertEqual(app.items('threads')[1]['thread_id'], other['thread_id'])
-        self.assertFalse(app.thread_handled(app.selected()))
+        self.assertFalse(app.thread_resolved(app.selected()))
         app.key('\r')
         self.assertEqual(app.reply_to, reply['message_id'])
         app.key(ESCAPE)

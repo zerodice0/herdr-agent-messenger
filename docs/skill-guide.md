@@ -203,6 +203,32 @@ Repeating a successful withdrawal returns `withdrawn:true` and preserves its
 first receipt/time. `mail show --thread UUID` reads the thread, and `repo show`
 reads this agent's repository/settings.
 
+`mail dismiss --message UUID [--message UUID ...] --reason TEXT` resolves sender
+attention for locally originated `undeliverable` mail only. The reason must be
+nonblank; repeated IDs are deduplicated and the batch is atomic. Authorization
+requires the verified original terminal in its send-time sender repo (including
+a restarted session), or the current active main in the original sender's
+host-local anchor role group. Linked worktrees share that role resolver;
+same-repo workers or unrelated mains do not qualify, and `off` grants no main
+override. Missing sender/group evidence fails closed.
+New v11 sends preserve the sender identity and anchor at send time in local
+`messages.sender_context`, so the anchor main remains authorized after the
+sender agent and linked workspace disappear. It never enters payload hashes
+or wire envelopes. Legacy v10 mail has no snapshot: a main override needs
+surviving recorded sender/workspace evidence; missing historical scope fails
+closed rather than selecting an arbitrary same-repo main.
+
+The first audit's actor/time/reason is immutable on retries, including after
+90-day body retention. `dismissal` is null before resolution and an audit object
+afterward in compact/verbose inbox reads and thread views. Its stable fields
+are `message_id`, `actor_alias`, `actor_terminal_id`, `reason`, `dismissed_at`.
+Raw state remains `undeliverable`; failure/native receipt fields, final/update
+timestamps and retention deadlines stay unchanged. Dismissal creates no ACK,
+handled receipt, wake or remote resolution: it affects only the origin ledger.
+Handled threads contain only genuinely handled or explicitly dismissed messages;
+unresolved/withdrawn messages and new live replies keep them Active. There is
+no TUI dismissal shortcut. See the [full contract](../.agents/skills/herdr-agent-messenger/reference.md#sender-dismissal).
+
 ### Repository history and read-only board
 
 ```text
@@ -505,6 +531,12 @@ queued before the update. No new schema, setting, or data migration is needed.
 The 300 seconds is minimum eligibility, not a scheduled delivery guarantee;
 idle-only FYI normally wakes on a natural event or the next five-minute safety
 check, about five to ten minutes after enqueue if other gates permit.
+
+Schema v11 adds local `mail_dismissals` and nullable `messages.sender_context`,
+preserving existing v10 payloads and settings. Upgrade/restart all HAM processes sharing a host ledger together;
+read-only opens never migrate, old code cannot open v11, and downgrade requires
+the pre-upgrade backup. Protocol 1 and receiving-runtime contracts are unchanged.
+See [sender dismissal migration](migration.md#sender-dismissal-schema-v11).
 
 Public status is independent of coordination mode:
 

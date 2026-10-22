@@ -975,17 +975,19 @@ class MailboxApp:
         return " · ".join(findings)
 
     @staticmethod
-    def thread_handled(item: Mapping[str, Any]) -> bool:
-        """Only explicit native handling completes every retained message.
+    def message_resolved(message: Mapping[str, Any]) -> bool:
+        """Recipient handling and sender dismissal resolve attention, not delivery."""
+        return message.get("state") == "handled" or bool(message.get("dismissal"))
 
-        Delivering is the unresolved-claim truth used by resolve/_claim_rows;
-        claim IDs and operator/native evidence survive successful handling.
-        Withdrawn is terminal cancellation, not handled. Direct/outbox transport
-        records cannot establish human handling either.
+    @classmethod
+    def thread_resolved(cls, item: Mapping[str, Any]) -> bool:
+        """Every retained message must be handled or explicitly dismissed.
+
+        Transport finality, claims and direct/outbox records are not resolutions.
         """
         messages = item.get("messages", [])
         return (item.get("type") == "thread" and bool(messages) and
-                all(message.get("state") == "handled" for message in messages))
+                all(cls.message_resolved(message) for message in messages))
 
     def items(self, region: str | None = None) -> list[Any]:
         region = region or (self.preview if self.focus == "detail" else self.focus)
@@ -998,7 +1000,7 @@ class MailboxApp:
         # Stable partition: retain the ledger's updated/recent order in each group.
         active, handled = [], []
         for item in values:
-            (handled if self.thread_handled(item) else active).append(item)
+            (handled if self.thread_resolved(item) else active).append(item)
         return active + handled
 
     def selected(self, region: str | None = None) -> Any:
@@ -2441,11 +2443,17 @@ class MailboxApp:
             "delivering": ("?", "warning"), "unknown": ("?", "warning"),
             "accepted": ("+", "success"), "delivered": ("+", "success"),
             "handled": ("=", "accent"),
+            "dismissed": ("x", "muted"),
             "failed": ("!", "error"), "undeliverable": ("!", "error"),
             "withdrawn": ("-", "muted"),
         }.get(state, ("?", "muted"))
         label = "UNCERTAIN delivering" if state == "delivering" else state
         return f"{glyph} {'DIRECT ' if direct else ''}{label}", palette
+
+    def message_state(self, message: Mapping[str, Any]) -> tuple[str, str]:
+        """Project a local resolution label without rewriting recorded state."""
+        return self.thread_state("dismissed" if message.get("dismissal") else
+                                 message.get("state", "unknown"))
 
     def thread_kind(self, kind: str) -> tuple[str, str]:
         return {"fyi": ("i fyi", "accent"), "action": ("! action", "activity")}.get(
@@ -2471,9 +2479,9 @@ class MailboxApp:
         lines: list[tuple[str, int, int, bool]] = []
         accents: dict[int, tuple[str, str, str, str]] = {}
         items = self.items("threads")
-        active_count = sum(not self.thread_handled(item) for item in items)
+        active_count = sum(not self.thread_resolved(item) for item in items)
         for index, item in enumerate(items):
-            handled = self.thread_handled(item)
+            handled = self.thread_resolved(item)
             if index == 0 or index == active_count:
                 if index:
                     lines.append(("", -1, 0, False))
@@ -2489,8 +2497,11 @@ class MailboxApp:
                 latest = messages[-1] if messages else {}
                 uncertain = any(message.get("state") == "delivering" for message in messages)
                 unfinished = next((message for message in reversed(messages)
-                                   if message.get("state") != "handled"), latest)
-                state, palette = self.thread_state("delivering" if uncertain else unfinished.get("state", "unknown"))
+                                   if not self.message_resolved(message)), None)
+                representative = unfinished or next(
+                    (message for message in reversed(messages) if message.get("dismissal")), latest)
+                state, palette = (self.thread_state("delivering") if uncertain else
+                                  self.message_state(representative))
                 kind, kind_palette = self.thread_kind(latest.get("kind", "unknown"))
                 body = (latest.get("body") or "").splitlines()
                 title = item.get("subject") or (body[0] if body else "(empty message)")
@@ -2525,7 +2536,7 @@ class MailboxApp:
                 chosen = _index == self.selections["threads"]
                 label_style = (self.selection_style() | curses.A_BOLD if chosen
                                else self.style(tone, curses.A_BOLD))
-                if self.thread_handled(items[_index]):
+                if self.thread_resolved(items[_index]):
                     label_style = ((self.selection_style() | curses.A_BOLD) if chosen else
                                    self.style(tone) | curses.A_DIM)
                 self.put(row, x + 2, clip(label, width - 2), label_style)
@@ -2562,7 +2573,7 @@ class MailboxApp:
         if item.get("type") == "thread":
             messages = item["messages"]
             for index, message in enumerate(messages, 1):
-                state, palette = self.thread_state(message["state"])
+                state, palette = self.message_state(message)
                 kind, _ = self.thread_kind(message["kind"])
                 summary = f"{kind} · {state}"
                 if message.get("confirmation_source") == "operator":
@@ -2584,6 +2595,16 @@ class MailboxApp:
                      self.style("warning" if message.get("confirmation_source") == "operator" else palette)
                      | curses.A_BOLD),
                     (message["body"], 0)])
+                dismissal = message.get("dismissal")
+                if dismissal:
+                    actor = dismissal.get("actor_alias") or dismissal.get("actor_terminal_id") or "—"
+                    result.extend([
+                        ("Sender dismissal · NOT delivered / recipient handled", curses.A_BOLD),
+                        (f"Dismissed by: {actor} · terminal: {dismissal.get('actor_terminal_id') or '—'}", 0),
+                        (f"Dismissed at: {self.format_time(dismissal.get('dismissed_at'), self.wall_clock())}", 0),
+                        (f"Reason: {dismissal.get('reason') or '—'}", 0),
+                        (f"Recorded delivery: {message['state']} · failure: {message.get('hold_reason') or '—'}",
+                         self.style("error"))])
                 if self.detail_technical:
                     result.extend((line, curses.A_DIM) for line in [
                         *self.message_target(message), describe_message(message),
@@ -2656,8 +2677,10 @@ class MailboxApp:
                            (message.get("sender") != "user" and
                             f"{message.get('origin_host')}/{message.get('sender_label')}" == address)
                            for message in thread.get("messages", []))]
-        handled = sum(self.thread_handled(thread) for thread in threads)
-        summary = (f"Threads: {len(threads) - handled} active · {handled} handled with this agent"
+        resolved = sum(self.thread_resolved(thread) for thread in threads)
+        dismissed = any(message.get("dismissal") for thread in threads for message in thread.get("messages", []))
+        resolution = "handled/dismissed" if dismissed else "handled"
+        summary = (f"Threads: {len(threads) - resolved} active · {resolved} {resolution} with this agent"
                    if threads else "No threads with this agent yet")
         return ["Mail", summary,
                 "Read: Tab → Threads, select a thread, Space opens it"]
@@ -2943,6 +2966,8 @@ class MailboxApp:
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
                     "Thread states: . queued/pending · > submitting · + accepted/delivered · = handled",
                     "! failed/undeliverable · - withdrawn · ? UNCERTAIN delivering / unknown",
+                    "x dismissed: audited sender resolution; NOT delivered / recipient handled",
+                    "Handled group: every message handled or dismissed; new live replies reopen Active.",
                     "Kinds: i fyi (cyan) · ! action (yellow) · > direct (user input, NOT native mail)",
                     "OUTBOX transport ops (cyan): > message · < receipt · # setting · - withdraw",
                     "States: yellow waiting/uncertain · green accepted/delivered · cyan handled · red failed",

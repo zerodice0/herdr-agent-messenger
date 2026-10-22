@@ -50,6 +50,9 @@ def add_parsers(subparsers: Any) -> None:
     body.add_argument("--body-file", help="Read the body from this UTF-8 file.")
     withdraw = mail_commands.add_parser("withdraw", help="Withdraw an unclaimed message from this terminal.")
     withdraw.add_argument("--message", required=True, help="Message UUID.")
+    dismiss = mail_commands.add_parser("dismiss", help="Audit local sender resolution of undeliverable mail; not recipient handling.")
+    dismiss.add_argument("--message", required=True, action="append", help="Message UUID; repeat for atomic batch dismissal.")
+    dismiss.add_argument("--reason", required=True, help="Nonblank audit reason; repeats preserve the first reason.")
     show = mail_commands.add_parser("show", help="View a thread without changing delivery state.")
     show.add_argument("--thread", required=True, help="Thread UUID (first message ID).")
     for operation, description in (
@@ -354,6 +357,8 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         return mailbox.handle(sender, arguments.message)
     if arguments.mail_command == "withdraw":
         return mailbox.withdraw(arguments.message, sender=sender)
+    if arguments.mail_command == "dismiss":
+        return mailbox.dismiss(sender, arguments.message, reason=arguments.reason)
     recipient = remote.resolve_recipient(arguments.to, sender)
     try:
         body = arguments.body if arguments.body is not None else Path(arguments.body_file).read_text(encoding="utf-8")

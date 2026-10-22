@@ -29,11 +29,15 @@ python3 scripts/herdr_agent_messenger.py inbox handle --message MESSAGE_UUID
 python3 scripts/herdr_agent_messenger.py mail send \
   --to CANONICAL_HOST/EXACT_LABEL --reply-to MESSAGE_UUID --kind fyi --body 'Findings and evidence.'
 python3 scripts/herdr_agent_messenger.py mail withdraw --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py mail dismiss --message MESSAGE_UUID --reason 'Recipient closed; no action remains'
 python3 scripts/herdr_agent_messenger.py status board --repo --host local
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing mailbox boundaries'
 ```
 
 CLI `--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Action wakes promptly; FYI wakes idle participating OMP in batches after ~5–10 minutes from local enqueue, or right after a turn if enqueued during fresh `working` state; existing wake gates apply. TUI compose defaults to `action`; Ctrl+G toggles action/FYI, resetting on every new compose. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Explicit/atomic handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
+
+`mail dismiss` resolves attention for locally originated `undeliverable` mail only; it never means delivered/handled or emits a recipient receipt. The verified original terminal (including restarts in the sender repo) or current main of that sender's host-local role group may dismiss. Repeat `--message` for an atomic batch; nonblank `--reason` is required. Repeats preserve the first actor/time/reason, even after body retention. Raw failure evidence/state stays unchanged; `dismissal` identifies this separate resolution. Same repo alone grants no authority. Schema v11 adds a durable local audit; upgrade/restart host HAM processes together, with no protocol/runtime contract change. Reference **Sender dismissal**.
+New v11 sends snapshot local sender identity/anchor scope, surviving closed agents/workspaces without entering message hashes or wire payloads. Legacy mail without this snapshot allows a main override only while recorded workspace metadata still proves the scope; otherwise it fails closed.
 
 `status set` takes a **positional phase**, not `--phase`; it works even off. Herdr owns turn state; do not infer it from phase. `status clear` removes phase/summary, retaining alias/active role and manual user borders.
 

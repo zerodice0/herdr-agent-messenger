@@ -132,6 +132,55 @@ class ReadCliTest(unittest.TestCase):
         ssh.chmod(0o700)
         return failure
 
+    def test_mail_dismiss_cli_atomic_flags_audit_and_read_projections(self):
+        first = self.mail.send(self.sender, self.recipient, body="First closed terminal")
+        second = self.mail.send(self.sender, self.recipient, body="Second closed terminal")
+        # Real reconcile marks queued mail undeliverable without a native ACK.
+        self.snapshot["agents"] = [raw for raw in self.snapshot["agents"] if raw["terminal_id"] != "term-b"]
+        self.snapshot["panes"] = [raw for raw in self.snapshot["panes"] if raw["terminal_id"] != "term-b"]
+        self.snapshot_path.write_text(json.dumps({"result": self.snapshot}))
+        AgentRegistry(self.store).reconcile(self.snapshot, refresh_display=False)
+        completed, result = self.cli("mail", "dismiss", "--message", first["message_id"],
+                                     "--message", first["message_id"], "--message", second["message_id"],
+                                     "--reason", "Recipient closed; resolved by sender")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(len(result["dismissals"]), 2)
+        audit = result["dismissals"][0]
+        self.assertEqual(audit["actor_terminal_id"], self.sender["terminal_id"])
+        self.assertEqual(audit["reason"], "Recipient closed; resolved by sender")
+        repeated, again = self.cli("mail", "dismiss", "--message", first["message_id"], "--reason", "Ignored")
+        self.assertEqual(repeated.returncode, 0)
+        self.assertEqual(again["dismissals"], [audit])
+        for arguments in (("mail", "show", "--thread", first["thread_id"]),
+                          ("mail", "threads", "--repo", self.repo_id)):
+            completed, view = self.cli(*arguments)
+            self.assertEqual(completed.returncode, 0)
+            messages = view["messages"] if "messages" in view else [
+                message for thread in view["threads"] for message in thread["messages"]]
+            found = next(message for message in messages if message["message_id"] == first["message_id"])
+            self.assertEqual(found["dismissal"], audit)
+            self.assertEqual(found["state"], "undeliverable")
+
+    def test_mail_dismiss_cli_reason_usage_and_domain_exit_codes(self):
+        sent = self.mail.send(self.sender, self.recipient, body="Not undeliverable")
+        for arguments in (("mail", "dismiss", "--message", sent["message_id"]),
+                          ("mail", "dismiss", "--reason", "Missing ID")):
+            result = subprocess.run([sys.executable, "-m", "ham", "cli", *arguments], cwd=ROOT,
+                                    env=self.environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2)
+        for message_id, reason, code in ((sent["message_id"], " \t", "missing_reason"),
+                                         (sent["message_id"], "Not eligible", "not_undeliverable"),
+                                         ("invalid", "Bad ID", "invalid_id")):
+            completed, result = self.cli("mail", "dismiss", "--message", message_id, "--reason", reason)
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(result["error"]["code"], code)
+        copied_launcher = ROOT / ".agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py"
+        result = subprocess.run([sys.executable, str(copied_launcher), "mail", "dismiss", "--help"],
+                                cwd=self.repo, env=self.environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--message", result.stdout)
+        self.assertIn("--reason", result.stdout)
+
     def test_runtime_status_without_client_reports_healthy_readonly_summary(self):
         home = Path(self.environment["HOME"])
         destinations = {"omp": home / ".omp/agent/extensions", "claude": home / ".claude"}

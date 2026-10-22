@@ -257,16 +257,18 @@ Headers and blank rows cannot be selected or activated. Arrows, paging and
 the wheel move between entries across the divider, and clicks target the exact
 entry even if a refresh has reordered the list.
 
-Only a nonempty native thread whose **every retained message is `handled`**
-belongs in Handled, with no unresolved claim/audit remaining. A newer handled
-message cannot hide earlier queued, delivered-but-unhandled, uncertain,
-failed or undeliverable mail. A new reply returns the thread to Active without
-changing its identity or losing selection. Withdrawn mail remains Active
-conservatively: withdrawal is final transport cancellation, not human handling.
+Only a nonempty native thread whose **every retained message is `handled` or has
+a sender dismissal audit** belongs in Handled. Dismissal resolves sender-side
+attention, not delivery or recipient work: the recorded state stays
+`undeliverable`. A newer handled or dismissed message cannot hide earlier queued,
+delivered-but-unhandled, uncertain or undismissed failure mail. A new reply
+returns the thread to Active without changing its identity or losing selection.
+Withdrawn mail remains Active: withdrawal is cancellation, not handling.
 Direct submissions and displayed pending/failed OUTBOX operations always remain
-Active; acceptance, transport success and operator evidence are not handling.
-Unresolved claims follow the recorded `delivering` state, not the mere presence
-of claim IDs or evidence: those audit fields remain after explicit handling.
+Active. Transport success, acceptance, claim IDs and operator evidence alone
+never establish resolution; recorded `delivering` claims remain uncertain.
+Agent Detail counts use the same rule and identify `handled/dismissed` totals
+when dismissal audits are present.
 
 | Threads cue | Meaning / color |
 | --- | --- |
@@ -275,6 +277,7 @@ of claim IDs or evidence: those audit fields remain after explicit handling.
 | `? UNCERTAIN delivering` | Unresolved native claim, yellow; not a delivered receipt |
 | `+ delivered`, `+ DIRECT accepted` | Recorded native delivery / separate direct acceptance, green |
 | `= handled` | Recorded handled state, cyan |
+| `x dismissed` | Audited sender resolution, dim; **not delivered or recipient handled** |
 | `! failed`, `! undeliverable` | Failure, red |
 | `- withdrawn` | Withdrawn, dim |
 | `? DIRECT unknown` | Uncertain direct acceptance, yellow |
@@ -290,6 +293,13 @@ retains its prefix, target and error. Its operation label does not infer the
 payload's mail kind. Detail repeats state/kind/transport cues and preserves
 operator-vs-native evidence; direct acceptance never means native delivered or
 handled. The `?` help overlay includes this legend.
+
+Dismissed message Detail always shows actor alias/terminal, dismissal time and
+reason, plus the preserved delivery state and former failure reason; technical
+mode is not required. Mixed handled+dismissed threads retain a dismissed list cue.
+This is a local origin-ledger resolution, not a recipient receipt or replicated
+handling event. Use `mail dismiss --message UUID --reason TEXT` from an authorized
+sender/main CLI context; the TUI adds no dismissal shortcut or mutation.
 
 State colors are redundant cues: **working is yellow**, **idle neutral**,
 **done green**, and **blocked red**; **unknown/stale states are dim**.

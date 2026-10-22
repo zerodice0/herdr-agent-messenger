@@ -122,7 +122,7 @@ def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         message = {
             key: row[key]
             for key in ("message_id", "thread_id", "kind", "priority", "state", "body",
-                        "reply_to", "hop", "truncated", "body_truncated", "body_omitted")
+                        "reply_to", "hop", "truncated", "body_truncated", "body_omitted", "dismissal")
             if row.get(key) is not None
         }
         message["sender"] = f"{row['origin_host']}/{row['sender_label']}"

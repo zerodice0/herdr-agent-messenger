@@ -148,6 +148,19 @@ class LedgerProjectionTest(unittest.TestCase):
         self.assertEqual(compact["warnings"], payload["warnings"])
         self.assertEqual(row["sender"], "private")
 
+    def test_inbox_keeps_dismissal_audit_separate_from_original_failure(self):
+        audit = {"message_id": "message", "actor_alias": "sender", "actor_terminal_id": "term",
+                 "reason": "Reviewed closed session", "dismissed_at": 1_800_000_000}
+        row = {"message_id": "message", "origin_host": "local", "sender_label": "sender",
+               "state": "undeliverable", "hold_reason": "terminal_closed", "body": "Request"}
+        for dismissal in (None, audit):
+            with self.subTest(dismissal=dismissal):
+                compact = agent_output.compact_inbox_payload(
+                    {"messages": [{**row, "dismissal": dismissal}]})["messages"][0]
+                self.assertEqual(compact.get("dismissal"), dismissal)
+                self.assertEqual(compact["state"], "undeliverable")
+                self.assertEqual(compact["hold_reason"], "terminal_closed")
+
 
 class AgentTextTest(unittest.TestCase):
     def test_real_omp_request_keeps_reply_without_echo_input_box_or_footer(self):

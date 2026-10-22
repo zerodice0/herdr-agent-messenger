@@ -69,6 +69,7 @@ python3 scripts/herdr_agent_messenger.py inbox read
 python3 scripts/herdr_agent_messenger.py inbox handle --message MESSAGE_UUID
 python3 scripts/herdr_agent_messenger.py mail show --thread THREAD_UUID
 python3 scripts/herdr_agent_messenger.py mail withdraw --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py mail dismiss --message MESSAGE_UUID --reason 'Recipient closed; no action remains'
 python3 scripts/herdr_agent_messenger.py repo show
 ```
 
@@ -81,6 +82,7 @@ python3 scripts/herdr_agent_messenger.py repo show
 | `mail threads` | Optional `--repo REPO_ID`, `--limit N` (default 100, 1–1000), `--cursor TOKEN`; retained threads originating in or involving that repo as sender/recipient, including pending remote copies. Returns `{repo_id,threads,next_cursor}`. |
 | `mail direct-list` | Same `--repo REPO_ID`, `--limit N`, `--cursor TOKEN`; retained `via=direct` user-input submissions, not `spawn_initial`. Returns `{repo_id,submissions,next_cursor}`. Read-only, not a direct-send command. |
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
+| `mail dismiss` | Required repeatable `--message UUID` and nonblank `--reason TEXT`; atomic, deduplicated, local sender-side resolution of `undeliverable` mail only. Returns `{dismissals:[audit,...]}`. Repeats preserve the first audit, including its actor/time/reason. See **Sender dismissal** below. |
 | `repo show` | Read-only repository identity, current settings, and local agents. No public setting mutation command. |
 
 Successful `mail send` may include advisory `warnings` entries:
@@ -196,6 +198,52 @@ message bodies expire after 90 days; permanent compact hashes/receipts prevent
 ID reuse even after deletion. Status/wake history expires after 30 days.
 Initial WAL/schema/host-identity setup is serialized by a private ledger-local
 bootstrap lock, including simultaneous first starts by separate CLI processes.
+
+### Sender dismissal
+
+`mail dismiss --message UUID [--message UUID ...] --reason TEXT` records an
+attention resolution on the **origin host's ledger**, not recipient work. Only
+raw `undeliverable` messages qualify. The verified current actor must own the
+original terminal and `sender_repo_id` (a restarted session is allowed), or be
+the active current main of the original sender's host-local anchor role group.
+Same-repo workers and unrelated workspace mains have no authority. Main
+authorization uses current manual/auto role rules, including linked worktrees;
+mode `off` grants no main override. Missing sender/group evidence fails closed.
+Thread-origin and recipient repositories never grant sender authority.
+
+New v11 agent sends persist `messages.sender_context`, a local-only send-time
+sender identity/anchor snapshot. The anchor main can therefore dismiss after
+both sender agent and linked workspace disappear. This column never enters
+immutable payload hashes, peer envelopes, or receipt state. Older v10 messages
+migrate with null context: main authority may be inferred only from surviving
+recorded sender identity and workspace metadata that still proves an anchor.
+If the linked workspace/anchor evidence is already gone, a main override fails
+closed; migration cannot reconstruct it. A verified original terminal in its
+sender repo may still dismiss when its ownership evidence is available.
+
+The batch validates every unique ID before any write and rechecks actor
+generation inside the serialized transaction. First success records the actor,
+reason and time in `mail_dismissals`. Authorized retries return that first
+audit without rewriting its reason, actor or time. Audits retain sender/group
+and failure snapshots without message-body foreign keys; they survive 90-day
+body retention and authorize repeats without restoring a body or extending
+its original retention deadline.
+
+`inbox read` (compact and verbose), `mail show`, and `mail threads` expose
+`dismissal`: null before resolution, an audit object afterward. Stable fields
+are `message_id`, `actor_alias`, `actor_terminal_id`, `reason`, `dismissed_at`;
+additional sender/actor identity and `failure` snapshot fields are diagnostic.
+The raw state remains `undeliverable`; hold reason, evidence, native receipt
+fields and original delivery/final/update timestamps remain unchanged. Thread
+ordering still uses delivery update timestamps, not dismissal time.
+
+No native ACK, handled receipt, wake, new remote receipt, wire state or outbox
+kind is created. Protocol 1 is unchanged. Recipient-host history is intentionally
+unaffected; duplicate authoritative failure receipts cannot erase the local
+audit. Threads moves to Handled only if every message is truly handled or has
+a dismissal audit; withdrawn/unresolved failures stay Active, and a new live
+reply makes it Active again. Dismissed mail remains visibly distinct from
+recipient-handled mail. There is no TUI dismissal shortcut.
 
 Internal plugin/runtime services use the same launcher: `ledger doctor`,
 `ledger reconcile`, `ledger event`, `ledger retention`, `ledger agent-session`,
@@ -418,7 +466,7 @@ resolution use the same group.
 
 Back up the database before upgrade. Stop old HAM processes sharing the host
 ledger, update host code and copied skills together, run upgraded `ledger reconcile`
-to migrate writable storage to the current schema (v10, including v9 workspace metadata), then restart the host's HAM processes.
+to migrate writable storage to the current schema (v11, including v9 workspace metadata), then restart the host's HAM processes.
 Read-only opens do not migrate. Protocol 1 is unchanged and old peers may consume
 computed roles without optional scope metadata, but still compute old semantics
 for their own agents. Old code cannot open schema-v9 storage: do not mix versions
@@ -433,6 +481,13 @@ needs no restart for this policy. See [turn-end FYI migration](../../../docs/mig
 Delayed idle FYI adds no schema or settings: existing queued FYI becomes eligible
 300 seconds after its local recipient enqueue timestamp, without migration.
 See [current migration and rollout](../../../docs/migration.md#worktree-role-grouping-schema-v9).
+
+Schema v11 adds `mail_dismissals` and nullable local `messages.sender_context`,
+including a supported v10→v11 upgrade without changing existing payloads/settings/receipts.
+Stop old host processes, back up the DB, upgrade code/copied skills, reconcile, then restart. Read-only
+opens do not migrate; old code cannot open v11. Downgrade requires the backup.
+No new remote receipt/state or runtime contract is introduced. See
+[sender dismissal migration](../../../docs/migration.md#sender-dismissal-schema-v11).
 
 The following v7 migration is historical; v9 supersedes its independent
 workspace role semantics:

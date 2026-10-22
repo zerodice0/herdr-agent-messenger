@@ -699,6 +699,33 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(result['error']['code'],'invalid_receipt')
         self.assertEqual(self.current('alpha',sent['message_id'])['recipient_terminal_id'],'term-beta')
 
+    def test_origin_dismissal_after_authoritative_undeliverable_receipt_is_local_only(self):
+        sent = self.send()
+        self.services['alpha'].pump()
+        AgentRegistry(self.stores['beta']).reconcile({'panes': [], 'agents': []}, refresh_display=False)
+        failed = public_receipt(self.current('beta', sent['message_id']))
+        self.assertEqual(failed['state'], 'undeliverable')
+        self.wire('alpha', 'receipt', self.services['beta'].envelope(failed))
+        mailbox = Mailbox(self.stores['alpha'])
+        with self.stores['alpha'].read() as connection:
+            before = [tuple(row) for row in connection.execute('SELECT * FROM outbox')]
+            original = receipt(connection, sent['message_id'])
+        with mock.patch.object(self.links['alpha'], 'call', side_effect=AssertionError('Dismissal is local')):
+            result = mailbox.dismiss(self.agents['alpha'], [sent['message_id']], reason='Recipient closed')
+        with self.stores['alpha'].read() as connection:
+            self.assertEqual([tuple(row) for row in connection.execute('SELECT * FROM outbox')], before)
+            self.assertEqual(receipt(connection, sent['message_id']), original)
+        self.wire('alpha', 'receipt', self.services['beta'].envelope(failed))
+        self.assertEqual(mailbox.show_thread(sent['message_id'])['messages'][0]['dismissal'],
+                         result['dismissals'][0])
+        # The recipient host cannot use its own same-repo main as sender authority.
+        AgentRegistry(self.stores['beta']).reconcile(self.snapshots['beta'], refresh_display=False)
+        current = AgentRegistry(self.stores['beta']).list()[0]
+        with self.assertRaises(LedgerError) as caught:
+            Mailbox(self.stores['beta']).dismiss(current, [sent['message_id']], reason='Wrong origin')
+        self.assertEqual(caught.exception.code, 'wrong_origin')
+        self.assertIsNone(Mailbox(self.stores['beta']).show_thread(sent['message_id'])['messages'][0]['dismissal'])
+
     def test_receipts_reordered_and_final_conflicts_do_not_regress(self):
         sent = self.send()
         self.services['alpha'].pump()

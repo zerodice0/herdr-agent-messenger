@@ -29,6 +29,25 @@ MAX_HISTORY_CURSOR_SIZE = 32768
 LOCAL_TURN_STATE_MAX_AGE = 15
 
 
+def _dismissal(row: Any) -> dict[str, Any]:
+    result = dict(row)
+    result["failure"] = json.loads(result["failure"])
+    return result
+
+
+def _message_views(connection: Any, rows: Sequence[Any]) -> list[dict[str, Any]]:
+    messages = [dict(row) for row in rows]
+    if not messages:
+        return messages
+    placeholders = ",".join("?" for _ in messages)
+    audits = {row["message_id"]: _dismissal(row) for row in connection.execute(
+        f"SELECT * FROM mail_dismissals WHERE message_id IN ({placeholders})",
+        [message["message_id"] for message in messages])}
+    for message in messages:
+        message["dismissal"] = audits.get(message["message_id"])
+    return messages
+
+
 def _history_scope(repo_id: str | None, limit: int) -> None:
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise LedgerError("invalid_limit", "History limit must be an integer between 1 and 1000.")
@@ -179,8 +198,8 @@ class Mailbox:
         terminals = tuple(terminal for terminal in (recipient_terminal, sender_terminal) if terminal)
         with self.store.transaction(terminals) as connection:
             if sender is not None:
-                check_generation(connection, self.store.host, sender["terminal_id"],
-                                 sender["agent_id"], sender["generation"])
+                verified_sender = check_generation(connection, self.store.host, sender["terminal_id"],
+                                                   sender["agent_id"], sender["generation"])
             if recipient["host"] == self.store.host and recipient_terminal:
                 current = check_generation(connection, self.store.host, recipient_terminal,
                                            recipient["agent_id"], recipient["generation"])
@@ -223,6 +242,15 @@ class Mailbox:
             value = validate_payload(payload)
             from ham.ledger.remote import RemoteLedger
             result = RemoteLedger(self.store, self.environment).submit(connection, value)
+            if sender is not None:
+                from ham.ledger.settings import RepoSettings
+                # Local-only identity/scope snapshot: never add it to value, its hash, or peer envelopes.
+                context = {key: verified_sender[key] for key in
+                           ("agent_id", "host", "repo_id", "terminal_id", "workspace_id")}
+                context["scope_workspace_id"] = RepoSettings.scope_workspace(
+                    connection, verified_sender["repo_id"], self.store.host, verified_sender["workspace_id"])
+                connection.execute("UPDATE messages SET sender_context=? WHERE message_id=?",
+                                   (json_text(context), payload["message_id"]))
             if payload["kind"] == "fyi" and recipient["host"] == self.store.host:
                 delivery = connection.execute("SELECT fyi_turn_end FROM deliveries WHERE message_id=?",
                                               (payload["message_id"],)).fetchone()
@@ -343,7 +371,7 @@ class Mailbox:
             elif not all_states:
                 query += " AND d.state IN ('queued','delivering','delivered')"
             rows = connection.execute(query + " ORDER BY m.created_at,m.message_id LIMIT ?", (*parameters, limit)).fetchall()
-            messages = [dict(row) for row in rows]
+            messages = _message_views(connection, rows)
         return {"terminal_id": agent["terminal_id"], "messages": messages}
 
     def show_thread(self, thread_id: str) -> dict[str, Any]:
@@ -354,7 +382,8 @@ class Mailbox:
                 raise LedgerError("thread_not_found", "No retained thread with that ID exists.")
             rows = connection.execute("SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) "
                                       "WHERE thread_id=? ORDER BY m.created_at,m.message_id", (thread_id,)).fetchall()
-        return {**dict(thread), "messages": [dict(row) for row in rows]}
+            messages = _message_views(connection, rows)
+        return {**dict(thread), "messages": messages}
     def list_threads(self, repo_id: str | None = None, limit: int = 100, *,
                      cursor: str | None = None) -> dict[str, Any]:
         """Live keyset pages, not a retained historical snapshot.
@@ -395,9 +424,10 @@ class Mailbox:
                 f"WHERE m.thread_id IN ({placeholders}) ORDER BY m.created_at,m.message_id",
                 thread_ids,
             ).fetchall()
+            message_views = _message_views(connection, messages)
         grouped = {thread_id: [] for thread_id in thread_ids}
-        for row in messages:
-            grouped[row["thread_id"]].append(dict(row))
+        for row in message_views:
+            grouped[row["thread_id"]].append(row)
         next_cursor = (_history_cursor(self.store, "threads", repo_id, rows[-1]["updated_at"],
                                        rows[-1]["thread_id"]) if more else None)
         return {"repo_id": repo_id,
@@ -610,6 +640,101 @@ class Mailbox:
                            "WHERE message_id=?", (at, at, message_id))
         connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, message_id))
         return save_receipt(connection, message_id)
+
+    def dismiss(self, actor: Mapping[str, Any], message_ids: Sequence[str], *, reason: str) -> dict[str, Any]:
+        """Resolve local sender attention only; never alter or publish a delivery receipt."""
+        from ham.ledger.settings import RepoSettings
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise LedgerError("missing_reason", "Dismissal needs an explicit nonempty reason.")
+        if not message_ids:
+            raise LedgerError("invalid_id", "At least one message ID is required.")
+        for message_id in message_ids:
+            require_uuid(message_id)
+        with self.store.transaction() as connection:
+            current = check_generation(connection, self.store.host, actor["terminal_id"],
+                                       actor["agent_id"], actor["generation"])
+            settings = RepoSettings(self.store)
+            pending = []
+            for message_id in dict.fromkeys(message_ids):
+                prior = connection.execute("SELECT * FROM mail_dismissals WHERE message_id=?",
+                                           (message_id,)).fetchone()
+                if prior is not None:
+                    audit = _dismissal(prior)
+                else:
+                    row = connection.execute(
+                        "SELECT m.*,d.* FROM messages m JOIN deliveries d USING(message_id) WHERE message_id=?",
+                        (message_id,)).fetchone()
+                    if row is None:
+                        raise LedgerError("message_not_found", "No retained message or dismissal audit with that ID exists.")
+                    if row["origin_host"] != self.store.host:
+                        raise LedgerError("wrong_origin", "Only the originating host can dismiss this message.")
+                    if row["state"] != "undeliverable":
+                        raise LedgerError("not_undeliverable", "Only undeliverable mail can be dismissed.")
+                    if row["sender_context"] is not None:
+                        context = json.loads(row["sender_context"])
+                        if (context["agent_id"] != row["sender"] or context["host"] != self.store.host or
+                                context["repo_id"] != row["sender_repo_id"] or not context["terminal_id"]):
+                            raise LedgerError("not_sender", "Original sender identity evidence does not match.")
+                    else:
+                        owner = connection.execute("SELECT * FROM agents WHERE agent_id=?",
+                                                   (row["sender"],)).fetchone()
+                        if (owner is None or owner["host"] != self.store.host or not owner["terminal_id"] or
+                                not row["sender_repo_id"] or owner["repo_id"] != row["sender_repo_id"]):
+                            raise LedgerError("not_sender", "Original sender identity evidence is missing.")
+                        # Legacy mail has no send-time snapshot. Only still-recorded workspace
+                        # metadata proves its scope; a missing linked workspace must not become
+                        # a guessed independent group (or an arbitrary same-repo main).
+                        workspace = connection.execute(
+                            "SELECT * FROM workspaces WHERE host=? AND workspace_id=?",
+                            (self.store.host, owner["workspace_id"])).fetchone()
+                        scope = ""
+                        if workspace is not None:
+                            if not workspace["is_linked_worktree"]:
+                                scope = owner["workspace_id"]
+                            elif workspace["repo_key"]:
+                                anchor = connection.execute(
+                                    "SELECT workspace_id FROM workspaces WHERE host=? AND repo_key=? "
+                                    "AND is_linked_worktree=0 ORDER BY workspace_id LIMIT 1",
+                                    (self.store.host, workspace["repo_key"])).fetchone()
+                                if anchor is not None:
+                                    scope = settings.scope_workspace(connection, row["sender_repo_id"],
+                                                                     self.store.host, owner["workspace_id"])
+                        context = {"terminal_id": owner["terminal_id"], "workspace_id": owner["workspace_id"],
+                                   "scope_workspace_id": scope}
+                    audit = {
+                        "message_id": message_id, "origin_host": row["origin_host"],
+                        "sender_agent_id": row["sender"], "sender_terminal_id": context["terminal_id"],
+                        "sender_repo_id": row["sender_repo_id"], "sender_workspace_id": context["workspace_id"],
+                        "sender_scope_workspace_id": context["scope_workspace_id"],
+                        "actor_agent_id": current["agent_id"], "actor_terminal_id": current["terminal_id"],
+                        "actor_generation": current["generation"], "actor_repo_id": current["repo_id"],
+                        "actor_workspace_id": current["workspace_id"], "actor_alias": current["alias"],
+                        "reason": reason, "dismissed_at": None,
+                        "failure": {**receipt(connection, message_id), "final_at": row["final_at"]},
+                    }
+                if audit["origin_host"] != self.store.host:
+                    raise LedgerError("wrong_origin", "Only the originating host can dismiss this message.")
+                same_repo = current["repo_id"] == audit["sender_repo_id"]
+                sender_owner = same_repo and current["terminal_id"] == audit["sender_terminal_id"]
+                scope = audit["sender_scope_workspace_id"]
+                group_main = (same_repo and bool(scope) and bool(audit["sender_workspace_id"]) and
+                              settings.scope_workspace(connection, current["repo_id"], self.store.host,
+                                                       current["workspace_id"]) == scope and
+                              settings.main(connection, audit["sender_repo_id"], self.store.host, scope) ==
+                              {"host": self.store.host, "terminal_id": current["terminal_id"]})
+                if not (sender_owner or group_main):
+                    raise LedgerError("not_sender", "Only the originating terminal or its current role-group main can dismiss mail.")
+                pending.append((audit, prior is None))
+            at = time.time()
+            for audit, fresh in pending:
+                if fresh:
+                    audit["dismissed_at"] = at
+                    stored = {**audit, "failure": json_text(audit["failure"])}
+                    connection.execute(
+                        f"INSERT INTO mail_dismissals ({','.join(stored)}) VALUES ({','.join('?' for _ in stored)})",
+                        list(stored.values()))
+        return {"dismissals": [audit for audit, _ in pending]}
 
     def withdraw(self, message_id: str, *, sender: Mapping[str, Any] | None = None,
                  origin_host: str | None = None) -> dict[str, Any]:

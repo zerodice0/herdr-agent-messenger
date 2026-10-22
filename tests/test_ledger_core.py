@@ -1018,7 +1018,7 @@ class LedgerCoreTest(unittest.TestCase):
         mail = Mailbox(migrated)
         with migrated.read() as connection:
             self.assertEqual(connection.execute(
-                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "10")
+                "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], str(SCHEMA_VERSION))
             column = next(row for row in connection.execute("PRAGMA table_info(deliveries)")
                           if row["name"] == "fyi_turn_end")
             self.assertEqual((column["type"], column["notnull"], column["dflt_value"]), ("INTEGER", 1, "0"))
