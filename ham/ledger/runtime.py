@@ -27,7 +27,7 @@ STATUS_RUN_LIMIT = 64
 def wake_capable(agent: Mapping[str, Any]) -> bool:
     """Whether HAM can wake this agent when idle (OMP in its extension, others from the worker).
 
-    Claude needs its installed hook (it binds the session UUID and root PID);
+    Claude needs its installed hook to register the session UUID;
     Codex needs nothing installed. Per-target availability is the adapter's call.
     """
     client = agent.get('client')

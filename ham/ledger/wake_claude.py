@@ -139,7 +139,7 @@ def _transcript(directory: Path, session: str, uid: int) -> Path:
 def discover(agent: Mapping[str, Any], *, environment: Mapping[str, str] | None = None,
              foreground_pid: ForegroundPid | None = None, proc_start: ProcStart | None = None,
              uid: int | None = None) -> WakeTarget:
-    """Verify one live, interactive, wakeable Claude session for this agent or say why not."""
+    """Verify a live session; an absent stored PID needs exact registry/start identity."""
     if agent.get("client") != "claude":
         raise WakeUnavailable("claude_not_claude", "The agent is not a Claude Code session.")
     if not agent.get("extension_present"):
@@ -148,16 +148,17 @@ def discover(agent: Mapping[str, Any], *, environment: Mapping[str, str] | None 
     if not isinstance(session, str) or not _UUID.match(session.lower()):
         raise WakeUnavailable("claude_session_unbound", "The Claude session id is not known yet.")
     session = session.lower()
-    pid = agent.get("native_session_pid")
-    if not _valid_pid(pid):
+    bound_pid = agent.get("native_session_pid")
+    if bound_pid is not None and not _valid_pid(bound_pid):
         raise WakeUnavailable("claude_pid_unbound", "The Claude process id is not verified yet.")
     if foreground_pid is None:
         from ham.ledger.status import claude_foreground_pid as foreground_pid
     live = foreground_pid(agent, environment, require_ancestor=False)
     if live is None:
         raise WakeUnavailable("claude_process_unverified", "The pane's foreground Claude process could not be verified.")
-    if live != pid:
+    if bound_pid is not None and live != bound_pid:
         raise WakeUnavailable("claude_pid_mismatch", "The pane's foreground Claude is not the session HAM bound.")
+    pid = live
     owner = os.getuid() if uid is None else uid
     directory = config_dir(environment)
     entry = _registry(directory, pid, owner)
@@ -170,6 +171,8 @@ def discover(agent: Mapping[str, Any], *, environment: Mapping[str, str] | None 
         raise WakeUnavailable("claude_not_interactive", "Only interactive Claude sessions can be woken.")
     started = entry.get("procStart")
     actual = (proc_start or linux_proc_start)(pid)
+    if bound_pid is None and (started is None or actual is None):
+        raise WakeUnavailable("claude_pid_unbound", "The Claude process start time cannot verify an unbound process id.")
     if started is not None and actual is not None and str(started) != actual:
         raise WakeUnavailable("claude_pid_recycled", "The process start time does not match the registry entry.")
     socket_path = entry.get("messagingSocketPath")

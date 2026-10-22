@@ -102,7 +102,6 @@ class DiscoverTest(ClaudeFixture):
         cases = [({"client": "codex"}, "claude_not_claude"), ({"extension_present": 0}, "claude_hook_missing"),
                  ({"session_ref": "not-a-uuid"}, "claude_session_unbound"),
                  ({"session_ref": None}, "claude_session_unbound"),
-                 ({"native_session_pid": None}, "claude_pid_unbound"),
                  ({"native_session_pid": True}, "claude_pid_unbound")]
         for changes, code in cases:
             with self.subTest(changes=changes):
@@ -118,6 +117,60 @@ class DiscoverTest(ClaudeFixture):
             return self.pid
         self.discover(foreground_pid=foreground)
         self.assertEqual(seen, {"require_ancestor": False})
+
+    def test_missing_stored_pid_uses_exact_foreground_registry_identity_without_mutating_agent(self):
+        for omitted in (False, True):
+            with self.subTest(omitted=omitted):
+                agent = {**self.agent, "native_session_pid": None}
+                if omitted:
+                    del agent["native_session_pid"]
+                before = dict(agent)
+                target = self.discover(agent)
+                self.assertEqual((target.session_ref, target.pid), (self.session, self.pid))
+                self.assertEqual(target.extra["socket_path"], self.socket_path)
+                self.assertEqual(agent, before)
+
+    def test_missing_stored_pid_requires_one_foreground_root(self):
+        agent = {**self.agent, "native_session_pid": None}
+        root = {"name": "claude", "argv": ["claude"], "pid": self.pid}
+        for roots in ([], [root, {**root, "pid": self.pid + 1}]):
+            with self.subTest(roots=roots):
+                responses = [
+                    {"pane": {"pane_id": agent["pane_id"], "terminal_id": agent["terminal_id"]}},
+                    {"process_info": {"pane_id": agent["pane_id"], "foreground_process_group_id": self.pid,
+                                      "foreground_processes": roots}},
+                ]
+                with mock.patch("ham.ledger.status.run_bounded_command",
+                                side_effect=[mock.Mock(returncode=0, stdout=json.dumps({"result": result}))
+                                             for result in responses]):
+                    self.assertEqual(self.reason(agent, foreground_pid=None), "claude_process_unverified")
+
+    def test_missing_stored_pid_does_not_override_session_or_process_identity(self):
+        agent = {**self.agent, "native_session_pid": None}
+        for changes, code in (
+            ({"sessionId": str(uuid.uuid4())}, "claude_session_mismatch"),
+            ({"pid": self.pid + 1}, "claude_session_mismatch"),
+            ({"procStart": "778"}, "claude_pid_recycled"),
+            ({"procStart": None}, "claude_pid_unbound"),
+            ({"kind": "headless"}, "claude_not_interactive"),
+            ({"messagingSocketPath": None}, "claude_socket_missing"),
+        ):
+            with self.subTest(changes=changes):
+                self.write_registry(**changes)
+                self.assertEqual(self.reason(agent), code)
+        self.write_registry()
+        self.assertEqual(self.reason(agent, proc_start=lambda pid: None), "claude_pid_unbound")
+        self.assertEqual(self.reason(agent, uid=os.getuid() + 1), "claude_registry_missing")
+        for session, code in ((None, "claude_session_unbound"), ("unreported", "claude_session_unbound"),
+                              ("not-a-uuid", "claude_session_unbound"),
+                              (str(uuid.uuid4()), "claude_session_mismatch")):
+            with self.subTest(session=session):
+                self.assertEqual(self.reason({**agent, "session_ref": session}), code)
+
+    def test_stored_pid_conflict_is_not_replaced_by_a_matching_registry(self):
+        agent = {**self.agent, "native_session_pid": self.pid + 1}
+        self.assertEqual(self.reason(agent), "claude_pid_mismatch")
+        self.assertEqual(agent["native_session_pid"], self.pid + 1)
 
     def test_registry_entry_rejections(self):
         self.write_registry(sessionId=str(uuid.uuid4()))
