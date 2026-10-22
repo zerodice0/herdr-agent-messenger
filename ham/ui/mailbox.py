@@ -433,6 +433,12 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
             raise LedgerError("invalid_settings_scope",
                               "Settings scope changed or the opener workspace is unavailable; reload Settings.")
         settings = RepoSettings(store)
+        if request.get("expected_main") is not None:
+            current = settings.show(repo_id, scope["host"], scope["requested_workspace_id"])[
+                "settings"].get("main", {}).get("value")
+            if current != request["expected_main"]:
+                raise LedgerError("main_pin_changed",
+                                  "The Main pin changed since this confirmation opened; reload and try again.")
         result = settings.mutate(repo_id, request["field"], request["value"],
                                  host=scope["host"] if scope["workspace_id"] else None,
                                  workspace_id=scope["requested_workspace_id"])
@@ -1404,7 +1410,8 @@ class MailboxApp:
         self.set_status(message, "error" if not self.repo_id else "info")
         return False
 
-    def save_setting(self, field: str, value: Any, scope: Mapping[str, Any] | None = None) -> bool:
+    def save_setting(self, field: str, value: Any, scope: Mapping[str, Any] | None = None,
+                     expected_main: Mapping[str, Any] | None = None) -> bool:
         if scope is not None and dict(scope) != self.current_settings_scope():
             self.set_status("Settings scope changed; reopen the picker or confirmation.", "error")
             return False
@@ -1420,12 +1427,50 @@ class MailboxApp:
             save_field = "thresholds"
             save_value = {name: self.setting_value(name) for name in DEFAULT_THRESHOLDS}
             save_value[field] = value
-        if not self.start_job("mutation", "setting", field=save_field, value=save_value):
+        extra = {"expected_main": dict(expected_main)} if expected_main is not None else {}
+        if not self.start_job("mutation", "setting", field=save_field, value=save_value, **extra):
             return False
         self.settings_saving = {"field": field, "scope": dict(self.current_settings_scope())}
         self.settings_results[field] = "Saving settings…"
         self.settings_pending.pop(field, None)
         return True
+
+    def agent_main(self) -> None:
+        """Pin/unpin the selected local role-group agent through Settings."""
+        agent = self.selected("agents")
+        if not agent:
+            self.set_status("Choose a live local agent to change Main.", "error")
+            return
+        if agent.get("host") != self.store.host:
+            self.set_status("Main can only be changed for an agent on this host.", "error")
+            return
+        if agent.get("stale") or not agent.get("active", True):
+            self.set_status("Main cannot be changed for an inactive agent.", "error")
+            return
+        if not self.repo_id:
+            self.repo_id = agent["repo_id"]
+            self.refresh()
+        if agent.get("repo_id") != self.repo_id:
+            self.set_status("Main cannot be changed for an agent in another repository.", "error")
+            return
+        if not self.settings_ready("main"):
+            return
+        if not self.settings_agent_in_scope(agent):
+            self.set_status("Main can only be changed within the opener's workspace role group.", "error")
+            return
+        if "mutation" in self.jobs:
+            self.set_status("An operation is pending; this setting has not been submitted.", "error")
+            return
+        target = {name: agent[name] for name in ("host", "terminal_id")}
+        clear = self.setting_value("main") == target
+        lines = [f"Target: {self.address(agent)}",
+                 f"Role group: workspace {self.current_settings_scope()['workspace_id']} @ {self.store.host}"]
+        lines.append("Clear the explicit pin. In auto mode, the incumbent or a unique candidate may become main."
+                     if clear else "Pin this agent as main for the opener's role group.")
+        self.open_confirm("Clear Main pin?" if clear else "Pin as Main?", lines, "setting",
+                          {"field": "main", "value": None if clear else target,
+                           "scope": dict(self.current_settings_scope()),
+                           **({"expected_main": target} if clear else {})})
 
     def open_settings_picker(self, field: str) -> None:
         current = self.configured_members_in_scope() if field == "members" else self.setting_value(field)
@@ -1433,7 +1478,7 @@ class MailboxApp:
             entries = [
                 ("off · No main or worker roles.", "off"),
                 ("manual · Explicit main and checked members only.", "manual"),
-                ("auto · Infer the group's sole agent or unique main-checkout agent; an empty linked anchor has no auto main.", "auto"),
+                ("auto · Keep the elected main until it leaves; otherwise infer a unique anchor candidate. An explicit pin wins.", "auto"),
             ]
         else:
             scope = self.current_settings_scope()
@@ -1793,6 +1838,8 @@ class MailboxApp:
                 self.choose_agent()
             elif self.focus == "threads":
                 self.reply()
+        elif key == "m" and self.focus == "agents":
+            self.agent_main()
         elif key == "s":
             agent = self.selected("agents")
             if not self.repo_id and agent:
@@ -2003,7 +2050,8 @@ class MailboxApp:
                     Hint("m", "Main"), Hint("Space", "Member"), Hint("Esc", "Discard/close", 0)]
         if self.mode == "help":
             return [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page"), Hint("F1", "Close", 1), Hint("Esc", "Close", 0)]
-        context = ([Hint("Space", "View"), Hint("Enter", "Send")] if self.focus == "agents" else
+        # Dropped before every core hint (priority 100) on narrow footers; F1 help lists it.
+        context = ([Hint("Space", "View"), Hint("Enter", "Send"), Hint("m", "Main", 120)] if self.focus == "agents" else
                    [Hint("Space", "View"), Hint("Enter", "Reply"), Hint("w", "Withdraw"),
                     Hint("t", "Retry"), Hint("a/n", "Recover")] if self.focus == "threads" else
                    [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")] +
@@ -2943,8 +2991,13 @@ class MailboxApp:
             result.append(("▌ " if index == self.settings_selection else "  ") + f"{self.setting_label(field)}: {shown}" +
                           (" · unsaved" if field in self.settings_pending else "") +
                           (" · " + feedback if feedback else ""))
+        main = settings.get("main")
+        main_agent = next((agent for agent in self.agents()
+                           if main and self.identity(agent) == (main["host"], main["terminal_id"])), main)
         result.extend([f"home: {settings.get('home_host') or 'unset'}",
-                       f"computed main: {json.dumps(settings.get('computed_main'), ensure_ascii=False)}",
+                       f"main source: {settings.get('main_source') or 'none'}",
+                       f"effective main: {self.address(main_agent) if main else '(none)'}",
+                       f"fallback candidate (computed main): {json.dumps(settings.get('computed_main'), ensure_ascii=False)}",
                        f"propagation pending: {settings.get('propagation_pending', 0)}"])
         for field, data in fields.items():
             result.append(f"{field} v{data.get('version', '—')} @ {data.get('origin_host', '—')}")
@@ -2960,6 +3013,8 @@ class MailboxApp:
             lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
+                    "Agents [m] Main: confirm pin for a live local role-group agent; press again on the pin to clear it.",
+                    "Clearing a Main pin may restore the auto incumbent or a uniquely elected main.",
                     "Agents / Threads Space view: read-only modal; Enter inside does nothing.",
                     "Viewer: ↑↓ / PgUp/PgDn / Home/End / wheel scroll · t technical · Esc/q/Space close.",
                     "Viewer: outside click closes; inside click is inert. Live arrivals follow only at latest.",
@@ -3087,7 +3142,7 @@ class MailboxApp:
 
     def footer_hints_for_nav(self) -> list[str]:
         if self.focus == "agents":
-            return ["Agents: Space view; Enter opens quick send"]
+            return ["Agents: Space view; Enter opens quick send; [m] Main pin/unpin"]
         if self.focus == "threads":
             return ["Threads: Space view; Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (

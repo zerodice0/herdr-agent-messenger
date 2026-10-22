@@ -83,6 +83,32 @@ confirm `extension_present=1`, or report **installed, activation pending**.
 Plugin loading never writes client configuration; the new-repository `auto`
 default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
 
+## Sticky auto main (schema v12)
+
+Schema v12 additively creates local-only `auto_main_incumbents`, keyed by
+`(repo_id, host, anchor_workspace_id)`, with `terminal_id` and `recorded_at`.
+Writable opens accept both v10 and v11, preserving user settings and mail data;
+v10 also receives the v11 additions. Migration itself does not elect a main.
+Back up the ledger, upgrade code and copied skills, run `ledger reconcile`,
+and restart the host's HAM processes together. Read-only opens never migrate;
+old code cannot open v12 and downgrade requires the pre-upgrade backup.
+
+Auto precedence is active explicit pin, valid incumbent, then the existing
+unique-candidate rule. The incumbent must still be active in the same scope
+and physically in its anchor workspace. Registry reconciliation records a
+unique candidate only without an active pin or valid incumbent, and removes
+invalid incumbents in the same transaction. Reads never record elections.
+Incumbency is terminal-keyed: a native session restart in the same terminal
+keeps it. A later main-checkout sibling does not demote the incumbent; when
+the incumbent leaves, the next unique candidate takes over. Two candidates
+in the first snapshot still produce no main. Linked siblings cannot steal it.
+
+This is election memory, not a user setting or explicit pin. Manual/off modes
+ignore it; clearing an explicit pin allows incumbent/computed auto election.
+No `workspace_settings` rows are rewritten. `repo show` adds read-only
+`main_source` (`pinned`, `auto`, or null); agent status exports and protocol 1
+are unchanged. Incumbents are never replicated; peers consume origin-host roles.
+
 ## Sender dismissal (schema v11)
 
 Schema v11 additively creates local `mail_dismissals` and nullable
@@ -168,10 +194,11 @@ fallback: ordinary workspaces must not be conflated.
 Existing `workspace_settings` rows are not migrated, copied or deleted.
 While linked workspaces are grouped, only the anchor's explicit main/member
 settings apply; linked settings remain unchanged and apply again if ungrouped.
-A valid explicit main may be anywhere in the group. Otherwise auto mode elects
-from active group agents only when the anchor has an active agent: the sole
-agent, or, with several, the unique active main-checkout agent. An open anchor
-without an agent has **no auto main**, even with a sole linked agent. Manual
+A valid explicit main may be anywhere in the group. Otherwise auto mode keeps
+a valid anchor incumbent (schema v12), then elects from active group agents
+only when the anchor has an active agent: the sole agent, or, with several,
+the unique active main-checkout agent. An open anchor without an agent has
+**no auto main**, even with a sole linked agent. Manual
 workers are the anchor's selected group members except main; auto workers are
 all other group agents. Opening/closing an anchor changes the group and refreshes
 affected roles. `repo show` returns `workspace_id` as the resolved anchor and
@@ -191,7 +218,7 @@ with mains give `main_ambiguous`. Named `HOST/LABEL` addressing is unchanged.
 2. From the updated HAM checkout on each host, run
    `python3 -m ham cli ledger reconcile`.
    Writable reconciliation upgrades older storage to the current schema
-   (v11, including v9 workspace metadata). Read-only commands never migrate.
+   (v12, including v9 workspace metadata). Read-only commands never migrate.
 3. Restart the host's HAM processes with the upgraded code. The OMP extension
    and Claude hook contracts are unchanged; no new adapter/hook configuration
    is required. Resume group-dependent routing after the participating hosts
@@ -230,8 +257,9 @@ copy. Inactive or unknown local targets cannot be mapped safely and are dropped;
 `ledger_meta.workspace_settings_migration_dropped` records JSON entries
 `{repo_id,field,target}`. Re-select any needed active replacements in Settings.
 The upgrade removes repo-level `main`, `members` and `computed_main` rows and
-their obsolete member/conditional-setting projections. The computed main is
-derived on read rather than saved or published. A stale explicit designation
+their obsolete member/conditional-setting projections. The unique-candidate
+fallback is derived on read; schema v12 separately remembers incumbents during
+registry reconciliation, never as `computed_main` settings. A stale explicit designation
 remains stored but is ignored while its target is inactive or outside the scope.
 
 Workspace role settings stay on the owning host and are never replicated.

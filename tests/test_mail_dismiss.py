@@ -305,8 +305,8 @@ class MailDismissTest(unittest.TestCase):
             {"HERDR_AGENT_LEDGER_DIR": str(self.store.directory)}))
         upgraded = LedgerStore(self.store.directory, canonical_name="alpha")
         self.assertEqual(upgraded.host_uuid, self.store.host_uuid)
-        self.assertEqual(upgraded.doctor()["schema_version"], 11)
-        self.assertEqual(SCHEMA_VERSION, 11)
+        self.assertEqual(upgraded.doctor()["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(SCHEMA_VERSION, 12)
         with upgraded.read() as connection:
             for table, rows in before.items():
                 self.assertEqual([tuple(row) for row in connection.execute(f"SELECT * FROM {table}")], rows)

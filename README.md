@@ -101,7 +101,7 @@ herdr plugin action invoke mailbox-tab --plugin herdr.agent-messenger
 
 You can also open **HAM: Mailbox (Right Split)** or **HAM: Mailbox (quick send)**
 from Herdr's command palette. Only the user changes mode, main, members, and
-wake thresholds in Settings. New repositories default to `auto`; existing
+wake thresholds: use Settings, or `m` on an Agents row to pin/unpin main. New repositories default to `auto`; existing
 settings are preserved. See [roles and participation](docs/skill-guide.md#modes-roles-and-public-status).
 
 Quick send, **Send Prompt to Agents**, **Held Messages**, and **HAM Skill** use
@@ -122,6 +122,7 @@ as `action`; the `[ACTION ^G]` chip shows the current kind.
 | `Ctrl+G` | Toggle `action` / `fyi` for the current compose. |
 | `Shift+Enter` / `Alt+Enter` | Insert a newline; use Alt+Enter on Moshi/mosh. |
 | `Tab` / `Shift+Tab` | Move between regions in navigation mode. |
+| `m` | Agents: confirm pinning the selected live local role-group agent as main, or clear its explicit pin. |
 | `s` | Open Settings in navigation mode. |
 | `?` / `F1` | Open help in navigation mode / while typing. |
 | `Esc` | Leave input while retaining the draft. |

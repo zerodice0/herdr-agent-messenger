@@ -191,11 +191,12 @@ class WorkspaceRolesTest(unittest.TestCase):
         self.assertEqual(self.show("w2")["main"], {"host": "alpha", "terminal_id": "b"})
         self.assertIsNone(self.show("unobserved")["main"])
 
-    def test_shared_scope_main_checkout_tie_rules(self):
+    def test_shared_scope_initial_ties_and_incumbent_survives_later_tie(self):
         cases = (
-            ((self.repo, self.worktree), {"a": "main", "b": "worker"}, "a"),
             ((self.worktree, self.worktree), {"a": "worker", "b": "worker"}, None),
             ((self.repo, self.repo), {"a": "worker", "b": "worker"}, None),
+            ((self.repo, self.worktree), {"a": "main", "b": "worker"}, "a"),
+            ((self.repo, self.repo), {"a": "main", "b": "worker"}, "a"),
         )
         for directories, roles, main in cases:
             with self.subTest(directories=directories):

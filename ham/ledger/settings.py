@@ -126,14 +126,16 @@ class RepoSettings:
                 "SELECT * FROM setting_conflicts WHERE repo_id=? ORDER BY seq", (repo_id,))]
             pending = connection.execute("SELECT count(*) FROM outbox WHERE kind='setting' AND state='pending' "
                                          "AND json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0]
-            main = self.main(connection, repo_id, host, workspace_id) if host is not None and workspace_id is not None else None
-            computed = self._computed_main(connection, repo_id, host, workspace_id) if (
-                host is not None and workspace_id is not None and fields.get("mode", {}).get("value") == "auto") else None
+            mode = fields.get("mode", {}).get("value", "off")
+            main = main_source = computed = None
+            if host is not None and workspace_id is not None:
+                main, main_source, computed = self._election(connection, repo_id, host, workspace_id, mode)
         return {"repo_id": repo_id, "host": host, "workspace_id": workspace_id,
                 "requested_workspace_id": requested_workspace_id,
                 "home_host": fields.get("home", {}).get("value"),
                 "mode": fields.get("mode", {}).get("value", "off"), "settings": {**fields, **scoped},
-                "main": main, "members": scoped.get("members", {}).get("value", []), "computed_main": computed,
+                "main": main, "main_source": main_source,
+                "members": scoped.get("members", {}).get("value", []), "computed_main": computed,
                 "conflicts": conflicts, "propagation_pending": pending}
 
     @staticmethod
@@ -249,25 +251,91 @@ class RepoSettings:
         return {"applied": changed, **self.show(incoming["repo_id"]), **self._display_result()}
 
     @staticmethod
-    def _computed_main(connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
-        workspace_id = RepoSettings.scope_workspace(connection, repo_id, host, workspace_id)
-        agents = RepoSettings.scope_agents(connection, repo_id, host, workspace_id)
+    def _computed_from(agents: Sequence[Mapping[str, Any]], host: str, anchor: str) -> dict[str, str] | None:
         # An open empty anchor never elects a linked worktree, even if it is the
         # sole active agent. Ordinary ungrouped workspaces keep the sole-agent rule.
         candidates = (agents if len(agents) == 1 else [agent for agent in agents if agent["is_main_checkout"]])
-        candidates = [agent for agent in candidates if agent["workspace_id"] == workspace_id]
+        candidates = [agent for agent in candidates if agent["workspace_id"] == anchor]
         return {"host": host, "terminal_id": candidates[0]["terminal_id"]} if len(candidates) == 1 else None
+
+    @staticmethod
+    def _pin_from(connection: Any, repo_id: str, host: str, anchor: str,
+                  agents: Sequence[Mapping[str, Any]]) -> dict[str, str] | None:
+        explicit = RepoSettings.workspace_fields(connection, repo_id, host, anchor).get("main", {}).get("value")
+        if explicit and explicit in [{"host": agent["host"], "terminal_id": agent["terminal_id"]} for agent in agents]:
+            return explicit
+        return None
+
+    @staticmethod
+    def _incumbent_from(connection: Any, repo_id: str, host: str, anchor: str,
+                        agents: Sequence[Mapping[str, Any]]) -> dict[str, str] | None:
+        row = connection.execute(
+            "SELECT terminal_id FROM auto_main_incumbents WHERE repo_id=? AND host=? AND anchor_workspace_id=?",
+            (repo_id, host, anchor)).fetchone()
+        if row and any(agent["terminal_id"] == row["terminal_id"] and agent["workspace_id"] == anchor
+                       for agent in agents):
+            return {"host": host, "terminal_id": row["terminal_id"]}
+        return None
+
+    @staticmethod
+    def _election(connection: Any, repo_id: str, host: str, workspace_id: str,
+                  mode: str) -> tuple[dict[str, str] | None, str | None, dict[str, str] | None]:
+        """Return (main, source, computed) from one scope scan; computed exists only in auto mode."""
+        if mode == "off":
+            return None, None, None
+        anchor = RepoSettings.scope_workspace(connection, repo_id, host, workspace_id)
+        agents = RepoSettings.scope_agents(connection, repo_id, host, anchor)
+        computed = RepoSettings._computed_from(agents, host, anchor) if mode == "auto" else None
+        pin = RepoSettings._pin_from(connection, repo_id, host, anchor, agents)
+        if pin:
+            return pin, "pinned", computed
+        if mode != "auto":
+            return None, None, None
+        elected = RepoSettings._incumbent_from(connection, repo_id, host, anchor, agents) or computed
+        return elected, "auto" if elected else None, computed
+
+    def reconcile_auto_main(self, connection: Any, at: float) -> set[tuple[str, str, str]]:
+        """Maintain local election memory only inside the authoritative registry transaction."""
+        host = self.store.host
+        stored = {(row["repo_id"], row["anchor_workspace_id"]): row["terminal_id"] for row in connection.execute(
+            "SELECT repo_id,anchor_workspace_id,terminal_id FROM auto_main_incumbents WHERE host=?", (host,))}
+        anchors: dict[str, str] = {}
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        # One pass gives each active scope the same agent order as scope_agents().
+        for row in connection.execute("SELECT * FROM agents WHERE host=? AND active=1 ORDER BY workspace_id,terminal_id", (host,)):
+            anchor = anchors.get(row["workspace_id"])
+            if anchor is None:
+                anchor = anchors[row["workspace_id"]] = self.scope_workspace(
+                    connection, row["repo_id"], host, row["workspace_id"])
+            groups.setdefault((row["repo_id"], anchor), []).append(dict(row))
+        modes: dict[str, str] = {}
+        changed: set[tuple[str, str, str]] = set()
+        for key in groups.keys() | stored.keys():
+            repo_id, anchor = key
+            agents = groups.get(key, [])
+            terminal = stored.get(key)
+            valid = terminal is not None and any(
+                agent["terminal_id"] == terminal and agent["workspace_id"] == anchor for agent in agents)
+            if terminal is not None and not valid:
+                connection.execute("DELETE FROM auto_main_incumbents WHERE repo_id=? AND host=? "
+                                   "AND anchor_workspace_id=?", (repo_id, host, anchor))
+                changed.add((repo_id, host, anchor))
+            if valid or not agents:
+                continue
+            if repo_id not in modes:
+                modes[repo_id] = self.fields(connection, repo_id).get("mode", {}).get("value", "off")
+            if modes[repo_id] != "auto" or self._pin_from(connection, repo_id, host, anchor, agents):
+                continue
+            candidate = self._computed_from(agents, host, anchor)
+            if candidate is not None:
+                connection.execute("INSERT INTO auto_main_incumbents VALUES (?,?,?,?,?)",
+                                   (repo_id, host, anchor, candidate["terminal_id"], at))
+                changed.add((repo_id, host, anchor))
+        return changed
 
     def main(self, connection: Any, repo_id: str, host: str, workspace_id: str) -> dict[str, str] | None:
         mode = self.fields(connection, repo_id).get("mode", {}).get("value", "off")
-        if mode == "off":
-            return None
-        explicit = self.workspace_fields(connection, repo_id, host, workspace_id).get("main", {}).get("value")
-        if explicit and explicit in [
-                {"host": agent["host"], "terminal_id": agent["terminal_id"]}
-                for agent in self.scope_agents(connection, repo_id, host, workspace_id)]:
-            return explicit
-        return self._computed_main(connection, repo_id, host, workspace_id) if mode == "auto" else None
+        return self._election(connection, repo_id, host, workspace_id, mode)[0]
 
     def role(self, agent: Mapping[str, Any], connection: Any = None) -> str | None:
         if connection is None:

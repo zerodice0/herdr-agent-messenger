@@ -5371,6 +5371,134 @@ class MailboxUiTest(unittest.TestCase):
                     pair.assert_not_called()
                     self.assertFalse(app.theme.colors_enabled)
 
+    def test_agents_main_shortcut_pins_and_clears_via_real_settings_service(self):
+        app = self.app()
+        selected = self.select_agent(app)
+        target = {name: selected[name] for name in ('host', 'terminal_id')}
+        for value in (target, None):
+            with self.subTest(value=value):
+                app.key('m')
+                self.assertEqual(app.mode, 'confirm')
+                self.assertEqual(app.confirm['values']['value'], value)
+                self.assertEqual(app.confirm['return_mode'], 'nav')
+                self.assertEqual(app.confirm['values']['scope'], app.current_settings_scope())
+                if value is None:
+                    self.assertIn('Clear Main pin?', app.confirm['title'])
+                    self.assertIn('incumbent', ' '.join(app.confirm['lines']))
+                    self.assertIn('auto mode', ' '.join(app.confirm['lines']))
+                self.accept(app)
+                self.assertEqual(app.mode, 'nav')
+                mutation = app.jobs['mutation']
+                self.assertEqual(mutation.request['operation'], 'setting')
+                with patch('ham.ledger.display.LedgerDisplay.refresh'):
+                    mutation.result = execute_job(mutation.request, self.environment)
+                app.tick()
+                self.assertEqual(RepoSettings(self.store).show(
+                    self.repo_id, self.store.host, 'w1')['settings']['main']['value'], value)
+                self.assertEqual(app.setting_value('main'), value)
+
+    def test_agents_main_shortcut_cancel_is_nonmutating(self):
+        for cancel in ('\r', ESCAPE):
+            with self.subTest(cancel=cancel):
+                app = self.app()
+                app.key('m')
+                app.key(cancel)
+                self.assertEqual(app.mode, 'nav')
+                self.assertNotIn('mutation', app.jobs)
+                self.assertIsNone(app.setting_value('main'))
+
+    def test_agents_main_shortcut_rejects_ineligible_rows_with_reason(self):
+        for changes, reason in (({'host': 'remote'}, 'this host'),
+                                ({'active': 0}, 'inactive'),
+                                ({'stale': True}, 'inactive'),
+                                ({'repo_id': 'foreign'}, 'another repository'),
+                                ({'workspace_id': 'other'}, 'role group')):
+            with self.subTest(changes=changes):
+                app = self.app()
+                self.select_agent(app).update(changes)
+                self.select_agent(app)
+                app.key('m')
+                self.assertEqual(app.mode, 'nav')
+                self.assertIn(reason, app.status)
+                self.assertIsNone(app.confirm)
+                self.assertNotIn('mutation', app.jobs)
+                self.assertIsNone(RepoSettings(self.store).show(
+                    self.repo_id, self.store.host, 'w1')['settings'].get('main', {}).get('value'))
+
+    def test_agents_main_confirmation_revalidates_opener_and_target(self):
+        app = self.app()
+        self.select_agent(app)
+        app.key('m')
+        self.move_opener()
+        self.accept(app)
+        self.assertNotIn('mutation', app.jobs)
+        self.assertIn('scope changed', app.status)
+        self.move_opener('w1')
+        app = self.app()
+        self.select_agent(app)
+        app.key('m')
+        self.accept(app)
+        self.registry.reconcile({'panes': self.snapshot['panes'][:1],
+                                 'agents': self.snapshot['agents'][:1]}, refresh_display=False)
+        with patch('ham.ledger.display.LedgerDisplay.refresh'), self.assertRaises(LedgerError):
+            execute_job(app.jobs['mutation'].request, self.environment)
+        self.assertIsNone(RepoSettings(self.store).show(
+            self.repo_id, self.store.host, 'w1')['settings'].get('main', {}).get('value'))
+
+    def test_agents_main_shortcut_is_nav_agents_only_and_keeps_narrow_footer(self):
+        app = self.app()
+        for focus in ('threads', 'detail'):
+            app.focus = focus
+            app.key('m')
+            self.assertEqual(app.mode, 'nav')
+            self.assertIsNone(app.confirm)
+        app.focus = 'agents'
+        for width, height in ((70, 24), (80, 24), (90, 30), (120, 40), (200, 55)):
+            text = '\n'.join(self.capture(app, height, width).lines())
+            for hint in ('[Enter] Send', '[F1] Help', '[q] Close') + (('[s] Settings',) if width >= 80 else ()):
+                self.assertIn(hint, text, width)
+            if width >= 120:
+                self.assertIn('[m] Main', text)
+        app.key(F1)
+        text = '\n'.join(self.capture(app, 55, 200).lines())
+        self.assertIn('[m] Main', text)
+        self.assertIn('pin to clear', text)
+
+    def test_agents_main_clear_does_not_erase_a_newer_pin(self):
+        app = self.app()
+        a = {name: self.select_agent(app, 'term-a')[name] for name in ('host', 'terminal_id')}
+        b = {name: self.select_agent(app, 'term-b')[name] for name in ('host', 'terminal_id')}
+        with patch('ham.ledger.display.LedgerDisplay.refresh'):
+            RepoSettings(self.store).mutate(self.repo_id, 'main', a, host=self.store.host, workspace_id='w1')
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
+        self.select_agent(app, 'term-a')
+        app.key('m')
+        self.assertEqual(app.confirm['title'], 'Clear Main pin?')
+        self.assertEqual(app.confirm['values']['expected_main'], a)
+        with patch('ham.ledger.display.LedgerDisplay.refresh'):
+            RepoSettings(self.store).mutate(self.repo_id, 'main', b, host=self.store.host, workspace_id='w1')
+        self.accept(app)
+        self.assertEqual(app.jobs['mutation'].request['expected_main'], a)
+        with patch('ham.ledger.display.LedgerDisplay.refresh'), self.assertRaises(LedgerError) as raised:
+            execute_job(app.jobs['mutation'].request, self.environment)
+        self.assertEqual(raised.exception.code, 'main_pin_changed')
+        self.assertEqual(RepoSettings(self.store).show(self.repo_id, self.store.host, 'w1')
+                         ['settings']['main']['value'], b)
+        # A pin request carries no expectation and keeps ordinary last-writer behavior.
+        app = self.app()
+        self.select_agent(app, 'term-a')
+        app.key('m')
+        self.assertNotIn('expected_main', app.confirm['values'])
+
+    def test_settings_metadata_shows_effective_main_with_source_and_fallback_candidate(self):
+        app = self.app()
+        app.local['settings'].update(main={'host': self.store.host, 'terminal_id': 'term-b'},
+                                     main_source='auto', computed_main=None)
+        text = '\n'.join(app.settings_lines())
+        self.assertIn('main source: auto', text)
+        self.assertIn('effective main: ' + app.address(self.recipient), text)
+        self.assertIn('fallback candidate (computed main): null', text)
+
     def test_settings_main_and_members_use_agents_selection_through_confirmation(self):
         for key, field in [('m', 'main'), (' ', 'members')]:
             with self.subTest(key=key):

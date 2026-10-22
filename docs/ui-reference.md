@@ -154,6 +154,7 @@ CONFIRM/Settings picker bindings.
 | `Space` | Open the selected Agents or Threads item in the read-only viewer. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
+| `m` | Agents only: confirm pinning the selected live local role-group agent as main; if already explicitly pinned, confirm clearing the pin. Remote, inactive and other-group rows show a reason without changing settings. |
 | `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
 | `s` | Open Settings. |
 | `?` | Open help, with contextual keys followed by the full keymap. |
@@ -410,6 +411,20 @@ Notification failure cannot turn a successful enqueue into an error. Only the
 submitted, unchanged draft is cleared: edits made while a send is pending are
 retained. Failure leaves the text open with an error.
 
+### Main shortcut in Agents
+
+In NAV, select a live agent on this host in the opener's repository/workspace role
+group and press `m`. The confirmation names the target and role group; Cancel is
+selected initially. Confirm pins that terminal as main through the same Settings
+service and live scope/target validation as the Settings overlay. Press `m` on
+the explicitly pinned row to clear the pin. The clear request carries the pinned
+terminal; if another Mailbox changed the pin before saving, the job fails with
+`main_pin_changed` and leaves the newer pin untouched. Clearing a pin does not turn off
+roles: in `auto`, the incumbent or a unique candidate may become main again.
+An automatically elected main is not an explicit pin, so `m` pins it rather than
+clearing it. The Settings picker and Settings `m` shortcut keep their existing
+behavior. No mutation CLI is available.
+
 ### Settings overlay
 
 Press `s` in NAV. `↑`/`↓` or `j`/`k` selects a row. Click a row to select it;
@@ -455,7 +470,9 @@ For the selected Agents row,
 `m` sets that agent as main; `Space` toggles its manual membership, only for
 active targets in the opener's settings scope. These two shortcuts still
 require confirmation, with Cancel selected by default.
-Home, computed main, version/origin stamps, propagation pending and conflicts
+Home, main source (`pinned`, `auto` or `none`), effective main (the resolved main,
+whether pinned or automatic), fallback candidate (the computed unique candidate, used only when there is no pin or
+incumbent), version/origin stamps, propagation pending and conflicts
 are read-only. Only repo-wide settings propagate. Requests, snapshots and save
 results are associated with the full repo/host/workspace scope, so a result from
 another scope cannot overwrite the current settings. Settings uses the internal

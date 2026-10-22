@@ -428,13 +428,18 @@ additive role-scope export metadata is optional under unchanged protocol 1.
 First enabling a repository creates a version-1 home proposal; **offline peers
 do not prevent local use**. Observed concurrent home proposals converge by
 canonical-name tie order. Home is not the authority for workspace roles.
-Main election is derived on read, not stored or published as `computed_main`.
-A valid explicit main must be active in the same repo/host/anchor role group.
-A target that becomes inactive or moves out is ignored without rewriting the
-setting. Auto election otherwise requires an active agent in the anchor:
-the sole active group agent wins, or, with several, the unique active
-main-checkout agent. An open anchor with no agent yields no auto main even if
-only one linked agent exists. All other auto group agents remain workers.
+Main reads never write or publish `computed_main` settings. A valid explicit main
+must be active in the same repo/host/anchor role group; an inactive/out-of-group
+target is ignored without rewriting the setting. Auto next keeps a valid
+terminal-keyed incumbent active in the anchor itself. Only without one does the
+sole group agent or unique active main-checkout agent in the anchor win. An open
+empty anchor never elects a linked agent; an initial tie still yields no main.
+A later sibling does not demote an incumbent, and a native session restart in
+the same terminal preserves it. Registry reconciliation alone records/clears
+incumbents atomically with agent changes. Manual/off ignore incumbency; clearing
+a user pin permits automatic election again. Other auto group agents are workers.
+`repo show.main_source` is read-only: `pinned`, `auto`, or null. Peer agent/status
+exports are unchanged; peers use the origin host's own role computation.
 
 `--to main` resolves on the sender's host at send time against the sender's
 current scope and stores the concrete terminal target in the immutable message.
@@ -466,7 +471,7 @@ resolution use the same group.
 
 Back up the database before upgrade. Stop old HAM processes sharing the host
 ledger, update host code and copied skills together, run upgraded `ledger reconcile`
-to migrate writable storage to the current schema (v11, including v9 workspace metadata), then restart the host's HAM processes.
+to migrate writable storage to the current schema (v12, including v9 workspace metadata), then restart the host's HAM processes.
 Read-only opens do not migrate. Protocol 1 is unchanged and old peers may consume
 computed roles without optional scope metadata, but still compute old semantics
 for their own agents. Old code cannot open schema-v9 storage: do not mix versions
@@ -488,6 +493,16 @@ Stop old host processes, back up the DB, upgrade code/copied skills, reconcile, 
 opens do not migrate; old code cannot open v11. Downgrade requires the backup.
 No new remote receipt/state or runtime contract is introduced. See
 [sender dismissal migration](../../../docs/migration.md#sender-dismissal-schema-v11).
+
+Schema v12 adds local-only `auto_main_incumbents` with primary key
+`(repo_id,host,anchor_workspace_id)`, `terminal_id`, and `recorded_at`. Both
+v10 and v11 upgrade directly; v10 also receives the v11 additions. No user
+settings or mail rows are rewritten, and migration itself does not record an
+incumbent. Reconciliation removes invalid incumbents and records a unique
+candidate only in auto mode without an active pin or valid incumbent.
+This is election memory, never a user setting or replicated payload. Old code
+cannot open v12; use the same backup/upgrade/reconcile/restart procedure.
+See [sticky auto main migration](../../../docs/migration.md#sticky-auto-main-schema-v12).
 
 The following v7 migration is historical; v9 supersedes its independent
 workspace role semantics:
@@ -531,7 +546,7 @@ hosts may temporarily disagree until settings propagate; there is no home failov
 | --- | --- | --- |
 | `off` | None | No roles or automatic wakes, and no participation-based legacy rejection. Explicit inbox reads and natural user-turn receiving remain allowed. |
 | `manual` | Active explicit user-designated terminal in the same repo/host/anchor role group, otherwise none | Anchor's explicit group members except main. Nonmembers can receive at natural boundaries but do not wake automatically. |
-| `auto` | Active group explicit designation first; otherwise requires an active anchor agent, then the sole active group agent or unique active main-checkout agent | All other group agents, even without a main. An open no-agent anchor prevents auto main even with one linked agent. Ungrouped workspaces keep independent election; host IDs never collide. |
+| `auto` | Active group explicit designation, then valid anchor incumbent, then sole active group agent or unique active main-checkout agent in the anchor | All other group agents, even without a main. An empty anchor prevents auto main; later siblings cannot demote an incumbent. Ungrouped workspaces elect independently; host IDs never collide. |
 
 The stable terminal slot survives a pane move; roles follow its current scope,
 and displays in both the old and new scopes are refreshed. A new native

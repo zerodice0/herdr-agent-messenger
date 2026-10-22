@@ -503,11 +503,16 @@ retained unchanged, not copied or deleted, and apply again if ungrouped.
   that scope are workers, excluding main. Nonmembers may receive naturally but
   cannot be auto-woken.
 - **auto:** an active explicit main from the anchor's settings wins, anywhere
-  in the group. Otherwise an active anchor agent is required: the sole group
-  agent becomes main, or, with several agents, the unique active main-checkout
-  agent. Without that unique choice there is no main. In particular an open
-  anchor without agents gives no auto main, even with one linked agent.
-  All other group agents are workers. Ungrouped workspaces elect independently.
+  in the group. Otherwise a valid incumbent in the anchor workspace keeps main,
+  even when a sibling opens. Without one, the sole group agent becomes main,
+  or, with several agents, the unique active main-checkout agent in the anchor.
+  With no unique choice there is no main; an empty anchor never elects a linked
+  agent. All other group agents are workers. Ungrouped workspaces elect independently.
+  Registry reconciliation alone records the terminal-keyed incumbent and clears
+  it when inactive/out of scope/out of the anchor; native session restarts in the
+  same terminal preserve it. Manual/off ignore incumbency. Clearing a user pin
+  permits incumbent/computed election again; user settings are not rewritten.
+  `repo show.main_source` is read-only (`pinned`, `auto`, or null).
 
 A designation that becomes inactive or moves out of the scope is ignored on
 read without rewriting the setting; auto falls back to the election above.
@@ -537,6 +542,12 @@ preserving existing v10 payloads and settings. Upgrade/restart all HAM processes
 read-only opens never migrate, old code cannot open v11, and downgrade requires
 the pre-upgrade backup. Protocol 1 and receiving-runtime contracts are unchanged.
 See [sender dismissal migration](migration.md#sender-dismissal-schema-v11).
+
+Schema v12 adds local-only `auto_main_incumbents`; v10/v11 upgrade directly
+without rewriting user settings or mail. Migration and read-only role queries
+never record elections. Upgrade/restart host HAM processes and copied skills
+together; old code cannot open v12. Protocol 1 and peer status exports are
+unchanged. See [sticky auto main migration](migration.md#sticky-auto-main-schema-v12).
 
 Public status is independent of coordination mode:
 

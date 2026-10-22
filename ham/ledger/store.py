@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -178,6 +178,10 @@ CREATE TABLE IF NOT EXISTS mail_dismissals (
  actor_agent_id TEXT NOT NULL, actor_terminal_id TEXT NOT NULL, actor_generation INTEGER NOT NULL,
  actor_repo_id TEXT NOT NULL, actor_workspace_id TEXT NOT NULL, actor_alias TEXT NOT NULL,
  reason TEXT NOT NULL, dismissed_at REAL NOT NULL, failure TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS auto_main_incumbents (
+ repo_id TEXT NOT NULL, host TEXT NOT NULL, anchor_workspace_id TEXT NOT NULL,
+ terminal_id TEXT NOT NULL, recorded_at REAL NOT NULL,
+ PRIMARY KEY(repo_id,host,anchor_workspace_id));
 """
 
 
@@ -211,7 +215,7 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
                 if "fyi_turn_end" not in columns:

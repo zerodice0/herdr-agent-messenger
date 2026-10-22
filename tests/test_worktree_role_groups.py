@@ -300,6 +300,141 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         agents = self.register(self.snapshot(("main", "anchor", "worktree"), workspaces=[self.workspace("anchor")]))
         self.assertEqual(agents["main"]["role"], "main")
 
+    def incumbents(self):
+        with self.store.read() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM auto_main_incumbents ORDER BY repo_id,host,anchor_workspace_id")]
+
+    def test_incumbent_survives_sibling_then_transfers_and_reopen_does_not_steal(self):
+        first = ("main", "anchor", "main-checkout")
+        sibling = ("second", "anchor", "main-checkout")
+        workspaces = [self.workspace("anchor"), self.workspace("w1", True)]
+        agents = self.register(self.snapshot(first, workspaces=workspaces))
+        self.assertEqual(agents["main"]["role"], "main")
+        elected = self.incumbents()
+        self.assertEqual([(row["host"], row["anchor_workspace_id"], row["terminal_id"]) for row in elected],
+                         [("alpha", "anchor", "main")])
+        joined = self.snapshot(first, sibling, ("worker", "w1", "main-checkout"), workspaces=workspaces)
+        agents = self.register(joined)
+        self.assertEqual({key: row["role"] for key, row in agents.items()},
+                         {"main": "main", "second": "worker", "worker": "worker"})
+        self.assertEqual(self.incumbents(), elected)
+        self.assertIsNone(self.show()["computed_main"])
+        self.assertEqual(self.show()["main_source"], "auto")
+        self.assertEqual(RemoteLedger(self.store).resolve_recipient("main", agents["worker"])["terminal_id"], "main")
+        agents = self.register(self.snapshot(sibling, ("worker", "w1", "main-checkout"), workspaces=workspaces))
+        self.assertEqual(agents["second"]["role"], "main")
+        self.assertEqual(self.incumbents()[0]["terminal_id"], "second")
+        agents = self.register(joined)
+        self.assertEqual(agents["second"]["role"], "main")
+        self.assertEqual(agents["main"]["role"], "worker")
+        self.assertEqual(self.show()["main"], self.target("second"))
+        self.assertNotIn("main", self.show()["settings"])
+
+    def test_terminal_restart_keeps_incumbent_but_anchor_departure_clears_it(self):
+        observed = self.grouped()
+        self.register(observed)
+        elected = self.incumbents()
+        restarted = copy.deepcopy(observed)
+        restarted["agents"][0]["agent_session"]["value"] = "new-session"
+        agents = self.register(restarted)
+        self.assertEqual(agents["main"]["generation"], 2)
+        self.assertEqual(agents["main"]["role"], "main")
+        self.assertEqual(self.incumbents(), elected)
+        # Staying active in a linked workspace is insufficient for incumbency.
+        for rows in (restarted["agents"], restarted["panes"]):
+            rows[0]["workspace_id"] = "w1"
+        agents = self.register(restarted)
+        self.assertIsNone(self.show()["main"])
+        self.assertEqual(self.incumbents(), [])
+        self.assertEqual({row["role"] for row in agents.values()}, {"worker"})
+
+    def test_pin_override_clear_and_modes_preserve_local_incumbent_not_user_rows(self):
+        observed = self.grouped()
+        self.register(observed)
+        elected = self.incumbents()
+        pinned = self.mutate("main", self.target("worker"))
+        self.assertEqual(pinned["main_source"], "pinned")
+        before = pinned["settings"]["main"]
+        self.register(observed)
+        self.assertEqual(self.show()["main"], self.target("worker"))
+        self.assertEqual(self.show()["settings"]["main"], before)
+        self.assertEqual(self.incumbents(), elected)
+        cleared = self.mutate("main", None)
+        self.assertEqual(cleared["main"], self.target("main"))
+        self.assertEqual(cleared["main_source"], "auto")
+        for mode in ("manual", "off"):
+            self.mutate("mode", mode)
+            self.register(observed)
+            self.assertIsNone(self.show()["main"])
+            self.assertIsNone(self.show()["main_source"])
+            self.assertEqual(self.incumbents(), elected)
+        self.mutate("mode", "auto")
+        self.assertEqual(self.show()["main"], self.target("main"))
+        self.register(self.snapshot(workspaces=observed["workspaces"]))
+        self.assertEqual(self.incumbents(), [])
+
+    def test_pin_blocks_new_incumbent_and_clearing_computes_without_read_write(self):
+        observed = self.grouped()
+        self.register(observed)
+        self.mutate("main", self.target("worker"))
+        with self.store.transaction() as connection:
+            connection.execute("DELETE FROM auto_main_incumbents")
+        self.register(observed)
+        self.assertEqual(self.incumbents(), [])
+        self.assertEqual(self.show()["main_source"], "pinned")
+        self.mutate("main", None)
+        with self.store.read() as connection:
+            before = list(connection.iterdump())
+        readonly = LedgerStore.open_readonly({"HERDR_AGENT_LEDGER_DIR": str(self.store.directory)})
+        settings = RepoSettings(readonly)
+        self.assertEqual(settings.show(self.repo_id, "alpha", "w1")["main"], self.target("main"))
+        self.assertEqual(settings.show(self.repo_id, "alpha", "w1")["main_source"], "auto")
+        agents = AgentRegistry(readonly).list()
+        self.assertEqual({row["terminal_id"]: settings.role(row) for row in agents},
+                         {"main": "main", "worker": "worker", "worker2": "worker"})
+        RemoteLedger(readonly).status_export()
+        status_board(readonly, host="local", resource_scanner=lambda: {
+            "listeners": [], "serve": [], "error": None})
+        with readonly.read() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+        self.assertEqual(self.incumbents(), [])
+        self.register(observed)
+        self.assertEqual(self.incumbents()[0]["terminal_id"], "main")
+
+    def test_v10_and_v11_upgrade_are_additive_and_election_waits_for_reconcile(self):
+        observed = self.grouped()
+        for version in (10, 11):
+            with self.subTest(version=version):
+                self.register(observed)
+                self.mutate("members", [self.target("worker")])
+                with self.store.transaction() as connection:
+                    settings_before = [tuple(row) for row in connection.execute(
+                        "SELECT * FROM workspace_settings ORDER BY workspace_id,field")]
+                    agents_before = [tuple(row) for row in connection.execute("SELECT * FROM agents ORDER BY agent_id")]
+                    connection.execute("DROP TABLE auto_main_incumbents")
+                    if version == 10:
+                        connection.execute("DROP TABLE mail_dismissals")
+                        connection.execute("ALTER TABLE messages DROP COLUMN sender_context")
+                    connection.execute("UPDATE ledger_meta SET value=? WHERE key='schema_version'", (str(version),))
+                self.assert_error("schema_upgrade_required", lambda: LedgerStore.open_readonly(
+                    {"HERDR_AGENT_LEDGER_DIR": str(self.store.directory)}))
+                upgraded = LedgerStore(self.store.directory, canonical_name="alpha")
+                with upgraded.read() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "12")
+                    self.assertEqual(connection.execute("SELECT count(*) FROM auto_main_incumbents").fetchone()[0], 0)
+                    self.assertEqual([tuple(row) for row in connection.execute(
+                        "SELECT * FROM workspace_settings ORDER BY workspace_id,field")], settings_before)
+                    self.assertEqual([tuple(row) for row in connection.execute(
+                        "SELECT * FROM agents ORDER BY agent_id")], agents_before)
+                    self.assertIn("sender_context", {row["name"] for row in connection.execute("PRAGMA table_info(messages)")})
+                    self.assertEqual(connection.execute("SELECT count(*) FROM mail_dismissals").fetchone()[0], 0)
+                self.assertEqual(self.show()["main"], self.target("main"))
+                self.assertEqual(self.incumbents(), [])
+                self.register(observed)
+                self.assertEqual(self.incumbents()[0]["terminal_id"], "main")
+
     def test_anchor_open_close_refreshes_all_surviving_linked_sidebar_and_borders(self):
         observed = self.grouped(main=False)
         closed = copy.deepcopy(observed)

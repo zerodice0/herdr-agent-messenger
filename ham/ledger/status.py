@@ -383,6 +383,7 @@ class AgentRegistry:
                                        (agent_id, "unknown", at))
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
                     changed_panes.add(value["pane_id"])
+            affected_scopes.update(settings.reconcile_auto_main(connection, at))
             # A move, arrival or departure can change the derived main for every
             # survivor in both scopes, even when their own registry rows did not change.
             current_panes = {row["terminal_id"]: row["pane_id"] for row in connection.execute(

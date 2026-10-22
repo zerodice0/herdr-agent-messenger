@@ -99,8 +99,8 @@ herdr plugin action invoke mailbox-tab --plugin herdr.agent-messenger
 ```
 
 Herdr 명령 팔레트의 **HAM: Mailbox (Right Split)** 또는 **HAM: Mailbox (quick send)**로도
-열 수 있습니다. 모드·main·구성원·깨우기 임곗값은 사용자만 Settings에서 바꿉니다.
-새 저장소의 기본 모드는 `auto`이며 기존 설정은 유지합니다.
+열 수 있습니다. 모드·main·구성원·깨우기 임곗값은 사용자만 바꿉니다. Settings를
+사용하거나 Agents에서 `m`을 눌러 main을 고정·해제하세요. 새 저장소의 기본 모드는 `auto`이며 기존 설정은 유지합니다.
 [역할과 참여 설정](docs/ko/skill-guide.md#모드-역할-공개-상태)을 참고하세요.
 
 빠른 전송, **Send Prompt to Agents**, **Held Messages**, **HAM Skill**은 Herdr
@@ -121,6 +121,7 @@ Herdr 명령 팔레트의 **HAM: Mailbox (Right Split)** 또는 **HAM: Mailbox (
 | `Ctrl+G` | 현재 작성창의 `action` / `fyi`를 전환합니다. |
 | `Shift+Enter` / `Alt+Enter` | 줄을 바꿉니다. Moshi/mosh에서는 Alt+Enter를 사용합니다. |
 | `Tab` / `Shift+Tab` | 탐색 모드에서 영역을 옮깁니다. |
+| `m` | Agents에서 선택한 로컬 역할 그룹의 활성 에이전트를 main으로 고정하거나 고정을 해제합니다. 확인을 거쳐 저장합니다. |
 | `s` | 탐색 모드에서 Settings를 엽니다. |
 | `?` / `F1` | 탐색 모드 / 입력 중에 도움말을 엽니다. |
 | `Esc` | 초안을 보존하고 입력창에서 나옵니다. |
