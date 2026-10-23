@@ -83,6 +83,22 @@ confirm `extension_present=1`, or report **installed, activation pending**.
 Plugin loading never writes client configuration; the new-repository `auto`
 default is unchanged. See the [receiving setup guide](skill-guide.md#receiving-dependency).
 
+### OMP receiver bell targeting
+
+OMP receivers watch their own terminal bell rather than the Mailbox TUI's
+`_board` bell. Ledger mutations must ring every local terminal whose mailbox,
+turn state, session identity, or effective role/settings changed. Registry
+heartbeat freshness, display/phase changes, and unrelated board activity do not
+wake receivers. `_board` still refreshes the Mailbox TUI, and the receiver's
+five-minute registration/safety sweep remains enabled.
+
+Upgrade the ledger writers and reinstall the OMP receiver together before
+restarting the selected sessions: an old writer may rely on `_board` alone for
+settings or operator claim-resolution notifications. No ledger schema change is
+required. Plugin-root discovery still runs per receiver operation so installation
+changes are not hidden by a cached checkout; eliminating unrelated wake probes
+also eliminates their associated discovery subprocesses.
+
 ## Sticky auto main (schema v12)
 
 Schema v12 additively creates local-only `auto_main_incumbents`, keyed by

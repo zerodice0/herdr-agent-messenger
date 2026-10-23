@@ -357,6 +357,11 @@ class LedgerStore:
 
     @contextmanager
     def transaction(self, terminals: Sequence[str] = ()) -> Iterator[sqlite3.Connection]:
+        """Commit board changes; callers supply only terminals whose receiver state changed.
+
+        A mutable terminal list may be filled while holding the transaction lock.
+        Heartbeats and board-only writes must not broadcast to native receivers.
+        """
         connection = self.connect()
         changed = False
         try:

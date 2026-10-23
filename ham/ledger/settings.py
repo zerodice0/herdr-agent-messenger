@@ -227,9 +227,12 @@ class RepoSettings:
         """Local user-TUI service. Intentionally not exposed by a mutation CLI."""
         if field not in {"mode", "main", "members", "thresholds"}:
             raise LedgerError("invalid_setting", "Only user settings can be changed here.")
-        with self.store.transaction() as connection:
+        terminals: list[str] = []
+        with self.store.transaction(terminals) as connection:
             if field in WORKSPACE_FIELDS:
                 self._mutate_workspace(connection, repo_id, field, value, host, workspace_id)
+                terminals.extend(agent["terminal_id"] for agent in
+                                 self.scope_agents(connection, repo_id, host, workspace_id))
             else:
                 fields = self.fields(connection, repo_id)
                 if field == "mode" and value != "off" and "home" not in fields:
@@ -238,6 +241,9 @@ class RepoSettings:
                 self._apply(connection, {"repo_id": repo_id, "field": field, "value": value,
                                          "version": self._next_version(connection, repo_id), "origin_host": self.store.host,
                                          "changed_by": "user", "changed_at": time.time()})
+                terminals.extend(row["terminal_id"] for row in connection.execute(
+                    "SELECT terminal_id FROM agents WHERE repo_id=? AND host=? AND active=1",
+                    (repo_id, self.store.host)))
         return {**self.show(repo_id, host, workspace_id), **self._display_result()}
 
     def accept(self, setting: Mapping[str, Any], source: str) -> dict[str, Any]:
@@ -246,8 +252,13 @@ class RepoSettings:
             return {"applied": False, "ignored": "workspace_local", **self.show(incoming["repo_id"])}
         if incoming["repo_id"].startswith("local:"):
             raise LedgerError("local_repo", "Host-local repositories do not propagate settings.")
-        with self.store.transaction() as connection:
+        terminals: list[str] = []
+        with self.store.transaction(terminals) as connection:
             changed = self._apply(connection, incoming, source=source)
+            if changed and incoming["field"] in {"mode", "thresholds"}:
+                terminals.extend(row["terminal_id"] for row in connection.execute(
+                    "SELECT terminal_id FROM agents WHERE repo_id=? AND host=? AND active=1",
+                    (incoming["repo_id"], self.store.host)))
         return {"applied": changed, **self.show(incoming["repo_id"]), **self._display_result()}
 
     @staticmethod

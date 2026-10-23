@@ -296,7 +296,9 @@ export class MailboxAdapter {
           try {
             this.watcher = watch(result.bell_directory, (_event, filename) => {
               if (epoch !== this.epoch) return;
-              if (!filename || String(filename) === "_board" || String(filename) === result.bell_name) this.schedule(ctx);
+              // _board is for the Mailbox TUI, not a broadcast to every receiver.
+              // Nameless events still conservatively recover a missed own-bell event.
+              if (!filename || String(filename) === result.bell_name) this.schedule(ctx);
             });
             this.watcher.on("error", error => { this.report(ctx, error); this.watcher?.close(); this.watcher = undefined; });
           } catch (error) { this.report(ctx, error); }

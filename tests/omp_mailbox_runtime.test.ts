@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, setSystemTime } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, watch, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -219,6 +219,36 @@ afterEach(async () => {
     const value = previousHerdrEnvironment.get(key);
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
+});
+
+test("isolated receiver ignores board-only and unrelated bells but wakes for its mail", async () => {
+  const f = new Fixture();
+  await f.setup();
+  await f.runNextTimeout();
+  const inspections = f.inspections.length;
+  const bell = path.join(f.directory, "ledger", "bell");
+  // Observe real filesystem delivery, not a guessed wall-clock delay. The
+  // receiver's watcher is registered first on the same directory.
+  const changeBell = async (name: string) => {
+    const observed = Promise.withResolvers<void>();
+    const observer = watch(bell, (_event, filename) => { if (String(filename) === name) observed.resolve(); });
+    try { writeFileSync(path.join(bell, name), "isolated bell change"); await observed.promise; }
+    finally { observer.close(); }
+  };
+  await changeBell("_board");
+  await changeBell("unrelated-terminal");
+  expect(f.timeoutTokens.size).toBe(0);
+  expect(f.inspections).toHaveLength(inspections);
+  const scheduled = Promise.withResolvers<void>();
+  f.onTimeout = () => scheduled.resolve();
+  await f.send("action");
+  await scheduled.promise;
+  expect(f.timeoutTokens.size).toBe(1);
+  await f.runNextTimeout();
+  expect(f.inspections.length).toBeGreaterThan(inspections);
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+  console.log("isolated bell smoke: board/unrelated=0 probes; action mail=1 receiver wake");
 });
 
 test("pending native publication waits without warning then clears status on registration", async () => {

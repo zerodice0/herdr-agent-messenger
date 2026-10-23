@@ -307,7 +307,8 @@ class AgentRegistry:
                                   "client": str(raw["agent"]), "alias": alias,
                                   "turn_state": str(raw.get("agent_status") or 'unknown'),
                                   "native_session_pid": native_session_pid}
-        with self.store.transaction(tuple(locations)) as connection:
+        wake_terminals: list[str] = []
+        with self.store.transaction(wake_terminals) as connection:
             from ham.ledger.settings import RepoSettings
             settings = RepoSettings(self.store)
             affected_scopes: set[tuple[str, str, str]] = set()
@@ -320,10 +321,18 @@ class AgentRegistry:
                 old_scope_terminals.setdefault((*scope[:2], anchor), set()).add(agent["terminal_id"])
             # This is a complete open-workspace snapshot, including empty anchors.
             # Missing worktree metadata deliberately restores independent scopes.
-            connection.execute("DELETE FROM workspaces WHERE host=?", (self.store.host,))
-            connection.executemany("INSERT INTO workspaces VALUES (?,?,?,?,?)",
-                                   [(self.store.host, workspace_id, *metadata)
-                                    for workspace_id, metadata in workspaces.items()])
+            previous_workspaces = {row["workspace_id"]: (row["repo_key"], row["is_linked_worktree"], row["label"])
+                                   for row in connection.execute("SELECT * FROM workspaces WHERE host=?",
+                                                                 (self.store.host,))}
+            for workspace_id in previous_workspaces.keys() - workspaces.keys():
+                connection.execute("DELETE FROM workspaces WHERE host=? AND workspace_id=?",
+                                   (self.store.host, workspace_id))
+            for workspace_id, metadata in workspaces.items():
+                if previous_workspaces.get(workspace_id) != metadata:
+                    connection.execute("INSERT INTO workspaces VALUES (?,?,?,?,?) "
+                                       "ON CONFLICT(host,workspace_id) DO UPDATE SET repo_key=excluded.repo_key,"
+                                       "is_linked_worktree=excluded.is_linked_worktree,label=excluded.label",
+                                       (self.store.host, workspace_id, *metadata))
             for scope, old_anchor in old_scope_by_workspace.items():
                 if settings.scope_workspace(connection, *scope) != old_anchor:
                     affected_scopes.add(scope)
@@ -332,7 +341,9 @@ class AgentRegistry:
             for terminal, location in locations.items():
                 connection.execute(
                     "INSERT INTO terminal_slots VALUES (?,?,?,?,1,?) ON CONFLICT(host,terminal_id) DO UPDATE SET "
-                    "pane_id=excluded.pane_id,workspace_id=excluded.workspace_id,present=1,updated_at=excluded.updated_at",
+                    "pane_id=excluded.pane_id,workspace_id=excluded.workspace_id,present=1,updated_at=excluded.updated_at "
+                    "WHERE terminal_slots.pane_id IS NOT excluded.pane_id "
+                    "OR terminal_slots.workspace_id IS NOT excluded.workspace_id OR terminal_slots.present<>1",
                     (self.store.host, terminal, location["pane_id"], location["workspace_id"], at))
                 connection.execute("INSERT OR IGNORE INTO pane_bindings VALUES (?,?,?)",
                                    (self.store.host, location["pane_id"], terminal))
@@ -345,6 +356,7 @@ class AgentRegistry:
                 observed_agent = observed.get(terminal)
                 if not observed_agent or any(old[key] != observed_agent[key] for key in ("session_ref", "client", "repo_id")):
                     affected_scopes.add((old["repo_id"], old["host"], old["workspace_id"]))
+                    wake_terminals.append(terminal)
                     connection.execute("UPDATE agents SET active=0,last_seen=? WHERE agent_id=?", (at, old["agent_id"]))
                     self._status(connection, old["agent_id"], "turn_state", "unknown", at)
             for terminal, value in observed.items():
@@ -364,6 +376,7 @@ class AgentRegistry:
                         (value["workspace_id"], value["pane_id"], value["alias"], value["is_main_checkout"], at,
                          value["native_session_pid"], agent_id))
                 else:
+                    wake_terminals.append(terminal)
                     changed_panes.add(value["pane_id"])
                     affected_scopes.add((value["repo_id"], self.store.host, value["workspace_id"]))
                     generation = connection.execute(
@@ -382,6 +395,7 @@ class AgentRegistry:
                     connection.execute("INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,?,?)",
                                        (agent_id, "unknown", at))
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
+                    wake_terminals.append(terminal)
                     changed_panes.add(value["pane_id"])
             affected_scopes.update(settings.reconcile_auto_main(connection, at))
             # A move, arrival or departure can change the derived main for every
@@ -390,6 +404,9 @@ class AgentRegistry:
                 "SELECT terminal_id,pane_id FROM agents WHERE host=? AND active=1", (self.store.host,))}
             for repo_id, host, workspace_id in affected_scopes:
                 old_anchor = old_scope_by_workspace.get((repo_id, host, workspace_id), workspace_id)
+                wake_terminals.extend(old_scope_terminals.get((repo_id, host, old_anchor), ()))
+                wake_terminals.extend(agent["terminal_id"] for agent in settings.scope_agents(
+                    connection, repo_id, host, workspace_id))
                 changed_panes.update(current_panes[terminal] for terminal in
                                      old_scope_terminals.get((repo_id, host, old_anchor), ())
                                      if terminal in current_panes)
@@ -409,6 +426,7 @@ class AgentRegistry:
                                        "updated_at=? WHERE message_id=? AND state='queued'", (at, row["message_id"]))
                     connection.execute("UPDATE messages SET final_at=? WHERE message_id=?", (at, row["message_id"]))
                     changed_ids.append(row["message_id"])
+                    wake_terminals.append(terminal)
                     continue
                 elif not target:
                     reason = "recipient_absent"
@@ -417,8 +435,13 @@ class AgentRegistry:
                 else:
                     reason = None
                 location = locations.get(terminal, {})
-                connection.execute("UPDATE deliveries SET hold_reason=?,workspace_id=?,pane_id=? WHERE message_id=?",
-                                   (reason, location.get("workspace_id", ''), location.get("pane_id", ''), row["message_id"]))
+                updated = connection.execute(
+                    "UPDATE deliveries SET hold_reason=?,workspace_id=?,pane_id=? WHERE message_id=? "
+                    "AND (hold_reason IS NOT ? OR workspace_id IS NOT ? OR pane_id IS NOT ?)",
+                    (reason, location.get("workspace_id", ''), location.get("pane_id", ''), row["message_id"],
+                     reason, location.get("workspace_id", ''), location.get("pane_id", ''))).rowcount
+                if updated:
+                    wake_terminals.append(terminal)
             for message_id in changed_ids:
                 save_receipt(connection, message_id)
             if prune_device_claims:
@@ -529,8 +552,8 @@ class AgentRegistry:
                 elif (client == "claude" and agent["native_session_pid"] is not None
                       and agent["native_session_pid"] != native_pid):
                     raise LedgerError("stale_session", "The pending native root process has changed.")
-                connection.execute("UPDATE agents SET extension_present=? WHERE agent_id=?",
-                                   (bool(extension_present), agent["agent_id"]))
+                connection.execute("UPDATE agents SET extension_present=? WHERE agent_id=? AND extension_present<>?",
+                                   (bool(extension_present), agent["agent_id"], bool(extension_present)))
                 agent["extension_present"] = bool(extension_present)
         return agent
 
@@ -538,7 +561,7 @@ class AgentRegistry:
                    feature_invoked: bool = False,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
         """Publish committed status; explicit feature use also refreshes unchanged values."""
-        with self.store.transaction((agent["terminal_id"],)) as connection:
+        with self.store.transaction() as connection:
             current = check_generation(
                 connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
             at = time.time()

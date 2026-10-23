@@ -163,6 +163,153 @@ class NativeReceiverTest(unittest.TestCase):
             return connection.execute('SELECT fyi_turn_end FROM deliveries WHERE message_id=?',
                                       (message_id,)).fetchone()[0]
 
+    def add_bell_peers(self, *, shared_repo=False):
+        if shared_repo:
+            subprocess.run(['git', 'init', '-q', str(self.repo)], check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(self.repo), 'remote', 'add', 'origin',
+                            'https://example.test/team/inspect-bells.git'], check=True, capture_output=True)
+        other_repo = self.root/'bell-other'
+        other_repo.mkdir()
+        live = snapshot(self.repo, recipient_session=self.session)
+        live['workspaces'] = [
+            {'workspace_id':'w1', 'worktree':{'repo_key':'bells', 'is_linked_worktree':False}},
+            {'workspace_id':'linked', 'worktree':{'repo_key':'bells', 'is_linked_worktree':True}},
+        ]
+        for terminal, workspace, directory in (
+                ('term-c', 'linked', self.repo), ('term-d', 'independent', self.repo),
+                ('term-e', 'other', other_repo)):
+            pane = {'terminal_id':terminal, 'pane_id':workspace+':p1', 'workspace_id':workspace}
+            live['panes'].append(pane)
+            live['agents'].append({**pane, 'agent':'omp', 'agent_status':'idle', 'name':terminal,
+                                   'agent_session':{'value':str(self.root/(terminal+'.jsonl'))},
+                                   'cwd':str(directory)})
+        self.registry.reconcile(live, refresh_display=False)
+        agents = self.registry.list()
+        self.sender = next(agent for agent in agents if agent['terminal_id']=='term-a')
+        self.recipient = next(agent for agent in agents if agent['terminal_id']=='term-b')
+        self.receiver.register(self.recipient, session_ref=self.session)
+        self.identity = {key:self.recipient[key] for key in ('terminal_id','agent_id','generation')}
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', self.thresholds)
+
+    def reset_terminal_bells(self):
+        from urllib.parse import quote
+        self.observed_bells = {
+            agent['terminal_id']:self.store.bell_directory/quote(agent['terminal_id'], safe='._-:')
+            for agent in self.registry.list()}
+        for path in self.observed_bells.values():
+            path.touch()
+            os.utime(path, (1, 1))
+
+    def assert_terminal_bells(self, terminals):
+        self.assertEqual({terminal for terminal, path in self.observed_bells.items()
+                          if path.stat().st_mtime_ns != 1_000_000_000}, set(terminals))
+
+    def test_local_mode_and_threshold_changes_ring_only_the_repository_consumers(self):
+        self.add_bell_peers()
+        for mode in ('off', 'manual', 'auto'):
+            with self.subTest(mode=mode):
+                self.reset_terminal_bells()
+                self.settings.mutate(self.recipient['repo_id'], 'mode', mode)
+                self.assert_terminal_bells(('term-a', 'term-b', 'term-c', 'term-d'))
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertEqual(inspected['mode'], mode)
+                self.assertEqual(inspected['role'], 'worker' if mode=='auto' else None)
+        thresholds = {**self.thresholds, 'idle_minutes':7, 'coalesce_seconds':11,
+                      'wakes_per_hour':2, 'max_hop':3}
+        self.reset_terminal_bells()
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds', thresholds)
+        self.assert_terminal_bells(('term-a', 'term-b', 'term-c', 'term-d'))
+        self.assertEqual(self.receiver.inspect(**self.identity)['thresholds'], thresholds)
+
+    def test_main_and_members_changes_ring_linked_role_scope_not_other_scopes_or_repos(self):
+        self.add_bell_peers()
+        self.settings.mutate(self.recipient['repo_id'], 'mode', 'manual')
+        address = {'host':self.store.host, 'terminal_id':'term-b'}
+        for field, value, expected_role in (
+                ('members', [address], 'worker'), ('members', [], None),
+                ('main', {'host':self.store.host, 'terminal_id':'term-a'}, None),
+                ('main', address, 'main'), ('main', None, None)):
+            with self.subTest(field=field, value=value):
+                self.reset_terminal_bells()
+                self.settings.mutate(self.recipient['repo_id'], field, value,
+                                     host=self.store.host, workspace_id='linked')
+                self.assert_terminal_bells(('term-a', 'term-b', 'term-c'))
+                self.assertEqual(self.receiver.inspect(**self.identity)['role'], expected_role)
+
+    def test_accepted_settings_ring_repo_consumers_but_duplicate_stale_and_legacy_do_not(self):
+        self.add_bell_peers(shared_repo=True)
+        for field, value in (
+                ('mode', 'off'),
+                ('thresholds', {**self.thresholds, 'idle_minutes':9, 'max_hop':2})):
+            with self.subTest(field=field):
+                incoming = {'repo_id':self.recipient['repo_id'], 'field':field, 'value':value,
+                            'version':100, 'origin_host':'beta', 'changed_by':'user', 'changed_at':time.time()}
+                self.reset_terminal_bells()
+                self.assertTrue(self.settings.accept(incoming, 'beta')['applied'])
+                self.assert_terminal_bells(('term-a', 'term-b', 'term-c', 'term-d'))
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertEqual(inspected[field], value)
+                for ignored in (incoming, {**incoming, 'version':99}):
+                    self.reset_terminal_bells()
+                    self.assertFalse(self.settings.accept(ignored, 'beta')['applied'])
+                    self.assert_terminal_bells(())
+        for field, value in (('main', None), ('members', [])):
+            self.reset_terminal_bells()
+            result = self.settings.accept(
+                {'repo_id':self.recipient['repo_id'], 'field':field, 'value':value, 'version':101,
+                 'origin_host':'beta', 'changed_by':'user', 'changed_at':time.time()}, 'beta')
+            self.assertEqual(result['ignored'], 'workspace_local')
+            self.assert_terminal_bells(())
+
+    def test_operator_claim_resolution_rings_only_recipient_and_refreshes_inspect(self):
+        for disposition in ('not_applied', 'applied'):
+            with self.subTest(disposition=disposition):
+                sent = self.send(kind='action')
+                claim = self.claim(wake=True)
+                before = self.receiver.inspect(**self.identity)
+                self.assertEqual(before['pending_claims'][0]['claim_id'], claim['claim_id'])
+                self.assertEqual(before['wake_count'], 1)
+                resolution = {key:claim[key] for key in ('claim_id','agent_id','generation')}
+                resolution.update(disposition=disposition, evidence='operator checked journal')
+                self.reset_terminal_bells()
+                self.mail.resolve_claim(**resolution)
+                self.assert_terminal_bells(('term-b',))
+                inspected = self.receiver.inspect(**self.identity)
+                self.assertEqual(inspected['pending_claims'], [])
+                self.assertEqual(inspected['wake_count'], 0)
+                self.assertEqual(inspected['queued_count'], int(disposition=='not_applied'))
+                self.assertEqual(inspected['has_action'], disposition=='not_applied')
+                self.reset_terminal_bells()
+                self.mail.resolve_claim(**resolution)
+                self.assert_terminal_bells(())
+                if disposition=='not_applied':
+                    retry = self.claim(wake=True)
+                    self.assertEqual([message['message_id'] for message in retry['messages']], [sent['message_id']])
+                    self.mail.resolve_claim(
+                        **{key:retry[key] for key in ('claim_id','agent_id','generation')},
+                        disposition='applied', evidence='operator checked retry journal')
+
+    def test_sending_rings_recipient_and_reply_rings_auto_handled_parent_consumer(self):
+        self.reset_terminal_bells()
+        sent = self.send(kind='action')
+        self.assert_terminal_bells(('term-b',))
+        self.reset_terminal_bells()
+        self.mail.send(self.recipient, self.sender, kind='action', body='reply', reply_to=sent['message_id'])
+        self.assert_terminal_bells(('term-a', 'term-b'))
+        self.assertEqual(self.receiver.inspect(**self.identity)['queued_count'], 0)
+
+    def test_remote_send_and_withdraw_do_not_ring_colliding_local_terminal(self):
+        with self.store.transaction() as connection:
+            connection.execute('INSERT INTO peers VALUES (?,?,?,?)',
+                               ('beta', str(uuid.uuid4()), 'beta-ssh', '/peer'))
+        remote = {**self.recipient, 'host':'beta', 'terminal_id':'term-a'}
+        self.reset_terminal_bells()
+        sent = self.mail.send(self.sender, remote, kind='action', body='remote action')
+        self.assert_terminal_bells(())
+        self.reset_terminal_bells()
+        self.mail.withdraw(sent['message_id'], sender=self.sender)
+        self.assert_terminal_bells(())
+
     def test_full_native_session_path_registration_not_uuid_or_stale_session(self):
         for reference,code in [('only-a-uuid','invalid_session'),(str(self.root/'other-session.jsonl'),'stale_session')]:
             with self.assertRaises(LedgerError) as caught:

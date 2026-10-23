@@ -342,6 +342,52 @@ class LedgerCoreTest(unittest.TestCase):
         agents = self.registry.list()
         return next(a for a in agents if a["terminal_id"] == "term-a"), next(a for a in agents if a["terminal_id"] == "term-b")
 
+    def bell_times(self):
+        return {path.name: path.stat().st_mtime_ns for path in self.store.bell_directory.iterdir()}
+
+    def changed_bells(self, before):
+        return {name for name, stamp in self.bell_times().items() if before.get(name) != stamp}
+
+    def test_registry_heartbeat_refreshes_freshness_without_receiver_bells(self):
+        self.send(kind="action")
+        before = self.bell_times()
+        old_seen = self.recipient["last_seen"]
+        self.registry.reconcile(snapshot(self.repo), now=old_seen + 10, refresh_display=False)
+        self.assertEqual(self.changed_bells(before), {"_board"})
+        _, recipient = self.agents()
+        self.assertEqual(recipient["last_seen"], old_seen + 10)
+
+    def test_registry_turn_transition_rings_only_changed_receiver(self):
+        before = self.bell_times()
+        live = snapshot(self.repo)
+        live["agents"][1]["agent_status"] = "done"
+        self.registry.reconcile(live, refresh_display=False)
+        self.assertEqual(self.changed_bells(before), {"_board", "term-b"})
+
+    def test_registry_departure_rings_surviving_role_scope(self):
+        before = self.bell_times()
+        self.registry.reconcile(snapshot(self.repo, recipient_present=False), refresh_display=False)
+        self.assertEqual(self.changed_bells(before), {"_board", "term-a", "term-b"})
+        self.assertEqual(self.registry.list()[0]["role"], "main")
+
+    def test_registry_display_and_phase_changes_are_board_only(self):
+        before = self.bell_times()
+        live = snapshot(self.repo)
+        live["agents"][1]["name"] = "renamed-owl"
+        self.registry.reconcile(live, refresh_display=False)
+        self.assertEqual(self.changed_bells(before), {"_board"})
+        before = self.bell_times()
+        self.registry.set_status(self.recipient, phase="review", summary="Board-only status")
+        self.assertEqual(self.changed_bells(before), {"_board"})
+
+    def test_repeated_extension_registration_does_not_ring(self):
+        self.registry.agent_session(terminal_id="term-b", session_ref="session-b", client="omp",
+                                    repo_id=self.recipient["repo_id"])
+        before = self.bell_times()
+        self.registry.agent_session(terminal_id="term-b", session_ref="session-b", client="omp",
+                                    repo_id=self.recipient["repo_id"])
+        self.assertEqual(self.changed_bells(before), set())
+
     def send(self, **options):
         return self.mail.send(self.sender, self.recipient, body="Please inspect the changed boundary. 한글", **options)
 

@@ -192,10 +192,11 @@ class Mailbox:
 
     def _submit_message(self, payload: dict[str, Any], *, sender: Mapping[str, Any] | None,
                         recipient: Mapping[str, Any], auto_handle_parent: bool) -> dict[str, Any]:
-        sender_terminal = sender.get("terminal_id") if sender is not None else None
         wake_recipient = recipient
         recipient_terminal = recipient.get("terminal_id")
-        terminals = tuple(terminal for terminal in (recipient_terminal, sender_terminal) if terminal)
+        terminals: list[str] = []
+        if recipient["host"] == self.store.host and recipient_terminal:
+            terminals.append(recipient_terminal)
         with self.store.transaction(terminals) as connection:
             if sender is not None:
                 verified_sender = check_generation(connection, self.store.host, sender["terminal_id"],
@@ -262,6 +263,7 @@ class Mailbox:
                     parent["recipient_terminal_id"] == sender["terminal_id"] and
                     parent["state"] in {"queued", "delivered"}):
                 self._handled(connection, reply_to, time.time())
+                terminals.append(sender["terminal_id"])
         submission = self.store.annotate({"message_id": payload["message_id"],
                                          "thread_id": payload["thread_id"], **result})
         client = recipient.get("client")
@@ -742,7 +744,7 @@ class Mailbox:
         terminals: list[str] = []
         with self.store.transaction(terminals) as connection:
             result = self._withdraw(connection, message_id, origin_host=origin, sender=sender)
-            if result.get("recipient_terminal_id"):
+            if result.get("recipient_host") == self.store.host and result.get("recipient_terminal_id"):
                 terminals.append(result["recipient_terminal_id"])
         return result
 
@@ -870,7 +872,8 @@ class Mailbox:
             raise LedgerError("invalid_disposition", "Operator resolution must be applied or not_applied.")
         if not isinstance(evidence, str) or not evidence.strip():
             raise LedgerError("missing_evidence", "Operator resolution needs explicit nonempty evidence.")
-        with self.store.transaction() as connection:
+        terminals: list[str] = []
+        with self.store.transaction(terminals) as connection:
             prior = connection.execute("SELECT * FROM claim_resolutions WHERE claim_id=? ORDER BY seq",
                                        (claim_id,)).fetchall()
             if prior:
@@ -890,6 +893,8 @@ class Mailbox:
             durable_evidence = f"operator:{disposition}:{evidence}"
             result = []
             for row in rows:
+                if row["authoritative"] and row["recipient_host"] == self.store.host:
+                    terminals.append(row["recipient_terminal_id"])
                 connection.execute(
                     "INSERT INTO claim_resolutions(claim_id,message_id,agent_id,generation,disposition,evidence,resolved_at) "
                     "VALUES (?,?,?,?,?,?,?)",
