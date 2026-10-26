@@ -36,6 +36,13 @@ the chosen host; linked workspaces in one group do not add candidates.
 Resolution stores its concrete target; replies/withdrawals do not re-resolve it.
 Remote resolution uses computed exported roles and optional role-scope metadata.
 
+For a handoff/report from your own checkout, use bare `main`. Reserve
+`[HOST/]main@REPO` for an intentional cross-project target whose repo and main
+you verified with `status board`. Never hard-code another project's repository
+or copy HAM's repository name into generic handoff/report templates. A resolved
+cross-project main send includes `cross_repo` (the resolved short repo name);
+notice it before treating the receipt as a handoff to your own coordinator.
+
 | Resolution error | Meaning / action |
 | --- | --- |
 | `repo_ambiguous` | REPO matches several repo IDs; use an exact ID or longer unique suffix. |
@@ -84,6 +91,20 @@ python3 scripts/herdr_agent_messenger.py repo show
 | `mail withdraw` | Required `--message UUID`; originating terminal only. Local withdrawal races atomically with queued→delivering claim. Remote mail never attempted on the wire is cancelled locally; otherwise the saved original route carries a withdrawal request to the final recipient. Inspect `withdrawn` and `withdraw_requested`; already-claimed/delivered/handled or other non-withdrawn final mail is not withdrawn. Repeating successful withdrawal returns `withdrawn:true`, preserving the first final receipt/time. |
 | `mail dismiss` | Required repeatable `--message UUID` and nonblank `--reason TEXT`; atomic, deduplicated, local sender-side resolution of `undeliverable` mail only. Optional `--verbose`. Returns `{dismissals:[audit,...]}` with only the stable audit fields by default (verbose adds sender/actor identity and the retained `failure` snapshot). Repeats preserve the first audit, including its actor/time/reason. See **Sender dismissal** below. |
 | `repo show` | Optional `--verbose`. Read-only repository identity, current settings, and local agents; compact output keeps participation (`mode`, nonempty `main`/`members`/`conflicts`), non-default setting values and agent address/role/status rows, while verbose adds setting stamps and full registry rows. No public setting mutation command. |
+
+#### Sender token discipline
+
+Put the decision, result and next action first; keep the body at most 2,048 UTF-8
+bytes, not 2,048 characters. Native wakes truncate larger bodies, so put long
+evidence in files/URLs and send their paths. A successful oversized CLI send adds
+`"hint":"body>2KB truncated in wakes"`; it does not reject, shorten or resend mail.
+
+Send one message per recipient per substantive boundary, combining results,
+questions and next steps. FYI still wakes a full model turn: send it only when
+the recipient's next decision changes. Otherwise fold it into the next
+substantive report. Changing `action` to `fyi` is not a token-saving substitute
+for omitting a dispensable update; wake timing and gates remain unchanged.
+
 
 Successful `mail send` may include advisory `warnings` entries:
 
@@ -171,9 +192,13 @@ Exhausting the retries shows unavailable. A different already-reported path rema
 Messages use the stable terminal slot, not inherited pane IDs. The CLI matches
 its process ancestors against Herdr's public `pane process-info` shell PID;
 cached old pane bindings only prioritize that lookup. Piped tool subprocesses
-work after a move without `HERDR_TERMINAL_ID` or a stdin TTY. A runtime that has
-already resolved its stable terminal can supply `HERDR_TERMINAL_ID`. If no
-identity can be proven, HAM fails closed rather than guessing from a stale pane.
+work after a move without `HERDR_TERMINAL_ID` or a stdin TTY.
+`HERDR_TERMINAL_ID` is a terminal selector, not proof of identity: HAM requires
+that terminal's live pane shell PID to be in the caller's process ancestry.
+Without it HAM probes live panes by ancestry; inherited pane IDs alone never
+establish sender identity. Internal worker/peer operations use their explicit
+generation/session-bound APIs, not this environment selector. If no identity
+can be proven, HAM fails closed rather than guessing from a stale pane.
 
 Git HTTPS/SSH/scp origins normalize to `git:host[:nondefault-port]/Path`, preserving
 path case. Set `git config ham.repo-id 'git:host/stable/repo'` before a configured
@@ -212,8 +237,12 @@ Storage is `${XDG_STATE_HOME:-~/.local/state}/herdr-agent-messenger/ledger`
 (directory 0700, database 0600, SQLite WAL). Use `HERDR_AGENT_LEDGER_DIR` for
 isolated tests; `HERDR_AGENT_CANONICAL_HOST` sets a new ledger's fixed host name,
 and reopening an existing ledger with a different name is rejected. Final
-message bodies expire after 90 days; permanent compact hashes/receipts prevent
-ID reuse even after deletion. Status/wake history expires after 30 days.
+message bodies expire after 90 days. Compact dedupe receipts/tombstones remain
+while a message or pending outbox needs them, then for a further 30-day replay
+window after body deletion; orphan receipts, dismissals and threads then expire.
+Status/wake history expires after 30 days. Completed direct/spawn submissions
+(`accepted`, `failed`, `unknown`) and terminal legacy request records expire
+after 30 days; `submitting` submissions and active requests remain.
 Initial WAL/schema/host-identity setup is serialized by a private ledger-local
 bootstrap lock, including simultaneous first starts by separate CLI processes.
 
@@ -244,8 +273,8 @@ generation inside the serialized transaction. First success records the actor,
 reason and time in `mail_dismissals`. Authorized retries return that first
 audit without rewriting its reason, actor or time. Audits retain sender/group
 and failure snapshots without message-body foreign keys; they survive 90-day
-body retention and authorize repeats without restoring a body or extending
-its original retention deadline.
+body retention through the additional 30-day replay window and authorize repeats
+without restoring a body or extending its original retention deadline.
 
 `inbox read` (compact and verbose), `mail show`, and `mail threads` expose
 `dismissal`: null before resolution, an audit object afterward. Stable fields
@@ -378,8 +407,9 @@ A permanent endpoint/protocol error marks that item `failed`, leaves the JSON
 error visible and lets later items progress. `ledger retry` retries the same
 outbox/message IDs; it never creates a replacement message. Lost ACKs replay
 the immutable payload and return its **current** resolved receipt. Hash
-conflicts are refused even after 90-day body deletion; compact receipts and
-withdrawal tombstones are permanent. Lower/reordered receipts never regress
+conflicts are refused through the additional 30-day replay window after body
+deletion; receipts/tombstones remain longer if a message or pending outbox needs
+them. Lower/reordered receipts never regress
 state, a final state cannot conflict-transition, and a resolved recipient
 terminal/address cannot change. Internal `delivering` is published as queued.
 
@@ -416,7 +446,7 @@ label. Success is one JSON object with `protocol:1`; errors retain
 | --- | --- |
 | `accept` | `{message:IMMUTABLE_MESSAGE,resolved:{recipient_host,recipient_terminal_id,recipient_address}}` → current receipt. New sends always carry a concrete terminal target matching the immutable target, including sends addressed to `main`. Legacy symbolic sends and relays fail with `legacy_symbolic_main`; upgrade every host before using `--to main` across hosts. |
 | `receipt` | Current compact public receipt, including `message_id`, `origin_host`, `payload_hash`, resolved recipient fields, `state`, `authoritative_host`, times and `withdraw_requested` → retained nonregressing receipt. Only the saved downstream route can advance the origin/relay copy. |
-| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target → withdrawn/current receipt. Unknown IDs create a permanent hash-bound tombstone before late acceptance only when sent by the message origin. |
+| `withdraw` | Original receipt identifying `message_id`, `origin_host`, `payload_hash` and target → withdrawn/current receipt. Unknown IDs create a hash-bound tombstone for the 30-day replay window before late acceptance only when sent by the message origin; retained messages/pending outbox extend its lifetime. |
 | `setting` | `{repo_id,field,value,version,origin_host,changed_by,changed_at}` → `{applied,...repo_settings}` for repo-wide `home`, `mode`, `thresholds`. Protocol-1 legacy `main`, `members`, `computed_main` payloads (including an old conditional `expected_main`) succeed as no-ops. Workspace settings never use this endpoint for replication. |
 | `status-export --wire` | Optional `{repo_id,refresh,resources}` → `{host:{canonical_name,uuid},agents:[...],resources?:{...}}` with roles and optional resource fields. Default refresh gets a fresh local snapshot; `refresh:false` reads stored rows without registry/status/last_seen/display/claim mutation. Only `resources:true` opts into server discovery and adds agent `servers` plus host `resources`; `status board` sends both flags. Missing/false `resources` avoids scans for send/policy/recipient lookup and leaves those fields unknown. Plain `status-export [--repo ID]` remains a fresh local export without server discovery. Remote rows are never inserted into local AGENTS. |
 
@@ -682,6 +712,12 @@ The **HAM: Mailbox (quick send)** overlay closes after a successful send result.
 `q` closes only the owned pane or overlay, confirming before discarding nonempty
 drafts (default Cancel). Top-level Esc closes only quick-send mode; Esc leaves
 input/dialogs without discarding drafts.
+
+`python3 -m ham mailbox job` is an internal TUI subprocess entrypoint, not an
+agent mutation CLI. It requires an inherited one-use capability from the
+Mailbox parent; direct calls without it are rejected. This prevents accidental
+agent use of user-only controls, not hostile code running as the same Unix user;
+the operating-system user remains the trust boundary.
 
 `herdr plugin action invoke fyi-now --plugin herdr.agent-messenger` (context `pane`)
 delivers the focused agent's queued FYI now and reports through a Herdr
@@ -1024,10 +1060,12 @@ and no ledger row, only a 30 s worker backoff. Reasons appear in `fyi-now`.
   and unambiguous. One JSON user line is written to that peer Unix socket. Evidence
   (`claude:peer-journal:SESSION#ID;sha256=HASH`) is the exact bundle text appearing in
   the session transcript as a peer user message, or as an absorbed mid-turn queued
-  command; a bare enqueue or socket write is not acceptance. A session running with
-  `bypassPermissions` or without inbound cross-session messages enabled
-  (`crossSessionInbound`) holds peer messages and is reported unavailable
-  (`claude_holds_peer_messages`), never woken.
+  command; a bare enqueue or socket write is not acceptance. A session running in
+  `bypassPermissions` holds peer messages unless `crossSessionInbound` is
+  `"accept"` and is then reported unavailable (`claude_holds_peer_messages`).
+  **Warning:** `crossSessionInbound: "accept"` lets any same-user socket writer
+  drive a bypassPermissions session. Do not enable it for bypass sessions;
+  HAM does not change this setting or permission mode.
 - **Codex:** the thread is derived from the foreground process's open rollout and
   thread-writer lock (embedded mode); a shared app-server daemon is unavailable.
   Delivery is `codex queue`; its exit 0 only proves a row was written. Evidence is the
@@ -1085,7 +1123,7 @@ agent settings or ACK escape hatch.
 | `ledger retry` | Required `--item UUID`; retry that durable item, not a new message. |
 | `ledger worker ensure\|run\|once\|status` | No extra flags. Ensure detached singleton, run foreground, execute one bounded pass, or inspect worker state. |
 | `ledger reconcile`, `ledger event` | No flags; fresh complete serialized Herdr snapshot, not a partial closure inference. Event is one-shot. |
-| `ledger retention` | No flags; expire final bodies after 90 days and status/wake logs after 30; preserve dedupe receipts/tombstones. |
+| `ledger retention` | No flags; expire final bodies after 90 days, status/wake logs and completed submissions after 30; keep dedupe receipts/tombstones through an additional 30-day replay window and while messages/pending outbox need them, then prune orphan metadata. |
 | `ledger accept\|receipt\|setting\|withdraw` | No argv payload flags; authenticated protocol-1 JSON stdin as described above. |
 | `ledger agent-session` | JSON stdin native session registration, not a guessed display/session revision. |
 | `ledger delivery claim\|started\|release` | JSON stdin exact claim/agent/generation and actual application/release evidence. |
@@ -1394,7 +1432,7 @@ Focus is not a draft-text detector: a person who leaves a pane containing unsent
 | --- | --- | --- |
 | `status board`, `status list` | Brief address/host/workspace/repo/role/turn/phase/summary/unread/stale/receiver rows; device/server counts; board host errors/resources counts, no duplicate host agent rows and no `workspaces` list | Full original registry/status/resource rows, timestamps/identity/placement, `hosts[].agents`, `workspaces` and full host metadata. See Status board output and fields. |
 | `inbox read` | `{messages,...warnings}`; nonnull `message_id`, `thread_id`, `sender` (`origin_host/sender_label`), `kind`, `priority` if provided, `state`, `body`, `reply_to`, `hop`, truncation/omission flags; nonempty `hold_reason`, true `withdraw_requested` | Full original message/delivery fields including hashes, routing, claim/recipient identity and timestamps/nulls. Priority is not synthesized if absent. Python `Mailbox.read()` is unchanged. |
-| `mail send` | `message_id`, `thread_id`, `recipient_address`, `state`; nonempty `hold_reason`/`withdraw_requested`, true `fyi_turn_end`, `fyi_wake_after_seconds`, `warnings` | Full receipt: `origin_host`, `payload_hash`, recipient host/terminal, `via`, delivery timestamps, `authoritative*`, `confirmation_source`, `evidence`. |
+| `mail send` | `message_id`, `thread_id`, `recipient_address`, `state`; nonempty `hold_reason`/`withdraw_requested`, true `fyi_turn_end`, `fyi_wake_after_seconds`, `warnings`; `hint` only for bodies over 2,048 B, `cross_repo` only for an explicit other-repo main selector | Full receipt: `origin_host`, `payload_hash`, recipient host/terminal, `via`, delivery timestamps, `authoritative*`, `confirmation_source`, `evidence`; same conditional sender hints. |
 | `inbox handle` | `{receipts:[{message_id,state}]}` | Full receipts as for `mail send`. |
 | `mail dismiss` | `{dismissals:[{message_id,actor_alias,actor_terminal_id,reason,dismissed_at}]}` | Sender/actor identity and repository fields plus the retained `failure` receipt. |
 | `repo show` | `repo_id`, `host`, `workspace_id`, `mode`, `requested_workspace_id` when different, nonempty `home_host`/`main`/`main_source`/`members`/`computed_main`/`conflicts`/`propagation_pending`, `settings` (name→value for fields beyond home/mode/main/members), `agents` rows with `address`, `workspace`, `client`, `role`, `turn_state`, `extension_present`, nonempty `phase`/`summary` | Full `settings` stamps (version/origin/changed_by/changed_at) and complete registry rows with IDs, generations and timestamps. |

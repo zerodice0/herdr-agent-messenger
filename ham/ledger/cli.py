@@ -369,6 +369,9 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         body = arguments.body if arguments.body is not None else Path(arguments.body_file).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise LedgerError("body_file_unreadable", str(error)) from None
-    return mailbox.send(sender, recipient, body=body, kind=arguments.kind,
-                        reply_to=arguments.reply_to, subject=arguments.subject)
+    from ham.agents.output import send_advisories
+    receipt = mailbox.send(sender, recipient, body=body, kind=arguments.kind,
+                           reply_to=arguments.reply_to, subject=arguments.subject)
+    return send_advisories(receipt, body=body, selector=arguments.to,
+                           sender_repo=sender["repo_id"], recipient_repo=recipient["repo_id"])
 

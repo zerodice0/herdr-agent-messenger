@@ -160,9 +160,9 @@ class WorkerHandoffTest(unittest.TestCase):
             pending = original(store)
             if not pending:
                 empty_calls += 1
-                # Normal worker: its final check just before unlock. One-pass:
-                # its only empty check, before the explicit once short-circuit.
-                if empty_calls == (1 if once else 2):
+                # Local-first worker: the first empty observation is the
+                # post-pump check, still under flock in normal and once modes.
+                if empty_calls == 1:
                     injected.append(self.send())
                     ensure_results.append(ledger_worker.ensure_worker(store,self.environment))
             return pending

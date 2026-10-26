@@ -3,9 +3,11 @@ import tests.ham_test_support as ham_test_support  # Protect the live ledger bef
 
 from copy import deepcopy
 from io import StringIO
+import base64
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -84,6 +86,8 @@ class CliCollaborationPolicyTest(unittest.TestCase):
         self.patch(agent_skill_cli, "probe_local_agents", self.local_probe)
         self.patch(agent_skill_cli, "query_remote_agents", self.remote_probe)
         self.patch(ledger_status, "live_snapshot", lambda environment=None: deepcopy(self.local_snapshot))
+        self.patch(ledger_status, "process_ancestors", lambda: {10})
+        self.patch(ledger_status, "pane_shell_pid", lambda pane, environment=None: 10)
         self.patch(agent_skill_cli, "run_bounded_command", self.native_command)
         self.patch(ledger_display, "run_bounded_command", self.display_command)
         # Only replace the wire call: peer selection, identity checks, roles and
@@ -135,9 +139,14 @@ class CliCollaborationPolicyTest(unittest.TestCase):
         self.display_calls.append(list(command))
         return subprocess.CompletedProcess(command, 0, '{"result":{"pane":{"label":""}}}', "")
 
+    @staticmethod
+    def native_command_text(command):
+        return (base64.b64decode(shlex.split(command[-1])[-1]).decode("utf-8")
+                if command[0] == "ssh" else " ".join(command))
+
     def native_command(self, command, **kwargs):
         self.transport_calls.append(list(command))
-        text = " ".join(command)
+        text = self.native_command_text(command)
         if "agent prompt" in text:
             self.events.append("prompt")
             self.turn_observation = 0
@@ -288,7 +297,7 @@ class CliCollaborationPolicyTest(unittest.TestCase):
         self.turn_observation = None
         code, payload = self.invoke(self.single_arguments(command, address))
         self.assertEqual(code, 0, payload)
-        self.assertEqual(sum("agent prompt" in " ".join(call) for call in self.transport_calls), 1)
+        self.assertEqual(sum("agent prompt" in self.native_command_text(call) for call in self.transport_calls), 1)
         if command == "send":
             self.assertTrue(payload["sent"])
             self.assertEqual(set(self.requests.list_request_ids()), before)

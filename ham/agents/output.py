@@ -12,6 +12,8 @@ import re
 from typing import Any, Protocol
 import zlib
 
+from ham.ledger.mail import sender_address
+
 
 CURSOR_VERSION = 1
 CURSOR_TAIL_BYTES = 4096
@@ -100,7 +102,7 @@ def compact_board_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if "hosts" in payload:
         hosts = []
         for row in payload["hosts"]:
-            host = {key: row[key] for key in ("host", "stale", "error", "unread") if key in row}
+            host = {key: row[key] for key in ("host", "stale", "error", "unread", "outbox_pending") if key in row}
             resources = row.get("resources")
             if isinstance(resources, Mapping):
                 host["resources"] = {
@@ -139,7 +141,7 @@ def compact_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         }
         if row.get("dismissal") is not None:
             message["dismissal"] = compact_dismissal(row["dismissal"])
-        message["sender"] = f"{row['origin_host']}/{row['sender_label']}"
+        message["sender"] = sender_address(row)
         for key in ("hold_reason", "withdraw_requested"):
             if row.get(key):
                 message[key] = row[key]
@@ -167,13 +169,25 @@ def _compact_receipt(receipt: Mapping[str, Any], keys: tuple[str, ...]) -> dict[
     return compact
 
 
+def send_advisories(payload: Mapping[str, Any], *, body: str, selector: str,
+                    sender_repo: str, recipient_repo: str) -> dict[str, Any]:
+    """Add sender-only guidance without altering the stored mail or wire receipt."""
+
+    result = dict(payload)
+    if len(body.encode("utf-8")) > 2048:
+        result["hint"] = "body>2KB truncated in wakes"
+    if re.match(r"(?:[^/]+/)?main@", selector) and recipient_repo != sender_repo:
+        result["cross_repo"] = recipient_repo.rsplit("/", 1)[-1]
+    return result
+
+
 def compact_send_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return the queued message's identity, resolved recipient and advisory fields."""
 
     compact = _compact_receipt(payload, ("message_id", "thread_id", "recipient_address"))
     if payload.get("fyi_turn_end"):
         compact["fyi_turn_end"] = True
-    for key in ("fyi_wake_after_seconds", "warnings"):
+    for key in ("fyi_wake_after_seconds", "warnings", "hint", "cross_repo"):
         if payload.get(key):
             compact[key] = payload[key]
     return compact

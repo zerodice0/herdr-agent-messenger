@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ham.agents.directory import herdr_executable, run_bounded_command
 from ham.ledger.wake_clients import Observation, WakeDeliveryFailed, WakeTarget, WakeUnavailable
+from ham.paths import trusted
 
 CODEX_QUEUE_TIMEOUT_SECONDS = 30.0
 # One argv element is capped near 128 KiB on Linux; stay well below it.
@@ -59,16 +60,19 @@ def find_codex_binary(environment: Mapping[str, str] | None = None) -> str | Non
     env = os.environ if environment is None else environment
 
     def usable(candidate: str) -> bool:
-        return os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+        return (os.path.isabs(candidate) and os.path.isfile(candidate) and
+                os.access(candidate, os.X_OK) and trusted(Path(candidate)))
 
     configured = env.get("CODEX_BIN")
     if configured and usable(configured):
         return configured
     found = shutil.which("codex", path=env.get("PATH"))
-    if found:
+    if found and usable(found):
         return found
+    home = env.get("HOME") or os.path.expanduser("~")
     for directory in _BINARY_DIRECTORIES:
-        candidate = os.path.join(os.path.expanduser(directory), "codex")
+        expanded = os.path.join(home, directory[2:]) if directory.startswith("~/") else directory
+        candidate = os.path.join(expanded, "codex")
         if usable(candidate):
             return candidate
     return None

@@ -192,8 +192,9 @@ def discover(agent: Mapping[str, Any], *, environment: Mapping[str, str] | None 
     if permission_mode(path, size) == "bypassPermissions" and _cross_session_inbound(directory, owner) != "accept":
         raise WakeUnavailable(
             "claude_holds_peer_messages",
-            "Claude is in bypassPermissions mode and holds peer messages for approval "
-            "(set crossSessionInbound to \"accept\" to allow them).")
+            "Claude is in bypassPermissions mode and holds peer messages for approval. "
+            "Warning: crossSessionInbound: \"accept\" lets any same-user socket writer drive "
+            "this bypassPermissions session; do not enable it for bypass sessions.")
     return WakeTarget("claude", session, pid, str(path), size,
                       {"socket_path": socket_path, "config_dir": str(directory)})
 

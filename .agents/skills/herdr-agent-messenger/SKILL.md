@@ -17,9 +17,10 @@ Use the absolute bundled/copied `scripts/herdr_agent_messenger.py` from caller c
 
 ## Token economy
 
-- **Content first:** decision/next action in the first lines; keep the body ≤ ~2 KB (native bundles cap each body at 2,048 B and truncate the rest); put long evidence in a file and send its path.
+- **Target deliberately:** from your checkout use `main`; never hard-code another project's `main@REPO`. Use it only for intentional cross-project mail verified via `status board`; generic handoff/report templates must not copy HAM's repo name.
+- **Content first:** decision/next action first, body ≤2 KB (wakes truncate at 2,048 B); evidence in files/URLs.
 - **One mail per recipient per boundary** (results + question + next step); one completion report per task, no progress pings.
-- **No ACK-only/thanks replies**: they wake the recipient. FYI also wakes after its delay, so `action`→`fyi` does not avoid a wake.
+- **No ACK-only/thanks replies. FYI wakes a full turn:** send only if the recipient's next decision changes; otherwise fold it into the next substantive report.
 - **Natively injected mail is already read**: `inbox read --message UUID` only if truncated or context is missing.
 - **Handle in one call**: `inbox handle --message A --message B`. A successful `mail send --reply-to UUID` already handles its addressed parent; do not add `handle`.
 - `status board` only when coordination needs it; default output is brief.

@@ -1,9 +1,11 @@
 import tests.ham_test_support as ham_test_support  # Protect the live ledger before product imports.
+import base64
 import contextlib
 import io
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -19,6 +21,9 @@ from ham.ops import plugin_rollout as plugin_rollout
 
 
 EXACT_REF = "1" * 40
+
+def remote_script(command: Sequence[str]) -> str:
+    return base64.b64decode(shlex.split(command[-1])[-1]).decode("utf-8")
 
 
 def target_snapshot() -> plugin_rollout.TargetSnapshot:
@@ -134,7 +139,7 @@ class FakeRemoteRunner:
         argv = list(command)
         self.calls.append((argv, timeout))
         host = argv[-2]
-        remote = argv[-1]
+        remote = remote_script(argv)
         if any(fragment in remote for fragment in self.failing_fragments):
             return subprocess.CompletedProcess(argv, 1, "", "forced failure")
         if "plugin install" in remote:
@@ -201,7 +206,7 @@ class LegacyMigrationRunner:
     ) -> subprocess.CompletedProcess[str]:
         argv = list(command)
         self.calls.append((argv, timeout))
-        remote = argv[-1]
+        remote = remote_script(argv)
         if "plugin install" in remote:
             match = re.search(r"--ref ([0-9a-f]{40})", remote)
             ref = match.group(1) if match else EXACT_REF
@@ -314,8 +319,8 @@ class PluginRolloutTest(unittest.TestCase):
         )
 
         self.assertEqual(command[-2], "desktop")
-        self.assertIn(f"plugin install {plugin_rollout.PLUGIN_SOURCE}", command[-1])
-        self.assertIn(f"--ref {EXACT_REF} --yes", command[-1])
+        self.assertIn(f"plugin install {plugin_rollout.PLUGIN_SOURCE}", remote_script(command))
+        self.assertIn(f"--ref {EXACT_REF} --yes", remote_script(command))
         self.assertIn("ClearAllForwardings=yes", command)
         self.assertIn("ForwardAgent=no", command)
         self.assertNotIn("StrictHostKeyChecking=accept-new", command)
@@ -541,7 +546,7 @@ class PluginRolloutTest(unittest.TestCase):
         self.assertEqual(checks["actions"], "skipped")
         self.assertEqual(checks["rollback"], "pass")
         self.assertFalse(
-            any("PYTHONDONTWRITEBYTECODE=1" in call[0][-1] for call in runner.calls)
+            any("PYTHONDONTWRITEBYTECODE=1" in remote_script(call[0]) for call in runner.calls)
         )
         self.assertNotIn("reload", [command["step"] for command in result.commands])
         self.assertNotIn("actions", [command["step"] for command in result.commands])

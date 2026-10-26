@@ -309,6 +309,8 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         with self.store.read() as connection:
             before = list(connection.iterdump())
         with mock.patch("ham.ledger.cli.live_snapshot", return_value=self.moved_snapshot()), \
+                mock.patch("ham.ledger.status.process_ancestors", return_value={10}), \
+                mock.patch("ham.ledger.status.pane_shell_pid", return_value=10), \
                 mock.patch.object(AgentRegistry, "refresh", side_effect=AssertionError("read-only repo show")):
             result = _dispatch(Namespace(command="repo"), {"HERDR_TERMINAL_ID": "terminal"}, self.store)
         self.assertEqual(result["workspace_id"], "moved-workspace")

@@ -12,6 +12,7 @@ import os
 import re
 import time
 from typing import Any, Mapping, Sequence
+import unicodedata
 import uuid
 
 from ham.ledger.status import check_generation
@@ -104,7 +105,21 @@ def _history_boundary(store: LedgerStore, kind: str, repo_id: str | None,
         raise LedgerError("invalid_cursor", "History cursor is invalid for this ledger, query, or repository.") from None
 
 
-def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def safe_label(value: str, maximum: int = 96) -> str:
+    """Bound display-only identity text without terminal or bidi controls."""
+    text = "".join(char for char in value if unicodedata.category(char) not in {"Cc", "Cf", "Zl", "Zp"})
+    return text.encode("utf-8")[:maximum].decode("utf-8", errors="ignore")
+
+
+def sender_address(message: Mapping[str, Any]) -> str:
+    """Display human provenance without trusting a peer's display-only label."""
+    host = safe_label(message["origin_host"])
+    if message.get("sender") == "user":
+        return "user@" + host
+    return host + "/" + safe_label(message["sender_label"])
+
+
+def validate_payload(payload: Mapping[str, Any], *, peer: bool = False) -> dict[str, Any]:
     if set(payload) not in (set(IMMUTABLE_FIELDS), set(IMMUTABLE_FIELDS + REPO_FIELDS)):
         raise LedgerError("invalid_message", "Message fields do not match a supported protocol 1 payload.")
     value = dict(payload)
@@ -119,8 +134,9 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         if key in value and (not isinstance(value[key], str) or not value[key] or len(value[key]) > 4096):
             raise LedgerError("invalid_message", f"{key} must be a bounded nonempty string.")
     if value["recipient_terminal_id"] is not None and (
-            not isinstance(value["recipient_terminal_id"], str) or not value["recipient_terminal_id"]):
-        raise LedgerError("invalid_message", "recipient_terminal_id must be a terminal ID or null.")
+            not isinstance(value["recipient_terminal_id"], str) or
+            re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.:-]{0,255}", value["recipient_terminal_id"]) is None):
+        raise LedgerError("invalid_message", "recipient_terminal_id must be a safe terminal ID or null.")
     if not isinstance(value["kind"], str) or value["kind"] not in {"fyi", "action"}:
         raise LedgerError("invalid_kind", "Message kind must be fyi or action.")
     if not isinstance(value["hop"], int) or isinstance(value["hop"], bool) or value["hop"] < 0:
@@ -134,6 +150,13 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise LedgerError("invalid_body", "A message body must not be empty.")
     if len(value["body"].encode('utf-8')) > MAX_BODY_BYTES:
         raise LedgerError("body_too_large", "A message body must fit within 16 KiB UTF-8.")
+    if peer:
+        for key in ("sender", "sender_label"):
+            value[key] = safe_label(value[key])
+            if (not value[key].strip() or
+                    (value[key].strip().casefold() == "user" and payload["sender"] != "user")):
+                raise LedgerError("invalid_sender", "Peer sender must be a human identity or a nonreserved agent label.")
+        value["created_at"] = time.time()
     return value
 
 
@@ -300,6 +323,10 @@ class Mailbox:
             if existing[0] != digest:
                 raise LedgerError("message_conflict", "This message ID already identifies a different immutable payload.")
             return receipt(connection, value["message_id"])
+        if upstream is not None:
+            # Receipts retain the original protocol-1 digest, including legacy
+            # payloads. Only the receiver's stored presentation/order is normalized.
+            value = validate_payload(value, peer=True)
         tombstone = connection.execute("SELECT origin_host FROM withdraw_tombstones WHERE message_id=?", (value["message_id"],)).fetchone()
         if tombstone and tombstone[0] != value["origin_host"]:
             raise LedgerError("message_conflict", "Withdrawal and message disagree about their origin.")

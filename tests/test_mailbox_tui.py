@@ -1764,6 +1764,36 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.mode, 'nav')
         self.assertIn('unavailable', app.status.lower())
 
+    def test_remote_human_sender_is_host_qualified_and_not_a_local_reply_target(self):
+        sent = self.mail.send_user(self.repo_id, self.recipient, body='Remote request')
+        app = self.app()
+        thread = app.local['threads'][0]
+        message = thread['messages'][0]
+        message.update(origin_host='peer-host', sender_label='operator')
+        self.assertEqual(app.message_sender(message), 'user@peer-host')
+        app.key('\t')
+        app.key('\r')
+        self.assertEqual(app.mode, 'nav')
+        self.assertIsNone(app.recipient)
+        self.assertIn('unavailable', app.status.lower())
+        self.assertEqual(self.mail.show_thread(sent['thread_id'])['messages'][0]['state'], 'queued')
+
+    def test_remote_human_cannot_replace_local_operators_selected_participant(self):
+        self.mail.send_user(self.repo_id, self.recipient, body='Local request')
+        app = self.app()
+        thread = app.local['threads'][0]
+        original = thread['messages'][0]
+        other = next(agent for agent in app.agents() if agent['terminal_id'] == 'term-a')
+        thread['messages'].append({**original, 'message_id': 'remote-human',
+                                   'origin_host': 'peer-host', 'created_at': original['created_at'] + 1,
+                                   'recipient_host': other['host'],
+                                   'recipient_terminal_id': other['terminal_id']})
+        app.key('\t')
+        app.key('\r')
+        self.assertEqual(app.mode, 'input')
+        self.assertEqual(app.recipient['terminal_id'], self.recipient['terminal_id'])
+        self.assertEqual(app.reply_to, 'remote-human')
+
     def test_reply_draft_is_distinct_from_new_message_draft(self):
         sent = self.mail.send_user(self.repo_id, self.recipient, body='Original')
         app = self.app()
@@ -3921,7 +3951,8 @@ class MailboxUiTest(unittest.TestCase):
     def thread_fixture(self, identity, *states):
         return {'thread_id': identity, 'subject': identity, 'messages': [
             {'message_id': f'{identity}-{index}', 'state': state, 'kind': 'fyi',
-             'body': f'{identity} body {index}', 'sender_label': 'user',
+             'body': f'{identity} body {index}', 'sender': 'user', 'sender_label': 'user',
+             'origin_host': self.store.host,
              'recipient_address': self.recipient['host'] + '/blue-owl',
              'recipient_host': self.recipient['host'],
              'recipient_terminal_id': self.recipient['terminal_id']}

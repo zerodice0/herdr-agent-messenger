@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import tests.ham_test_support as ham_test_support  # Protect the live ledger before product imports.
+import base64
 import json
 import os
 from pathlib import Path
@@ -585,9 +586,10 @@ class AgentDirectoryTest(unittest.TestCase):
         command = agent_directory._remote_herdr_command(
             ["agent", "prompt", "blue-raven", prompt]
         )
-        shell, login_flag, script = shlex.split(command)
-        self.assertEqual((shell, login_flag), ("sh", "-c"))
-        self.assertIn(shlex.quote(prompt), script)
+        shell, login_flag, decoder, name, encoded = shlex.split(command)
+        self.assertEqual((shell, login_flag, name), ("sh", "-c", "ham"))
+        self.assertNotIn(prompt, decoder)
+        self.assertIn(shlex.quote(prompt), base64.b64decode(encoded).decode("utf-8"))
 
     def test_ssh_command_hardens_probe_without_overriding_host_key_policy(self):
         command = agent_directory.ssh_command(
@@ -613,8 +615,10 @@ class AgentDirectoryTest(unittest.TestCase):
         self.assertIn("ClearAllForwardings=yes", command)
         self.assertIn("ForwardAgent=no", command)
         self.assertNotIn("StrictHostKeyChecking=accept-new", command)
-        shell, login_flag, script = shlex.split(command[-1])
-        self.assertEqual((shell, login_flag), ("sh", "-c"))
+        shell, login_flag, decoder, name, encoded = shlex.split(command[-1])
+        self.assertEqual((shell, login_flag, name), ("sh", "-c", "ham"))
+        script = base64.b64decode(encoded).decode("utf-8")
+        self.assertNotIn("/tmp/plugin checkout", decoder)
         self.assertIn("cd -- '/tmp/plugin checkout'", script)
         self.assertIn("exec python3 -m unittest -q", script)
 
@@ -719,10 +723,12 @@ class AgentDirectoryTest(unittest.TestCase):
         for call in run.call_args_list:
             command = call.args[0]
             self.assertEqual(command[0], "ssh")
-            _, _, remote_script = shlex.split(command[-1])
+            remote_script = base64.b64decode(shlex.split(command[-1])[-1]).decode("utf-8")
             self.assertIn(f"export HERDR_SOCKET_PATH={shlex.quote(selected_socket)};", remote_script)
             self.assertNotIn(default_socket, remote_script)
-        _, _, prompt_script = shlex.split(run.call_args_list[1].args[0][-1])
+        prompt_script = base64.b64decode(
+            shlex.split(run.call_args_list[1].args[0][-1])[-1]
+        ).decode("utf-8")
         self.assertIn(shlex.quote(expected_prompt), prompt_script)
 
     def test_bounded_command_uses_explicit_environment(self):

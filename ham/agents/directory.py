@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
+import base64
 import glob
 import json
 import os
@@ -14,11 +15,15 @@ import selectors
 import shlex
 import socket
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
+
+from ham.paths import trusted
 
 
 DELETED_BINARY_SUFFIX = " (deleted)"
@@ -127,12 +132,15 @@ def herdr_executable(environment: Mapping[str, str] | None = None) -> str:
     # A server that outlives a binary upgrade reports its own path with this suffix.
     if recorded.endswith(DELETED_BINARY_SUFFIX):
         recorded = recorded[: -len(DELETED_BINARY_SUFFIX)]
-    if recorded and os.path.isfile(recorded) and os.access(recorded, os.X_OK):
+    if (recorded and os.path.isabs(recorded) and os.path.isfile(recorded) and
+            os.access(recorded, os.X_OK) and trusted(Path(recorded))):
         return recorded
-    if shutil.which("herdr", path=values.get("PATH", os.defpath)):
+    found = shutil.which("herdr", path=values.get("PATH", os.defpath))
+    if found and os.path.isabs(found) and trusted(Path(found)):
         return "herdr"
     for candidate in herdr_fallback_paths(values.get("HOME") or os.path.expanduser("~")):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if (os.path.isabs(candidate) and os.path.isfile(candidate) and
+                os.access(candidate, os.X_OK) and trusted(Path(candidate))):
             return candidate
     return "herdr"
 
@@ -564,6 +572,26 @@ def ssh_hosts(environment: Mapping[str, str] | None = None) -> list[str]:
     return [host for host in configured_hosts if host in allowed]
 
 
+def _remote_shell_command(script: str) -> str:
+    """Keep variable data out of the SSH login shell's quoting grammar.
+
+    fish interprets backslash escapes even in single quotes, unlike POSIX sh.
+    Only this fixed, backslash/single-quote-free decoder and base64 data reach
+    that shell. eval runs the decoded POSIX script without consuming stdin,
+    which the ledger transport needs for its wire envelope. Both decoder flags
+    are supported here: GNU uses -d; older macOS base64 uses -D.
+    """
+    decoder = (
+        'decoder=/usr/bin/base64; '
+        '[ -x "$decoder" ] || decoder=$(command -v base64) || exit 127; '
+        'script=$(printf %s "$1" | "$decoder" -d 2>/dev/null) || '
+        'script=$(printf %s "$1" | "$decoder" -D) || exit; '
+        'eval "$script"'
+    )
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return f"sh -c '{decoder}' ham {encoded}"
+
+
 def _remote_herdr_command(arguments: Sequence[str], *, remote_socket: str | None = None) -> str:
     quoted_arguments = " ".join(shlex.quote(argument) for argument in arguments)
     socket_override = (
@@ -588,7 +616,25 @@ def _remote_herdr_command(arguments: Sequence[str], *, remote_socket: str | None
         + "else exit 127; fi; "
         f"{socket_override}exec \"$herdr_bin\" {quoted_arguments}"
     )
-    return f"sh -c {shlex.quote(script)}"
+    return _remote_shell_command(script)
+
+
+def _ssh_control_path() -> str | None:
+    """Return a private multiplex socket path within the local Unix socket limit."""
+    directory = Path.home() / ".ssh" / "ham-cm"
+    limit = 108 if sys.platform.startswith("linux") else 104
+    # OpenSSH expands %C to 40 bytes and adds a 17-byte temporary socket suffix.
+    # The socket pathname must also leave room for its terminating NUL byte.
+    if len(os.fsencode(directory)) + 1 + 40 + 17 >= limit:
+        # Unusually long home directories cannot safely use a Unix socket here.
+        return None
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = directory.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ValueError("SSH control directory must be owned by the current user and not a symlink")
+    directory.chmod(0o700)
+    # Literal percent signs in a home directory must survive token expansion.
+    return os.fspath(directory).replace("%", "%%") + "/%C"
 
 
 def _ssh_transport_command(
@@ -598,6 +644,11 @@ def _ssh_transport_command(
     config_path: Path,
 ) -> list[str]:
     """Build the shared hardened SSH transport without changing trust policy."""
+    control_path = _ssh_control_path()
+    reuse_options = (
+        ["-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-S", control_path]
+        if control_path is not None else ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    )
 
     return [
         "ssh",
@@ -617,6 +668,7 @@ def _ssh_transport_command(
         "ForwardX11=no",
         "-o",
         "PermitLocalCommand=no",
+        *reuse_options,
         "-T",
         host,
         remote_command,
@@ -653,7 +705,7 @@ def ssh_program_command(
         command = f"cd -- {shlex.quote(cwd)} && {command}"
     return _ssh_transport_command(
         host,
-        f"sh -c {shlex.quote(command)}",
+        _remote_shell_command(command),
         config_path=config_path,
     )
 
@@ -1018,6 +1070,8 @@ def _send_local_prompt(
     environment: Mapping[str, str] | None,
     cancel_event: threading.Event | None = None,
 ) -> SendResult:
+    # Herdr's prompt API requires positional TEXT (no stdin/file option).
+    # Keep this residual argv exposure explicit; base64 SSH wrapping is not secrecy.
     result = _run_command(
         [herdr_executable(environment), "agent", "prompt", target.target, prompt],
         cancel_event=cancel_event,

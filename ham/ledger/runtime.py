@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-from ham.ledger.mail import Mailbox
+from ham.ledger.mail import Mailbox, safe_label, sender_address
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import AgentRegistry, check_generation
 from ham.ledger.store import LedgerError, LedgerStore
@@ -59,11 +59,10 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
     for message in messages:
         sender_repo = message.get('sender_repo_id', message.get('repo_id', ''))
         recipient_repo = message.get('recipient_repo_id', message.get('repo_id', ''))
-        repo = (' (repo ' + truncate_utf8(sender_repo.rsplit('/', 1)[-1], 96) + ')'
+        repo = (' (repo ' + safe_label(sender_repo.rsplit('/', 1)[-1]) + ')'
                 if sender_repo and sender_repo != recipient_repo else '')
-        headers.append('\n--- ' + message['message_id'] + ' ---\n' +
-                       'From ' + truncate_utf8(message['origin_host'],128) + '/' +
-                       truncate_utf8(message['sender_label'],96) + repo + ' [' + message['kind'] + ']\n' +
+        headers.append('\n--- ' + message['message_id'] + ' ' + marker + ' ---\n' +
+                       'From ' + sender_address(message) + repo + ' [' + message['kind'] + ']\n' +
                        'Thread ' + message['thread_id'] + ' / hop ' + str(message['hop']) + '\n')
     omitted = ['[body omitted; inbox read --message ' + message['message_id'] + ']' for message in messages]
     available = BUNDLE_BYTES - len(prefix.encode('utf-8')) - sum(len(header.encode('utf-8')) for header in headers)
@@ -73,7 +72,9 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
     for index,(message,header) in enumerate(zip(messages,headers)):
         minimum = len(omitted[index].encode('utf-8'))
         budget = min(MESSAGE_BYTES,max(minimum,available // (len(headers)-index)))
-        body = message['body']
+        # Quote every logical line, including CR and Unicode line separators.
+        # Only nonce-bearing unquoted headers belong to the transport.
+        body = '\n'.join('> ' + line for line in message['body'].splitlines())
         if len(body.encode('utf-8')) > budget:
             suffix = '\n[truncated; inbox read --message ' + message['message_id'] + ']'
             room = budget - len(suffix.encode('utf-8'))

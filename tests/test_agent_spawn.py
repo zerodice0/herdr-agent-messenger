@@ -1,5 +1,6 @@
 import tests.ham_test_support as ham_test_support  # Protect the live ledger before product imports.
 import argparse
+import base64
 import json
 import os
 import shlex
@@ -55,7 +56,7 @@ class FakeHerdr:
     def __call__(self, command, **kwargs):
         self.transports.append(list(command))
         if command[0] == "ssh":
-            script = shlex.split(command[-1])[2]
+            script = base64.b64decode(shlex.split(command[-1])[-1]).decode("utf-8")
             arguments = shlex.split(script.partition('exec "$herdr_bin" ')[2])
         else:
             arguments = command[1:]
@@ -704,7 +705,7 @@ class InitialMessageSpawnTest(unittest.TestCase):
         self.assertEqual(self.record(result)["target"]["transport_host"], "remote-alias")
         self.assertTrue(backend.transports)
         for command in backend.transports:
-            script = shlex.split(command[-1])[2]
+            script = base64.b64decode(shlex.split(command[-1])[-1]).decode("utf-8")
             self.assertIn("export HERDR_SOCKET_PATH=/private-disk/ham.sock;", script)
         self.assertEqual(len(backend.prompts), 1)
 

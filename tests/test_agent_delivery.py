@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import tests.ham_test_support as ham_test_support  # Protect the live ledger before product imports.
+import base64
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
 import importlib
 import io
@@ -8,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tempfile
 import unittest
@@ -166,7 +168,8 @@ class AgentDeliveryTest(unittest.TestCase):
         self.assertEqual(commands[1][0], "ssh")
         self.assertEqual(commands[1][-2], "remote")
         self.assertIn("held 3 min", commands[0][-1])
-        self.assertIn("sender-machine", commands[1][-1])
+        script = base64.b64decode(shlex.split(commands[1][-1])[-1]).decode("utf-8")
+        self.assertIn("sender-machine", script)
         self.assertEqual(record["defer"]["notified"], {"local": "shown", "remote": "no_foreground_client"})
 
     def test_awaiting_local_request_notifies_without_constructing_transport(self):

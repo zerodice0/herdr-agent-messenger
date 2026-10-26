@@ -230,7 +230,7 @@ surviving recorded sender/workspace evidence; missing historical scope fails
 closed rather than selecting an arbitrary same-repo main.
 
 The first audit's actor/time/reason is immutable on retries, including after
-90-day body retention. `dismissal` is null before resolution and an audit object
+90-day body retention, through the additional 30-day replay window. `dismissal` is null before resolution and an audit object
 afterward in compact/verbose inbox reads and thread views. Its stable fields
 are `message_id`, `actor_alias`, `actor_terminal_id`, `reason`, `dismissed_at`.
 Raw state remains `undeliverable`; failure/native receipt fields, final/update
@@ -454,7 +454,8 @@ no pending maintenance remains. Failed Herdr access is not proof that a terminal
 closed. A failed item is visible and does not block later items; an offline peer
 cannot block independent destinations. Explicit retry retains item/message IDs.
 Repeated/lost-ACK accepts use the same immutable message ID and return current
-state, including permanent dedupe after body retention. A bell failure after
+state, including dedupe through a further 30-day replay window after body deletion
+and while retained messages or pending outbox items need it. A bell failure after
 commit is a successful store with a `notification_failed`, `committed:true`
 warning, not permission to resend.
 
@@ -841,9 +842,11 @@ proxy, not typing detection: a user typing in an idle pane is not seen.
 entry (id, pid, start time, interactive) and a user-owned peer socket plus
 transcript, then writes one peer message line to the socket. Acceptance is the exact
 bundle text in the transcript as a peer user message or an absorbed queued command;
-the socket write alone proves nothing. A session that holds cross-session messages
-(`crossSessionInbound` off, or `bypassPermissions` mode) is reported as not
-wakeable rather than woken.
+the socket write alone proves nothing. In `bypassPermissions` mode, peer messages
+are held unless `crossSessionInbound` is `"accept"`; HAM reports that held session
+as not wakeable. **Warning:** `crossSessionInbound: "accept"` lets any same-user
+socket writer drive a bypassPermissions session. Do not enable it for bypass
+sessions; HAM does not change this setting or permission mode.
 
 **Codex.** The thread is derived from the foreground process's open rollout and
 thread-writer lock (embedded mode; a shared app-server daemon is not wakeable).
@@ -903,10 +906,14 @@ Deploy in this order, separately on every participating host:
 
 Storage uses a private 0700 state directory, 0600 SQLite database and WAL.
 Final message bodies expire after 90 days; wake/status logs after 30 days.
+Completed direct/spawn submissions (`accepted`, `failed`, `unknown`) and terminal
+legacy request records expire after 30 days; `submitting` and active requests remain.
 Each worker run performs startup cleanup immediately after taking its lock,
 regardless of the monotonic clock's epoch, including one-pass/no-work runs.
 A continuing worker repeats cleanup hourly.
-Dedupe hashes, compact receipts and withdrawal tombstones remain. The UI checks
+Dedupe hashes, compact receipts and withdrawal tombstones remain while messages
+or pending outbox items need them, plus a 30-day replay window after body deletion.
+Orphan receipts, dismissals and threads then expire. The UI checks
 the local bell every second and remote live status every 30 seconds
 independently; these and worker/OMP safety checks are code-only, not model
 polling. There is no database replica, ASR router, urgent channel, or ownership

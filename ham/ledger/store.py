@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -345,6 +346,7 @@ class LedgerStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA secure_delete=ON")
         return connection
 
     @contextmanager
@@ -412,40 +414,107 @@ class LedgerStore:
             connection.close()
 
     def ring(self, terminals: Sequence[str] = ()) -> None:
-        for name in {"_board", *(quote(terminal, safe="._-:") for terminal in terminals if terminal)}:
-            path = self.bell_directory / name
-            descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(descriptor)
-            path.touch()
+        names = {"_board"}
+        failure: OSError | None = None
+        for terminal in terminals:
+            if not terminal or terminal in {".", ".."} or "/" in terminal or "\0" in terminal:
+                failure = failure or OSError("Invalid terminal bell name.")
+                continue
+            names.add(quote(terminal, safe="._-:"))
+        for name in sorted(names):
+            try:
+                path = self.bell_directory / name
+                descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+                path.touch()
+            except OSError as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
     def doctor(self) -> dict[str, Any]:
         with self.read() as connection:
             counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("agents", "messages", "deliveries", "outbox", "dedupe_receipts")}
+            backlog = pending_outbox_backlog(connection)
         with self.read() as connection:
             failures = [dict(row) for row in connection.execute(
                 "SELECT * FROM notification_failures ORDER BY seq DESC LIMIT 10")]
-        return {"protocol": 1, "schema_version": SCHEMA_VERSION, "directory": str(self.directory),
-                "host": {"canonical_name": self.host, "uuid": self.host_uuid},
-                "counts": counts, "notification_failures": failures}
+        result = {"protocol": 1, "schema_version": SCHEMA_VERSION, "directory": str(self.directory),
+                  "host": {"canonical_name": self.host, "uuid": self.host_uuid},
+                  "counts": counts, "notification_failures": failures}
+        if backlog:
+            result["outbox_pending"] = backlog
+        return result
 
     def retention(self, *, now: float | None = None) -> dict[str, int]:
         at = time.time() if now is None else now
+        history_cutoff = at - 30 * 86400
+        body_cutoff = at - 90 * 86400
         with self.transaction() as connection:
-            # Final message payloads must not survive via sent/failed OUTBOX JSON.
+            before = connection.total_changes
+            # Keep a further 30-day replay/conflict window after body removal.
+            # Pending transport rows and live messages retain dedupe indefinitely.
+            connection.execute("UPDATE dedupe_receipts SET updated_at=max(updated_at,?) "
+                               "WHERE message_id IN (SELECT message_id FROM messages "
+                               "WHERE final_at IS NOT NULL AND final_at<?)", (at, body_cutoff))
             connection.execute("DELETE FROM outbox WHERE message_id IN (SELECT message_id FROM messages WHERE "
                                "final_at IS NOT NULL AND final_at<?) AND state IN ('sent','failed','cancelled')",
-                               (at - 90 * 86400,))
+                               (body_cutoff,))
+            # A pending row may finish only after its message was purged.
+            connection.execute("DELETE FROM outbox WHERE state IN ('sent','failed','cancelled') "
+                               "AND next_try_at<? AND (message_id IS NULL OR NOT EXISTS "
+                               "(SELECT 1 FROM messages m WHERE m.message_id=outbox.message_id))",
+                               (history_cutoff,))
             expired = connection.execute(
-                "DELETE FROM messages WHERE final_at IS NOT NULL AND final_at<?",
-                (at - 90 * 86400,)).rowcount
+                "DELETE FROM messages WHERE final_at IS NOT NULL AND final_at<?", (body_cutoff,)).rowcount
+            submissions = connection.execute(
+                "DELETE FROM submissions WHERE updated_at<? AND acceptance IN ('accepted','failed','unknown')",
+                (history_cutoff,)).rowcount
+            dedupe = connection.execute(
+                "DELETE FROM dedupe_receipts WHERE updated_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id=dedupe_receipts.message_id) "
+                "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=dedupe_receipts.message_id "
+                "AND o.state='pending')", (history_cutoff,)).rowcount
+            connection.execute("DELETE FROM withdraw_tombstones WHERE created_at<? "
+                               "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id=withdraw_tombstones.message_id) "
+                               "AND NOT EXISTS (SELECT 1 FROM dedupe_receipts r WHERE r.message_id=withdraw_tombstones.message_id) "
+                               "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=withdraw_tombstones.message_id "
+                               "AND o.state='pending')", (history_cutoff,))
+            dismissals = connection.execute(
+                "DELETE FROM mail_dismissals WHERE dismissed_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id=mail_dismissals.message_id) "
+                "AND NOT EXISTS (SELECT 1 FROM dedupe_receipts r WHERE r.message_id=mail_dismissals.message_id) "
+                "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=mail_dismissals.message_id "
+                "AND o.state='pending')", (history_cutoff,)).rowcount
+            threads = connection.execute(
+                "DELETE FROM threads WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=threads.thread_id) "
+                "AND NOT EXISTS (SELECT 1 FROM dedupe_receipts r "
+                "WHERE json_extract(r.receipt,'$.thread_id')=threads.thread_id)").rowcount
+            connection.execute("DELETE FROM message_routes WHERE "
+                               "NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id=message_routes.message_id) "
+                               "AND NOT EXISTS (SELECT 1 FROM dedupe_receipts r WHERE r.message_id=message_routes.message_id) "
+                               "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=message_routes.message_id AND o.state='pending')")
+            connection.execute("DELETE FROM claim_resolutions WHERE resolved_at<? AND NOT EXISTS "
+                               "(SELECT 1 FROM deliveries d WHERE d.message_id=claim_resolutions.message_id)",
+                               (history_cutoff,))
             connection.execute("DELETE FROM native_claims WHERE NOT EXISTS "
                                "(SELECT 1 FROM deliveries d WHERE d.claim_id=native_claims.claim_id)")
-            # Threads have no message bodies and remain useful as stable reply identities.
-            status = connection.execute("DELETE FROM status_log WHERE at<?", (at - 30 * 86400,)).rowcount
-            wake = connection.execute("DELETE FROM wake_log WHERE at<?", (at - 30 * 86400,)).rowcount
-            connection.execute("DELETE FROM notification_failures WHERE at<?", (at - 30 * 86400,))
-        return {"messages": expired, "status_log": status, "wake_log": wake}
+            connection.execute("DELETE FROM ledger_meta WHERE key LIKE 'outbox_enqueued:%' AND NOT EXISTS "
+                               "(SELECT 1 FROM outbox o WHERE ledger_meta.key='outbox_enqueued:'||o.item_id)")
+            status = connection.execute("DELETE FROM status_log WHERE at<?", (history_cutoff,)).rowcount
+            wake = connection.execute("DELETE FROM wake_log WHERE at<?", (history_cutoff,)).rowcount
+            connection.execute("DELETE FROM notification_failures WHERE at<?", (history_cutoff,))
+            purged = connection.total_changes > before
+        if purged:
+            # secure_delete clears freed cells; a nonblocking checkpoint also
+            # drops historical WAL frames when no concurrent reader pins them.
+            with self.read() as connection:
+                connection.execute("PRAGMA busy_timeout=0")
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return {"messages": expired, "status_log": status, "wake_log": wake,
+                "submissions": submissions, "dedupe_receipts": dedupe,
+                "mail_dismissals": dismissals, "threads": threads}
 
     def annotate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(payload)
@@ -495,7 +564,43 @@ def queue_outbox(connection: sqlite3.Connection, target_host: str, kind: str,
     connection.execute("INSERT INTO outbox(item_id,target_host,peer_seq,kind,message_id,payload,state,next_try_at) "
                        "VALUES (?,?,?,?,?,?,'pending',?)",
                        (item_id, target_host, sequence, kind, message_id, json_text(payload), time.time()))
+    connection.execute("INSERT INTO ledger_meta(key,value) VALUES (?,?)",
+                       ("outbox_enqueued:" + item_id, str(time.time())))
     return item_id
+
+
+def pending_outbox_backlog(connection: sqlite3.Connection, *, now: float | None = None) -> dict[str, dict[str, int]]:
+    """Count pending transport work and its oldest best-known enqueue age."""
+    at = time.time() if now is None else now
+    result: dict[str, dict[str, int]] = {}
+    for row in connection.execute(
+            "SELECT o.target_host,o.payload,o.next_try_at,m.value AS enqueued_at FROM outbox o "
+            "LEFT JOIN ledger_meta m ON m.key='outbox_enqueued:'||o.item_id WHERE o.state='pending'"):
+        timestamp = None
+        try:
+            candidate = float(row["enqueued_at"])
+            if math.isfinite(candidate) and candidate > 0:
+                timestamp = candidate
+        except (TypeError, ValueError):
+            pass
+        if timestamp is None:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                payload = {}
+            for key in ("created_at", "changed_at", "updated_at"):
+                candidate = payload.get(key) if isinstance(payload, dict) else None
+                if (isinstance(candidate, (int, float)) and not isinstance(candidate, bool)
+                        and math.isfinite(candidate) and candidate > 0):
+                    timestamp = candidate
+                    break
+        if timestamp is None:
+            timestamp = row["next_try_at"]
+        age = max(0, int(at - timestamp)) if math.isfinite(timestamp) else 0
+        peer = result.setdefault(row["target_host"], {"count": 0, "oldest_age_s": 0})
+        peer["count"] += 1
+        peer["oldest_age_s"] = max(peer["oldest_age_s"], age)
+    return result
 
 
 def public_receipt(value: Mapping[str, Any]) -> dict[str, Any]:

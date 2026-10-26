@@ -411,6 +411,7 @@ class RemoteLedgerTest(unittest.TestCase):
         path.mkdir()
         (path / "python3").symlink_to(sys.executable)
         (path / "env").symlink_to("/usr/bin/env")
+        (path / "sh").symlink_to("/bin/sh")
         binary = home / ".local/bin/herdr"
         binary.parent.mkdir(parents=True)
         snapshot = json.dumps({"result": {"snapshot": {"panes": [], "agents": []}}})
@@ -426,11 +427,11 @@ class RemoteLedgerTest(unittest.TestCase):
         def run_remote_shell_locally(command, **kwargs):
             # Keep the production SSH argv/remote-shell construction, replacing
             # only the SSH connection with an isolated non-login local shell.
-            self.assertEqual(command[0], "ssh")
+            self.assertTrue(Path(command[0]).is_absolute())
+            self.assertEqual(Path(command[0]).name, "ssh")
             self.assertEqual(command[-2], "b")
-            shell = shlex.split(command[-1])
-            self.assertEqual(shell[:2], ["sh", "-c"])
-            return run(["/bin/sh", *shell[1:]], env=environment, **kwargs)
+            kwargs["env"] = environment
+            return run(["/bin/sh", "-c", command[-1]], **kwargs)
 
         with mock.patch("ham.ledger.remote.subprocess.run", side_effect=run_remote_shell_locally):
             result = transport._invoke(peer, "status-export",
@@ -1101,7 +1102,7 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertIn('upgrade every host', error['message'])
         self.assertEqual(self.stores['beta'].doctor()['counts']['messages'], 0)
 
-    def test_concrete_main_wire_cannot_change_target_or_use_home_relay(self):
+    def test_concrete_main_wire_cannot_change_target_and_configured_relay_keeps_target(self):
         sent = self.send()
         payload = json.loads(next(item for item in self.services['alpha'].outbox()
                                   if item['message_id'] == sent['message_id'])['payload'])
@@ -1110,10 +1111,44 @@ class RemoteLedgerTest(unittest.TestCase):
         changed = {**payload, 'resolved': {**payload['resolved'], 'recipient_terminal_id': 'another'}}
         result = self.wire('beta', 'accept', self.services['alpha'].envelope(changed), expected=1)
         self.assertEqual(result['error']['code'], 'invalid_recipient')
-        result = self.wire('beta', 'accept', self.services['gamma'].envelope(payload), expected=1)
-        self.assertEqual(result['error']['code'], 'wrong_origin')
-        accepted = self.wire('beta', 'accept', self.services['alpha'].envelope(payload))
+        accepted = self.wire('beta', 'accept', self.services['gamma'].envelope(payload))
         self.assertEqual(accepted['recipient_terminal_id'], 'term-beta')
+        repeated = self.wire('beta', 'accept', self.services['alpha'].envelope(payload))
+        self.assertEqual(repeated['payload_hash'], accepted['payload_hash'])
+
+    def test_human_mail_relays_through_configured_peer_without_local_operator_privilege(self):
+        sent = Mailbox(self.stores['alpha'], self.environment).send_user(
+            self.repo_id, self.agents['gamma'], body='Human request across relay')
+        payload = json.loads(next(item for item in self.services['alpha'].outbox()
+                                  if item['message_id'] == sent['message_id'])['payload'])
+        with self.stores['beta'].transaction() as connection:
+            self.services['beta'].submit(connection, payload['message'], upstream='alpha',
+                                         resolved=payload['resolved'])
+        self.services['beta'].pump(now=time.time() + 1000)
+        inbox = Mailbox(self.stores['gamma']).read(self.agents['gamma'])['messages']
+        message = next(row for row in inbox if row['message_id'] == sent['message_id'])
+        self.assertEqual((message['sender'], message['origin_host'], message['sender_label']),
+                         ('user', 'alpha', 'user'))
+        self.assertEqual(message['payload_hash'], sent['payload_hash'])
+        self.assertIsNone(message['sender_context'])
+        receiver = NativeReceiver(self.stores['gamma'], environment=self.environment)
+        with self.stores['gamma'].read() as connection:
+            state, rows, trigger, reason = receiver.wake_gate(
+                connection, self.agents['gamma'], time.time() + 1000, ready_since=0)
+        self.assertIsNone(state['role'])
+        self.assertEqual(trigger['message_id'], sent['message_id'])
+        self.assertEqual(reason, 'not_participating')
+        with self.stores['gamma'].read() as connection:
+            self.assertEqual(connection.execute(
+                'SELECT receipt_host FROM message_routes WHERE message_id=?',
+                (sent['message_id'],)).fetchone()[0], 'beta')
+        for operation in (
+                lambda: Mailbox(self.stores['gamma']).withdraw(sent['message_id']),
+                lambda: Mailbox(self.stores['gamma']).dismiss(
+                    self.agents['gamma'], [sent['message_id']], reason='Not local operator mail')):
+            with self.assertRaises(LedgerError) as caught:
+                operation()
+            self.assertEqual(caught.exception.code, 'wrong_origin')
 
     def test_explicit_address_remains_cross_workspace_and_cross_host(self):
         other = self.add_agent('alpha', 'other-workspace', 'another')

@@ -12,9 +12,25 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 import uuid
+import unicodedata
 
 from ham.agents.directory import agent_label, herdr_executable, run_bounded_command
 from ham.ledger.store import LedgerError, LedgerStore, save_receipt
+
+
+def sanitize_status_text(value: Any, limit: int) -> str:
+    """Keep ordinary Unicode while excluding terminal and bidi controls."""
+    text = str(value or "")
+    # Preserve separation at line/tab boundaries instead of joining words.
+    text = "".join(" " if character.isspace() else character
+                   for character in text
+                   if character.isspace() or unicodedata.category(character) not in {"Cc", "Cf"})
+    return " ".join(text.split())[:limit].rstrip()
+
+
+def sanitize_agent_status(agent: Mapping[str, Any]) -> dict[str, Any]:
+    return {**agent, "phase": sanitize_status_text(agent.get("phase"), 64),
+            "summary": sanitize_status_text(agent.get("summary"), 200)}
 
 
 def normalize_origin(origin: str) -> str:
@@ -454,6 +470,8 @@ class AgentRegistry:
         # Field is selected by internal code, never interpolated from external input.
         if field not in {"turn_state", "phase", "summary"}:
             raise LedgerError("invalid_status_field", "Unknown agent status field.")
+        if field in {"phase", "summary"}:
+            value = sanitize_status_text(value, 64 if field == "phase" else 200)
         old = connection.execute(f"SELECT {field} FROM agent_status WHERE agent_id=?", (agent_id,)).fetchone()
         if old is not None and old[0] != value:
             connection.execute(f"UPDATE agent_status SET {field}=?,updated_at=? WHERE agent_id=?", (value, at, agent_id))
@@ -471,9 +489,9 @@ class AgentRegistry:
                 parameters = (repo_id,)
             from ham.ledger.settings import RepoSettings
             settings = RepoSettings(self.store)
-            return [{**dict(row), "role": settings.role(row, connection=connection),
+            return [sanitize_agent_status({**dict(row), "role": settings.role(row, connection=connection),
                      "role_workspace_id": settings.scope_workspace(
-                         connection, row["repo_id"], row["host"], row["workspace_id"])}
+                         connection, row["repo_id"], row["host"], row["workspace_id"])})
                     for row in connection.execute(query + " ORDER BY a.host,a.alias,a.terminal_id", parameters)]
 
     def resolve_context(self, environment: Mapping[str, str] | None = None,
@@ -481,17 +499,20 @@ class AgentRegistry:
         values = os.environ if environment is None else environment
         terminal = values.get("HERDR_TERMINAL_ID")
         inherited_pane = values.get("HERDR_PANE_ID", '')
-        if not terminal:
-            if snapshot is None:
-                snapshot = live_snapshot(environment)
+        if snapshot is None:
+            snapshot = live_snapshot(environment)
+        ancestors = process_ancestors()
+        if terminal:
+            claimed = next((raw for raw in snapshot["panes"] if raw["terminal_id"] == terminal), None)
+            if claimed is None or pane_shell_pid(claimed["pane_id"], environment) not in ancestors:
+                raise LedgerError("sender_unresolved", "The claimed terminal is not an ancestor of this process.")
+        else:
             with self.store.read() as connection:
                 cached = {row[0] for row in connection.execute(
                     "SELECT terminal_id FROM pane_bindings WHERE host=? AND pane_id=?",
                     (self.store.host, inherited_pane))}
-            # Old pane bindings only prioritize probes. They never prove that a
-            # piped tool subprocess belongs to that terminal after a pane move.
+            # Cached bindings prioritize probes but cannot establish identity.
             panes = sorted(snapshot["panes"], key=lambda raw: raw["terminal_id"] not in cached)
-            ancestors = process_ancestors()
             for raw in panes:
                 if pane_shell_pid(raw["pane_id"], environment) in ancestors:
                     terminal = raw["terminal_id"]
@@ -561,6 +582,8 @@ class AgentRegistry:
                    feature_invoked: bool = False,
                    environment: Mapping[str, str] | None = None) -> dict[str, Any]:
         """Publish committed status; explicit feature use also refreshes unchanged values."""
+        phase = sanitize_status_text(phase, 64)
+        summary = sanitize_status_text(summary, 200)
         with self.store.transaction() as connection:
             current = check_generation(
                 connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])

@@ -39,15 +39,15 @@ class RenderBundleTest(unittest.TestCase):
     def test_compact_prefix_and_exact_short_bundle_hashes(self):
         self.assertEqual(render_bundle([], self.marker), self.prefix)
         self.assertEqual(len(self.prefix.encode()), 415)
-        fixtures = ((1, 542, '28f7a435ce52318085a875cef5a4807bbe12debda90e3aadebd9d872ba2c767f'),
-                    (3, 796, 'd728b3d5e9685db64b7fd445fc174d949de13c4ded53c85584d7f02baab7cfa8'))
+        fixtures = ((1, 624, '3136f86459a2afc9c5bbd7a3006f077dccb5f3fe97a7128661a0808727d01e66'),
+                    (3, 1042, '4805267bcc0e93341876e4e74b975d4a58f4755861ec681eabc9155758b9dbfd'))
         for count, size, digest in fixtures:
             with self.subTest(count=count):
                 messages = self.messages(count)
                 content = render_bundle(messages, self.marker)
                 expected = self.prefix + ''.join(
-                    '\n--- ' + message['message_id'] + ' ---\nFrom winmini/main [action]\n'
-                    'Thread ' + message['thread_id'] + ' / hop 0\nOK' for message in messages)
+                    '\n--- ' + message['message_id'] + ' ' + self.marker + ' ---\nFrom winmini/main [action]\n'
+                    'Thread ' + message['thread_id'] + ' / hop 0\n> OK' for message in messages)
                 self.assertEqual(content, expected)
                 self.assertEqual(len(content.encode()), size)
                 self.assertEqual(hashlib.sha256(content.encode()).hexdigest(), digest)
@@ -68,9 +68,9 @@ class RenderBundleTest(unittest.TestCase):
                    'recipient_repo_id': 'git:example.test/team/dxp-api'}
         content = render_bundle([message], self.marker)
         self.assertIn('From macbook/purple-deer (repo monitor_mobile) [action]\n', content)
-        self.assertEqual(len(content.encode()), 571)
+        self.assertEqual(len(content.encode()), 653)
         self.assertEqual(hashlib.sha256(content.encode()).hexdigest(),
-                         '70fe42f6ea41d343ae542adc72fbbbc4ba3c4f70d5fc36f88a25504e9ee92464')
+                         '95f974e110dfe7b87430330423a76795a446e0567792ab0f4cd170c79e03c349')
         same_repo = {**message, 'sender_repo_id': message['recipient_repo_id']}
         same_content = render_bundle([same_repo], self.marker)
         self.assertNotIn('(repo ', same_content)
@@ -93,11 +93,11 @@ class RenderBundleTest(unittest.TestCase):
 
     def test_original_caps_and_truncation_budget_follow_actual_prefix_bytes(self):
         self.assertEqual((MESSAGE_BYTES, BUNDLE_BYTES, BUNDLE_MESSAGES), (2048, 8192, 8))
-        for count, expected_size in ((1, 2048), (BUNDLE_MESSAGES, 6777)):
+        for count, expected_size in ((1, 2048), (BUNDLE_MESSAGES, 6137)):
             with self.subTest(count=count):
                 messages = self.messages(count, 'x' * 10000)
                 content = render_bundle(messages, self.marker)
-                headers = ['\n--- ' + message['message_id'] + ' ---\nFrom winmini/main [action]\n'
+                headers = ['\n--- ' + message['message_id'] + ' ' + self.marker + ' ---\nFrom winmini/main [action]\n'
                            'Thread ' + message['thread_id'] + ' / hop 0\n' for message in messages]
                 available = BUNDLE_BYTES - len(self.prefix.encode()) - sum(len(h.encode()) for h in headers)
                 self.assertEqual(min(available, MESSAGE_BYTES * count), expected_size)
@@ -238,18 +238,20 @@ class NativeReceiverTest(unittest.TestCase):
 
     def test_accepted_settings_ring_repo_consumers_but_duplicate_stale_and_legacy_do_not(self):
         self.add_bell_peers(shared_repo=True)
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO peers VALUES (?,?,?,?)", ('beta', str(uuid.uuid4()), 'beta', '/peer'))
         for field, value in (
                 ('mode', 'off'),
-                ('thresholds', {**self.thresholds, 'idle_minutes':9, 'max_hop':2})):
+                ('thresholds', {**self.thresholds, 'idle_minutes':9, 'coalesce_seconds':60, 'max_hop':2})):
             with self.subTest(field=field):
                 incoming = {'repo_id':self.recipient['repo_id'], 'field':field, 'value':value,
-                            'version':100, 'origin_host':'beta', 'changed_by':'user', 'changed_at':time.time()}
+                            'version':10, 'origin_host':'beta', 'changed_by':'user', 'changed_at':time.time()}
                 self.reset_terminal_bells()
                 self.assertTrue(self.settings.accept(incoming, 'beta')['applied'])
                 self.assert_terminal_bells(('term-a', 'term-b', 'term-c', 'term-d'))
                 inspected = self.receiver.inspect(**self.identity)
                 self.assertEqual(inspected[field], value)
-                for ignored in (incoming, {**incoming, 'version':99}):
+                for ignored in (incoming, {**incoming, 'version':9}):
                     self.reset_terminal_bells()
                     self.assertFalse(self.settings.accept(ignored, 'beta')['applied'])
                     self.assert_terminal_bells(())
@@ -535,7 +537,7 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertTrue(any(message['kind']=='action' for message in claim['messages']))
         self.assertEqual(sum(state=='queued' for state in self.states().values()),98)
     def represented_ids(self,content):
-        return set(re.findall(r'^--- ([0-9a-f-]{36}) ---$',content,flags=re.M))
+        return set(re.findall(r'^--- ([0-9a-f-]{36}) HAM_CLAIM_[0-9a-f-]+_[0-9a-f]+ ---$',content,flags=re.M))
 
     def test_acknowledged_ids_exactly_equal_represented_ids_when_budget_cannot_hold_all(self):
         sent = [self.send(kind='action' if index==7 else 'fyi',body='한글🙂'*900) for index in range(8)]
@@ -562,7 +564,7 @@ class NativeReceiverTest(unittest.TestCase):
     def test_budget_for_only_the_action_leaves_every_earlier_fyi_queued(self):
         fyis = [self.send(body='older '+str(index)) for index in range(3)]
         action = self.send(kind='action',body='action 한글'*200)
-        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 345
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 425
         with mock.patch('ham.ledger.runtime.BUNDLE_BYTES', budget):
             claim = self.claim(wake=True)
         self.assertEqual([message['message_id'] for message in claim['messages']],[action['message_id']])
@@ -834,7 +836,7 @@ class NativeReceiverTest(unittest.TestCase):
         self.set_turn_state('working')
         flagged = self.send(body='Turn-end context 한글'*200)
         self.set_turn_state('done')
-        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 345
+        budget = len(render_bundle([], RenderBundleTest.marker).encode()) + 425
         with mock.patch('ham.ledger.runtime.BUNDLE_BYTES', budget):
             claim = self.claim(wake=True)
         self.assertEqual([message['message_id'] for message in claim['messages']], [flagged['message_id']])

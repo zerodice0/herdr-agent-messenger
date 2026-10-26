@@ -108,6 +108,8 @@ class NewRepoDefaultsTest(unittest.TestCase):
                 store = LedgerStore(self.root / f"existing-{index}", canonical_name="alpha")
                 settings = RepoSettings(store)
                 with store.transaction() as connection:
+                    connection.execute("INSERT INTO peers VALUES (?,?,?,?)",
+                                       ("beta", str(uuid.uuid4()), "b", "/peer"))
                     settings._apply(connection, {"repo_id": self.repo_id, "field": field, "value": value,
                                                  "version": 1, "origin_host": "beta",
                                                  "changed_by": "user", "changed_at": 1.0})
@@ -817,8 +819,11 @@ class LedgerCoreTest(unittest.TestCase):
     def test_terminal_move_keeps_slot_and_generation(self):
         self.send()
         old = self.recipient
-        self.registry.reconcile(snapshot(self.repo, moved=True))
-        moved = self.registry.resolve_context({"HERDR_TERMINAL_ID": "term-b"})
+        live = snapshot(self.repo, moved=True)
+        self.registry.reconcile(live)
+        with patch("ham.ledger.status.process_ancestors", return_value={10}), \
+                patch("ham.ledger.status.pane_shell_pid", return_value=10):
+            moved = self.registry.resolve_context({"HERDR_TERMINAL_ID": "term-b"}, live)
         self.assertEqual((moved["terminal_id"], moved["agent_id"], moved["generation"]),
                          (old["terminal_id"], old["agent_id"], old["generation"]))
         self.assertEqual(moved["pane_id"], "w2:p9")

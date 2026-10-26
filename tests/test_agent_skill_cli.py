@@ -74,6 +74,10 @@ class IsolatedLegacyCliTest(ham_test_support.IsolatedLedgerTest):
         environment_patch = mock.patch.dict(os.environ, self.environment)
         environment_patch.start()
         self.addCleanup(environment_patch.stop)
+        for target, value in (("process_ancestors", {10}), ("pane_shell_pid", 10)):
+            patch = mock.patch("ham.ledger.status." + target, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
         store = LedgerStore(environment=self.environment, canonical_name="legacy-cli-test")
         repo_id = agent_skill_cli.repository_identity(agent().cwd, store.host)["repo_id"]
         with store.transaction() as connection:

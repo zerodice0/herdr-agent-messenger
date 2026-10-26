@@ -6,9 +6,11 @@ independent authorization system. No SQLite or AGENTS replication occurs.
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import time
 from typing import Any, Mapping
@@ -23,6 +25,15 @@ from ham.ledger.store import (FINAL_STATES, STATE_RANK, LedgerError, LedgerStore
 PROTOCOL = 1
 TRANSIENT_CODES = frozenset({"transport_unavailable", "host_unavailable", "ledger_unavailable", "busy"})
 WIRE_COMMANDS = frozenset({"accept", "receipt", "setting", "withdraw"})
+# Explicit protocol-1 union of routing, collaboration preflight, and Mailbox
+# consumers. session_ref is required by old/current exact-session safety checks.
+STATUS_AGENT_FIELDS = (
+    "agent_id", "host", "terminal_id", "workspace_id", "pane_id", "session_ref",
+    "generation", "client", "repo_id", "is_main_checkout", "alias", "active",
+    "extension_present", "last_ham_label", "first_seen", "last_seen",
+    "turn_state", "phase", "summary", "status_updated_at", "role", "role_workspace_id",
+)
+STATUS_DEVICE_FIELDS = ("kind", "label", "device_id", "claimed_at", "attached")
 
 
 class SSHTransport:
@@ -30,10 +41,15 @@ class SSHTransport:
         self.store = store
         self.environment = environment
 
-    def _run(self, command: list[str], data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _run(self, command: list[str], data: Mapping[str, Any] | None = None, *,
+             timeout: float = 20) -> dict[str, Any]:
+        values = os.environ if self.environment is None else self.environment
+        executable = shutil.which(command[0], path=values.get("PATH", os.defpath))
+        if executable is None or not os.path.isabs(executable):
+            raise LedgerError("transport_unavailable", "SSH executable is unavailable in the configured absolute PATH.")
         try:
-            result = subprocess.run(command, input=None if data is None else json_text(data),
-                                    capture_output=True, text=True, timeout=20, check=False)
+            result = subprocess.run([executable, *command[1:]], input=None if data is None else json_text(data),
+                                    capture_output=True, text=True, timeout=timeout, check=False, env=values)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise LedgerError("transport_unavailable", str(error)) from None
         try:
@@ -87,7 +103,7 @@ class SSHTransport:
         return {**peer, "canonical_name": identity["canonical_name"], "uuid": identity["uuid"]}
 
     def _invoke(self, peer: Mapping[str, Any], command: str,
-                data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                data: Mapping[str, Any] | None = None, *, timeout: float = 20) -> dict[str, Any]:
         self._allowed(peer["ssh_alias"])
         arguments = ["env"]
         if peer.get("remote_ledger_dir"):
@@ -102,13 +118,13 @@ class SSHTransport:
             arguments.append("--wire")
         return self._run(ssh_program_command(peer["ssh_alias"], arguments,
                                             config_path=ssh_config_path(self.environment),
-                                            cwd=peer["remote_ham_root"]), data)
+                                            cwd=peer["remote_ham_root"]), data, timeout=timeout)
 
     def call(self, peer: Mapping[str, Any], command: str,
-             payload: Mapping[str, Any]) -> dict[str, Any]:
+             payload: Mapping[str, Any], *, timeout: float = 20) -> dict[str, Any]:
         envelope = {"protocol": PROTOCOL, "transport_host": self.store.host,
                     "transport_uuid": self.store.host_uuid, "payload": payload}
-        result = self._invoke(peer, command, envelope)
+        result = self._invoke(peer, command, envelope, timeout=timeout)
         if result.get("protocol") != PROTOCOL:
             raise LedgerError("unsupported_protocol", "Remote endpoint did not return mailbox protocol 1.")
         return result
@@ -171,12 +187,22 @@ class RemoteLedger:
                 "transport_uuid": self.store.host_uuid, "payload": dict(payload)}
 
     def authenticate(self, envelope: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-        if set(envelope) != {"protocol", "transport_host", "transport_uuid", "payload"} or envelope["protocol"] != PROTOCOL:
+        if (not isinstance(envelope, Mapping) or
+                set(envelope) != {"protocol", "transport_host", "transport_uuid", "payload"} or
+                type(envelope["protocol"]) is not int or envelope["protocol"] != PROTOCOL):
             raise LedgerError("unsupported_protocol", "Expected a protocol 1 transport envelope.")
+        if (not isinstance(envelope["transport_host"], str) or not envelope["transport_host"] or
+                not isinstance(envelope["transport_uuid"], str)):
+            raise LedgerError("peer_identity_conflict", "Transport identity must name a registered peer.")
         with self.store.read() as connection:
-            peer = connection.execute("SELECT uuid FROM peers WHERE canonical_name=?", (envelope["transport_host"],)).fetchone()
-        if peer is None or peer[0] != envelope["transport_uuid"]:
+            peer = connection.execute("SELECT uuid,ssh_alias FROM peers WHERE canonical_name=?",
+                                      (envelope["transport_host"],)).fetchone()
+        if peer is None or peer["uuid"] != envelope["transport_uuid"]:
             raise LedgerError("peer_identity_conflict", "Transport canonical name/UUID does not match a registered peer.")
+        # This is still an asserted identity, not proof of the caller's SSH key.
+        # Revoking an alias in the SSH allowlist must also revoke inbound claims.
+        if peer["ssh_alias"] not in ssh_hosts(self.environment):
+            raise LedgerError("host_not_configured", "Transport peer is no longer in HAM's SSH allowlist.")
         if not isinstance(envelope["payload"], dict):
             raise LedgerError("invalid_request", "Wire payload must be a JSON object.")
         return envelope["transport_host"], envelope["payload"]
@@ -193,13 +219,13 @@ class RemoteLedger:
         elif command == "withdraw":
             result = self.accept_withdraw(payload, source)
         elif command == "status-export":
-            result = self.status_export(payload.get("repo_id"), resources=payload.get("resources") is True)
+            result = self.status_export(payload.get("repo_id"), resources=payload.get("resources") is True, wire=True)
         else:
             raise LedgerError("invalid_command", "Unsupported wire command.")
         return {"protocol": PROTOCOL, **result}
 
     def status_export(self, repo_id: str | None = None, *, resources: bool = False,
-                      resource_scanner: Any = None) -> dict[str, Any]:
+                      resource_scanner: Any = None, wire: bool = False) -> dict[str, Any]:
         all_agents = AgentRegistry(self.store).list()
         agents = [agent for agent in all_agents if repo_id is None or agent["repo_id"] == repo_id]
         from ham.ledger.devices import device_rows
@@ -214,15 +240,18 @@ class RemoteLedger:
         with self.store.read() as connection:
             claims = device_rows(connection)
             workspaces = [dict(row) for row in connection.execute(
-                "SELECT * FROM workspaces WHERE host=? ORDER BY workspace_id", (self.store.host,))]
+                "SELECT host,workspace_id,label FROM workspaces WHERE host=? ORDER BY workspace_id",
+                (self.store.host,))]
             counts = {(row["recipient_host"], row["recipient_terminal_id"], row["recipient_repo_id"]): row["unread"]
                       for row in connection.execute(
                           "SELECT recipient_host,recipient_terminal_id,recipient_repo_id,count(*) AS unread "
                           "FROM deliveries WHERE state IN ('queued','delivering') "
                           "GROUP BY recipient_host,recipient_terminal_id,recipient_repo_id")}
-        exported = [{**agent,
+        exported = [{**{key: agent[key] for key in STATUS_AGENT_FIELDS
+                       if key in agent and (not wire or key != "last_ham_label")},
                      "unread": counts.get((agent["host"], agent["terminal_id"], agent["repo_id"]), 0),
-                     "devices": [row for row in claims if not row["stale"]
+                     "devices": [{key: row[key] for key in STATUS_DEVICE_FIELDS if key in row}
+                                 for row in claims if not row["stale"]
                                  and row["holder"]["agent_id"] == agent["agent_id"]],
                      **({"servers": servers.get(agent["agent_id"], [])} if resources else {})}
                     for agent in agents]
@@ -246,6 +275,8 @@ class RemoteLedger:
         result = self.transport.call(peer, "status-export", payload)
         if result.get("host") != {"canonical_name": peer["canonical_name"], "uuid": peer["uuid"]}:
             raise LedgerError("peer_identity_conflict", "Live status endpoint identity has changed.")
+        from ham.ledger.status import sanitize_agent_status
+        result["agents"] = [sanitize_agent_status(agent) for agent in result.get("agents", [])]
         return result
 
     def resolve_recipient(self, address: str, sender: Mapping[str, Any]) -> dict[str, Any]:
@@ -330,6 +361,9 @@ class RemoteLedger:
         if set(payload) != {"message", "resolved"} or not isinstance(payload["message"], dict):
             raise LedgerError("invalid_message", "Accept requires immutable message and a routing resolution.")
         value = validate_payload(payload["message"])
+        # Validate normalized presentation before entering a bell-producing
+        # transaction, but preserve original wire bytes for protocol-1 receipts.
+        validate_payload(value, peer=True)
         if value["recipient_terminal_id"] is None and value["recipient_address"] == "main":
             raise LedgerError("legacy_symbolic_main",
                               "Legacy symbolic --to main is unsupported; upgrade every host before using --to main across hosts.")
@@ -343,8 +377,10 @@ class RemoteLedger:
             raise LedgerError("wrong_host", "An accept endpoint cannot forward an arbitrary concrete host.")
         if resolved != {key: value[key] for key in route_fields}:
             raise LedgerError("invalid_recipient", "Concrete routing cannot alter the immutable message recipient.")
-        if source != value["origin_host"]:
-            raise LedgerError("wrong_origin", "Only the message origin can transport this message.")
+        configured = {peer["canonical_name"] for peer in self.peers()
+                      if peer["ssh_alias"] in ssh_hosts(self.environment)}
+        if source not in configured or value["origin_host"] not in configured:
+            raise LedgerError("wrong_origin", "Mail requires a configured source and a configured remote origin.")
         with self.store.transaction((resolved["recipient_terminal_id"],)) as connection:
             return self.submit(connection, value, upstream=source, resolved=resolved)
 
@@ -488,44 +524,88 @@ class RemoteLedger:
             connection.execute("UPDATE outbox SET state='pending',next_try_at=0,last_error=NULL WHERE item_id=?", (item_id,))
         return {"item_id": item_id, "state": "pending"}
 
-    def pump(self, *, now: float | None = None, limit: int = 100) -> dict[str, int]:
-        """One finite FIFO pass. Worker flock is the only transport execution lock."""
+    def pending_backlog(self, *, now: float | None = None) -> dict[str, dict[str, int]]:
+        from ham.ledger.store import pending_outbox_backlog
+        with self.store.read() as connection:
+            return pending_outbox_backlog(connection, now=now)
+
+    def pump(self, *, now: float | None = None, limit: int = 100,
+             budget_seconds: float = 3) -> dict[str, int]:
+        """Bounded concurrent transport, with one in-flight FIFO head per peer.
+
+        Only this flock-owning caller changes SQLite. Timed-out calls may have
+        reached a peer; retry uses the same immutable identity, never a new mail.
+        """
         at = time.time() if now is None else now
-        sent = failed = deferred = 0
+        deadline = time.monotonic() + max(0, budget_seconds)
+        totals = {"sent": 0, "failed": 0, "deferred": 0}
         blocked: set[str] = set()
-        for _ in range(limit):
-            with self.store.read() as connection:
-                rows = connection.execute("SELECT o.* FROM outbox o WHERE o.state='pending' AND NOT EXISTS "
-                                          "(SELECT 1 FROM outbox earlier WHERE earlier.target_host=o.target_host AND "
-                                          "earlier.state='pending' AND earlier.peer_seq<o.peer_seq) ORDER BY o.target_host").fetchall()
-            candidates = [row for row in rows if row["target_host"] not in blocked and row["next_try_at"] <= at]
-            if not candidates:
-                break
-            for item in candidates:
-                with self.store.transaction() as connection:
-                    attempted = connection.execute("UPDATE outbox SET attempts=attempts+1 WHERE item_id=? AND state='pending'",
-                                                   (item["item_id"],)).rowcount
-                if not attempted:
-                    continue
-                try:
-                    peer = self.peer(item["target_host"])
-                    command = {"message": "accept", "receipt": "receipt", "setting": "setting", "withdraw": "withdraw"}[item["kind"]]
-                    payload = json.loads(item["payload"])
-                    response = self.transport.call(peer, command, payload)
+        attempted_count = 0
+        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ham-outbox")
+
+        def transmit(item: Any) -> dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LedgerError("transport_unavailable", "Outbox sweep deadline reached.")
+            peer = self.peer(item["target_host"])
+            command = {"message": "accept", "receipt": "receipt", "setting": "setting", "withdraw": "withdraw"}[item["kind"]]
+            payload = json.loads(item["payload"])
+            if isinstance(self.transport, SSHTransport):
+                return self.transport.call(peer, command, payload, timeout=remaining)
+            return self.transport.call(peer, command, payload)
+
+        def defer_or_fail(item: Any, error: LedgerError) -> None:
+            transient = error.code in TRANSIENT_CODES
+            with self.store.transaction() as connection:
+                connection.execute("UPDATE outbox SET state=?,last_error=?,next_try_at=? WHERE item_id=? AND state='pending'",
+                                   ("pending" if transient else "failed",
+                                    json_text({"code": error.code, "message": error.message}),
+                                    at + min(300, 2 ** min(item["attempts"] + 1, 9)), item["item_id"]))
+            if transient:
+                blocked.add(item["target_host"])
+                totals["deferred"] += 1
+            else:
+                totals["failed"] += 1
+
+        try:
+            while attempted_count < limit and time.monotonic() < deadline:
+                with self.store.read() as connection:
+                    rows = connection.execute("SELECT o.* FROM outbox o WHERE o.state='pending' AND NOT EXISTS "
+                                              "(SELECT 1 FROM outbox earlier WHERE earlier.target_host=o.target_host AND "
+                                              "earlier.state='pending' AND earlier.peer_seq<o.peer_seq) ORDER BY o.target_host").fetchall()
+                candidates = [row for row in rows if row["target_host"] not in blocked and row["next_try_at"] <= at]
+                if not candidates:
+                    break
+                pending = {}
+                for item in candidates[:limit - attempted_count]:
                     with self.store.transaction() as connection:
-                        if item["kind"] in {"message", "withdraw"}:
-                            self.apply_receipt(connection, response, item["target_host"])
-                        connection.execute("UPDATE outbox SET state='sent',last_error=NULL WHERE item_id=?", (item["item_id"],))
-                    sent += 1
-                except LedgerError as error:
-                    transient = error.code in TRANSIENT_CODES
-                    with self.store.transaction() as connection:
-                        connection.execute("UPDATE outbox SET state=?,last_error=?,next_try_at=? WHERE item_id=?",
-                                           ("pending" if transient else "failed", json_text({"code": error.code, "message": error.message}),
-                                            at + min(300, 2 ** min(item["attempts"] + 1, 9)), item["item_id"]))
-                    if transient:
-                        blocked.add(item["target_host"])
-                        deferred += 1
-                    else:
-                        failed += 1
-        return {"sent": sent, "failed": failed, "deferred": deferred}
+                        attempted = connection.execute("UPDATE outbox SET attempts=attempts+1 WHERE item_id=? AND state='pending'",
+                                                       (item["item_id"],)).rowcount
+                    if attempted:
+                        attempted_count += 1
+                        pending[executor.submit(transmit, item)] = item
+                while pending:
+                    completed, _ = wait(pending, timeout=max(0, deadline - time.monotonic()),
+                                        return_when=FIRST_COMPLETED)
+                    if not completed:
+                        for future, item in pending.items():
+                            future.cancel()
+                            defer_or_fail(item, LedgerError("transport_unavailable", "Outbox sweep deadline reached."))
+                        break
+                    for future in completed:
+                        item = pending.pop(future)
+                        try:
+                            response = future.result()
+                            with self.store.transaction() as connection:
+                                if item["kind"] in {"message", "withdraw"}:
+                                    self.apply_receipt(connection, response, item["target_host"])
+                                connection.execute("UPDATE outbox SET state='sent',last_error=NULL WHERE item_id=? AND state='pending'",
+                                                   (item["item_id"],))
+                            totals["sent"] += 1
+                        except LedgerError as error:
+                            defer_or_fail(item, error)
+        finally:
+            # Real SSH calls carry the same deadline. A custom transport's late
+            # completion cannot change state or postpone local maintenance.
+            executor.shutdown(wait=False, cancel_futures=True)
+        return totals

@@ -270,7 +270,7 @@ class StatusBoardTest(unittest.TestCase):
         self.assertFalse(beta["stale"])
         self.assertIsNone(beta["error"])
         self.assertEqual(beta["agents"][0]["summary"], "Stored summary beta")
-        self.assertEqual(self.transport.calls, [
+        self.assertCountEqual(self.transport.calls, [
             ("beta", "status-export", {"repo_id": REPO, "refresh": False, "resources": True}),
             ("gamma", "status-export", {"repo_id": REPO, "refresh": False, "resources": True}),
         ])

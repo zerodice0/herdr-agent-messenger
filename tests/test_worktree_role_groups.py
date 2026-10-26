@@ -483,11 +483,12 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         self.assertEqual({row["role_workspace_id"] for row in exported["agents"]}, {"anchor"})
         self.assertEqual({row["role"] for row in exported["agents"]}, {"worker"})
         anchor = next(row for row in exported["workspaces"] if row["workspace_id"] == "anchor")
-        self.assertEqual(anchor, {"host": "alpha", "workspace_id": "anchor", "repo_key": self.repo_key,
-                                  "is_linked_worktree": 0, "label": "label-anchor"})
+        self.assertEqual(anchor, {"host": "alpha", "workspace_id": "anchor", "label": "label-anchor"})
         board = status_board(self.store, host="local", resource_scanner=lambda: {
             "listeners": [], "serve": [], "error": None})
-        self.assertEqual(board["workspaces"], exported["workspaces"])
+        self.assertEqual(
+            [{key: row[key] for key in ("host", "workspace_id", "label")} for row in board["workspaces"]],
+            exported["workspaces"])
         self.assertEqual({row["role_workspace_id"] for row in board["agents"]}, {"anchor"})
         with self.store.read() as connection:
             self.assertEqual(list(connection.iterdump()), before)

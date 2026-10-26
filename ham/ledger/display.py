@@ -11,7 +11,7 @@ from typing import Any
 
 from ham.agents.directory import herdr_executable, run_bounded_command
 from ham.ledger.settings import RepoSettings
-from ham.ledger.status import AgentRegistry
+from ham.ledger.status import AgentRegistry, sanitize_status_text
 from ham.ledger.store import LedgerError, LedgerStore
 
 SOURCE = "herdr.agent-messenger"
@@ -48,6 +48,8 @@ def build_display(agent: str, alias: str, marker: str = "", color: str = "", *,
                   role: str | None = None, phase: str = "", summary: str = "",
                   phone: str | None = None, emu: str | None = None) -> DisplayProjection:
     """Keep Agents addressable by suffix and put border identity before status."""
+    phase = sanitize_status_text(phase, 64)
+    summary = sanitize_status_text(summary, 200)
     role_label = {"main": "[메인]", "worker": "[워커]"}.get(role, "")
     display = " ".join(part for part in (marker, role_label, alias) if part)
     content = " · ".join(part for part in (alias, summary) if part)

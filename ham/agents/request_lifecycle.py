@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -174,7 +175,7 @@ class JsonRequestStateStore:
         return payload
 
     @contextmanager
-    def lock(self, request_id: str) -> Iterator[None]:
+    def lock(self, request_id: str, *, blocking: bool = True) -> Iterator[None]:
         self._validate_request_id(request_id)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(
@@ -182,7 +183,7 @@ class JsonRequestStateStore:
         )
         try:
             os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             yield
         finally:
             os.close(descriptor)
@@ -219,6 +220,46 @@ def open_request_store(
     environment: Mapping[str, str] | None = None,
 ) -> JsonRequestStateStore:
     return JsonRequestStateStore(request_state_directory(environment))
+
+
+def prune_request_records(
+    environment: Mapping[str, str] | None = None, *, now: float | None = None,
+) -> int:
+    """Remove only explicitly terminal records untouched for more than 30 days.
+
+    File mtime works for existing records, which have no consistent timestamp
+    field. Keep unknown/corrupt records and never wait on a live request lock.
+    Lock files stay in place: unlinking a lock can split concurrent writers.
+    """
+    store = open_request_store(environment)
+    cutoff = (time.time() if now is None else now) - 30 * 86400
+    removed = 0
+    for request_id in store.list_request_ids():
+        path = store._path(request_id)
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_mtime >= cutoff:
+                continue
+            with store.lock(request_id, blocking=False):
+                record = store.load(request_id)
+                if (not record or record.get("terminal") is not True or
+                        record.get("state") not in (
+                            RequestState.SUBMISSION_FAILED.value,
+                            RequestState.SUBMITTED_SETTLED.value,
+                            RequestState.SUBMITTED_UNKNOWN.value,
+                        )):
+                    continue
+                # A refresh may have replaced the file since our age check.
+                after = path.lstat()
+                if ((after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size) !=
+                        (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size)):
+                    continue
+                path.unlink()
+                removed += 1
+        except (OSError, ValueError):
+            # One corrupt/unavailable record must not prevent other pruning.
+            continue
+    return removed
 
 
 def _is_deferred(record: Mapping[str, Any]) -> bool:

@@ -79,6 +79,9 @@ class ReadCliTest(unittest.TestCase):
         herdr = self.root / "bin/herdr"
         herdr.write_text("#!" + sys.executable + "\nimport json,sys\n"
                          + "with open(" + repr(str(self.herdr_calls)) + ",'a') as stream: stream.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                         + "if sys.argv[1:3] == ['pane','process-info']:\n"
+                         + " print(json.dumps({'result':{'process_info':{'pane_id':sys.argv[-1],'shell_pid':"
+                         + str(os.getpid()) + "}}}));sys.exit(0)\n"
                          + "if sys.argv[1:] != ['api','snapshot']: sys.exit(71)\n"
                          + "print(open(" + repr(str(self.snapshot_path)) + ").read())\n")
         herdr.chmod(0o700)
@@ -95,6 +98,10 @@ class ReadCliTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("UPDATE agent_status SET phase='review',summary='Read-only summary',updated_at=125.0 WHERE agent_id=?",
                                (self.sender["agent_id"],))
+        for target, value in (("process_ancestors", {10}), ("pane_shell_pid", 10)):
+            patch = mock.patch("ham.ledger.status." + target, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def cli(self, *arguments, stdin=None, environment=None):
         completed = subprocess.run([sys.executable, "-m", "ham", "cli", *arguments], cwd=ROOT,

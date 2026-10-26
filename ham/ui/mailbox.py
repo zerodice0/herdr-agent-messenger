@@ -11,13 +11,17 @@ import argparse
 from contextlib import redirect_stdout
 import curses
 import fcntl
+import hashlib
+import hmac
 import json
 import locale
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +35,7 @@ from ham.ui import messenger as agent_messenger
 from ham.ui.messenger import focused_pane_id, terminal_flow_control_disabled
 from ham.ui import key_input as key_input
 from ham.ledger.runtime import NativeReceiver
-from ham.ledger.mail import Mailbox
+from ham.ledger.mail import Mailbox, sender_address
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import repository_identity
@@ -541,6 +545,50 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
     raise LedgerError("invalid_operation", "Unsupported mailbox UI operation.")
 
 
+JOB_AUTH_FD = "HERDR_HAM_JOB_AUTH_FD"
+JOB_AUTH_FILE = "HERDR_HAM_JOB_AUTH_FILE"
+
+
+def authorize_job(environment: Mapping[str, str]) -> None:
+    """Consume a parent's one-use capability, never a token exposed in argv/env.
+
+    This prevents accidental agent use of the operator entrypoint; it is not an
+    OS security boundary against arbitrary code running as the same Unix user.
+    """
+    denied = LedgerError("ui_job_unauthorized", "Mailbox jobs require a live TUI parent capability.")
+    try:
+        descriptor = int(environment.get(JOB_AUTH_FD, "-1"))
+        path = environment.get(JOB_AUTH_FILE, "")
+        if descriptor < 3 or not path:
+            raise denied
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r", encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                raise denied
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(stream.fileno()).st_nlink != 1:
+                raise denied
+            record = json.loads(stream.read(512))
+            if record.get("parent_pid") != os.getppid() or not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
+                raise denied
+            # Job writes before spawning: a missing writer must never block.
+            os.set_blocking(descriptor, False)
+            token = os.read(descriptor, 65)
+            if len(token) != 64 or not hmac.compare_digest(
+                    hashlib.sha256(token).hexdigest(), str(record.get("sha256") or "")):
+                raise denied
+            os.unlink(path)
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise denied from None
+    finally:
+        if "descriptor" in locals() and descriptor >= 3:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 class Job:
     """A bounded process keeps SSH/SQLite waits out of the curses input loop."""
     def __init__(self, request: Mapping[str, Any], environment: Mapping[str, str], *, timeout: float = JOB_TIMEOUT):
@@ -553,9 +601,28 @@ class Job:
         self.input = tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=ui_state_directory(environment))
         json.dump(request, self.input, ensure_ascii=False)
         self.input.seek(0)
-        self.process = subprocess.Popen([sys.executable, "-m", "ham", "mailbox", "job"],
-                                        cwd=PLUGIN_ROOT, env=dict(environment), stdin=self.input, stdout=self.output,
-                                        stderr=self.errors, text=True, start_new_session=True)
+        token = secrets.token_hex(32).encode("ascii")
+        read_fd, write_fd = os.pipe()
+        auth_fd, auth_path = tempfile.mkstemp(prefix="job-auth-", dir=ui_state_directory(environment))
+        self.auth_path = Path(auth_path)
+        try:
+            with os.fdopen(auth_fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump({"parent_pid": os.getpid(), "sha256": hashlib.sha256(token).hexdigest()}, stream)
+            os.write(write_fd, token)
+            values = {**environment, JOB_AUTH_FD: str(read_fd), JOB_AUTH_FILE: auth_path}
+            self.process = subprocess.Popen([sys.executable, "-m", "ham", "mailbox", "job"],
+                                            cwd=PLUGIN_ROOT, env=values, stdin=self.input, stdout=self.output,
+                                            stderr=self.errors, text=True, start_new_session=True,
+                                            pass_fds=(read_fd,))
+        except BaseException:
+            self.auth_path.unlink(missing_ok=True)
+            for stream in (self.input, self.output, self.errors):
+                stream.close()
+            raise
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
     def poll(self) -> tuple[bool, Any]:
         if self.process.poll() is None:
@@ -595,6 +662,8 @@ class Job:
         self.process.wait()
         for stream in (self.input, self.output, self.errors):
             stream.close()
+        if getattr(self, "auth_path", None) is not None:
+            self.auth_path.unlink(missing_ok=True)
 
 
 class SnapshotJob:
@@ -1256,15 +1325,18 @@ class MailboxApp:
             return
         latest = max(item["messages"], key=lambda message: (message.get("created_at", 0), message["message_id"]))
         agents = self.agents()
-        # Agent replies identify their sender by immutable agent ID; user-origin
-        # messages identify the other participant by the concrete recipient slot.
+        # Only locally originated human mail proves this operator's recipient
+        # choice. A remote human cannot be replied to as a local operator.
         participant = next((agent for agent in agents
                             if latest.get("sender") not in (None, "user") and
+                            agent.get("host") == latest.get("origin_host") and
                             agent.get("agent_id") == latest["sender"]), None)
         if participant is not None:
             identity = self.identity(participant)
         else:
-            user_messages = [message for message in item["messages"] if message.get("sender") in (None, "user")]
+            user_messages = [message for message in item["messages"]
+                             if message.get("sender") == "user" and
+                             message.get("origin_host") == self.store.host]
             other = max(user_messages, key=lambda message: (message.get("created_at", 0), message["message_id"])) if user_messages else None
             identity = ((other.get("recipient_host"), other.get("recipient_terminal_id")) if other else None)
         recipient = next((agent for agent in agents if self.identity(agent) == identity and not agent.get("stale")), None)
@@ -2635,7 +2707,9 @@ class MailboxApp:
         return f"{glyph} {kind}", "accent" if kind in {"message", "receipt", "setting", "withdraw"} else "muted"
 
     def message_sender(self, message: Mapping[str, Any]) -> str:
-        sender = str(message.get("sender_label") or "—")
+        sender = (sender_address(message) if message.get("sender") == "user" and
+                  message.get("origin_host") != self.store.host else
+                  str(message.get("sender_label") or "—"))
         repo = message.get("sender_repo_id") or message.get("repo_id")
         if self.repo_id is not None and repo and repo != self.repo_id:
             sender += f" (repo {truncate_display_text(Path(repo).name, 24)})"
@@ -3341,6 +3415,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                  "--env", f"{OPENER_PANE}={opener_id}",
                                  "--env", f"{OPENER_TERMINAL}={opener['terminal_id']}"]) else 1
         if arguments.command == "job":
+            authorize_job(values)
+            values.pop(JOB_AUTH_FD, None)
+            values.pop(JOB_AUTH_FILE, None)
             result = execute_job(json.load(sys.stdin), values)
             print(json.dumps(result, ensure_ascii=False))
             return 0

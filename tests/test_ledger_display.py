@@ -305,7 +305,7 @@ class LedgerDisplayTest(unittest.TestCase):
                 self.assertEqual(build_display("omp", alias, role=role, summary=summary).label, expected)
         summary = "아주 긴 작업 요약 " * 100
         self.assertEqual(build_display("omp", "orange-rabbit", role="main", summary=summary).label,
-                         f"[메인] orange-rabbit · {summary}")
+                         f"[메인] orange-rabbit · {summary.strip()[:200].rstrip()}")
 
     def test_preexisting_owned_role_summary_border_restores_alias(self):
         self.settings.mutate(self.repo_id, "mode", "auto")

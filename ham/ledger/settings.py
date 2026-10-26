@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -15,6 +17,9 @@ REPO_FIELDS = frozenset({"home", "mode", "thresholds"})
 WORKSPACE_FIELDS = frozenset({"main", "members"})
 LEGACY_FIELDS = WORKSPACE_FIELDS | {"computed_main"}
 FIELDS = REPO_FIELDS | LEGACY_FIELDS
+MAX_SETTING_VERSION = (1 << 53) - 1
+MAX_PEER_VERSION_STEP = 64
+LOGGER = logging.getLogger(__name__)
 
 
 def _target(value: Any) -> bool:
@@ -22,15 +27,19 @@ def _target(value: Any) -> bool:
                              and all(isinstance(v, str) and v for v in value.values()))
 
 
-def validate_setting(value: Mapping[str, Any]) -> dict[str, Any]:
+def validate_setting(value: Mapping[str, Any], *, allow_oversized_version: bool = False) -> dict[str, Any]:
     required = {"repo_id", "field", "value", "version", "origin_host", "changed_by", "changed_at"}
     if set(value) not in (required, required | {"expected_main"}) or value.get("field") not in FIELDS:
         raise LedgerError("invalid_setting", "Setting fields do not match protocol 1.")
     result = dict(value)
     if (not isinstance(result["repo_id"], str) or not result["repo_id"] or
-            not isinstance(result["origin_host"], str) or not result["origin_host"] or
-            not isinstance(result["version"], int) or isinstance(result["version"], bool) or result["version"] < 1):
-        raise LedgerError("invalid_setting", "Setting repository, origin and positive version are required.")
+            not isinstance(result["origin_host"], str) or
+            (result["origin_host"] != "!default" and
+             re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", result["origin_host"]) is None) or
+            not isinstance(result["version"], int) or isinstance(result["version"], bool) or
+            result["version"] < 1 or
+            (not allow_oversized_version and result["version"] > MAX_SETTING_VERSION)):
+        raise LedgerError("invalid_setting", "Setting repository, valid origin and bounded positive version are required.")
     field, data = result["field"], result["value"]
     valid = True
     if field == "home":
@@ -140,7 +149,11 @@ class RepoSettings:
 
     @staticmethod
     def _next_version(connection: Any, repo_id: str) -> int:
-        return connection.execute("SELECT coalesce(max(version),0)+1 FROM repo_settings WHERE repo_id=?", (repo_id,)).fetchone()[0]
+        current = connection.execute("SELECT coalesce(max(version),0) FROM repo_settings WHERE repo_id=?",
+                                     (repo_id,)).fetchone()[0]
+        if not isinstance(current, int) or current >= MAX_SETTING_VERSION:
+            raise LedgerError("setting_version_exhausted", "Repository setting version has reached its safe integer limit.")
+        return current + 1
 
     def _publish(self, connection: Any, value: Mapping[str, Any], *, exclude: str | None = None) -> None:
         if value["repo_id"].startswith("local:") or value["field"] not in REPO_FIELDS:
@@ -150,8 +163,37 @@ class RepoSettings:
                 queue_outbox(connection, peer[0], "setting", value)
 
     def _apply(self, connection: Any, value: Mapping[str, Any], *, source: str | None = None) -> bool:
-        incoming = validate_setting(value)
+        incoming = validate_setting(value, allow_oversized_version=source is not None)
         repo_id, field = incoming["repo_id"], incoming["field"]
+        if source is not None and field not in LEGACY_FIELDS:
+            peers = {row[0] for row in connection.execute("SELECT canonical_name FROM peers")}
+            origin = incoming["origin_host"]
+            seeded_default = (origin == "!default" and field == "mode" and incoming["value"] == "auto"
+                              and incoming["version"] == 1 and incoming["changed_by"] == "home")
+            if source not in peers or (origin == "!default" and not seeded_default):
+                raise LedgerError("wrong_origin", "Settings require a configured source and a valid origin host.")
+            if field == "thresholds":
+                limits = incoming["value"]
+                if (limits["idle_minutes"] < 1 or limits["coalesce_seconds"] < 1 or
+                        limits["wakes_per_hour"] > 60 or limits["max_hop"] > DEFAULT_THRESHOLDS["max_hop"]):
+                    raise LedgerError("unsafe_peer_thresholds", "Peer thresholds cannot disable wake and loop safeguards.")
+            ignored = None
+            if incoming["version"] > MAX_SETTING_VERSION:
+                ignored = "unsafe_version"
+            elif origin == self.store.host:
+                retained = self.fields(connection, repo_id).get(field)
+                if retained is None or any(retained[key] != incoming[key] for key in
+                                           ("version", "origin_host", "value", "changed_by", "changed_at")):
+                    ignored = "self_origin_mismatch"
+            if ignored is None:
+                current = connection.execute("SELECT coalesce(max(version),0) FROM repo_settings WHERE repo_id=?",
+                                             (repo_id,)).fetchone()[0]
+                if incoming["version"] > current + MAX_PEER_VERSION_STEP:
+                    ignored = "version_step"
+            if ignored is not None:
+                LOGGER.warning("Ignoring peer setting: reason=%s source=%s repo=%s field=%s",
+                               ignored, source, repo_id, field)
+                return False
         # Protocol-1 peers may still publish their old repository-wide roles.
         # Acknowledge without storing or forwarding them.
         if field in LEGACY_FIELDS:
@@ -224,7 +266,7 @@ class RepoSettings:
 
     def mutate(self, repo_id: str, field: str, value: Any, *, host: str | None = None,
                workspace_id: str | None = None) -> dict[str, Any]:
-        """Local user-TUI service. Intentionally not exposed by a mutation CLI."""
+        """Local user-TUI service, reached through an inherited one-use job capability."""
         if field not in {"mode", "main", "members", "thresholds"}:
             raise LedgerError("invalid_setting", "Only user settings can be changed here.")
         terminals: list[str] = []
@@ -247,7 +289,7 @@ class RepoSettings:
         return {**self.show(repo_id, host, workspace_id), **self._display_result()}
 
     def accept(self, setting: Mapping[str, Any], source: str) -> dict[str, Any]:
-        incoming = validate_setting(setting)
+        incoming = validate_setting(setting, allow_oversized_version=True)
         if incoming["field"] in LEGACY_FIELDS:
             return {"applied": False, "ignored": "workspace_local", **self.show(incoming["repo_id"])}
         if incoming["repo_id"].startswith("local:"):

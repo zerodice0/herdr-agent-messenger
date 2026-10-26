@@ -37,6 +37,10 @@ class DeviceClaimsTest(unittest.TestCase):
         self.registry.reconcile(self.snapshot, refresh_display=False)
         self.project = mock.patch.object(AgentRegistry, "_refresh_display", return_value={"updated": [], "failed": []}).start()
         self.addCleanup(mock.patch.stopall)
+        for target, value in (("process_ancestors", {10}), ("pane_shell_pid", 10)):
+            patch = mock.patch("ham.ledger.status." + target, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "List of devices attached\nserial device\noffline offline\n", ""))
         self.claims = DeviceClaims(self.store, registry=self.registry, runner=self.runner)
 

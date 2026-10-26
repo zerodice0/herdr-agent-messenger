@@ -374,3 +374,236 @@ herdr plugin action list --plugin herdr.agent-messenger
 
 The final action list should contain `agent-skill-guide`, `label-current`, and
 `message-agents`, with only `herdr.agent-messenger` enabled.
+
+## Peer protocol hardening (protocol 1, schema 12)
+
+The forwarding source must be a configured peer. A configured peer may relay
+any well-formed origin hostname or repository home, including hosts that are
+not directly connected to this host; this preserves multi-hop topologies.
+Relayed `changed_by=user` stamps remain peer assertions, not local operator
+authority. A local-origin stamp received back applies no change unless it
+exactly matches the retained local stamp. A mismatching or stale self-origin
+echo is logged, ignored, and acknowledged rather than failing the outbox.
+The legacy `!default` origin is accepted only for the fixed version-1
+`mode=auto`, `changed_by=home` seed, never as a user claim.
+
+Versions stay below 2^53 and incoming versions may advance at most 64 beyond
+the local repository maximum. Excessive steps and versions at or above 2^53
+are logged, ignored without forwarding, and acknowledged; they never replace
+the current value or strand a peer's outbox. Exhausted local versions fail
+explicitly without SQLite integer overflow. Malformed payloads, unconfigured
+sources, and unsafe thresholds still fail. Peer thresholds require
+idle/coalescing delays of at least one minute/second respectively, at most
+60 wakes/hour, and at most ten thread hops. Zero wake/hop budgets remain safe.
+Local user Settings keep their existing 0..10000 validation range; settings
+outside the peer safety envelope are deliberately not accepted remotely.
+
+Native bundle headers repeat the unpredictable claim marker; each body line is
+quoted with `> `, including CR/Unicode line boundaries. The coordination/user
+priority preamble remains unchanged. A short one-message bundle grows from 542
+to 624 bytes (+82); three grow from 796 to 1042 (+246). Message/body and total
+bundle caps remain 2048 and 8192 bytes. Received sender identities/labels strip
+Cc/Cf controls and fit 96 UTF-8 bytes. Peer mail with `sender=user` remains
+valid, including multi-hop relays, but is attributed as `user@<origin_host>`
+in inboxes and native headers. Remote human mail never acquires local operator
+authority from the literal sender name. Remote creation times are stored as
+receiver time for coalescing and ordering.
+The immutable original wire digest is retained for old-peer deduplication and
+receipts, including retries. Concrete terminal IDs are restricted to bounded
+safe filename components, excluding `.`, `..`, slashes, and controls.
+
+Inbound transport assertions now also require the peer's SSH alias to remain
+in the configured allowlist, and reject malformed identity/protocol types.
+This is revocation/accident prevention, **not cryptographic SSH-key binding**:
+the protocol-1 name/UUID is public, and a same-user process can still forge it.
+Binding the caller to an SSH key requires an authorized_keys forced-command (or
+a newly provisioned shared signing secret); neither is silently installed.
+Remote origins, including relayed user setting stamps and human mail, remain
+assertions by configured peers. The setting/version/threshold limits,
+local-origin guard, explicit remote-user attribution, and nonce-quoted bundles
+bound their impact without changing user SSH configuration. No protocol or
+schema bump is required.
+
+## Local operator authority and status hardening
+
+The Mailbox TUI gives each isolated job a one-use capability over an inherited
+pipe, checked against a private 0600 file bound to the TUI parent's PID. Calling
+`mailbox job` directly without that capability is rejected before any job JSON
+is executed. Job process groups and timeouts are unchanged. This is an
+operator/agent accident-prevention boundary, not isolation from arbitrary code
+running as the same Unix user.
+
+`HERDR_TERMINAL_ID` now selects a terminal but cannot establish sender identity:
+its current live pane shell must be in the caller's process ancestry. Stale pane
+IDs are only probe hints. Native session-bound registrations, internal worker
+operations, and peer wire calls keep their explicit identity APIs; there is no
+environment flag bypass.
+
+Phase and summary keep ordinary Unicode, including Korean, but remove control
+and format characters, collapse whitespace, and cap output at 64 and 200
+characters respectively. New writes, local exports, peer-board rows (including
+stale cached rows), and Herdr metadata/borders apply the same sanitization.
+Protocol 1 and schema 12 are unchanged; status from older peers is sanitized
+locally without requiring an upgrade of the sender.
+
+## Sender guidance and Claude bypass warning
+
+Refresh copied canonical HAM skill bundles with the plugin update. From a
+project checkout use bare `main`; use `[HOST/]main@REPO` only for an intentional
+cross-project target verified with `status board`, never a concrete HAM repo
+copied into generic handoff templates. FYI still wakes a full model turn: send
+only decision-changing information, combine one report per recipient per
+boundary, and keep content-first bodies within 2,048 UTF-8 bytes with evidence
+in files/URLs.
+
+CLI send receipts add `hint` only above that body size and `cross_repo` (resolved
+short repo name) only for an explicit other-repo main selector. Ordinary compact
+receipts are unchanged; mail bodies, wake policy, protocol 1 and schema 12 are
+unchanged, so mixed-version peers need no new fields.
+
+Claude's held-message diagnostic no longer suggests enabling
+`crossSessionInbound: "accept"` for bypass sessions: it lets any same-user socket
+writer drive the bypassPermissions session. Do not enable it for bypass
+sessions. HAM does not modify this setting, permission mode or existing wake
+eligibility.
+
+## SSH shell safety, reuse, and remaining argv exposure
+
+Remote Herdr commands (including direct prompts, legacy request/send, spawn,
+snapshot/read and notification calls) and remote program commands now carry the
+POSIX script as base64 behind a fixed login-shell-safe decoder. Prompt text,
+cwd, socket overrides and program/environment arguments are never parsed by the
+remote login shell, including fish. The decoder uses `/usr/bin/base64` or
+`base64` from PATH, trying `-d` then the macOS `-D` spelling; missing decoders
+exit 127. Ledger envelopes still travel over stdin unchanged. This requires no
+new HAM helper on the receiving host and keeps protocol 1 and schema 12.
+
+SSH uses `ControlMaster=auto`, `ControlPersist=60` and a private 0700
+`~/.ssh/ham-cm/` directory with OpenSSH's `%C` connection hash. Existing
+BatchMode, connect timeout, no-forwarding and host-key policy remain unchanged;
+the directory is not shared with user-configured master sockets. Symlinks and
+foreign-owned control directories are rejected. The socket guard reserves the
+40-byte `%C` hash, one slash, and OpenSSH's 17-byte temporary suffix; paths at
+or above the Unix-socket limit (104 bytes on Darwin, 108 on Linux) use ordinary
+non-multiplexed SSH. Command timeouts still bound individual calls; an idle
+master may remain for up to 60 seconds after a call finishes.
+
+Residual F6: the installed `herdr agent prompt --help` requires positional TEXT
+and `codex queue --help` requires `--message TEXT`; neither supports stdin or a
+message file. Their final process argv therefore still contains prompt/bundle
+text. The encoded SSH script is reversible, not encryption, and remains
+visible in SSH argv. A 0600 file cannot remove that exposure without upstream
+stdin/file support, so this release does not pretend otherwise. Do not send
+secrets over these prompt APIs on shared-user hosts; use ledger mail for
+transport payloads over stdin, while remembering Codex native wake bundles
+ultimately use the same argv-only queue API.
+
+### Status-export field minimization
+
+Status exports now use an explicit agent-field allowlist, omit the native
+session PID, and limit workspaces to host/ID/label and agent devices to
+kind/label/ID/claim time/attachment. The wire endpoint also omits the local-only
+HAM border label; local snapshots retain it for user-border ownership checks.
+Repository IDs and session references are intentionally retained: current and
+older protocol-1 recipient resolution and collaboration/direct-input safety
+checks require them. Source review of the 6c998e0 Mailbox, board, and
+collaboration-policy consumers confirmed these dependencies; removing session
+references would cause safe preflight/direct delivery to fail, not improve
+authentication. Origin-computed roles/group IDs remain unchanged. Optional
+server and host resource diagnostics retain their existing protocol-1 shapes.
+
+## Local content retention and test-state protection
+
+Protocol 1 and schema 12 are unchanged. Hourly worker maintenance now removes
+request JSON files only when they explicitly say `terminal: true` and have not
+been modified for more than 30 days. Deferred, awaiting-decision, working, and
+nonterminal uncertain requests remain available regardless of age. Malformed,
+locked, and symlink records are skipped; persistent lock files contain no
+request content and are intentionally not unlinked while another process might
+still hold them. Existing records need no migration: their file mtime supplies
+the age boundary.
+
+Ledger final-message bodies retain the existing 90-day window. Completed direct
+and spawn submissions (`accepted`, `failed`, or `unknown`) expire after 30 days;
+`submitting` records remain protected against duplicate submissions. Dedupe
+receipts retain a further 30-day replay/conflict window after message-body
+removal, and are never removed while a message or pending outbox row still
+needs them. After that window, old orphan dismissals, withdrawal tombstones,
+routes, claim-resolution history, and empty thread metadata are removed.
+Unlike earlier releases, dedupe is not a permanent guarantee after every
+retention window has elapsed; do not replay archived message or operation IDs.
+Old peers can continue exchanging the same payloads during rollout.
+
+All SQLite connections enable `secure_delete=ON`, which overwrites freed cells
+in the pages being changed rather than vacuuming the whole database. Following
+a purge, maintenance attempts a nonblocking `wal_checkpoint(TRUNCATE)`; an
+active reader can defer WAL truncation until a later purge/checkpoint. This is
+best-effort local data minimization, not secure erasure of filesystem snapshots,
+backups, or SSD storage.
+
+Invalid bell names are rejected only after the valid advisory bells have been
+rung; a bad terminal or broken bell no longer suppresses other receivers.
+The test tripwire now protects both current and legacy HAM state roots,
+including requests, registries, lock files, direct writes, renames, and deletes.
+It propagates protected roots through `HAM_TEST_PROTECTED_STATE_DIRS` without
+redirecting storage or deleting pre-existing live fixture files.
+
+
+## Bounded peer latency and durable outbox recovery
+
+The host worker refreshes its local registry, observes Claude acceptance and
+attempts eligible Claude/Codex wakes before remote transport. Each outbox sweep
+has a three-second elapsed budget, at most four simultaneous peers and at most
+100 attempts total. A peer has only its oldest pending item in flight; transient
+failure defers that peer for the sweep and retains its FIFO. Healthy peers can
+send while another peer is unavailable. A timeout can mean the remote commit
+succeeded but its acknowledgement was lost; retries keep the original identity
+and are deduplicated rather than creating another message.
+
+CLI board peer reads use a four-query maximum and one shared 20-second deadline,
+not a separate wait per peer. Host ordering, verified-UUID stale snapshots and
+unknown unread counts on failure are unchanged. The Mailbox polling cadence is
+unchanged.
+
+Workers preserve trusted absolute PATH directories and add standard Linux/macOS
+install locations, including `~/.local/bin`, Homebrew and mise shims. Every
+resolved executable and ancestor must be owned by root or the current user
+and must not be world-writable. Group-write is allowed only for macOS's
+privileged `admin` group or the current user's private primary group: matching
+primary gid, matching user/group names, no supplementary group members, and
+no other passwd entry with that primary gid. This preserves Linuxbrew and
+`~/.local` installations using mode 775 without trusting shared groups.
+Relative and otherwise writable/untrusted paths are excluded. Herdr/Codex
+overrides, PATH candidates, and local installation fallbacks use the same
+trust predicate; a rejected override cannot reappear through a fallback.
+SSH is resolved to an absolute executable using the worker's configured
+environment. The effective PATH and resolved tool paths are recorded once
+per worker run in `worker.log` (stderr for foreground runs). Missing tools
+remain a visible unavailable-tool failure, not a silent fallback to a
+different transport.
+
+Pending durable outbox entries never expire automatically. `ledger doctor`
+adds `outbox_pending` only when nonempty, grouped by destination with `count`
+and `oldest_age_s`. Each board destination entry exposes the same tiny field
+for locally queued traffic to that host. New enqueue timestamps are stored in
+local ledger metadata, without changing protocol 1 or schema 12; older rows use
+their best-known payload timestamp, then retry timestamp if no payload time
+exists. Legacy ages are therefore estimates, not reconstructed enqueue times.
+Mixed-version peers need no new fields or settings to exchange mail.
+
+Manual recovery (run from the HAM checkout on the originating host):
+
+1. Inspect `python3 -m ham cli ledger doctor`, then
+   `python3 -m ham cli ledger outbox --limit 1000`. Match the exact destination,
+   `item_id`, `message_id`, state and `last_error`; do not create replacement mail.
+2. Repair the configured SSH route, host identity or refused setting as
+   appropriate. Retry the saved item with
+   `python3 -m ham cli ledger retry --item <exact-item-UUID>`, then request a
+   finite sweep with `python3 -m ham cli ledger worker once`.
+3. If the user cancels a message, use its exact message's **Withdraw** action
+   in Mailbox. A never-attempted message can cancel locally; after an attempt,
+   withdrawal must reach the authoritative recipient and may itself wait on the
+   outage. It is not an immediate override of a claimed/final delivery.
+   Settings/receipt items have no arbitrary force-cancel operation: preserve
+   them and repair/retry rather than deleting SQLite rows or skipping FIFO.
+
