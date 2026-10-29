@@ -157,7 +157,7 @@ CONFIRM/Settings picker bindings.
 | `Space` | Open the selected Agents or Threads item in the read-only viewer. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
 | `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
-| `f` | Agents only: deliver the selected local agent's queued ordinary FYI now (no prompt typed, no confirmation); see [Deliver FYI now](#deliver-fyi-now). Remote and inactive rows show a reason without changing anything. |
+| `f` | Agents only: request the selected local agent's queued FYI without the FYI delay or input quiet wait (no prompt typed, no confirmation); see [Deliver FYI now](#deliver-fyi-now). Remote and inactive rows show a reason without changing anything. |
 | `m` | Agents only: confirm pinning the selected live local role-group agent as main; if already explicitly pinned, confirm clearing the pin. Remote, inactive and other-group rows show a reason without changing settings. |
 | `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
 | `s` | Open Settings. |
@@ -432,9 +432,10 @@ behavior. No mutation CLI is available.
 ### Deliver FYI now
 
 Queued ordinary FYI normally waits for the FYI delay (about ten to fifteen minutes).
-Two triggers let you skip that wait without composing mail or typing into the agent,
-so the request itself spends no model tokens. The only model work is the agent's
-own turn that reads the delivered bundle.
+Two explicit operator triggers skip that delay **and the input quiet wait**
+without composing mail or typing into the agent, so the request itself spends
+no model tokens. The only model work is the agent's own turn that reads the
+delivered bundle.
 
 - **Mailbox:** in NAV, select a local agent in Agents and press `f`. The result appears in
   the status line and as a short tag on the row.
@@ -460,28 +461,43 @@ own turn that reads the delivered bundle.
   Check your own config for an existing `prefix+f` before adding it. Both triggers are local
   only: for an agent on another host, use the Mailbox on that host.
 
-The request marks that agent's queued, unheld, ordinary FYI deliveries wake-eligible by
-setting the local `deliveries.fyi_turn_end` flag, whose meaning is now "deliver without the
-FYI delay: turn end or user request". It appends a `fyi_now` row to the status log, then
-rings the agent's local bell so the receiver inspects at once. Action mail, held mail,
-handled mail, and other agents are untouched. No schema, protocol, or runtime change is
-involved, and the OMP extension needs no restart.
+The request marks that agent's queued, unheld FYI within the hop limit
+wake-eligible by setting the local `deliveries.fyi_turn_end` flag. Every valid
+press appends a `fyi_now` status-log request, even if those flags were already
+set, refreshing a **600-second** quiet-skip authorization scoped to the queued
+message IDs and current recipient generation/session. It then rings the local
+bell. Action mail, held mail, handled mail and other agents are untouched.
+The automatic fresh-working enqueue flag skips only the FYI delay, not quiet.
 
-Every wake gate still applies, because the receiver (for Claude and Codex, the ledger
-worker) enforces them: the agent must take part (mode and role), its turn must be idle
-or done, the hourly wake limit must have room, the hop limit holds, and the quiet period
-must have passed. For OMP the prompt must be empty and quiet for the idle threshold; for
-Claude and Codex the agent must have been continuously idle for it, since the worker cannot
-see typed prompts. For these two, the request also starts the worker if needed (unless
-autostart is off) and first checks that the session can be woken; a
-`worker_start_failed` note means the worker could not be started. A
-working agent receives the FYI right after its turn. One wake carries at most 8 messages
-and 8 KiB; any remainder follows in later wakes. The status line names exactly what applies:
+The quiet skip is consumed when delivery of a scoped message is confirmed,
+including natural OMP/hook receipt, or expires after 600 seconds. A definite
+non-applied claim release keeps it valid until delivery or expiry; uncertain
+claims still block another wake. It cannot be reused for later unrelated mail
+or a replacement session. Press again to refresh it. Expiration or consumption
+does not clear the messages' FYI-delay bypass flag.
+
+Only the OMP input quiet timer or Claude/Codex continuous-idle proxy is skipped.
+The receiver still requires participation, an idle/done turn, empty OMP editor,
+idle runtime with no pending work/continuation/retry hold, no conflicting claim,
+unheld mail, available hourly budget, hop admission and coalescing
+(**60 seconds** by default). It revalidates the request when claiming and before
+OMP enqueue. A working agent gets `after_turn`, not an interrupted turn or a
+promise of immediate delivery. Claude/Codex cannot observe typed drafts; skipping
+their idle proxy does not make editor contents visible.
+
+For Claude/Codex, the request starts the worker if needed (unless autostart is
+off) and first checks that the session can be woken; a `worker_start_failed`
+note means the worker could not be started. One wake carries at most 8 messages
+and 8 KiB; any remainder follows in later wakes under normal quiet admission
+unless the operator makes another request. No schema or protocol version
+changes are needed; the updated OMP extension must be active to skip input quiet.
+The status line puts the request and remaining readiness conditions before
+the target name so the key message fits at 80 columns:
 
 | Outcome | Message (shape) |
 | --- | --- |
-| `requested` | OMP: `N FYI eligible now, wake requested; delivers once prompt empty and quiet M min`. Claude/Codex: `... delivers once idle for M min` |
-| `after_turn` | `agent is working: N FYI delivered right after its turn` |
+| `requested` | OMP: `N FYI requested; quiet skipped; empty prompt + idle required.` Claude/Codex: `N FYI requested; quiet skipped; idle turn required.` |
+| `after_turn` | `N FYI after turn; quiet skipped; ... required.` followed by the agent and its turn state |
 | `hourly_limit` | `N FYI marked, wake limit reached (4/4 this hour); next wake possible HH:MM` |
 | `nothing_queued` / `only_held` | no deliverable FYI, with the queued action or held count |
 | `not_participating` | mode off, or manual non-member: HAM never wakes it; FYI wait for its next turn |

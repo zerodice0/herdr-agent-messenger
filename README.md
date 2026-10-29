@@ -124,7 +124,7 @@ as `action`; the `[ACTION ^G]` chip shows the current kind.
 | `Shift+Enter` / `Alt+Enter` | Insert a newline; use Alt+Enter on Moshi/mosh. |
 | `Tab` / `Shift+Tab` | Move between regions in navigation mode. |
 | `m` | Agents: confirm pinning the selected live local role-group agent as main, or clear its explicit pin. |
-| `f` | Agents: deliver the selected local agent's queued FYI now instead of after the FYI delay (no prompt typed). |
+| `f` | Agents: request the selected local agent's queued FYI without the FYI delay or input quiet wait (no prompt typed). |
 | `s` | Open Settings in navigation mode. |
 | `?` / `F1` | Open help in navigation mode / while typing. |
 | `Esc` | Leave input while retaining the draft. |
@@ -134,7 +134,11 @@ Ctrl+J is not a newline key. `HAM_MAILBOX_NO_KITTY=1` disables the request.
 
 The pane action **HAM: Deliver queued FYI now** (`herdr.agent-messenger.fyi-now`) does the
 same for the focused agent pane; bind it yourself, for example `prefix+f` (and `prefix+ㄹ` on
-hangul layouts). All wake gates still apply. See [Deliver FYI now](docs/ui-reference.md#deliver-fyi-now).
+hangul layouts). The quiet skip lasts 600 seconds or until confirmed delivery of scoped
+FYI, and every valid press refreshes it. Empty OMP editor, idle runtime/turn,
+participation, holds, hop/hourly limits, pending claims and coalescing (default 60 s)
+still apply; a working recipient waits until after its turn.
+See [Deliver FYI now](docs/ui-reference.md#deliver-fyi-now).
 
 Threads keep the question and replies together. Viewing them never ACKs mail.
 

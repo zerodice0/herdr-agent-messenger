@@ -136,16 +136,34 @@ when its locally reconciled `agents.last_seen` is within 15 seconds and
 retain all runtime/admission gates. The flag is local delivery metadata, never
 a new kind or immutable wire field.
 
-A user can also set the flag on demand: Mailbox Agents `f` or the pane action
-`herdr.agent-messenger.fyi-now` (`python3 -m ham mailbox fyi-now`, **HAM: Deliver
-queued FYI now**) run `NativeReceiver.fyi_now`, which sets `fyi_turn_end=1` on the
-local active agent's queued, unheld `kind='fyi'` deliveries (hop within limit),
-appends a `status_log` row with `field='fyi_now'` and the flagged message IDs, and
-rings the agent's bell. The flag therefore means "deliver without the FYI delay:
-turn end or user request". Action, held, handled, and other agents' mail is untouched;
-no schema, protocol, or receiver-extension change. Every gate (role, idle/done turn,
-`wakes_per_hour`, hop, hold, quiet editor, coalescing) still applies; `wake_log` is
-not written. For Claude and Codex the worker is ensured (unless autostart is off) and
+A user can explicitly request delivery without the FYI delay **or input quiet
+wait**: Mailbox Agents `f` or the pane action `herdr.agent-messenger.fyi-now`
+(`python3 -m ham mailbox fyi-now`, **HAM: Deliver queued FYI now**) run
+`NativeReceiver.fyi_now`. It sets `fyi_turn_end=1` on the local active agent's
+queued, unheld `kind='fyi'` deliveries within the hop limit and rings its bell.
+Every valid press appends a `status_log` `fyi_now` request, even when the flags
+were already set, refreshing a **600-second** quiet-skip authorization scoped
+to those message IDs and the recipient's current generation/session. The
+automatic fresh-`working` enqueue flag alone never skips quiet.
+
+The quiet skip expires after 600 seconds and is consumed by confirmed delivery
+of a scoped message, including natural OMP/hook receipt. A definite non-applied
+claim release retains authorization until delivery or expiry; uncertain claims
+still block another wake. It cannot authorize later unrelated mail or a
+replacement session. The operator can press again to refresh the request.
+Expiration/consumption does not clear the messages' FYI-delay bypass flag.
+`NativeReceiver.inspect` and successful OMP claim responses expose additive
+boolean `skip_input_quiet`; absent/false means normal quiet admission. Both the
+claim transaction and OMP's final pre-enqueue check revalidate authorization.
+No schema or protocol version change is needed.
+
+Only the OMP input quiet timer or Claude/Codex continuous-idle proxy is skipped.
+Participation, empty OMP editor, idle runtime/no pending work, idle/done turn,
+held-mail exclusions, hop/hourly limits, pending-claim checks and coalescing
+(default **60 seconds**) still apply. A `working` recipient returns `after_turn`;
+the request never interrupts its turn or types a prompt. Action, held, handled,
+and other agents' mail is untouched; requesting alone does not write `wake_log`.
+For Claude and Codex the worker is ensured (unless autostart is off) and
 the wake is driven by it, so `fyi-now` no longer reports `no_receiver` for them; it
 does when the adapter probe says the session cannot be woken right now, then also
 returning `reason` (adapter code, e.g. `claude_pid_mismatch`) and `detail`, and
@@ -988,11 +1006,15 @@ after about ten to fifteen minutes (600 seconds is minimum eligibility), or righ
 after a turn when locally flagged at fresh `working` enqueue or by user request (`fyi-now`).
 Automatic action or FYI wake requires a
 participating recipient role, matching recipient-repo snapshot/generation, TUI mode with supported empty-editor
-evidence, configured input quiet time, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending work, no continuation or
-retry hold, and coalescing/hour/hop admission. Pane focus is not a wake gate.
+evidence, configured input quiet time (except a valid explicit FYI-now quiet
+skip), Herdr `turn_state` of `idle` or `done`, an idle OMP runtime/no pending
+work, no continuation or retry hold, and coalescing/hour/hop admission.
+Pane focus is not a wake gate.
 Young ordinary FYI does not enter wake-gate polling before eligibility;
-after eligibility, the unchanged quiet/editor and Herdr-ready gates can still
-defer its wake.
+after eligibility, quiet/editor and Herdr-ready gates can still defer its wake.
+Only explicit FYI-now requests skip input quiet, not automatic `fyi_turn_end`;
+the empty editor, runtime and turn gates remain and authorization is rechecked
+after claim immediately before enqueue.
 Final conditions and agent-attributed
 `sendMessage(...,{deliverAs:"nextTurn",triggerTurn:true})` occur in the same
 synchronous tick, never steering an ongoing turn; unavailable editor/RPC/ACP
@@ -1033,12 +1055,13 @@ sharing a terminal cannot manufacture delivered receipts.
 
 The ledger worker (not the agent, not a hook) wakes an idle Claude Code or Codex
 session. Each worker pass runs only after a fresh registry refresh, so a stale
-snapshot never wakes anyone. Schema, wire protocol, and the OMP/Claude integrations
-are unchanged; OMP keeps its own extension-driven wake.
+snapshot never wakes anyone. Schema and wire protocol versions are unchanged;
+OMP keeps its own extension-driven wake.
 
 Gates (all must hold; otherwise the mail stays queued and nothing is sent):
 role participating (mode `auto`, or `manual` member); `turn_state` is `idle` or `done`
-(never `working`, `blocked`, `unknown`); the **quiet proxy**; `wakes_per_hour` not
+(never `working`, `blocked`, `unknown`); the **quiet proxy** unless a valid
+explicit FYI-now request skips it; `wakes_per_hour` not
 reached (`wake_log` plus pending wake reservations); no other pending claim for the
 agent (hook or wake: a second wake never overlaps a claim whose acceptance is not yet
 known); hop within `max_hop`; coalescing (`coalesce_seconds`, and the FYI delay
@@ -1047,9 +1070,12 @@ unless `fyi_turn_end`/`fyi_now`). Claude additionally needs `extension_present=1
 **Quiet proxy.** The worker cannot see a half-typed prompt, so "quiet" means the
 agent has been continuously `idle`/`done` for `idle_minutes`, measured from the
 oldest `status_log` `turn_state` row of the current idle/done run (worker memory of
-first observation is only the fallback). `idle_minutes=0` is quiet immediately. This
-is a proxy: a user typing into an idle pane is not detected; the delivered text may
-land in or beside that draft.
+first observation is only the fallback). `idle_minutes=0` is quiet immediately.
+A valid explicit FYI-now request skips this continuous-idle wait until a scoped
+message is delivered or 600 seconds pass; automatic `fyi_turn_end` does not.
+The worker revalidates the request and all remaining gates in the claim
+transaction. This is a proxy: a user typing into an idle pane is not detected;
+the delivered text may land in or beside that draft even without a quiet skip.
 
 Discovery is per attempt and fail-safe: an unavailable target creates **no claim**
 and no ledger row, only a 30 s worker backoff. Reasons appear in `fyi-now`.
@@ -1412,7 +1438,7 @@ Creates a labeled interactive session. Optional initial messaging is a single pe
 
 ### Focus-held delivery
 
-Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM overlay sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead requires Herdr `turn_state` of `idle` or `done` plus runtime idle/editor/quiet-time admission and ignores pane focus.
+Where participation policy permits legacy prompt routing, agent CLI `request`, `send`, and `batch` respect recipient focus on the selected host, including remote Herdr. HAM overlay sends and coordinator delegation initiated by the user are not focus-held. A deferred request is already accepted for eventual delivery: **do not resend, bypass HAM, or ask the user to unfocus**. Mailbox native wake instead requires Herdr `turn_state` of `idle` or `done` plus runtime idle/editor admission and quiet time (except a valid explicit FYI-now quiet skip), and ignores pane focus.
 
 Self-send fails immediately with `recipient_is_sender`, before any focus check; the sender's focused pane never causes a self-addressed message to be deferred.
 

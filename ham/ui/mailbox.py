@@ -454,11 +454,9 @@ def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple
     if any(warning.get("code") == "worker_start_failed" for warning in result.get("warnings", [])):
         tail += " The wake worker could not start; run worker status."
     if client in ("claude", "codex"):
-        # The ledger worker cannot see a typed prompt: it wakes after the turn has been idle.
-        quiet = (f"idle for {result['idle_minutes']} min" if result.get("idle_minutes") else "idle")
+        readiness = "idle turn required"
     else:
-        quiet = (f"prompt empty and quiet {result['idle_minutes']} min" if result.get("idle_minutes")
-                 else "prompt empty")
+        readiness = "empty prompt + idle required"
     if outcome == "hourly_limit":
         limit = f"{result.get('wake_count')}/{result.get('wakes_per_hour')} this hour"
         frees = result.get("limit_frees_at")
@@ -469,11 +467,15 @@ def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple
             when = ("automatic wakes are off (wakes_per_hour 0)" if not result.get("wakes_per_hour")
                     else "wait for the hourly window to free up")
         return f"{name}: {eligible} FYI marked, wake limit reached ({limit}); {when}.{tail}", "error", "fyi limit"
+    # put() clips the single status row; keep the request and remaining safety
+    # condition before the target name so even long aliases work at 80 columns.
+    condition = f"quiet skipped; {readiness}"
+    lifetime = " Quiet skip: 10 min or until delivery; other gates remain."
     if outcome == "after_turn":
-        return (f"{name} is {result.get('turn_state') or 'unknown'}: {eligible} FYI delivered right after "
-                f"its turn ({quiet}).{tail}"), "info", "fyi after turn"
-    wait = f", after {math.ceil(result['ready_in'])} s coalescing" if result.get("ready_in", 0) > 0 else ""
-    return (f"{name}: {eligible} FYI eligible now, wake requested; delivers once {quiet}{wait}.{tail}",
+        return (f"{eligible} FYI after turn; {condition}. "
+                f"{name} is {result.get('turn_state') or 'unknown'}.{lifetime}{tail}"), "info", "fyi after turn"
+    wait = f" {math.ceil(result['ready_in'])} s coalescing remains." if result.get("ready_in", 0) > 0 else ""
+    return (f"{eligible} FYI requested; {condition}. {name}.{wait}{lifetime}{tail}",
             "info", "fyi now")
 
 
@@ -1598,7 +1600,7 @@ class MailboxApp:
         return True
 
     def agent_fyi_now(self) -> None:
-        """Let the selected local agent's queued FYI skip the 10 min delay; no prompt is typed."""
+        """Request queued FYI without its delay or input quiet wait; no prompt is typed."""
         agent = self.selected("agents")
         if not agent:
             self.set_status("Choose a live local agent to deliver its queued FYI now.", "error")
@@ -3208,8 +3210,10 @@ class MailboxApp:
                     "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
                     "Agents [m] Main: confirm pin for a live local role-group agent; press again on the pin to clear it.",
                     "Clearing a Main pin may restore the auto incumbent or a uniquely elected main.",
-                    "Agents [f] FYI now: deliver the selected local agent's queued FYI at once, no prompt typed.",
-                    "Every wake gate still applies (participant, idle turn, hourly limit, quiet prompt); a working agent gets it after its turn.",
+                    "Agents [f] FYI now: skip the FYI delay and input quiet wait; no prompt typed.",
+                    "Quiet skip expires in 10 min or on delivery; a working agent waits until after its turn.",
+                    "Other gates remain: participant, empty editor, idle runtime/turn, holds and hop limit.",
+                    "Hourly limit and coalescing (default 60 s) still apply.",
                     "Agents / Threads Space view: read-only modal; Enter inside does nothing.",
                     "Viewer: ↑↓ / PgUp/PgDn / Home/End / wheel scroll · t technical · Esc/q/Space close.",
                     "Viewer: outside click closes; inside click is inert. Live arrivals follow only at latest.",

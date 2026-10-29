@@ -52,7 +52,7 @@ if op=='setup':
  registry.reconcile(snapshot(repo,recipient_session=str(root/'session.jsonl')))
  settings=RepoSettings(store); rid=registry.list()[0]['repo_id']
  settings.mutate(rid,'mode','auto')
- settings.mutate(rid,'thresholds',{**DEFAULT_THRESHOLDS,'idle_minutes':data.get('idle_minutes',0),'coalesce_seconds':0})
+ settings.mutate(rid,'thresholds',{**DEFAULT_THRESHOLDS,'idle_minutes':data.get('idle_minutes',0),'coalesce_seconds':data.get('coalesce_seconds',0)})
 if op in ('session','turn_state'):
  live=snapshot(repo,recipient_session=data['session_ref'])
  if op=='turn_state': live['agents'][1]['agent_status']=data['turn_state']
@@ -204,7 +204,7 @@ class Fixture {
   cli(operation: string, data: Record<string, unknown>) {
     return this.execute(["-m", "ham", "cli", "ledger", operation === "release" ? "delivery" : "runtime", operation], data);
   }
-  async setup(idle_minutes = 0) { await this.fixture("setup", { idle_minutes }); await this.adapter.start(this.context); }
+  async setup(idle_minutes = 0, coalesce_seconds = 0) { await this.fixture("setup", { idle_minutes, coalesce_seconds }); await this.adapter.start(this.context); }
   async send(kind = "fyi") { return this.fixture("send", { kind, body: "Real isolated body / " + kind }); }
   async view() { return ledgerView(await this.fixture("view")); }
   accept(message: NativeMessage) { this.branch.push({ ...message, type: "custom_message", id: "accepted-" + this.branch.length, parentId: null, timestamp: new Date().toISOString() }); }
@@ -505,7 +505,7 @@ function nextScheduledTimer(f: Fixture): Promise<void> {
   return promise;
 }
 
-test("user FYI-now request wakes an idle agent through the unchanged extension right after the bell", async () => {
+test("user FYI-now request wakes an idle agent through the extension right after the bell", async () => {
   const f = new Fixture(); await f.setup(); await f.send();
   while (f.timeoutTokens.size) await f.runNextTimeout();
   await f.adapter.kick(f.context);
@@ -629,6 +629,114 @@ test("nonempty/unsupported editor and RPC's empty-string getter never authorize 
   f.editorSupported = true; f.mode = "rpc"; await f.adapter.kick(f.context);
   expect(f.sent).toHaveLength(0); expect((await f.view()).messages[0].state).toBe("queued");
   f.mode = "tui"; await f.adapter.kick(f.context); expect(f.sent).toHaveLength(1);
+});
+
+test("input-quiet permission is opt-in and rejects malformed wire values", async () => {
+  const f = new Fixture(); await f.setup(); await f.send();
+  const { skip_input_quiet, ...legacy } = f.registrationReply!;
+  expect(parseReply("inspect", legacy).skip_input_quiet).toBe(false);
+  expect(parseReply("inspect", { ...legacy, skip_input_quiet: true }).skip_input_quiet).toBe(true);
+  expect(() => parseReply("inspect", { ...legacy, skip_input_quiet: "true" })).toThrow("input-quiet permission");
+  const result = await f.adapter.natural({ prompt: "real user" }, f.context);
+  const raw = { ...result!.message.details, session_ref: f.session, content_sha256: "fixture-digest",
+    message: result!.message };
+  expect(parseReply("claim", raw)).toMatchObject({ skip_input_quiet: false });
+  expect(parseReply("claim", { ...raw, skip_input_quiet: true })).toMatchObject({ skip_input_quiet: true });
+  expect(() => parseReply("claim", { ...raw, skip_input_quiet: 1 })).toThrow("input-quiet permission");
+});
+
+test("explicit FYI now wakes after recent input without waiting three minutes", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3); await f.send();
+  f.clock = now + 1000; setSystemTime(f.clock); f.terminalInput!("x");
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0);
+  expect(await f.fixture("fyi_now")).toMatchObject({ outcome: "requested" });
+  await f.adapter.kick(f.context);
+  expect(f.inspections.at(-1)).toMatchObject({ skip_input_quiet: true });
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0].options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+});
+
+test("FYI now retains empty supported editor and genuine runtime idle requirements", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3); await f.send();
+  f.clock = now + 1000; setSystemTime(f.clock); f.terminalInput!("x");
+  await f.fixture("fyi_now");
+  f.editor = "draft"; await f.adapter.kick(f.context);
+  f.editor = ""; f.editorSupported = false; await f.adapter.kick(f.context);
+  f.editorSupported = true; f.mode = "rpc"; await f.adapter.kick(f.context);
+  f.mode = "tui"; f.idle = false; await f.adapter.kick(f.context);
+  f.idle = true; f.queued = true; await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0);
+  expect(f.operations).not.toContain("claim");
+  f.queued = false; await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+});
+
+test("FYI now during working still waits for idle or done, not for input quiet", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3);
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "working" });
+  await f.send();
+  f.clock = now + 1000; setSystemTime(f.clock); f.terminalInput!("x");
+  expect(await f.fixture("fyi_now")).toMatchObject({ outcome: "after_turn", flagged: 0 });
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0); expect(f.operations).not.toContain("claim");
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "done" });
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+});
+
+test("automatic turn-end FYI never bypasses the three-minute input quiet gate", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3);
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "working" });
+  await f.send();
+  await f.fixture("turn_state", { session_ref: f.session, turn_state: "done" });
+  f.clock = now + 1000; setSystemTime(f.clock); f.terminalInput!("x");
+  await f.adapter.kick(f.context);
+  expect(f.inspections.at(-1)).toMatchObject({ has_action: true, skip_input_quiet: false });
+  f.clock = now + 180999; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0); expect(f.operations).not.toContain("claim");
+  f.clock = now + 181000; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+});
+
+test("explicit FYI now preserves the sixty-second coalescing deadline", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3, 60); await f.send();
+  f.clock = now + 1000; setSystemTime(f.clock); f.terminalInput!("x");
+  expect(await f.fixture("fyi_now")).toMatchObject({ outcome: "requested", ready_in: 59 });
+  await f.adapter.kick(f.context);
+  f.clock = now + 59999; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0);
+  f.clock = now + 60000; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(1);
+});
+
+test("claim-time expired FYI-now permission cannot use a stale inspection to skip quiet", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3); await f.send();
+  await f.fixture("fyi_now");
+  f.clock = now + 600001; setSystemTime(f.clock); f.terminalInput!("x");
+  f.transformInspection = state => ({ ...state, skip_input_quiet: true });
+  await f.adapter.kick(f.context);
+  expect(f.operations).toContain("claim");
+  expect(f.operations).toContain("release");
+  expect(f.sent).toHaveLength(0);
+  expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
+});
+
+test("FYI-now quiet bypass does not override input arriving during claim", async () => {
+  const now = Date.now(); setSystemTime(now);
+  const f = new Fixture(); f.clock = now; await f.setup(3); await f.send();
+  await f.fixture("fyi_now");
+  f.afterClaim = async data => { if (data.wake) f.terminalInput!("x"); };
+  await f.adapter.kick(f.context);
+  expect(f.sent).toHaveLength(0);
+  expect(f.operations).toContain("release");
+  expect((await f.view()).messages[0]).toMatchObject({ state: "queued", claim_id: null });
 });
 
 test("last actual key restarts N-minute quiet interval; focus does not defer", async () => {

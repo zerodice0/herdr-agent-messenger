@@ -16,11 +16,11 @@ interface ClaimDetails { protocol: 1; claim_id: string; agent_id: string; genera
 export interface NativeMessage {
   customType: "ham_mailbox"; content: string; details: ClaimDetails; display: true; attribution: "agent";
 }
-export interface ClaimBundle extends NativeClaim { message: NativeMessage }
+export interface ClaimBundle extends NativeClaim { message: NativeMessage; skip_input_quiet?: boolean }
 interface Thresholds { idle_minutes: number; coalesce_seconds: number; wakes_per_hour: number; max_hop: number }
 interface Inspection {
   thresholds: Thresholds; role: "main" | "worker" | null; turn_state: string; wake_count: number;
-  pending_claims: NativeClaim[]; has_action: boolean; coalesce_until: number;
+  pending_claims: NativeClaim[]; has_action: boolean; coalesce_until: number; skip_input_quiet?: boolean;
 }
 interface Registration extends Inspection { agent: NativeAgent; bell_directory: string; bell_name: string }
 export interface ReceiverReplies {
@@ -48,6 +48,11 @@ function number(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Invalid HAM numeric field");
   return value;
 }
+function skipInputQuiet(value: Request): boolean {
+  if (value.skip_input_quiet === undefined) return false;
+  if (typeof value.skip_input_quiet !== "boolean") throw new Error("Invalid HAM input-quiet permission");
+  return value.skip_input_quiet;
+}
 function array(value: unknown): unknown[] {
   if (!Array.isArray(value)) throw new Error("Invalid HAM array field");
   return value;
@@ -64,7 +69,8 @@ function inspection(value: Request): Inspection {
   return { thresholds: { idle_minutes: number(thresholds.idle_minutes), coalesce_seconds: number(thresholds.coalesce_seconds),
       wakes_per_hour: number(thresholds.wakes_per_hour), max_hop: number(thresholds.max_hop) },
     role: value.role, turn_state: string(value.turn_state), wake_count: number(value.wake_count),
-    pending_claims: array(value.pending_claims).map(nativeClaim), has_action: value.has_action, coalesce_until: number(value.coalesce_until) };
+    pending_claims: array(value.pending_claims).map(nativeClaim), has_action: value.has_action, coalesce_until: number(value.coalesce_until),
+    skip_input_quiet: skipInputQuiet(value) };
 }
 export function parseReply<O extends Operation>(operation: O, raw: unknown): ReceiverReplies[O] {
   const value = record(raw);
@@ -81,7 +87,7 @@ export function parseReply<O extends Operation>(operation: O, raw: unknown): Rec
       const message = record(value.message), details = record(message.details);
       if (message.customType !== "ham_mailbox" || message.attribution !== "agent" || message.display !== true || details.protocol !== 1)
         throw new Error("Invalid HAM context message");
-      parsed = { ...nativeClaim(value), message: { customType: "ham_mailbox", content: string(message.content),
+      parsed = { ...nativeClaim(value), skip_input_quiet: skipInputQuiet(value), message: { customType: "ham_mailbox", content: string(message.content),
         display: true, attribution: "agent", details: { protocol: 1, claim_id: string(details.claim_id),
           agent_id: string(details.agent_id), generation: number(details.generation), session_ref: string(details.session_ref), marker: string(details.marker) } } };
     }
@@ -373,10 +379,10 @@ export class MailboxAdapter {
     } catch (error) { if (epoch === this.epoch) this.report(ctx, error); return undefined; }
     finally { if (epoch === this.epoch) this.preparing--; }
   }
-  private quiet(ctx: ExtensionContext, thresholds: Thresholds): boolean {
+  private quiet(ctx: ExtensionContext, thresholds: Thresholds, skipInputQuiet = false): boolean {
     return ctx.mode === "tui" && ctx.hasUI && ctx.ui.supportsEditor === true &&
       typeof ctx.ui.getEditorText === "function" && ctx.ui.getEditorText() === "" &&
-      Date.now() - this.lastKey >= thresholds.idle_minutes * 60000;
+      (skipInputQuiet || Date.now() - this.lastKey >= thresholds.idle_minutes * 60000);
   }
   private idle(ctx: ExtensionContext): boolean {
     return !this.active && !this.continuation && !this.retrying && !this.failureBlocked && !this.compacting &&
@@ -395,7 +401,7 @@ export class MailboxAdapter {
     // A settled but unpublished preparation is uncertain, never automatic replay.
     for (const pending of this.pending.values()) if (pending.phase !== "unknown") await this.release(pending, "unknown", "settled without accepted active-branch context", ctx);
     if (this.pending.size || !state.has_action || state.role === null) return;
-    if (!this.quiet(ctx, state.thresholds)) {
+    if (!this.quiet(ctx, state.thresholds, state.skip_input_quiet)) {
       if (ctx.mode === "tui") this.schedule(ctx, Math.max(1000, this.lastKey + state.thresholds.idle_minutes * 60000 - Date.now()));
       return;
     }
@@ -408,7 +414,8 @@ export class MailboxAdapter {
     const pending: Pending = { ...claim, phase: "prepared" };
     this.pending.set(claim.claim_id, pending);
     // No await may separate this final public UI/idle/session check and sendMessage.
-    if (!this.current(ctx, epoch) || serial !== this.inputSerial || !this.idle(ctx) || !this.quiet(ctx, state.thresholds)) {
+    // The claim revalidates operator permission; a stale inspect cannot bypass quiet.
+    if (!this.current(ctx, epoch) || serial !== this.inputSerial || !this.idle(ctx) || !this.quiet(ctx, state.thresholds, claim.skip_input_quiet)) {
       await this.release(pending, "not_applied", "wake never submitted after final user/idle/session gate changed", ctx);
       return;
     }

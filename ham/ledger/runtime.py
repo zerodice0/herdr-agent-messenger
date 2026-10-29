@@ -20,6 +20,7 @@ BUNDLE_BYTES = 8192
 BUNDLE_MESSAGES = 8
 WAKE_READY_STATES = frozenset({'idle', 'done'})
 FYI_WAKE_DELAY_SECONDS = 600
+FYI_NOW_QUIET_SECONDS = 600
 WAKE_CLIENTS = frozenset({'claude','codex'})
 STATUS_RUN_LIMIT = 64
 
@@ -176,6 +177,36 @@ class NativeReceiver:
                 rows = sorted([*rows[:BUNDLE_MESSAGES-1],trigger],key=lambda row:(row['created_at'],row['message_id']))
         return rows
 
+    def _skip_input_quiet(self, connection: Any, agent: Mapping[str, Any],
+                          rows: Sequence[Mapping[str, Any]], now: float) -> bool:
+        """One bounded operator request, scoped to this session's requested FYI.
+
+        Automatic turn-end flags and legacy audit arrays are not authorization.
+        A confirmed delivery of any requested message consumes the whole request,
+        including natural receipt; a definitely unapplied claim does not.
+        """
+        request = connection.execute(
+                "SELECT value,at FROM status_log WHERE agent_id=? AND field='fyi_now' ORDER BY seq DESC LIMIT 1",
+                (agent['agent_id'],)).fetchone()
+        if request is None or not request['at'] <= now < request['at']+FYI_NOW_QUIET_SECONDS:
+            return False
+        try:
+            value = json.loads(request['value'])
+        except (ValueError, TypeError):
+            return False
+        if (not isinstance(value, dict) or value.get('generation') != agent['generation']
+                or value.get('session_ref') != agent['session_ref']
+                or not isinstance(value.get('message_ids'), list)):
+            return False
+        message_ids = {item for item in value['message_ids'] if isinstance(item, str)}
+        if not any(row['kind']=='fyi' and row['message_id'] in message_ids for row in rows):
+            return False
+        delivered = connection.execute(
+                'SELECT message_id FROM deliveries WHERE recipient_host=? AND recipient_terminal_id=? '
+                'AND recipient_repo_id=? AND delivered_at>=?',
+                (self.store.host,agent['terminal_id'],agent['repo_id'],request['at']))
+        return not any(row['message_id'] in message_ids for row in delivered)
+
     def inspect(self,*,terminal_id: str,agent_id: str,generation: int) -> dict[str, Any]:
         now = time.time()
         with self.store.read() as connection:
@@ -183,25 +214,28 @@ class NativeReceiver:
             state = self._state(connection,agent,now)
             rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=True,
                                   coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
+            trigger = min(rows,key=lambda row:(
+                not (row['kind']=='action' and wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now),
+                wake_ready_at(row,state['thresholds']['coalesce_seconds'])),default=None)
+            bundle = fit_claim_rows(rows,wake_trigger=trigger['message_id']) if trigger is not None else []
+            skip_input_quiet = self._skip_input_quiet(connection,agent,bundle,now)
         # Keep young ordinary FYI out of the extension's one-second editor/status
         # guard retries. Its existing safety interval and natural events recheck.
         triggers = [row for row in rows if row['kind']=='action' or row['fyi_turn_end']
                     or wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now]
-        return {**state,'queued_count':len(rows),'has_action':bool(triggers),
+        return {**state,'queued_count':len(rows),'has_action':bool(triggers),'skip_input_quiet':skip_input_quiet,
                 'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0)}
 
     def fyi_now(self,*,terminal_id: str,agent_id: str | None = None,generation: int | None = None) -> dict[str, Any]:
-        """User request: let this agent's queued ordinary FYI skip the FYI delay.
+        """Request queued FYI without its delay and with bounded input-quiet bypass.
 
-        ``deliveries.fyi_turn_end`` therefore means "deliver without the FYI
-        delay": set at enqueue while the recipient was working, or by this
-        user request. OMP's unchanged receiver extension then sees ``has_action``
-        from its normal inspect; Claude/Codex are woken by the ledger worker
-        (``NativeWaker``), which this request makes sure is running. Every wake
-        gate still applies (role, idle turn, quiet, hourly limit, hop, holds,
-        coalescing). A Claude/Codex agent whose wake target cannot be discovered
-        reports ``no_receiver`` with the adapter's reason and flags nothing.
-        The request is local-only, never touches wake_log, and is audited in status_log.
+        Every accepted press snapshots eligible FYI and refreshes a session-bound
+        status_log request, even if enqueue-time/earlier requests already set
+        ``fyi_turn_end``. OMP uses ``skip_input_quiet``; Claude/Codex skip their
+        continuous-idle proxy. All other wake gates, including coalescing, remain.
+        The request expires after 600 seconds or a scoped confirmed delivery.
+        Discovery failures flag nothing; this local-only operation never writes
+        wake_log or injects editor input.
         """
         now = time.time()
         # Wake availability is probed outside the write transaction: discovery
@@ -237,6 +271,7 @@ class NativeReceiver:
                 "AND d.recipient_repo_id=? AND d.state='queued' ORDER BY m.created_at,m.message_id",
                 (self.store.host,terminal_id,agent['repo_id'])).fetchall()
             fresh: list[str] = []
+            requested: list[str] = []
             for item in queued:
                 if item['kind']=='action':
                     result['queued_action'] += 1
@@ -246,6 +281,7 @@ class NativeReceiver:
                     result['over_hop'] += 1
                 else:
                     result['queued_fyi'] += 1
+                    requested.append(item['message_id'])
                     if item['fyi_turn_end']:
                         result['eligible'] += 1
                     else:
@@ -262,8 +298,10 @@ class NativeReceiver:
                 connection.execute('UPDATE deliveries SET fyi_turn_end=1 WHERE message_id IN (%s) '
                                    "AND state='queued' AND fyi_turn_end=0 AND hold_reason IS NULL"
                                    % ','.join('?' for _ in fresh),fresh)
-                connection.execute("INSERT INTO status_log(agent_id,field,value,at) VALUES (?,'fyi_now',?,?)",
-                                   (agent['agent_id'],json.dumps(fresh),now))
+            connection.execute("INSERT INTO status_log(agent_id,field,value,at) VALUES (?,'fyi_now',?,?)",
+                               (agent['agent_id'],json.dumps({
+                                   'generation':agent['generation'],'session_ref':agent['session_ref'],
+                                   'message_ids':requested}),now))
             result['flagged'] = len(fresh)
             result['eligible'] += len(fresh)
             rows = self._eligible(connection,agent,thresholds['max_hop'],wake=True,
@@ -289,12 +327,6 @@ class NativeReceiver:
                 result['outcome'] = 'after_turn'
             else:
                 result['outcome'] = 'requested'
-        if not result['flagged']:
-            # A repeat request changed nothing, so the transaction rang no bell.
-            try:
-                self.store.ring((terminal_id,))
-            except OSError as error:
-                self.store.notification_errors.append({'code':'notification_failed','message':str(error),'committed':True})
         if result['agent']['client'] in WAKE_CLIENTS and result.get('queued_fyi'):
             # Claude/Codex are woken by the ledger worker, not by an extension
             # watching the bell: make sure that worker is running.
@@ -319,6 +351,7 @@ class NativeReceiver:
             rows = fit_claim_rows(rows,wake_trigger=trigger['message_id'] if trigger is not None else None)
             if not rows:
                 return {'claim_id':None,'reason':'unrepresentable','messages':[]}
+            skip_input_quiet = self._skip_input_quiet(connection,agent,rows,now)
             claim = Mailbox._claim_messages(connection,rows,agent_id,generation,'wake' if wake else 'before_agent_start')
             marker = 'HAM_CLAIM_' + claim['claim_id'] + '_' + uuid.uuid4().hex
             message = format_context(claim,agent,marker)
@@ -326,7 +359,8 @@ class NativeReceiver:
             connection.execute('INSERT INTO native_claims '
                     '(claim_id,client,session_ref,marker,content_sha256,created_at) VALUES (?,?,?,?,?,?)',
                     (claim['claim_id'],'omp',agent['session_ref'],marker,digest,now))
-        return {**claim,'session_ref':agent['session_ref'],'marker':marker,'content_sha256':digest,'message':message}
+        return {**claim,'session_ref':agent['session_ref'],'marker':marker,'content_sha256':digest,'message':message,
+                'skip_input_quiet':skip_input_quiet}
 
     def applied(self,*,claim_id: str,agent_id: str,generation: int,session_ref: str,
                 marker: str,content_sha256: str,entry_id: str) -> dict[str, Any]:
@@ -348,8 +382,8 @@ class NativeReceiver:
 
         OMP evaluates quiet/idle/editor in its own extension, so its claim path
         never asks for them. A worker-driven wake cannot observe input, so it
-        also requires no pending claim and a continuous ready period of
-        ``idle_minutes`` (the quiet proxy).
+        also requires no pending claim and, unless explicitly requested by the
+        operator, a continuous ready period of ``idle_minutes`` (the quiet proxy).
         """
         thresholds = state['thresholds']
         if state['role'] is None:
@@ -359,7 +393,8 @@ class NativeReceiver:
         if external:
             if state['pending_claims']:
                 return 'claim_pending'
-            if ready_since is None or now-ready_since<thresholds['idle_minutes']*60:
+            if not state.get('skip_input_quiet',False) and (
+                    ready_since is None or now-ready_since<thresholds['idle_minutes']*60):
                 return 'quiet'
         if state['wake_count']>=thresholds['wakes_per_hour']:
             return 'hourly_limit'
@@ -398,6 +433,8 @@ class NativeReceiver:
         trigger = min(rows,key=lambda row:(
             not (row['kind']=='action' and wake_ready_at(row,thresholds['coalesce_seconds'])<=now),
             wake_ready_at(row,thresholds['coalesce_seconds'])),default=None)
+        bundle = fit_claim_rows(rows,wake_trigger=trigger['message_id']) if trigger is not None else []
+        state['skip_input_quiet'] = self._skip_input_quiet(connection,agent,bundle,now)
         return state,rows,trigger,self._wake_reason(state,trigger,now,external=True,ready_since=ready_since)
 
     def wake_adapter(self, client: str) -> Any:

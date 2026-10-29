@@ -709,9 +709,11 @@ replay an unknown claim or send a replacement while application is uncertain.
 **OMP:** opt-in receiving is limited to the root Herdr session and a supported
 native session file; the extension delegates ledger work to Python. In a
 supported TUI, automatic wake needs an empty editor, quiet input for
-`idle_minutes`, Herdr `turn_state` of `idle` or `done`, an idle OMP runtime with no pending message, `willContinue`, or retry
-hold, an eligible action or FYI and participating role, plus coalescing/hourly/hop
-limits. Eligibility is rechecked in the same tick immediately before enqueue.
+`idle_minutes` (except a valid explicit FYI-now quiet skip), Herdr `turn_state`
+of `idle` or `done`, an idle OMP runtime with no pending message, `willContinue`,
+or retry hold, an eligible action or FYI and participating role, plus
+coalescing/hourly/hop limits. Eligibility and quiet-skip authorization are
+rechecked in the same tick immediately before enqueue, including after claim.
 It uses agent-attributed `nextTurn` + `triggerTurn`, never steer. Focus itself
 does not block this wake; it is not the legacy focused-pane hold.
 
@@ -732,13 +734,33 @@ wake gates: local enqueue records `delivery.fyi_turn_end` only for fresh
 bypassing the 600-second delay. Later state changes do not retroactively set
 the flag. All wake gates still apply, including participation and idle state.
 The flag is local delivery metadata, not a change of mail kind or wire payload.
-A user can also skip the FYI delay for one agent: Mailbox Agents `f`, or the pane
-action `fyi-now` (`herdr.agent-messenger.fyi-now`, **HAM: Deliver queued FYI now**,
-bound by the user to a key such as `prefix+f`). Either sets `delivery.fyi_turn_end` on that
-agent's queued, unheld ordinary FYI, appends a `fyi_now` status-log row, and rings
-the local bell. The flag therefore means "deliver without the FYI delay: turn end or user
-request". All wake gates, the hourly wake limit and the unchanged OMP extension's
-idle-prompt checks still apply; nothing is typed into the agent. Local only. See
+A user can explicitly skip both the FYI delay and input quiet wait for one
+agent: Mailbox Agents `f`, or the pane action `fyi-now`
+(`herdr.agent-messenger.fyi-now`, **HAM: Deliver queued FYI now**, bound by the
+user to a key such as `prefix+f`). Either sets `delivery.fyi_turn_end` on that
+agent's queued, unheld FYI within the hop limit and rings the local bell.
+Every valid press appends a `fyi_now` status-log request, even if the flags were
+already set, refreshing the quiet-skip authorization for **600 seconds**.
+The request is scoped to those queued message IDs and the recipient's current
+generation/session, so later mail or a replacement session cannot reuse it.
+The automatic fresh-`working` `fyi_turn_end` flag never skips quiet.
+
+The quiet skip is consumed by confirmed delivery of a scoped message (including
+natural OMP/hook receipt), or expires after 600 seconds if unused. A definite
+non-applied claim release retains authorization until delivery or expiry;
+uncertain claims still block another wake. Press again to refresh the request.
+The FYI-delay bypass flag remains after the quiet skip expires or is consumed.
+`NativeReceiver.inspect` and successful OMP claims expose additive boolean
+`skip_input_quiet` (absent/false retains normal quiet admission), revalidated
+when claiming and before OMP enqueue. No schema or protocol version changes.
+
+Only the OMP input quiet timer or Claude/Codex continuous-idle proxy is skipped.
+The empty OMP editor, runtime idle/no pending work, idle/done turn, participation,
+held-mail exclusions, hop/hourly limits, pending claims, and **60-second default
+coalescing** remain. A working recipient returns `after_turn`; this never
+interrupts it or types a prompt. Status/toast text reports a request, not a
+completed delivery, and keeps the quiet skip and required readiness visible
+at 80 columns. Local only. See
 [Deliver FYI now](ui-reference.md#deliver-fyi-now).
 Natural user turns can receive both kinds even in off mode or for manual
 nonmembers. Wakes use the same bounded bundle: at most eight messages / 8 KiB
@@ -823,20 +845,24 @@ and Codex**), and a pull read must never be reported as native delivery.
 ### Idle wake for Claude Code and Codex
 
 The ledger worker, not the agent, wakes an idle Claude Code or Codex session. It
-runs only after a fresh registry refresh and adds no schema, protocol or
-integration change; OMP keeps its own extension-driven wake.
+runs only after a fresh registry refresh and adds no schema or protocol version
+change; OMP keeps its own extension-driven wake.
 
 **Gates.** All must hold or the mail stays queued: the agent participates (mode
 `auto`, or `manual` member); Herdr `turn_state` is `idle` or `done`; the quiet
-period has passed; `wakes_per_hour` is not reached; no other pending claim (hook or
+period has passed unless a valid explicit FYI-now request skips it;
+`wakes_per_hour` is not reached; no other pending claim (hook or
 wake) exists for the agent; the hop limit is respected; and coalescing has passed
 (ordinary FYI also waits its 600 s delay unless flagged by a turn end or `fyi-now`).
 Claude additionally needs its registered hook (`extension_present=1`).
 
 **Quiet proxy.** The worker cannot see typed prompts. "Quiet" means the agent has
 been continuously `idle`/`done` for `idle_minutes`, measured from the start of the
-current run in the durable status log (worker memory only as a fallback). This is a
-proxy, not typing detection: a user typing in an idle pane is not seen.
+current run in the durable status log (worker memory only as a fallback).
+An explicit FYI-now request skips this proxy until a scoped message is delivered
+or 600 seconds pass, and is revalidated in the claim transaction. Automatic
+`fyi_turn_end` flags do not skip it. This is a proxy, not typing detection:
+a user typing in an idle pane is not seen.
 
 **Claude Code.** HAM verifies the pane's foreground process, the session registry
 entry (id, pid, start time, interactive) and a user-owned peer socket plus

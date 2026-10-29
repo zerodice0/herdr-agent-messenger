@@ -112,7 +112,7 @@ class NativeWaker:
             self._unavailable(key,now,result,'discover_failed',str(error))
             return
         self.unavailable.pop(key,None)
-        claim = self.receiver.claim_wake(agent,target,ready_since=ready_since,now=now)
+        claim = self.receiver.claim_wake(agent,target,ready_since=ready_since,now=self.clock())
         if not claim['claim_id']:
             result['skipped'][key] = claim['reason']
             return

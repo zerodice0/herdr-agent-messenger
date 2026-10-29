@@ -12,7 +12,7 @@ from unittest import mock
 
 from ham.ledger.mail import Mailbox
 from ham.ledger.native_wake import (FAILURE_BACKOFF_SECONDS, UNAVAILABLE_BACKOFF_SECONDS, NativeWaker)
-from ham.ledger.runtime import NativeReceiver, wake_capable
+from ham.ledger.runtime import BUNDLE_MESSAGES, FYI_NOW_QUIET_SECONDS, NativeReceiver, wake_capable
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore
@@ -615,7 +615,8 @@ class WakeCapabilityTests(unittest.TestCase):
 
 class FyiNowWakeTests(WakeFixture):
     def fyi_now(self):
-        with mock.patch('ham.ledger.worker.ensure_worker') as ensure:
+        with mock.patch('ham.ledger.worker.ensure_worker') as ensure, \
+                mock.patch('ham.ledger.runtime.time.time', return_value=self.now):
             self.environment = {**os.environ, 'HERDR_AGENT_LEDGER_AUTOSTART': '1'}
             self.receiver.environment = self.environment
             result = self.receiver.fyi_now(terminal_id=self.recipient['terminal_id'])
@@ -672,6 +673,150 @@ class FyiNowWakeTests(WakeFixture):
         self.send(kind='fyi')
         self.fyi_now()
         self.assertEqual(self.sweep()['claimed'], 1)
+
+    def test_explicit_request_skips_recent_continuous_idle_without_waiting_three_minutes(self):
+        self.set_thresholds(idle_minutes=3)
+        self.send(kind='fyi')
+        self.fyi_now()
+        self.assertEqual(self.sweep()['claimed'], 1)
+        self.assertEqual(len(self.adapter.delivered), 1)
+
+    def test_automatic_turn_end_does_not_skip_the_continuous_idle_proxy(self):
+        self.set_thresholds(idle_minutes=3)
+        self.set_turn_state('working')
+        self.send(kind='fyi')
+        self.assertEqual(self.flags(), {1})
+        self.set_turn_state('idle')
+        self.assertEqual(self.skipped(self.sweep()), 'quiet')
+        self.assertEqual(self.adapter.delivered, [])
+        self.assertEqual(self.sweep(advance=181)['claimed'], 1)
+
+    def test_explicit_request_waits_for_working_to_finish_but_not_another_quiet_period(self):
+        self.set_thresholds(idle_minutes=3)
+        self.set_turn_state('working')
+        self.send(kind='fyi')
+        result, _ = self.fyi_now()
+        self.assertEqual(result['outcome'], 'after_turn')
+        self.assertEqual(self.skipped(self.sweep()), 'not_idle')
+        self.set_turn_state('done')
+        self.assertEqual(self.sweep()['claimed'], 1)
+
+    def test_explicit_request_preserves_sixty_second_coalescing(self):
+        self.set_thresholds(idle_minutes=3, coalesce_seconds=60)
+        self.send(kind='fyi')
+        self.fyi_now()
+        self.assertEqual(self.skipped(self.sweep()), 'coalescing')
+        self.assertEqual(self.sweep(advance=61)['claimed'], 1)
+
+    def test_expiry_restores_the_quiet_proxy_until_a_repeat_press_refreshes_it(self):
+        self.set_thresholds(idle_minutes=3)
+        self.send(kind='fyi')
+        self.fyi_now()
+        self.now += FYI_NOW_QUIET_SECONDS
+        self.set_turn_state('working')
+        self.set_turn_state('idle')
+        self.assertEqual(self.skipped(self.sweep()), 'quiet')
+        result, _ = self.fyi_now()
+        self.assertEqual(result['flagged'], 0)
+        self.assertEqual(self.sweep()['claimed'], 1)
+
+    def test_discovery_cannot_bypass_a_new_working_state_in_the_claim_transaction(self):
+        self.set_thresholds(idle_minutes=3)
+        self.send(kind='fyi')
+        self.fyi_now()
+        discover = self.adapter.discover
+
+        def work_during_discovery(*args, **kwargs):
+            self.set_turn_state('working')
+            return discover(*args, **kwargs)
+
+        self.adapter.discover = work_during_discovery
+        result = self.sweep()
+        self.assertEqual((result['claimed'], self.skipped(result)), (0, 'not_idle'))
+        self.assertEqual(self.adapter.delivered, [])
+
+    def test_claim_resamples_clock_when_discovery_crosses_request_expiry(self):
+        self.set_thresholds(idle_minutes=20)
+        self.send(kind='fyi')
+        self.fyi_now()
+        discover = self.adapter.discover
+
+        def slow_discovery(*args, **kwargs):
+            self.now += FYI_NOW_QUIET_SECONDS
+            return discover(*args, **kwargs)
+
+        self.adapter.discover = slow_discovery
+        result = self.sweep()
+        self.assertEqual((result['claimed'], self.skipped(result)), (0, 'quiet'))
+        self.assertEqual(self.adapter.delivered, [])
+
+    def test_claim_rechecks_request_consumption_during_external_discovery(self):
+        self.set_thresholds(idle_minutes=3)
+        for index in range(BUNDLE_MESSAGES+1):
+            self.send(kind='fyi', body=str(index))
+        self.fyi_now()
+        discover = self.adapter.discover
+
+        def receipt_during_discovery(*args, **kwargs):
+            # A natural receiver confirms part of the same scoped request.
+            with mock.patch('ham.ledger.mail.time.time', return_value=self.now):
+                with self.store.transaction() as connection:
+                    agent = dict(connection.execute('SELECT * FROM agents WHERE agent_id=?',
+                                                    (self.agent_id,)).fetchone())
+                    rows = self.receiver._eligible(connection,agent,10,wake=False)[:1]
+                    claim = Mailbox._claim_messages(connection,rows,self.agent_id,agent['generation'],'hook')
+                self.mail.started(**{key:claim[key] for key in ('claim_id','agent_id','generation')},
+                                  evidence='natural journal receipt')
+            return discover(*args, **kwargs)
+
+        self.adapter.discover = receipt_during_discovery
+        result = self.sweep()
+        self.assertEqual((result['claimed'], self.skipped(result)), (0, 'quiet'))
+        self.assertEqual(self.adapter.delivered, [])
+
+    def test_delivery_consumes_request_for_remainder_but_a_new_press_can_request_it(self):
+        self.set_thresholds(idle_minutes=3)
+        for index in range(BUNDLE_MESSAGES+1):
+            self.send(kind='fyi', body=str(index))
+        self.fyi_now()
+        self.assertEqual(self.sweep()['claimed'], 1)
+        self.adapter.observation = lambda **_kwargs: Observation('accepted', 200, 'journal accepted')
+        with mock.patch('ham.ledger.runtime.time.time', return_value=self.now):
+            result = self.sweep()
+        self.assertEqual(len(result['receipts']), BUNDLE_MESSAGES)
+        self.assertEqual((result['claimed'], self.skipped(result)), (0, 'quiet'))
+        self.fyi_now()
+        self.assertEqual(self.sweep()['claimed'], 1)
+
+    def test_definite_non_delivery_retains_request_but_pending_claim_still_blocks(self):
+        self.set_thresholds(idle_minutes=3)
+        self.send(kind='fyi')
+        self.fyi_now()
+        self.adapter.deliver_error = WakeDeliveryFailed('not_sent', 'no bytes written',
+                                                      definitely_not_delivered=True)
+        self.assertEqual(self.sweep()['claimed'], 1)
+        self.assertEqual(self.states(), ['queued'])
+        self.adapter.deliver_error = None
+        self.assertEqual(self.sweep(advance=FAILURE_BACKOFF_SECONDS+1)['claimed'], 1)
+        self.send(kind='fyi')
+        self.fyi_now()
+        self.assertEqual(self.skipped(self.sweep()), 'claim_pending')
+        self.assertEqual(len(self.adapter.delivered), 2)
+
+    def test_future_fyi_after_withdrawal_does_not_inherit_an_operator_request(self):
+        self.set_thresholds(idle_minutes=3)
+        original = self.send(kind='fyi')
+        self.fyi_now()
+        self.mail.withdraw(original['message_id'], sender=self.sender)
+        self.set_turn_state('working')
+        self.send(kind='fyi')
+        self.set_turn_state('idle')
+        self.assertEqual(self.skipped(self.sweep()), 'quiet')
+        self.assertEqual(self.adapter.delivered, [])
+
+
+class ClaudeFyiNowWakeTests(FyiNowWakeTests):
+    client = 'claude'
 
 
 class WorkerLoopWakeTests(WakeFixture):

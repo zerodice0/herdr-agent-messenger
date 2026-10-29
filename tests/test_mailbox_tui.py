@@ -5525,12 +5525,31 @@ class MailboxUiTest(unittest.TestCase):
         job.result = execute_job(job.request, self.environment)
         app.tick()
         self.assertEqual(app.status_level, 'info')
-        self.assertIn('blue-owl: 2 FYI eligible now, wake requested', app.status)
-        self.assertIn('quiet 3 min', app.status)
+        self.assertIn('2 FYI requested; quiet skipped; empty prompt + idle required.', app.status)
+        self.assertNotIn('quiet 3 min', app.status)
         self.assertEqual(app.result_tags[app.identity(selected)][0], 'fyi now')
         self.assertEqual({self.fyi_flags()[item['message_id']] for item in sent}, {1})
         text = '\n'.join(self.capture(app, 30, 140).lines())
-        self.assertIn('2 FYI eligible now', text)
+        self.assertIn('2 FYI requested; quiet skipped; empty prompt + idle required.', text)
+
+    def test_fyi_now_status_keeps_quiet_skip_and_remaining_gates_visible_at_80_columns(self):
+        for client in ('omp', 'claude', 'codex'):
+            for outcome in ('requested', 'after_turn'):
+                with self.subTest(client=client, outcome=outcome):
+                    app = self.app()
+                    app.finish_fyi_now({
+                        'agent': {'alias': '매우긴이름' * 20, 'client': client},
+                        'outcome': outcome, 'eligible': 3, 'idle_minutes': 3,
+                        'turn_state': 'working' if outcome == 'after_turn' else 'idle',
+                        'ready_in': 60,
+                    }, None)
+                    status = self.capture(app, height=24, width=80).lines()[-2]
+                    readiness = 'empty prompt + idle required' if client == 'omp' else 'idle turn required'
+                    request = 'after turn' if outcome == 'after_turn' else 'requested'
+                    self.assertIn(f'3 FYI {request}; quiet skipped; {readiness}.', status)
+                    self.assertNotIn('quiet 3 min', status)
+                    self.assertNotIn('delivered', status)
+                    self.assertIn('10 min or until delivery; other gates remain', app.status)
 
     def test_agents_fyi_now_shortcut_names_the_blocker_and_flags_nothing_without_a_receiver(self):
         self.omp_receiver_with_queued_fyi()
@@ -5574,14 +5593,16 @@ class MailboxUiTest(unittest.TestCase):
         app.key(F1)
         text = '\n'.join(self.capture(app, 55, 200).lines())
         self.assertIn('[f] FYI now', text)
-        self.assertIn('Every wake gate still applies', text)
+        self.assertIn('skip the FYI delay and input quiet wait', text)
+        self.assertIn('Other gates remain', text)
+        self.assertIn('coalescing (default 60 s)', text)
 
     def test_fyi_now_summary_covers_every_outcome_with_distinct_reasons(self):
         agent = {'alias': 'blue-owl', 'client': 'omp', 'terminal_id': 't'}
         base = {'agent': agent, 'eligible': 3, 'remaining': 0, 'idle_minutes': 3, 'turn_state': 'idle'}
         cases = {
-            'requested': ({}, 'info', '3 FYI eligible now, wake requested'),
-            'after_turn': ({'turn_state': 'working'}, 'info', 'blue-owl is working: 3 FYI delivered right after'),
+            'requested': ({}, 'info', '3 FYI requested; quiet skipped; empty prompt + idle required.'),
+            'after_turn': ({'turn_state': 'working'}, 'info', '3 FYI after turn; quiet skipped; empty prompt + idle required.'),
             'hourly_limit': ({'wake_count': 4, 'wakes_per_hour': 4, 'limit_frees_at': 1000+1800}, 'error',
                              'wake limit reached (4/4 this hour); next wake possible'),
             'nothing_queued': ({'queued_action': 2}, 'info', '2 queued action mail wakes it by itself'),
@@ -5611,10 +5632,20 @@ class MailboxUiTest(unittest.TestCase):
                                               'agent': {**agent, 'client': client}})
             self.assertEqual(level, 'error')
             self.assertIn(f'{client.capitalize()} cannot be woken right now (x_reason: why)', text)
-        text, _, _ = fyi_now_summary({**base, 'outcome': 'requested', 'agent': {**agent, 'client': 'codex'}},
-                                     wall_clock=lambda: 0)
-        self.assertIn('delivers once idle for 3 min', text)
-        self.assertNotIn('prompt empty', text)
+        for client in ('omp', 'claude', 'codex'):
+            with self.subTest(client=client):
+                text, _, _ = fyi_now_summary({
+                    **base, 'outcome': 'requested', 'ready_in': 60, 'agent': {**agent, 'client': client},
+                }, wall_clock=lambda: 0)
+                self.assertIn('quiet skipped', text)
+                self.assertIn('60 s coalescing remains', text)
+                self.assertIn('10 min or until delivery; other gates remain', text)
+                self.assertNotIn('3 min', text)
+                if client == 'omp':
+                    self.assertIn('empty prompt + idle required', text)
+                else:
+                    self.assertIn('idle turn required', text)
+                    self.assertNotIn('prompt', text)
 
     def test_fyi_now_pane_action_resolves_the_focused_pane_and_notifies_without_a_prompt(self):
         sent = self.omp_receiver_with_queued_fyi()
@@ -5628,7 +5659,9 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(record.call_args.args[0], 'w1:p2')
         typed.assert_not_called()
         body = notify.call_args.args[0]
-        self.assertTrue(body.startswith('FYI now · blue-owl: 1 FYI eligible now, wake requested'), body)
+        self.assertTrue(body.startswith('FYI now · 1 FYI requested; quiet skipped; empty prompt + idle required.'), body)
+        self.assertIn('blue-owl', body)
+        self.assertIn('10 min or until delivery; other gates remain', body)
         self.assertEqual(self.fyi_flags()[sent[0]['message_id']], 1)
 
     def test_fyi_now_pane_action_reports_a_non_agent_pane_and_falls_back_to_stderr(self):

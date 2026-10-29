@@ -13,7 +13,7 @@ import uuid
 from unittest import mock
 
 from ham.ledger.mail import Mailbox
-from ham.ledger.runtime import BUNDLE_BYTES, BUNDLE_MESSAGES, FYI_WAKE_DELAY_SECONDS, MESSAGE_BYTES, NativeReceiver, render_bundle
+from ham.ledger.runtime import BUNDLE_BYTES, BUNDLE_MESSAGES, FYI_NOW_QUIET_SECONDS, FYI_WAKE_DELAY_SECONDS, MESSAGE_BYTES, NativeReceiver, render_bundle
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore
@@ -1050,12 +1050,14 @@ class NativeReceiverTest(unittest.TestCase):
             self.assertEqual(self.turn_end_flag(message['message_id']), expected, message['message_id'])
         rows = self.status_log_rows()
         self.assertEqual([(row['agent_id'], json.loads(row['value'])) for row in rows],
-                         [(self.recipient['agent_id'], [first['message_id'], second['message_id']])])
+                         [(self.recipient['agent_id'], {
+                             'generation':self.recipient['generation'],'session_ref':self.session,
+                             'message_ids':[first['message_id'], second['message_id']]})])
         self.assertGreater(self.bell_path().stat().st_mtime, time.time()-60)
         with self.store.read() as connection:
             self.assertEqual(connection.execute('SELECT count(*) FROM wake_log').fetchone()[0], 0)
 
-    def test_fyi_now_makes_fyi_alone_a_trigger_and_the_unchanged_wake_claim_delivers_it(self):
+    def test_fyi_now_makes_fyi_alone_a_trigger_and_the_wake_claim_delivers_it(self):
         self.set_turn_state('idle')
         sent = self.send()
         self.assertFalse(self.receiver.inspect(**self.identity)['has_action'])
@@ -1063,23 +1065,33 @@ class NativeReceiverTest(unittest.TestCase):
         self.assertEqual(result['outcome'], 'requested')
         inspected = self.receiver.inspect(**self.identity)
         self.assertTrue(inspected['has_action'])
+        self.assertIs(inspected['skip_input_quiet'], True)
         self.assertLessEqual(inspected['coalesce_until'], time.time())
         claim = self.claim(wake=True)
+        self.assertIs(claim['skip_input_quiet'], True)
         self.assertEqual([message['message_id'] for message in claim['messages']], [sent['message_id']])
         self.applied(claim)
         self.assertEqual(self.states()[sent['message_id']], 'delivered')
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
         self.assertEqual(self.fyi_now()['outcome'], 'nothing_queued')
 
-    def test_fyi_now_is_idempotent_and_still_rings_the_bell_without_a_second_audit_row(self):
+    def test_fyi_now_repeated_press_refreshes_the_request_and_rings_the_bell(self):
         self.set_turn_state('idle')
         sent = self.send()
-        self.fyi_now()
+        now = time.time()
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now):
+            self.fyi_now()
         os.utime(self.bell_path(), (1, 1))
-        again = self.fyi_now()
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now+500):
+            again = self.fyi_now()
         self.assertEqual((again['outcome'], again['flagged'], again['eligible']), ('requested', 0, 1))
-        self.assertEqual(len(self.status_log_rows()), 1)
+        self.assertEqual(len(self.status_log_rows()), 2)
         self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
         self.assertGreater(self.bell_path().stat().st_mtime, time.time()-60)
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now+FYI_NOW_QUIET_SECONDS):
+            self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], True)
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now+500+FYI_NOW_QUIET_SECONDS):
+            self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
 
     def test_fyi_now_waits_for_the_turn_to_end_and_never_bypasses_the_working_gate(self):
         self.set_turn_state('working')
@@ -1122,6 +1134,10 @@ class NativeReceiverTest(unittest.TestCase):
                          ('requested', len(sent), BUNDLE_MESSAGES, 2))
         claim = self.claim(wake=True)
         self.assertEqual(len(claim['messages']), BUNDLE_MESSAGES)
+        self.assertIs(claim['skip_input_quiet'], True)
+        self.applied(claim)
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
 
     def test_fyi_now_outcomes_without_a_wake_flag_nothing(self):
         self.set_turn_state('idle')
@@ -1149,6 +1165,110 @@ class NativeReceiverTest(unittest.TestCase):
         for message in (action, held, queued):
             self.assertEqual(self.turn_end_flag(message['message_id']), 0)
         self.assertEqual(self.status_log_rows(), [])
+
+    def test_automatic_turn_end_and_action_never_authorize_input_quiet_skip(self):
+        self.set_turn_state('working')
+        sent = self.send()
+        self.assertEqual(self.turn_end_flag(sent['message_id']), 1)
+        self.set_turn_state('idle')
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        claim = self.claim(wake=True)
+        self.assertIs(claim['skip_input_quiet'], False)
+        self.applied(claim)
+        self.send(kind='action')
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
+
+    def test_fyi_now_expiry_is_revalidated_by_claim_not_cached_from_inspect(self):
+        self.set_turn_state('idle')
+        self.send()
+        now = time.time()
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now):
+            self.fyi_now()
+            self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], True)
+        with mock.patch('ham.ledger.runtime.time.time', return_value=now+FYI_NOW_QUIET_SECONDS):
+            claim = self.claim(wake=True)
+        self.assertIsNotNone(claim['claim_id'])
+        self.assertIs(claim['skip_input_quiet'], False)
+
+    def test_fyi_now_does_not_bypass_sixty_second_coalescing(self):
+        self.set_turn_state('idle')
+        self.settings.mutate(self.recipient['repo_id'], 'thresholds',
+                             {**self.thresholds, 'coalesce_seconds':60})
+        sent = self.send()
+        self.fyi_now()
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], True)
+        self.assertEqual(self.claim(wake=True)['reason'], 'coalescing')
+        with self.store.read() as connection:
+            created_at = connection.execute('SELECT created_at FROM messages WHERE message_id=?',
+                                            (sent['message_id'],)).fetchone()[0]
+        with mock.patch('ham.ledger.runtime.time.time', return_value=created_at+61):
+            self.assertIs(self.claim(wake=True)['skip_input_quiet'], True)
+
+    def test_not_applied_claim_retains_request_until_confirmed_natural_delivery(self):
+        self.set_turn_state('idle')
+        sent = [self.send(body=str(index)) for index in range(BUNDLE_MESSAGES+1)]
+        self.fyi_now()
+        claim = self.claim(wake=True)
+        self.mail.release(**{key:claim[key] for key in ('claim_id','agent_id','generation')},
+                          disposition='not_applied', evidence='editor changed before injection')
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], True)
+        natural = self.claim()
+        self.assertIs(natural['skip_input_quiet'], True)
+        self.applied(natural)
+        # Handling does not erase delivery evidence or revive the request.
+        self.mail.handle(self.recipient, message_ids=[sent[0]['message_id']])
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
+
+    def test_future_mail_cannot_inherit_a_request_after_requested_mail_is_withdrawn(self):
+        self.set_turn_state('idle')
+        original = self.send()
+        self.fyi_now()
+        self.mail.withdraw(original['message_id'], sender=self.sender)
+        self.set_turn_state('working')
+        later = self.send()
+        self.assertEqual(self.turn_end_flag(later['message_id']), 1)
+        self.set_turn_state('idle')
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
+
+    def test_scoped_fyi_held_after_inspect_cannot_authorize_an_unrelated_action_claim(self):
+        self.set_turn_state('idle')
+        sent = self.send()
+        self.fyi_now()
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], True)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE deliveries SET hold_reason='recipient_changed' WHERE message_id=?",
+                               (sent['message_id'],))
+        action = self.send(kind='action')
+        claim = self.claim(wake=True)
+        self.assertEqual([row['message_id'] for row in claim['messages']], [action['message_id']])
+        self.assertIs(claim['skip_input_quiet'], False)
+
+    def test_generation_and_session_changes_invalidate_a_request(self):
+        self.set_turn_state('idle')
+        self.send()
+        self.fyi_now()
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE agents SET generation=generation+1 WHERE agent_id=?',
+                               (self.recipient['agent_id'],))
+        identity = {**self.identity, 'generation':self.identity['generation']+1}
+        self.assertIs(self.receiver.inspect(**identity)['skip_input_quiet'], False)
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE agents SET generation=?,session_ref=? WHERE agent_id=?',
+                               (self.identity['generation'], self.session+'.new', self.recipient['agent_id']))
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
+
+    def test_legacy_audit_arrays_do_not_authorize_quiet_bypass(self):
+        self.set_turn_state('working')
+        sent = self.send()
+        self.set_turn_state('idle')
+        with self.store.transaction() as connection:
+            connection.execute("INSERT INTO status_log(agent_id,field,value,at) VALUES (?,'fyi_now',?,?)",
+                               (self.recipient['agent_id'], json.dumps([sent['message_id']]), time.time()))
+        self.assertIs(self.receiver.inspect(**self.identity)['skip_input_quiet'], False)
+        self.assertIs(self.claim(wake=True)['skip_input_quiet'], False)
 
     def test_fyi_now_rejects_unknown_terminals_and_stale_generations(self):
         self.assertEqual(self.receiver.fyi_now(terminal_id='no-such-terminal')['outcome'], 'not_agent')
