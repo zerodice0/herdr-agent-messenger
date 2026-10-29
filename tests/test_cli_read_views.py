@@ -15,6 +15,7 @@ import uuid
 from unittest import mock
 
 from ham.ledger import cli as ledger_cli
+from ham.ledger.display import LedgerDisplay
 from ham.ledger.mail import Mailbox
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.status import AgentRegistry
@@ -694,6 +695,19 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual(verbose["workspaces"], expected["workspaces"])
 
     def test_mutation_receipts_are_compact_by_default_and_full_with_verbose(self):
+        # Receipt formatting is independent of display repair. Report truthful,
+        # already-matching effective metadata and borders from the private fake.
+        display = LedgerDisplay(self.store)
+        projections = {agent["pane_id"]: display.projection(agent)
+                       for agent in AgentRegistry(self.store).list()}
+        for pane in self.snapshot["panes"]:
+            pane["label"] = projections[pane["pane_id"]].label
+        for agent in self.snapshot["agents"]:
+            projected = projections[agent["pane_id"]]
+            agent["display_agent"] = projected.display_agent
+            agent["tokens"] = {key: getattr(projected, key)
+                               for key in ("alias", "color", "recap", "phone", "emu")}
+        self.snapshot_path.write_text(json.dumps({"result": self.snapshot}))
         full_receipt = {"payload_hash", "origin_host", "authoritative", "updated_at"}
         completed, sent = self.cli("mail", "send", "--to", "local/" + self.other["alias"], "--body", "Compact receipt")
         self.assertEqual(completed.returncode, 0)
@@ -704,6 +718,7 @@ class ReadCliTest(unittest.TestCase):
                                       "--body", "Full receipt", "--verbose")
         self.assertEqual(completed.returncode, 0)
         self.assertTrue(full_receipt <= verbose.keys())
+        self.assertNotIn("warnings", verbose)
 
         inbound = [self.mail.send(self.other, self.sender, body="Handle " + name) for name in ("compact", "full")]
         completed, handled = self.cli("inbox", "handle", "--message", inbound[0]["message_id"])
@@ -725,6 +740,7 @@ class ReadCliTest(unittest.TestCase):
                          {"alpha/" + row["alias"] for row in (self.sender, self.recipient)})
         self.assertIn("agent_id", repo_full["agents"][0])
 
+        # Explicit status writes still exercise the fake's unsupported pane get.
         completed, status = self.cli("status", "set", "review", "--summary", "Compact status")
         self.assertEqual(completed.returncode, 0)
         self.assertEqual((status["phase"], status["summary"]), ("review", "Compact status"))

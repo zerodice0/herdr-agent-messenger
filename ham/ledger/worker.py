@@ -12,9 +12,10 @@ from pathlib import Path
 import shutil
 import sys
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from ham.ledger.remote import RemoteLedger
+from ham.ledger.display_repair import load as load_display_repair
 from ham.ledger.settings import RepoSettings
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore
@@ -75,6 +76,8 @@ def worker_lock(store: LedgerStore) -> Iterator[bool]:
 
 def maintenance_pending(store: LedgerStore) -> bool:
     with store.read() as connection:
+        if any(entry["state"] == "pending" for entry in load_display_repair(connection).values()):
+            return True
         if connection.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone():
             return True
         if connection.execute("SELECT 1 FROM deliveries WHERE authoritative=1 AND state IN ('queued','delivering') LIMIT 1").fetchone():
@@ -140,6 +143,22 @@ def ensure_worker(store: LedgerStore, environment: Mapping[str, str] | None = No
             os._exit(1)
     os.waitpid(process, 0)
     return {"started": True, "reason": "detached_spawn_requested"}
+
+
+def ensure_after_mutation(store: LedgerStore, payload: dict[str, Any],
+                          environment: Mapping[str, str] | None = None, *,
+                          ensure: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Request the existing host worker without failing a committed mutation."""
+    values = os.environ if environment is None else environment
+    if values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") == "0":
+        return payload
+    try:
+        (ensure_worker if ensure is None else ensure)(store, environment)
+    except (OSError, LedgerError) as error:
+        message = error.message if isinstance(error, LedgerError) else str(error)
+        return {**payload, "warnings": [*payload.get("warnings", []),
+                {"code": "worker_start_failed", "message": message, "committed": True}]}
+    return payload
 
 
 def run_worker(store: LedgerStore, environment: Mapping[str, str] | None = None, *,

@@ -56,6 +56,20 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.commands, [])
         return self.registry.list()[0]
 
+    def effective_snapshot(self, snapshot=None):
+        """A new snapshot sees the fake server's effective metadata and borders."""
+        observed = copy.deepcopy(self.snapshot if snapshot is None else snapshot)
+        for pane in observed["panes"]:
+            pane_id = pane["pane_id"]
+            if pane_id in self.herdr.labels:
+                pane["label"] = self.herdr.labels[pane_id]
+                pane["tokens"] = copy.deepcopy(self.herdr.metadata[pane_id]["tokens"])
+        for raw in observed["agents"]:
+            metadata = self.herdr.metadata[raw["pane_id"]]
+            raw["display_agent"] = metadata.get(SOURCE, {}).get("display_agent", "")
+            raw["tokens"] = copy.deepcopy(metadata["tokens"])
+        return observed
+
     def clear_commands(self):
         self.herdr.commands.clear()
         self.observations.clear()
@@ -116,23 +130,22 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             )]
         self.assertEqual(status, [("phase", "review"), ("summary", "Inspect committed status")])
 
-    def test_unchanged_status_and_snapshot_never_redraw(self):
+    def test_unchanged_status_and_matching_snapshot_never_redraw(self):
         agent = self.seed()
         self.registry.set_status(agent, phase="review", summary="Stable")
         self.clear_commands()
         result = self.registry.set_status(agent, phase="review", summary="Stable")
         self.assertNotIn("display", result)
-        self.registry.reconcile(self.snapshot, now=100)
-        self.registry.reconcile(self.snapshot, now=200)
+        self.registry.reconcile(self.effective_snapshot(), now=100)
+        self.registry.reconcile(self.effective_snapshot(), now=200)
         self.assertEqual(self.herdr.commands, [])
 
-    def test_same_source_metadata_and_detection_revisions_do_not_feedback(self):
+    def test_matching_source_metadata_and_detection_revisions_do_not_feedback(self):
         self.registry.reconcile(self.snapshot)
         self.clear_commands()
-        updated = copy.deepcopy(self.snapshot)
+        updated = self.effective_snapshot()
         raw = updated["agents"][0]
-        raw.update({"revision": 42, "display_agent": "🟧 orange-rabbit",
-                    "tokens": {"alias": "orange-rabbit", "color": "orange", "recap": "review"}})
+        raw["revision"] = 42
         self.registry.reconcile(updated)
         raw["revision"] = 43
         self.registry.reconcile(updated)
@@ -149,18 +162,17 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.assertTrue(all(rows[0]["alias"] == "blue-fox" for _, rows in self.observations))
         self.assertEqual(self.registry.list()[0]["agent_id"], agent["agent_id"])
         self.clear_commands()
-        self.registry.reconcile(updated)
+        self.registry.reconcile(self.effective_snapshot(updated))
         self.assertEqual(self.herdr.commands, [])
 
-    def test_turn_state_change_projects_committed_row_once(self):
-        self.seed()
-        updated = copy.deepcopy(self.snapshot)
+    def test_turn_state_change_with_matching_projection_never_redraws(self):
+        self.registry.reconcile(self.snapshot)
+        self.clear_commands()
+        updated = self.effective_snapshot()
         updated["agents"][0]["agent_status"] = "working"
         self.registry.reconcile(updated)
-        self.assertEqual(len(self.reports()), 1)
-        self.assertTrue(all(rows[0]["turn_state"] == "working" for _, rows in self.observations))
-        self.clear_commands()
-        self.registry.reconcile(updated)
+        self.assertEqual(self.registry.list()[0]["turn_state"], "working")
+        self.registry.reconcile(self.effective_snapshot(updated))
         self.assertEqual(self.herdr.commands, [])
 
     def moved_snapshot(self):
@@ -329,7 +341,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.registry.set_status(agent, phase="review", summary="Device holder")
         self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["phone"], "📱 Pixel")
         self.clear_commands()
-        remaining = {**self.snapshot, "agents": []}
+        remaining = {**self.effective_snapshot(), "agents": []}
         with mock.patch("ham.ledger.status.live_snapshot", return_value=remaining):
             self.registry.refresh()
         self.assertEqual(self.reports(), [

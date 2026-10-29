@@ -244,8 +244,7 @@ class AgentRegistry:
             result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment,
                                      prune_device_claims=prune_device_claims)
             if refresh_display:
-                if changed_panes:
-                    self._refresh_display(changed_panes, environment=environment)
+                self._refresh_display(changed_panes, environment=environment, snapshot=snapshot)
         return snapshot, result
 
     def reconcile(self, snapshot: Mapping[str, Any], *, now: float | None = None,
@@ -254,8 +253,8 @@ class AgentRegistry:
         """Commit a snapshot, then project changed panes; DB-only callers may opt out."""
         changed_panes: set[str] = set()
         result = self._reconcile(snapshot, now=now, changed_panes=changed_panes, environment=environment)
-        if refresh_display and changed_panes:
-            self._refresh_display(changed_panes, environment=environment)
+        if refresh_display:
+            self._refresh_display(changed_panes, environment=environment, snapshot=snapshot, now=now)
         return result
 
     def _reconcile(self, snapshot: Mapping[str, Any], *, changed_panes: set[str],
@@ -282,6 +281,7 @@ class AgentRegistry:
             linked = int(bool(worktree.get("is_linked_worktree"))) if isinstance(worktree, dict) else 0
             workspaces[workspace_id] = (repo_key, linked, str(raw.get("label") or workspace_id))
         locations: dict[str, dict[str, str]] = {}
+        borders: dict[str, str | None] = {}
         for raw in panes:
             if not isinstance(raw, dict) or not raw.get("terminal_id") or not raw.get("pane_id"):
                 raise LedgerError("invalid_snapshot", "Every pane must identify its terminal and location.")
@@ -289,6 +289,8 @@ class AgentRegistry:
             if terminal in locations:
                 raise LedgerError("invalid_snapshot", "Duplicate terminal in snapshot.")
             locations[terminal] = {key: str(raw.get(key) or '') for key in ("terminal_id", "pane_id", "workspace_id")}
+            label = raw.get("label", "")
+            borders[terminal] = label if isinstance(label, str) else None
         # Resolve Git outside the write lock. Never accept caller-injected repo_id from events.
         with self.store.read() as connection:
             pending = {row["terminal_id"]: dict(row) for row in connection.execute(
@@ -301,6 +303,8 @@ class AgentRegistry:
             terminal = str(raw.get("terminal_id") or '')
             if terminal not in locations:
                 raise LedgerError("invalid_snapshot", "An agent has no matching terminal pane.")
+            if raw.get("pane_id") != locations[terminal]["pane_id"]:
+                raise LedgerError("invalid_snapshot", "An agent has a mismatched terminal/pane binding.")
             session = raw.get("agent_session")
             session_ref = str(session.get("value") or '') if isinstance(session, dict) else ''
             native_session_pid = None
@@ -410,6 +414,19 @@ class AgentRegistry:
                          generation, value["client"], value["repo_id"], value["is_main_checkout"], value["alias"], at, at))
                     connection.execute("INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,?,?)",
                                        (agent_id, "unknown", at))
+                # The border belongs to the terminal binding, not the session
+                # generation. Reclaim only exact labels previously written by
+                # HAM on this host/terminal/pane; a role prefix proves nothing.
+                current_border = borders[terminal]
+                if current_border is not None and (not same or old["last_ham_label"] is None):
+                    previous = connection.execute(
+                        "SELECT 1 FROM agents WHERE host=? AND terminal_id=? AND pane_id=? "
+                        "AND active=0 AND generation<(SELECT generation FROM agents WHERE agent_id=?) "
+                        "AND last_ham_label=? LIMIT 1",
+                        (self.store.host, terminal, value["pane_id"], agent_id, current_border)).fetchone()
+                    if previous is not None:
+                        connection.execute("UPDATE agents SET last_ham_label=? WHERE agent_id=?",
+                                           (current_border, agent_id))
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
                     wake_terminals.append(terminal)
                     changed_panes.add(value["pane_id"])
@@ -596,12 +613,70 @@ class AgentRegistry:
                 {current["pane_id"]}, environment=environment, feature_invoked=feature_invoked)
         return result
 
+    def _display_plan(self, display: Any, pane_ids: set[str],
+                      snapshot: Mapping[str, Any] | None) -> tuple[dict[str, Any], set[str], set[str]]:
+        from ham.ledger.display import border_owned, metadata_matches
+        from ham.ledger.display_repair import fingerprint
+
+        agents = {agent["pane_id"]: agent for agent in self.list() if agent["host"] == self.store.host}
+        if snapshot is None:
+            # Explicit device cleanup and the later safety sweep must use the
+            # same binding fingerprint, while a replacement terminal resets it.
+            with self.store.read() as connection:
+                panes = {row["pane_id"]: dict(row) for row in connection.execute(
+                    "SELECT pane_id,terminal_id FROM terminal_slots WHERE host=? AND present=1",
+                    (self.store.host,))}
+        else:
+            panes = {pane["pane_id"]: pane for pane in snapshot["panes"]}
+        observed = {} if snapshot is None else {raw["pane_id"]: raw for raw in snapshot["agents"]
+                                               if raw.get("agent")}
+        targets = pane_ids if snapshot is None else pane_ids | agents.keys() | panes.keys()
+        plan: dict[str, Any] = {}
+        matching: set[str] = set()
+        for pane_id in targets:
+            agent = agents.get(pane_id)
+            raw = observed.get(pane_id)
+            pane = panes.get(pane_id)
+            if snapshot is not None and pane is None:
+                continue
+            if agent is not None:
+                desired = display.projection(agent)
+                if snapshot is not None:
+                    if raw is None or raw.get("terminal_id") != agent["terminal_id"]:
+                        continue
+                    current = pane.get("label", "")
+                    owned = isinstance(current, str) and border_owned(current, agent["last_ham_label"])
+                    if metadata_matches(desired, raw) and (current == desired.label or not owned):
+                        matching.add(pane_id)
+                        if current == desired.label and agent["last_ham_label"] != desired.label:
+                            self.set_display_label(agent["agent_id"], agent["last_ham_label"], desired.label)
+                        continue
+                desired_key = fingerprint(agent, desired)
+            else:
+                # Only device tokens survive an agent's exit. Never project an
+                # old identity into a replacement pane or revive other fields.
+                if raw is not None:
+                    continue
+                tokens = {} if pane is None else pane.get("tokens") or {}
+                if snapshot is not None and not any(tokens.get(key) for key in ("phone", "emu")):
+                    matching.add(pane_id)
+                    continue
+                desired_key = fingerprint({"host": self.store.host, **(pane or {"pane_id": pane_id})})
+            plan[pane_id] = (desired_key, raw)
+        return plan, matching, set(panes)
+
     def _refresh_display(self, pane_ids: set[str], *,
                          environment: Mapping[str, str] | None = None,
-                         feature_invoked: bool = False) -> dict[str, list[str]]:
-        # Import lazily: the projector reads this registry, but never reconciles it.
-        # It alone owns border ownership checks and last_ham_label compare-and-set.
+                         feature_invoked: bool = False,
+                         snapshot: Mapping[str, Any] | None = None,
+                         now: float | None = None) -> dict[str, list[str]]:
+        # Reserve attempts durably before external writes. A successful command
+        # is still dirty until a later snapshot confirms the effective output.
+        from ham.ledger import display_repair
         result: dict[str, list[str]] = {"updated": [], "failed": []}
+        attempts: dict[str, str] = {}
+        diagnostics: list[str] = []
+        at = time.time() if now is None else now
         try:
             from ham.ledger.display import LedgerDisplay
             runner = self.display_runner
@@ -609,18 +684,59 @@ class AgentRegistry:
                 runner = lambda command: run_bounded_command(
                     [herdr_executable(environment), *command], timeout=10, environment=environment)
             display = LedgerDisplay(self.store, runner=runner)
-            for pane_id in sorted(pane_ids):
-                refreshed = display.refresh(pane_id, feature_invoked=feature_invoked)
-                for key in result:
-                    result[key].extend(refreshed[key])
-        except Exception as error:
-            # The registry transaction has committed. A failed projection cannot
-            # truthfully be reported as a failed/rolled-back status mutation.
-            result["failed"].extend(sorted(pane_ids - set(result["updated"]) - set(result["failed"])))
-            self._display_failure(str(error))
-        else:
+            # Include pending shell device cleanup even without registry changes.
+            with self.store.read() as connection:
+                queued = display_repair.load(connection)
+            targets = pane_ids | queued.keys() if snapshot is not None else pane_ids
+            plan, matching, present = self._display_plan(display, targets, snapshot)
+            with self.store.transaction() as connection:
+                entries = display_repair.load(connection)
+                before = json.dumps(entries, sort_keys=True)
+                for pane_id in list(entries):
+                    if pane_id in matching or (snapshot is not None and pane_id not in present):
+                        del entries[pane_id]
+                for pane_id, (desired, _raw) in sorted(plan.items()):
+                    allowed, diagnostic = display_repair.reserve(
+                        entries, pane_id, desired, at, force=snapshot is None)
+                    if diagnostic:
+                        diagnostics.append(diagnostic)
+                    if allowed:
+                        attempts[pane_id] = desired
+                    elif snapshot is None:
+                        # An explicit caller must not mistake an exhausted or
+                        # capacity-blocked projection for a successful redraw.
+                        result["failed"].append(pane_id)
+                if json.dumps(entries, sort_keys=True) != before:
+                    display_repair.save(connection, entries)
+            for pane_id in attempts:
+                try:
+                    arguments: dict[str, Any] = {"feature_invoked": feature_invoked}
+                    if snapshot is not None:
+                        arguments["observed"] = plan[pane_id][1]
+                    refreshed = display.refresh(pane_id, **arguments)
+                    for key in result:
+                        result[key].extend(refreshed[key])
+                except Exception as error:
+                    result["failed"].append(pane_id)
+                    diagnostics.append(str(error))
             if result["failed"]:
-                self._display_failure("Could not refresh panes: " + ", ".join(result["failed"]))
+                detail = "Could not refresh panes: " + ", ".join(result["failed"])
+                diagnostics.append(detail)
+                with self.store.transaction() as connection:
+                    entries = display_repair.load(connection)
+                    for pane_id in result["failed"]:
+                        entry = entries.get(pane_id)
+                        if entry and entry["fingerprint"] == attempts.get(pane_id):
+                            diagnostic = display_repair.failed(entry, detail)
+                            if diagnostic:
+                                diagnostics.append(diagnostic)
+                    display_repair.save(connection, entries)
+        except Exception as error:
+            # The registry transaction has committed. Projection is advisory.
+            result["failed"].extend(sorted(pane_ids - set(result["updated"]) - set(result["failed"])))
+            diagnostics.append(str(error))
+        for detail in diagnostics:
+            self._display_failure(detail)
         return result
 
     def _display_failure(self, detail: str) -> None:
@@ -649,7 +765,13 @@ class AgentRegistry:
             current = connection.execute("SELECT agent_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
                                          (row["host"], row["terminal_id"])).fetchone()
             last = row["last_ham_label"]
-            if not row["active"] or current is None or current["agent_id"] != agent_id or last != expected_last:
+            if not row["active"] or current is None or current["agent_id"] != agent_id:
+                return {"updated": False, "last_ham_label": last}
+            if last == desired:
+                # Another projector may already have saved the exact same
+                # ownership while this one was reading the current border.
+                return {"updated": True, "last_ham_label": last}
+            if last != expected_last:
                 return {"updated": False, "last_ham_label": last}
             changed = connection.execute(
                 "UPDATE agents SET last_ham_label=? WHERE agent_id=? AND active=1 AND last_ham_label IS ?",

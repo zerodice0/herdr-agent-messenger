@@ -14,6 +14,7 @@ from unittest import mock
 from ham.agents import labels as agent_labels
 from ham.agents import spawn as agent_spawn
 from ham.ledger import display as ledger_display
+from ham.ledger import display_repair
 from ham.agents.directory import ssh_program_command
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.display import (LEGACY_SOURCE, RECAP_SOURCE, SOURCE, LedgerDisplay,
@@ -128,7 +129,7 @@ class LedgerDisplayTest(unittest.TestCase):
     def status(self, *, phase="구현 중", summary="Implement mailbox"):
         # These cases explicitly exercise the projector below. Keep the real
         # status commit, but defer its already-covered notification boundary.
-        with mock.patch.object(LedgerDisplay, "refresh", return_value={"updated": [], "failed": []}):
+        with mock.patch.object(self.registry, "_refresh_display", return_value={"updated": [], "failed": []}):
             return self.registry.set_status(self.agent(), phase=phase, summary=summary)
 
     def claim(self, device_id, kind, label, *, terminal="main", claimed_at=1.0):
@@ -507,6 +508,90 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
         self.assertFalse(any(command[:2] == ["agent", "rename"] for command in self.herdr.commands))
 
+    def test_repeated_named_label_events_only_patch_metadata_after_source_drift(self):
+        self.status()
+        self.claim("device-a", "phone", "Pixel")
+        self.herdr.labels["p-main"] = "User review border"
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        expected = copy.deepcopy(self.herdr.metadata["p-main"])
+        info = self.snapshot["agents"][0]
+
+        def run(*arguments):
+            if arguments[:2] == ("agent", "get"):
+                self.herdr.commands.append(list(arguments))
+                metadata = self.herdr.metadata["p-main"]
+                observed = {
+                    **info,
+                    "display_agent": metadata[SOURCE]["display_agent"],
+                    "tokens": copy.deepcopy(metadata["tokens"]),
+                }
+                return subprocess.CompletedProcess(
+                    arguments, 0, json.dumps({"result": {"agent": observed}}), "")
+            return self.herdr(arguments)
+
+        with (mock.patch("ham.ledger.display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=run),
+              mock.patch.object(agent_labels, "event_data", return_value={"pane_id": "p-main"}),
+              mock.patch.object(agent_labels, "event_name", return_value="pane.agent_status_changed")):
+            for _ in range(3):
+                self.herdr.commands.clear()
+                self.assertEqual(agent_labels.handle_event(), 0)
+                self.assertEqual(self.herdr.commands, [["agent", "get", "p-main"]])
+
+            self.herdr(["pane", "report-metadata", "p-main", "--source", LEGACY_SOURCE,
+                        "--token", "alias=stale-alias", "--token", "recap=stale phase"])
+            self.herdr.commands.clear()
+            self.assertEqual(agent_labels.handle_event(), 0)
+            writes = [command for command in self.herdr.commands
+                      if command[:2] != ["agent", "get"] and command[:2] != ["pane", "get"]]
+            self.assertEqual(writes, [self.display.projection(self.agent()).metadata_command("p-main")])
+            self.assertEqual(self.herdr.metadata["p-main"]["tokens"], expected["tokens"])
+            self.assertEqual(self.herdr.metadata["p-main"][SOURCE], expected[SOURCE])
+            self.assertEqual(self.herdr.labels["p-main"], "User review border")
+
+            self.herdr.commands.clear()
+            self.assertEqual(agent_labels.handle_event(), 0)
+            self.assertEqual(self.herdr.commands, [["agent", "get", "p-main"]])
+
+    def test_named_label_events_cannot_bypass_pending_or_exhausted_repair_budget(self):
+        self.status()
+        self.herdr.labels["p-main"] = "User review border"
+        agent = self.agent()
+        desired = display_repair.fingerprint(agent, self.display.projection(agent))
+        observed = {**self.snapshot["agents"][0], "display_agent": "Stale source",
+                    "tokens": {"alias": "stale-alias", "recap": "stale phase"}}
+
+        def run(*arguments):
+            if arguments[:2] == ("agent", "get"):
+                self.herdr.commands.append(list(arguments))
+                return subprocess.CompletedProcess(
+                    arguments, 0, json.dumps({"result": {"agent": observed}}), "")
+            return self.herdr(arguments)
+
+        with (mock.patch("ham.ledger.display.LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=run),
+              mock.patch.object(agent_labels, "event_data", return_value={"pane_id": "p-main"}),
+              mock.patch.object(agent_labels, "event_name", return_value="pane.agent_status_changed")):
+            for state in ("pending", "exhausted"):
+                with self.subTest(state=state):
+                    entries = {}
+                    attempts = 1 if state == "pending" else display_repair.MAX_ATTEMPTS
+                    for _ in range(attempts):
+                        display_repair.reserve(entries, "p-main", desired, 100.0, force=True)
+                        display_repair.failed(entries["p-main"], "Source drift remains")
+                    self.assertEqual(entries["p-main"]["state"], state)
+                    with self.store.transaction() as connection:
+                        display_repair.save(connection, entries)
+                    before = copy.deepcopy(self.herdr.metadata)
+                    for _ in range(3):
+                        self.herdr.commands.clear()
+                        self.assertEqual(agent_labels.handle_event(), 0)
+                        self.assertEqual(self.herdr.commands, [["agent", "get", "p-main"]])
+                    self.assertEqual(self.herdr.metadata, before)
+                    self.assertEqual(self.herdr.labels["p-main"], "User review border")
+                    with self.store.read() as connection:
+                        self.assertEqual(display_repair.load(connection), entries)
+
     def test_name_taken_race_refreshes_the_winning_alias_metadata(self):
         info = {"agent": "codex", "terminal_id": "worker",
                 "agent_session": {"value": "worker-session"}}
@@ -529,6 +614,8 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["alias"], "review-worker")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
+        self.assertEqual([command[4] for command in self.herdr.commands
+                          if command[:2] == ["pane", "report-metadata"]], [SOURCE])
 
     def test_initial_named_agent_without_registry_row_uses_plain_builder_only(self):
         initial = HerdrDisplay(["p-unregistered"])
@@ -543,7 +630,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(initial.metadata["p-unregistered"][SOURCE], {
             "agent": "codex", "display_agent": "initial-reviewer",
         })
-        self.assertEqual([command[4] for command in initial.commands], [LEGACY_SOURCE, SOURCE])
+        self.assertEqual([command[4] for command in initial.commands], [SOURCE])
         self.assertTrue(all(command[:2] == ["pane", "report-metadata"] for command in initial.commands))
         self.assertEqual(initial.labels["p-unregistered"], "User's existing border")
         self.assertEqual(initial.metadata["p-unregistered"]["tokens"], {
@@ -596,6 +683,8 @@ class LedgerDisplayTest(unittest.TestCase):
                 self.assertNotIn("phone", surface.metadata[pane_id]["tokens"])
                 self.assertNotIn("emu", surface.metadata[pane_id]["tokens"])
         self.assertEqual(surface.labels["p-worker"], "User review border")
+        self.assertTrue(all(command[4] == SOURCE for command in surface.commands
+                            if command[:2] == ["pane", "report-metadata"]))
 
     def test_spawn_local_refresh_preserves_authoritative_role_and_status(self):
         self.settings.mutate(self.repo_id, "mode", "auto")

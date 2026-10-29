@@ -515,6 +515,11 @@ home 제안은 관찰된 뒤 결정적인 규칙으로 수렴합니다.
 사용합니다. 로컬 원장·소켓·HOME/XDG·기존 request 경로도 모두 격리하세요.
 `HERDR_AGENT_LEDGER_AUTOSTART=0`은 암시적인 worker 시작을 막고 명시적인 원격
 원장에도 전달합니다. `ledger worker once|run|ensure`는 계속 직접 실행할 수 있습니다.
+공개 명령인 `status set|clear`와 `device claim|release`도 변경을 커밋한 뒤 기존
+호스트 worker의 실행을 요청하므로, `off` 모드에서도 대기 중인 표시 복구를 이어갑니다.
+읽기 전용 상태·기기 조회와 라이브러리 내부 변경은 worker를 시작하지 않습니다.
+worker 시작이 실패하면 변경을 취소하거나 명령을 실패시키지 않고, 커밋되었음을
+알리는 `worker_start_failed` 경고를 덧붙입니다.
 정확한 JSON·오류·격리 계약은 [영문 참고서](../../.agents/skills/herdr-agent-messenger/reference.md#hosts-fifo-transport-and-worker)에
 있습니다. 이 명령들은 runtime이나 전역 설정을 설치하지 않습니다.
 
@@ -612,6 +617,14 @@ python3 "$HAM_CLI" repo show
 요약이 먼저 잘립니다. `status clear`는 phase와 summary만 지우고 별칭과 현재
 역할은 유지합니다. 사용자가 지정한 기존 테두리는 보존합니다. Agents에서는 역할을
 주소로 쓸 별칭 앞에 표시하며, off에서도 역할 접두사 없이 상태 기능이 동작합니다.
+레지스트리를 갱신할 때 기록된 표시의 불일치를 모델 토큰·깨우기·메일 없이 복구합니다.
+의미 있는 phase·summary 변화는 여전히 `status set`으로 명시해야 합니다.
+복구는 스냅샷 확인을 기다리며, 5초부터 시작하는 지수 백오프로 최대 다섯 번
+시도합니다. 한도를 소진한 대상은 `ledger doctor`의 `display_repair` 맵에서
+진단하세요. 같은 상태를 반복해서 지정하거나 워커를 다시 시작해도 한도는 초기화되지
+않습니다. 이전 세대의 테두리 소유권은 같은 호스트의 동일한 terminal·pane 연결에서
+정확한 라벨이 확인될 때만 이어받으며, 역할 접두사만으로 판단하지 않습니다.
+자세한 내용은 [표시 복구와 테두리 소유권](ui-reference.md#역할-phase와-테두리-소유권)을 참고하세요.
 `status list`는 저장된 로컬 상태를 나열합니다. 값 없는 `--repo`는 호출자의 저장소를,
 `--repo ID`는 해당 저장소를 선택합니다. 상세한 로컬·등록 peer 조회에는
 `status board`를 사용하며, `status list`에 기존 상위 명령의 `--host`를 붙여

@@ -13,7 +13,7 @@ from ham.ledger.mail import Mailbox
 from ham.ledger.status import AgentRegistry, claude_foreground_pid, live_snapshot, repository_identity
 from ham.ledger.store import LedgerError, LedgerStore
 from ham.ledger.remote import RemoteLedger, SSHTransport
-from ham.ledger.worker import ensure_worker, run_worker, worker_status
+from ham.ledger.worker import ensure_after_mutation, ensure_worker, run_worker, worker_status
 
 COMMANDS = frozenset({"mail", "inbox", "repo", "ledger", "runtime", "device"})
 
@@ -190,19 +190,15 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
     if store is None:
         raise LedgerError("ledger_not_initialized", "No existing HAM ledger is available to read.")
     payload = _dispatch(arguments, environment, store)
-    values = os.environ if environment is None else environment
     mutating = ((arguments.command == "mail" and arguments.mail_command not in {"show", "threads", "direct-list"}) or
                 (arguments.command == "inbox" and arguments.inbox_command == "handle") or
                 (arguments.command == "ledger" and arguments.ledger_command in
                  {"reconcile", "event", "accept", "receipt", "setting", "withdraw", "retry", "agent-session", "delivery", "peer", "runtime"}))
-    if mutating and values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") != "0":
-        try:
-            ensure_worker(store, environment)
-        except (OSError, LedgerError) as error:
-            message = error.message if isinstance(error, LedgerError) else str(error)
-            payload = {**payload, "warnings": [*payload.get("warnings", []),
-                       {"code": "worker_start_failed", "message": message, "committed": True}]}
+    if mutating:
+        payload = ensure_after_mutation(store, payload, environment, ensure=ensure_worker)
     return store.annotate(payload)
+
+
 def status_operation(operation: str, *, environment: Mapping[str, str] | None = None,
                      phase: str | None = None, summary: str = "",
                      repo_id: str | None = None, host: str | None = None) -> dict[str, Any]:
@@ -229,13 +225,14 @@ def status_operation(operation: str, *, environment: Mapping[str, str] | None = 
         raise LedgerError("invalid_status_operation", "Status operation must be set, clear, list, or board.")
     snapshot, _ = registry.refresh(environment)
     agent = registry.resolve_context(environment, snapshot)
-    return registry.set_status(
+    payload = registry.set_status(
         agent,
         phase="" if operation == "clear" else str(phase or ""),
         summary="" if operation == "clear" else summary,
         feature_invoked=True,
         environment=environment,
     )
+    return ensure_after_mutation(store, payload, environment, ensure=ensure_worker)
 
 
 

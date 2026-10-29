@@ -74,6 +74,15 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
             self.workspace("w1", True), self.workspace("w2", True)])
 
     def register(self, snapshot, *, display=False):
+        # Reused placements still observe the fake's current effective output.
+        snapshot = copy.deepcopy(snapshot)
+        for pane in snapshot["panes"]:
+            pane["label"] = self.herdr.labels[pane["pane_id"]]
+            pane["tokens"] = copy.deepcopy(self.herdr.metadata[pane["pane_id"]]["tokens"])
+        for agent in snapshot["agents"]:
+            metadata = self.herdr.metadata[agent["pane_id"]]
+            agent["display_agent"] = metadata.get(SOURCE, {}).get("display_agent", "")
+            agent["tokens"] = copy.deepcopy(metadata["tokens"])
         self.registry.reconcile(snapshot, refresh_display=display)
         return {agent["terminal_id"]: agent for agent in self.registry.list()}
 
@@ -457,21 +466,40 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
 
     def test_group_arrival_departure_and_missing_metadata_refresh_survivors_only(self):
         observed = self.grouped()
-        self.register(observed, display=True)
+        agents = self.register(observed, display=True)
+        self.assertEqual({terminal: agent["role"] for terminal, agent in agents.items()},
+                         {"main": "main", "worker": "worker", "worker2": "worker"})
         self.herdr.commands.clear()
         without_main = copy.deepcopy(observed)
         without_main["agents"] = without_main["agents"][1:]
         without_main["panes"] = without_main["panes"][1:]
-        self.register(without_main, display=True)
-        self.assertEqual({command[2] for command in self.herdr.commands}, {"p-worker", "p-worker2"})
+        agents = self.register(without_main, display=True)
+        self.assertEqual({terminal: agent["role"] for terminal, agent in agents.items()},
+                         {"worker": "worker", "worker2": "worker"})
+        # Losing the main leaves surviving workers' effective output unchanged.
+        self.assertEqual(self.herdr.commands, [])
+        for terminal in agents:
+            self.assertTrue(self.herdr.labels["p-" + terminal].startswith("[워커]"))
+            self.assertIn("[워커]", self.herdr.metadata["p-" + terminal][SOURCE]["display_agent"])
         self.herdr.commands.clear()
-        self.register(observed, display=True)
-        self.assertEqual({command[2] for command in self.herdr.commands}, {"p-main", "p-worker", "p-worker2"})
+        agents = self.register(observed, display=True)
+        self.assertEqual({terminal: agent["role"] for terminal, agent in agents.items()},
+                         {"main": "main", "worker": "worker", "worker2": "worker"})
+        # The returning main's metadata and border already match as well.
+        self.assertEqual(self.herdr.commands, [])
+        self.assertTrue(self.herdr.labels["p-main"].startswith("[메인]"))
+        self.assertIn("[메인]", self.herdr.metadata["p-main"][SOURCE]["display_agent"])
         without_metadata = copy.deepcopy(observed)
         without_metadata.pop("workspaces")
         self.herdr.commands.clear()
-        self.register(without_metadata, display=True)
-        self.assertEqual({command[2] for command in self.herdr.commands}, {"p-main", "p-worker", "p-worker2"})
+        agents = self.register(without_metadata, display=True)
+        self.assertEqual({agent["role"] for agent in agents.values()}, {"main"})
+        writes = [command for command in self.herdr.commands
+                  if command[:2] in (["pane", "report-metadata"], ["pane", "rename"])]
+        self.assertEqual({command[2] for command in writes}, {"p-worker", "p-worker2"})
+        for terminal in agents:
+            self.assertTrue(self.herdr.labels["p-" + terminal].startswith("[메인]"))
+            self.assertIn("[메인]", self.herdr.metadata["p-" + terminal][SOURCE]["display_agent"])
         self.assertEqual(self.show()["workspace_id"], "w1")
         self.assertEqual(self.show()["main"], self.target("worker"))
 

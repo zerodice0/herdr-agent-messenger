@@ -682,12 +682,41 @@ Status projection preserves these claims, and force replacement reprojects the
 previous live holder too. Herdr uses a flat per-pane token map: metadata sources
 do not isolate keys. HAM leaves unrelated token keys untouched.
 
-When status/roles are invoked, summary supplies `[메인] summary` or
-`[워커] summary` on the border; off-mode status has no role prefix. HAM updates
-only a blank border, a verified legacy border, or its own last recorded border
-value. A differing user rename is preserved. The old `user:pane-recap` token is
-cleared only when the new status/role feature is invoked; this UI does not
+HAM-owned borders show `[메인] alias · summary` or `[워커] alias · summary`,
+omitting absent parts; off-mode status has no role prefix. HAM updates only a
+blank border, a verified legacy border, or its exact last recorded border.
+Ownership carries across agent generations only on the same host and exact
+terminal/pane binding. Recovery requires an exact match to the recorded
+prior-generation label; a role prefix alone never proves ownership. A differing
+manual rename is preserved. If the border already equals the desired label,
+HAM records ownership again without renaming it. The old `user:pane-recap` token
+is cleared only when the new status/role feature is invoked; this UI does not
 deploy or remove global recap rules.
+
+Registry refresh compares the already-fetched Herdr snapshot with HAM's desired
+`display_agent`, alias/color/recap/phone/emu tokens and owned border. Drift repair
+uses no model tokens, model wake or mail, and starts no extra process or timer.
+At matching steady state it performs no display writes or extra subprocesses.
+It restores recorded phase/summary; meaningful updates still require explicit
+`status set`. A fallback writer racing a projection is checked again on the next
+worker snapshot, not treated as confirmation merely because the write succeeded.
+
+Every projection write, whether it succeeds or fails, waits for a later snapshot
+to confirm the desired display. Unconfirmed mismatches retry with exponential
+backoff starting at five seconds, up to five attempts including the initial
+write. The queue holds at most 256 panes; overflow reports a diagnostic without
+writing the overflowing pane. Pending entries keep the existing maintenance
+worker alive even before their retry is due; exhausted entries alone do not.
+Retry state persists across events and worker instances until the desired output
+or terminal/pane binding changes, or a snapshot matches.
+
+For persistent conflicts, run `python3 -m ham cli ledger doctor` and inspect the
+pane-keyed `display_repair` mapping: `state` (`pending` or `exhausted`), `attempts`,
+`next_try_at`, `fingerprint` and `last_error`. An exhausted entry stops automatic
+writes for that unchanged target. Inspect the actual pane display and competing
+writer before changing anything; restarting a worker or repeating an unchanged
+status does not reset the cap. Preserve manual border names rather than treating
+their role-like prefixes as permission to overwrite them.
 
 ## Legacy direct-prompt overlay
 

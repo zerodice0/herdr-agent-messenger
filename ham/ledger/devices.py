@@ -144,4 +144,5 @@ def device_operation(arguments, environment=None) -> dict[str, Any]:
                               force=arguments.force, environment=environment)
     else:
         result = claims.release(agent, arguments.kind, arguments.device, environment=environment)
-    return store.annotate(result)
+    from ham.ledger.worker import ensure_after_mutation
+    return store.annotate(ensure_after_mutation(store, result, environment))

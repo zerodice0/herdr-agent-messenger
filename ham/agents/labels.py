@@ -9,7 +9,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Iterator, Mapping, NamedTuple
 
 from ham.agents.directory import herdr_executable
 from ham.ledger.display import LEGACY_SOURCE, SOURCE, report_agent_metadata
@@ -207,11 +207,14 @@ def report_agent_label_metadata(
     alias: str,
     marker: str,
     color: str,
+    *,
+    observed: Mapping[str, Any] | None = None,
 ) -> bool:
     return report_agent_metadata(
         pane_id, agent, alias, marker, color,
         runner=lambda command: run_herdr(*command),
         on_failure=report_command_failure,
+        observed=observed,
     )
 
 
@@ -236,6 +239,7 @@ def assign_label(pane_id: str) -> int:
         return 0 if report_agent_label_metadata(
             pane_id, agent, name,
             palette.marker if palette else "", palette.color if palette else "",
+            observed=info,
         ) else 1
 
     session_data = info.get("agent_session")
@@ -253,6 +257,7 @@ def assign_label(pane_id: str) -> int:
                 candidate.name,
                 candidate.marker,
                 candidate.color,
+                observed=info,
             )
             print(candidate.name)
             return 0 if metadata_reported else 1
@@ -264,6 +269,7 @@ def assign_label(pane_id: str) -> int:
                 reported = report_agent_label_metadata(
                     pane_id, str(current.get("agent") or agent), current_name,
                     palette.marker if palette else "", palette.color if palette else "",
+                    observed=current,
                 )
                 return 0 if reported else 1
             continue

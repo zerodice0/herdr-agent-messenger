@@ -433,16 +433,20 @@ class LedgerStore:
             raise failure
 
     def doctor(self) -> dict[str, Any]:
+        from ham.ledger.display_repair import load as load_display_repair
+
         with self.read() as connection:
             counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("agents", "messages", "deliveries", "outbox", "dedupe_receipts")}
             backlog = pending_outbox_backlog(connection)
+            display_repair = load_display_repair(connection)
         with self.read() as connection:
             failures = [dict(row) for row in connection.execute(
                 "SELECT * FROM notification_failures ORDER BY seq DESC LIMIT 10")]
         result = {"protocol": 1, "schema_version": SCHEMA_VERSION, "directory": str(self.directory),
                   "host": {"canonical_name": self.host, "uuid": self.host_uuid},
-                  "counts": counts, "notification_failures": failures}
+                  "counts": counts, "notification_failures": failures,
+                  "display_repair": display_repair}
         if backlog:
             result["outbox_pending"] = backlog
         return result
