@@ -673,6 +673,11 @@ main and selected group members. All displays use origin-host computed roles.
 See [schema-v9 storage and rollout](migration.md#worktree-role-grouping-schema-v9)
 before sharing a ledger with upgraded code: old processes cannot open v9 storage.
 
+Every named alias receives a color marker and token, including custom names.
+A palette-color first hyphen segment chooses that color; otherwise a stable
+SHA-256-derived palette color is used on every host. This identity cue does not
+change Mailbox/status-board turn-state colors or routing addresses.
+
 HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
 the alias remains addressable. A shared projection reports alias, color,
 display name, phase (`recap`) and ledger-backed device tokens under metadata

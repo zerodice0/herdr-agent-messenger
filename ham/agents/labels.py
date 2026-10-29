@@ -77,6 +77,20 @@ ALIASES = tuple(
 )
 
 
+def alias_identity(name: str) -> Alias:
+    """Derive one host-independent colour for palette and user-chosen aliases."""
+    if not name:
+        return Alias(name, "", "")
+    prefix = name.partition("-")[0]
+    for color, marker in COLORS:
+        if prefix == color:
+            return Alias(name, marker, color)
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:SEED_HASH_BYTES], "big") % len(COLORS)
+    color, marker = COLORS[index]
+    return Alias(name, marker, color)
+
+
 def run_herdr(*args: str) -> subprocess.CompletedProcess[str]:
     command = [herdr_executable(), *args]
     try:
@@ -235,10 +249,10 @@ def assign_label(pane_id: str) -> int:
         return 0
     name = str(info.get("name") or info.get("agent_name") or "")
     if name:
-        palette = next((alias for alias in ALIASES if alias.name == name), None)
+        identity = alias_identity(name)
         return 0 if report_agent_label_metadata(
             pane_id, agent, name,
-            palette.marker if palette else "", palette.color if palette else "",
+            identity.marker, identity.color,
             observed=info,
         ) else 1
 
@@ -265,10 +279,10 @@ def assign_label(pane_id: str) -> int:
             current = fetch_agent_info(pane_id)
             current_name = str(current.get("name") or current.get("agent_name") or "")
             if current_name:
-                palette = next((alias for alias in ALIASES if alias.name == current_name), None)
+                identity = alias_identity(current_name)
                 reported = report_agent_label_metadata(
                     pane_id, str(current.get("agent") or agent), current_name,
-                    palette.marker if palette else "", palette.color if palette else "",
+                    identity.marker, identity.color,
                     observed=current,
                 )
                 return 0 if reported else 1

@@ -27,7 +27,7 @@ from ham.agents.directory import (
     ssh_program_command,
     submission_failure_is_uncertain,
 )
-from ham.agents.labels import ALIASES, Alias, candidates
+from ham.agents.labels import Alias, alias_identity, candidates
 from ham.agents.output import compact_agent_payload, compact_spawn_payload
 from ham.agents.route import encode_agent_route
 from ham.ledger.display import LedgerDisplay
@@ -433,7 +433,7 @@ def spawn_command(
             if agent.get(key)
         }
         aliases = (
-            [Alias(label, "", "")] if label is not None
+            [alias_identity(label)] if label is not None
             else (alias for alias in candidates(f"{placement.terminal_id}:") if alias.name not in taken)
         )
         selected: Alias | None = None
@@ -469,9 +469,8 @@ def spawn_command(
         if selected is None:
             raise SpawnError("label_unavailable", "No HAM color-animal label is available.")
         label = selected.name
-        palette_alias = next((alias for alias in ALIASES if alias.name == label), None)
         metadata_reported = _report_metadata(
-            run, placement.pane_id, kind, palette_alias or Alias(label, "", ""),
+            run, placement.pane_id, kind, selected,
             host=host, environment=values, command_runner=command_runner,
         )
         placement_label_reported = True
@@ -497,8 +496,8 @@ def spawn_command(
         payload: dict[str, Any] = {
             "address": f"{host}/{label}",
             "label": label,
-            "marker": palette_alias.marker if palette_alias else "",
-            "color": palette_alias.color if palette_alias else "",
+            "marker": selected.marker,
+            "color": selected.color,
             "host": host,
             "created": placement.created,
             "pane_id": placement.pane_id,
@@ -528,7 +527,8 @@ def spawn_command(
         if body is not None:
             payload = {
                 "address": f"{host}/{label}" if label else "",
-                "marker": "", "created": placement.created, "pane_id": placement.pane_id,
+                "marker": alias_identity(label).marker if label else "",
+                "created": placement.created, "pane_id": placement.pane_id,
                 "workspace_id": placement.workspace_id,
                 "initial_prompt": {"operation_id": operation_id, "acceptance": "failed",
                                    "error_code": error.code, "evidence": error.message},

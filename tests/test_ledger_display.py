@@ -330,11 +330,11 @@ class LedgerDisplayTest(unittest.TestCase):
         main = self.herdr.metadata["p-main"][SOURCE]
         worker = self.herdr.metadata["p-worker"][SOURCE]
         self.assertEqual(main["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(worker["display_agent"], "[메인] review-worker")
+        self.assertEqual(worker["display_agent"], "🟫 [메인] review-worker")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"],
                          {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중", "other": "keep"})
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"],
-                         {"alias": "review-worker", "color": "", "recap": "", "other": "keep"})
+                         {"alias": "review-worker", "color": "brown", "recap": "", "other": "keep"})
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
@@ -353,11 +353,11 @@ class LedgerDisplayTest(unittest.TestCase):
         self.status()
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [워커] review-worker")
         self.settings.mutate(self.repo_id, "mode", "off")
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 review-worker")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_auto_roles_in_shared_workspace_prefer_the_main_checkout(self):
@@ -367,7 +367,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.settings.mutate(self.repo_id, "mode", "auto")
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [워커] review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
 
     def test_registry_move_redraws_roles_in_both_old_and_new_workspaces(self):
@@ -376,7 +376,7 @@ class LedgerDisplayTest(unittest.TestCase):
             snapshot[section][1]["workspace_id"] = "w-main"
         self.registry.reconcile(snapshot, refresh_display=False)
         self.settings.mutate(self.repo_id, "mode", "auto")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[워커] review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [워커] review-worker")
         identities = {agent["terminal_id"]: (agent["agent_id"], agent["generation"])
                       for agent in self.registry.list()}
         for section in ("panes", "agents"):
@@ -384,7 +384,7 @@ class LedgerDisplayTest(unittest.TestCase):
         with mock.patch("ham.ledger.status.live_snapshot", return_value=snapshot):
             self.registry.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "[메인] review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [메인] review-worker")
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit")
         self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
         self.assertEqual({agent["terminal_id"]: (agent["agent_id"], agent["generation"])
@@ -503,7 +503,9 @@ class LedgerDisplayTest(unittest.TestCase):
               mock.patch("sys.stdout", new_callable=io.StringIO) as output):
             self.assertEqual(agent_labels.assign_label("p-worker"), 0)
         self.assertEqual(output.getvalue(), "")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        identity = agent_labels.alias_identity("review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], f"{identity.marker} review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["color"], identity.color)
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["alias"], "review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
         self.assertFalse(any(command[:2] == ["agent", "rename"] for command in self.herdr.commands))
@@ -612,7 +614,9 @@ class LedgerDisplayTest(unittest.TestCase):
             self.assertEqual(agent_labels.assign_label("p-worker"), 0)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["alias"], "review-worker")
-        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "review-worker")
+        identity = agent_labels.alias_identity("review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], f"{identity.marker} review-worker")
+        self.assertEqual(self.herdr.metadata["p-worker"]["tokens"]["color"], identity.color)
         self.assertEqual(self.herdr.labels["p-worker"], "User review border")
         self.assertEqual([command[4] for command in self.herdr.commands
                           if command[:2] == ["pane", "report-metadata"]], [SOURCE])
@@ -627,14 +631,15 @@ class LedgerDisplayTest(unittest.TestCase):
               mock.patch("sys.stdout", new_callable=io.StringIO) as output):
             self.assertEqual(agent_labels.assign_label("p-unregistered"), 0)
         self.assertEqual(output.getvalue(), "")
+        identity = agent_labels.alias_identity("initial-reviewer")
         self.assertEqual(initial.metadata["p-unregistered"][SOURCE], {
-            "agent": "codex", "display_agent": "initial-reviewer",
+            "agent": "codex", "display_agent": f"{identity.marker} initial-reviewer",
         })
         self.assertEqual([command[4] for command in initial.commands], [SOURCE])
         self.assertTrue(all(command[:2] == ["pane", "report-metadata"] for command in initial.commands))
         self.assertEqual(initial.labels["p-unregistered"], "User's existing border")
         self.assertEqual(initial.metadata["p-unregistered"]["tokens"], {
-            "alias": "initial-reviewer", "color": "", "recap": "", "other": "keep",
+            "alias": "initial-reviewer", "color": identity.color, "recap": "", "other": "keep",
             "phone": "serial", "emu": "5554",
         })
         self.assertEqual(len(self.registry.list()), 2)

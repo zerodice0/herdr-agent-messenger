@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ham.agents import spawn as agent_spawn
 from ham.agents.directory import SSH_CONFIG_ENV, SSH_HOSTS_FILE_ENV, parse_agent_payload
-from ham.agents.labels import ALIASES, candidates
+from ham.agents.labels import ALIASES, alias_identity, candidates
 from ham.agents.route import resolve_agent_route
 from ham.ledger.display import build_display, report_metadata
 from ham.ledger.mail import Mailbox
@@ -193,13 +193,18 @@ class AgentSpawnTest(unittest.TestCase):
         self.assertEqual(len(backend.agents), 1)
         self.assertEqual(result["pane_id"], backend.pane_id)
 
-    def test_custom_label_is_preserved_verbatim_without_a_palette_marker(self):
-        backend = FakeHerdr()
-        result = self.spawn(backend, "--label", "Review Worker")
-        self.assertEqual(result["address"], "local/Review Worker")
-        self.assertEqual(result["marker"], "")
-        self.assertNotIn("label_metadata_reported", result)
-        self.assertEqual(backend.agents[0]["name"], "Review Worker")
+    def test_custom_label_is_preserved_verbatim_with_a_colour_marker(self):
+        for name in ("Review Worker", "readzone-sol", "blue-custom-project"):
+            with self.subTest(alias=name):
+                backend = FakeHerdr()
+                identity = alias_identity(name)
+                result = self.spawn(backend, "--label", name, "--verbose")
+                self.assertEqual(result["address"], f"local/{name}")
+                self.assertEqual(result["marker"], identity.marker)
+                self.assertEqual(result["color"], identity.color)
+                self.assertTrue(result["label_metadata_reported"])
+                self.assertEqual(backend.agents[0]["name"], name)
+                self.assertEqual(backend.metadata[backend.pane_id]["display_agent"], f"{identity.marker} {name}")
 
     def test_explicit_palette_label_receives_metadata(self):
         backend = FakeHerdr()

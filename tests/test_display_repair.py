@@ -10,6 +10,8 @@ from unittest import mock
 
 from ham.ledger import display_repair
 from ham.ledger import worker
+from ham.agents.directory import agent_label
+from ham.agents.labels import alias_identity
 from ham.ledger.display import LedgerDisplay, SOURCE, build_display, metadata_matches, report_metadata
 from ham.ledger.settings import RepoSettings
 from ham.ledger.status import AgentRegistry
@@ -124,6 +126,40 @@ class DisplayRepairTest(unittest.TestCase):
             else:
                 self.assertEqual(metadata["tokens"].get(key), expected)
         self.assertEqual(metadata["tokens"]["other"], "keep")
+
+    def test_custom_alias_converges_with_labels_fallback_and_stays_write_free(self):
+        from ham.agents.labels import report_agent_label_metadata
+
+        for index, name in enumerate(("readzone-sol", "blue-custom-project")):
+            with self.subTest(alias=name):
+                at = 100 + index * 200
+                self.template["agents"][0]["name"] = name
+                self.registry.reconcile(self.snapshot(), now=at)
+                self.registry.reconcile(self.snapshot(), now=at + 1)
+                identity = alias_identity(name)
+                projection = LedgerDisplay(self.store, runner=self.herdr).projection(self.agent())
+                self.assertEqual(projection.display_agent, f"{identity.marker} {name}")
+                self.assertEqual(projection.color, identity.color)
+                self.assert_matching()
+                self.assertEqual(self.entries(), {})
+                observed = self.snapshot()["agents"][0]
+                self.herdr.commands.clear()
+                with mock.patch("ham.ledger.display.LedgerStore", return_value=self.store):
+                    self.assertTrue(report_agent_label_metadata(
+                        "pane", "omp", name, identity.marker, identity.color, observed=observed,
+                    ))
+                for now in (at + 2, at + 3, at + 100):
+                    self.registry.reconcile(self.snapshot(), now=now)
+                self.assertEqual(self.herdr.commands, [])
+                self.assertEqual(self.entries(), {})
+                self.assertEqual(agent_label(observed), (name, name))
+                self.assertTrue(
+                    projection.display_agent == name or projection.display_agent.endswith(f" {name}")
+                )
+                if name == "readzone-sol":
+                    # Lost registered names still resolve by the decorated alias suffix.
+                    observed.pop("name")
+                    self.assertEqual(agent_label(observed), (name, "pane"))
 
     def test_border_only_drift_renames_once_without_metadata_write(self):
         self.initialize()

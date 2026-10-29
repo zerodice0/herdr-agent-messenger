@@ -151,7 +151,7 @@ class LedgerDisplay:
 
     def projection(self, agent: Mapping[str, Any], *, alias: str | None = None,
                    marker: str | None = None, color: str | None = None) -> DisplayProjection:
-        from ham.agents.labels import ALIASES
+        from ham.agents.labels import alias_identity
         from ham.ledger.devices import device_rows
 
         with self.store.read() as connection:
@@ -160,12 +160,12 @@ class LedgerDisplay:
         phones = " ".join(claim["label"] for claim in claims if claim["kind"] == "phone")
         emulators = " ".join(claim["label"] for claim in claims if claim["kind"] == "emu")
         name = str(agent["alias"] if alias is None else alias)
-        palette = next((item for item in ALIASES if item.name == name), None)
+        identity = alias_identity(name)
         role = agent["role"] if "role" in agent else self.settings.role(agent)
         return build_display(
             str(agent["client"]), name,
-            (palette.marker if palette else "") if marker is None else marker,
-            (palette.color if palette else "") if color is None else color,
+            identity.marker if marker is None else marker,
+            identity.color if color is None else color,
             role=role, phase=str(agent.get("phase") or ""),
             summary=str(agent.get("summary") or ""),
             phone=f"📱 {phones}" if phones else "",

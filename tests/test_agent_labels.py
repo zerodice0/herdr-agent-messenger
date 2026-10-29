@@ -6,6 +6,8 @@ import io
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -59,6 +61,75 @@ class AgentLabelsTest(ham_test_support.IsolatedLedgerTest):
         self.assertEqual(len(names), 256)
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(len(name) <= 32 and name.replace("-", "").islower() for name in names))
+
+    def test_unnamed_agent_has_no_identity_marker(self):
+        self.assertEqual(agent_labels.alias_identity(""), agent_labels.Alias("", "", ""))
+
+    def test_palette_alias_identity_is_unchanged(self):
+        for alias in agent_labels.ALIASES:
+            with self.subTest(alias=alias.name):
+                self.assertEqual(agent_labels.alias_identity(alias.name), alias)
+
+    def test_custom_alias_identity_is_stable_across_processes(self):
+        names = ("readzone-sol", "tokyo-travel", "custom-별명")
+        identities = [agent_labels.alias_identity(name) for name in names]
+        for name, identity in zip(names, identities):
+            self.assertEqual(identity, agent_labels.alias_identity(name))
+            self.assertEqual(identity.name, name)
+            self.assertIn((identity.color, identity.marker), agent_labels.COLORS)
+        script = (
+            "import json; from ham.agents.labels import alias_identity; "
+            f"print(json.dumps([alias_identity(name) for name in {names!r}]))"
+        )
+        for seed in ("1", "987654"):
+            with self.subTest(hash_seed=seed):
+                result = subprocess.run(
+                    [sys.executable, "-c", script], check=True, capture_output=True,
+                    text=True, env={**os.environ, "PYTHONHASHSEED": seed},
+                )
+                self.assertEqual(
+                    agent_labels.json.loads(result.stdout),
+                    [list(identity) for identity in identities],
+                )
+
+    def test_colour_prefixed_custom_alias_uses_palette_colour(self):
+        for color, marker in agent_labels.COLORS:
+            with self.subTest(color=color):
+                self.assertEqual(
+                    agent_labels.alias_identity(f"{color}-my-project"),
+                    agent_labels.Alias(f"{color}-my-project", marker, color),
+                )
+
+    def test_existing_custom_alias_reports_derived_identity_without_renaming(self):
+        for name in ("readzone-sol", "blue-my-project"):
+            info = {"agent": "omp", "name": name}
+            identity = agent_labels.alias_identity(name)
+            with (
+                self.subTest(alias=name),
+                mock.patch.object(agent_labels, "fetch_agent_info", return_value=info),
+                mock.patch.object(agent_labels, "report_agent_label_metadata", return_value=True) as report,
+                mock.patch.object(agent_labels, "run_herdr") as run,
+            ):
+                self.assertEqual(agent_labels.assign_label("pane"), 0)
+                report.assert_called_once_with(
+                    "pane", "omp", name, identity.marker, identity.color, observed=info,
+                )
+                run.assert_not_called()
+
+    def test_custom_alias_winning_rename_race_reports_same_identity(self):
+        current = {"agent": "omp", "name": "tokyo-travel"}
+        identity = agent_labels.alias_identity(current["name"])
+        with (
+            mock.patch.object(agent_labels, "fetch_agent_info", side_effect=[{"agent": "omp"}, current]),
+            mock.patch.object(agent_labels, "run_herdr", return_value=mock.Mock(
+                returncode=1, stderr="agent_name_taken",
+            )),
+            mock.patch.object(agent_labels, "report_agent_label_metadata", return_value=True) as report,
+        ):
+            self.assertEqual(agent_labels.assign_label("pane"), 0)
+        report.assert_called_once_with(
+            "pane", "omp", current["name"], identity.marker, identity.color, observed=current,
+        )
 
     def test_candidates_visit_every_alias(self):
         candidates = list(agent_labels.candidates("term-1:session-1"))

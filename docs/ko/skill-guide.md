@@ -1281,9 +1281,11 @@ python3 "$HAM_CLI" spawn --kind omp --host macbook-pro \
 `tab`, `workspace` 중 하나입니다. `label_metadata_reported`와
 `placement_label_reported`는 `false`일 때만 표시됩니다. `--verbose`를 사용하면
 `label`, `color`, `host`, `kind`, `cwd`, `route`, `agent`와 두 보고 플래그를
-모두 확인할 수 있습니다. HAM 팔레트에 없는 라벨은 marker가 비어 있고 팔레트
-메타데이터가 없습니다. 보고 플래그가 `false`여도 세션 생성 실패를 뜻하지는 않으므로
-실제 주소와 상태를 확인하세요.
+모두 확인할 수 있습니다. 사용자 지정 라벨에도 marker와 color를 부여합니다.
+하이픈으로 구분한 첫 부분이 팔레트 색상 이름이면 그 색을 사용하고, 그 외에는
+SHA-256으로 모든 호스트에서 같은 팔레트 색을 정합니다. 이름과 주소는 유지합니다.
+보고 플래그가 `false`여도 세션 생성 실패를 뜻하지는 않으므로 실제 주소와 상태를
+확인하세요.
 
 생성 후 시작 단계가 실패하면 HAM은 자신이 만든 리소스를 닫으려고 시도하고 오류
 메시지에 `cleanup` 결과를 포함합니다. 실패 시 무조건 다시 생성하지 말고 해당

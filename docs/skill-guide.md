@@ -1033,7 +1033,7 @@ python3 .agents/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py sp
   --placement workspace --workspace-label Review -- --model MODEL
 ```
 
-Compact spawn results contain `address`, palette `marker`, `created` (`pane`/`tab`/`workspace`), `pane_id`, `workspace_id`, and `tab_id` when available. Reporting flags `label_metadata_reported` / `placement_label_reported` appear only when false. Use `--verbose` for label/color, host, kind, cwd, route, agent metadata, and both reporting flags. A custom nonpalette name has an empty marker and no palette metadata. A successful session need not have successful optional metadata reporting; inspect false flags. Startup failure includes cleanup information; inspect for surviving resources before trying again.
+Compact spawn results contain `address`, color `marker`, `created` (`pane`/`tab`/`workspace`), `pane_id`, `workspace_id`, and `tab_id` when available. Reporting flags `label_metadata_reported` / `placement_label_reported` appear only when false. Use `--verbose` for label/color, host, kind, cwd, route, agent metadata, and both reporting flags. Custom names also receive a marker and color: a palette-color first hyphen segment takes precedence; otherwise a stable SHA-256-derived palette color is shared across hosts. Names and addresses are unchanged. See [color assignment](migration.md). A successful session need not have successful optional metadata reporting; inspect false flags. Startup failure includes cleanup information; inspect for surviving resources before trying again.
 
 ### GUI routes
 

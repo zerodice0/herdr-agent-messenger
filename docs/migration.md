@@ -55,7 +55,12 @@ herdr plugin link "$PWD" --enabled
 The plugin's display name is **HAM** and its ID is `herdr.agent-messenger`.
 Existing unnamed agents can be labeled with **Assign Agent Label**. Unnamed
 agents detected after installation receive `color-animal` labels such as
-`blue-otter`, with matching color markers. Manually named agents are left unchanged.
+`blue-otter`, with matching color markers. Manually named agents keep their names
+and also receive a color marker. If the first hyphen-separated segment is one of
+`white`, `blue`, `green`, `yellow`, `orange`, `red`, `purple`, or `brown`, that color
+is used. Otherwise SHA-256 of the alias's UTF-8 bytes selects a stable palette
+color (first four digest bytes, big-endian, modulo eight in the listed order).
+The same alias therefore has the same color on every host, without stored state.
 
 ### Receiving dependency
 
