@@ -655,7 +655,7 @@ replaced; a different live holder blocks claiming unless the user explicitly
 instructs `--force`. Failed Herdr refresh does not imply a stale holder.
 `device list` is read-only. See the [skill guide](skill-guide.md#device-claims-and-resource-presence)
 for command results and device details. Product code imports no legacy device
-JSON. `heavy_slot.py` remains separate and unchanged; its slots are not displayed.
+JSON.
 
 ### Role, phase and border ownership
 

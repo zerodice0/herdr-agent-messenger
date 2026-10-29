@@ -679,8 +679,7 @@ with exact values `phone=📱 <labels space-joined>` and
 there are no claims, preserves these values during status/role refresh and
 reprojects both affected live panes after force replacement.
 No legacy device JSON is imported by product code; any one-time rollout
-migration happens outside the product. `heavy_slot.py` is a separate,
-unchanged script and is neither read nor displayed by HAM.
+migration happens outside the product.
 
 `status board --verbose` and status-export payload agent rows add independently
 optional `devices` and `servers` lists. `devices` contains held nonstale claims

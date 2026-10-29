@@ -361,8 +361,7 @@ HAM owns the exact sidebar values `phone=📱 <labels space-joined>` and
 Claim/release and status projection keep these values synchronized, including a
 live previous holder after force replacement. Herdr tokens are a flat per-pane
 map, not isolated by metadata source. Product code does not import the legacy
-device JSON; any one-time rollout migration is external. `heavy_slot.py` remains
-a separate, unchanged script: HAM neither reads nor displays heavy-work slots.
+device JSON; any one-time rollout migration is external.
 
 ### Mailbox terminology
 
