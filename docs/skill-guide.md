@@ -487,9 +487,11 @@ Isolated verification can pin `peer add --remote-root /ABS/WORK_COPY
 Use private local ledger/socket/HOME/XDG/request directories as well.
 `HERDR_AGENT_LEDGER_AUTOSTART=0` disables implicit workers (also for explicit
 remote-ledger overrides); `ledger worker once|run|ensure` remains explicit.
-Public `status set|clear` and `device claim|release` also request the existing
-host worker after committing, so pending display repairs continue even in `off`
-mode. Read-only status/device views and library mutations never start workers.
+Public `status set|clear` and `device claim|release` request the existing host
+worker after committing only when maintenance remains, so failed display writes
+continue even in `off` mode. Successful explicit projections do not queue repair
+confirmation or start a worker by themselves. Read-only status/device views and
+library mutations never start workers.
 Worker startup failures add a committed `worker_start_failed` warning; they do
 not roll back or fail the mutation.
 See the [wire/setup reference](../.agents/skills/herdr-agent-messenger/reference.md#hosts-fifo-transport-and-worker)
@@ -589,8 +591,9 @@ An existing user border is preserved. Agents keeps the role before the
 addressable alias; status still works in off mode without a role prefix.
 Registry refresh repairs drift in the recorded display without model tokens,
 wakes or mail; meaningful phase/summary changes still need explicit `status set`.
-Repairs wait for snapshot confirmation and stop after five attempts with
-exponential backoff starting at five seconds. Diagnose exhausted targets with
+Snapshot repairs wait for snapshot confirmation and stop after five attempts with
+exponential backoff starting at five seconds. Explicit projections queue only
+failures; a successful explicit write clears its pending repair. Diagnose exhausted targets with
 `ledger doctor`'s `display_repair` mapping; unchanged status or worker restarts do
 not reset the cap. Exact prior-generation border ownership is carried only on the
 same host and terminal/pane binding, never inferred from a role prefix. See

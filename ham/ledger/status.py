@@ -670,8 +670,8 @@ class AgentRegistry:
                          feature_invoked: bool = False,
                          snapshot: Mapping[str, Any] | None = None,
                          now: float | None = None) -> dict[str, list[str]]:
-        # Reserve attempts durably before external writes. A successful command
-        # is still dirty until a later snapshot confirms the effective output.
+        # Snapshot repairs reserve durably until a later snapshot confirms them.
+        # Explicit writes queue only failures, avoiding maintenance for success.
         from ham.ledger import display_repair
         result: dict[str, list[str]] = {"updated": [], "failed": []}
         attempts: dict[str, str] = {}
@@ -689,7 +689,8 @@ class AgentRegistry:
                 queued = display_repair.load(connection)
             targets = pane_ids | queued.keys() if snapshot is not None else pane_ids
             plan, matching, present = self._display_plan(display, targets, snapshot)
-            with self.store.transaction() as connection:
+            reserve_durably = snapshot is not None and bool(plan or queued)
+            with (self.store.transaction() if reserve_durably else self.store.read()) as connection:
                 entries = display_repair.load(connection)
                 before = json.dumps(entries, sort_keys=True)
                 for pane_id in list(entries):
@@ -706,7 +707,7 @@ class AgentRegistry:
                         # An explicit caller must not mistake an exhausted or
                         # capacity-blocked projection for a successful redraw.
                         result["failed"].append(pane_id)
-                if json.dumps(entries, sort_keys=True) != before:
+                if reserve_durably and json.dumps(entries, sort_keys=True) != before:
                     display_repair.save(connection, entries)
             for pane_id in attempts:
                 try:
@@ -719,18 +720,33 @@ class AgentRegistry:
                 except Exception as error:
                     result["failed"].append(pane_id)
                     diagnostics.append(str(error))
+            detail = "Could not refresh panes: " + ", ".join(result["failed"])
             if result["failed"]:
-                detail = "Could not refresh panes: " + ", ".join(result["failed"])
                 diagnostics.append(detail)
+            if result["failed"] or (snapshot is None and any(
+                    pane_id in queued for pane_id in result["updated"])):
                 with self.store.transaction() as connection:
                     entries = display_repair.load(connection)
+                    before = json.dumps(entries, sort_keys=True)
+                    if snapshot is None:
+                        for pane_id in result["updated"]:
+                            entry = entries.get(pane_id)
+                            previous = queued.get(pane_id, {})
+                            if entry and entry["fingerprint"] in (
+                                    attempts.get(pane_id), previous.get("fingerprint")):
+                                del entries[pane_id]
+                        for pane_id in result["failed"]:
+                            if pane_id in attempts:
+                                display_repair.reserve(
+                                    entries, pane_id, attempts[pane_id], at, force=True)
                     for pane_id in result["failed"]:
                         entry = entries.get(pane_id)
                         if entry and entry["fingerprint"] == attempts.get(pane_id):
                             diagnostic = display_repair.failed(entry, detail)
                             if diagnostic:
                                 diagnostics.append(diagnostic)
-                    display_repair.save(connection, entries)
+                    if json.dumps(entries, sort_keys=True) != before:
+                        display_repair.save(connection, entries)
         except Exception as error:
             # The registry transaction has committed. Projection is advisory.
             result["failed"].extend(sorted(pane_ids - set(result["updated"]) - set(result["failed"])))

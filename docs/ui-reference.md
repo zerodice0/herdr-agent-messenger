@@ -701,8 +701,10 @@ It restores recorded phase/summary; meaningful updates still require explicit
 `status set`. A fallback writer racing a projection is checked again on the next
 worker snapshot, not treated as confirmation merely because the write succeeded.
 
-Every projection write, whether it succeeds or fails, waits for a later snapshot
-to confirm the desired display. Unconfirmed mismatches retry with exponential
+Snapshot-driven projection writes, whether they succeed or fail, wait for a later
+snapshot to confirm the desired display. Explicit status/device writes queue only
+failures and clear pending repair on success, without an extra verification
+subprocess or worker request. Unconfirmed mismatches retry with exponential
 backoff starting at five seconds, up to five attempts including the initial
 write. The queue holds at most 256 panes; overflow reports a diagnostic without
 writing the overflowing pane. Pending entries keep the existing maintenance

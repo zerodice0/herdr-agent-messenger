@@ -305,10 +305,8 @@ class DisplayRepairTest(unittest.TestCase):
         with mock.patch("ham.ledger.status.time.time", return_value=at + 30000):
             result = self.registry.set_status(self.agent(), phase="review", summary="New desired task")
         self.assertEqual(result["display"]["failed"], [])
-        entry = self.entries()["pane"]
-        self.assertNotEqual(entry["fingerprint"], fingerprint)
-        self.assertEqual((entry["attempts"], entry["state"]), (1, "pending"))
-        self.assertTrue(worker.maintenance_pending(self.store))
+        self.assertEqual(self.entries(), {})
+        self.assertFalse(worker.maintenance_pending(self.store))
         self.registry.reconcile(self.snapshot(), now=at + 30001)
         self.assertEqual(self.entries(), {})
 
@@ -321,6 +319,46 @@ class DisplayRepairTest(unittest.TestCase):
         self.assertNotEqual(entry["fingerprint"], fingerprint)
         self.assertEqual((entry["attempts"], entry["state"]), (1, "pending"))
         self.assertEqual(len(self.reports()), 1)
+
+    def test_successful_explicit_status_does_not_queue_snapshot_confirmation(self):
+        self.initialize()
+        with mock.patch("ham.ledger.status.time.time", return_value=200):
+            result = self.registry.set_status(
+                self.agent(), phase="review", summary="ok", feature_invoked=True)
+        self.assertEqual(result["display"], {"updated": ["pane"], "failed": []})
+        self.assertEqual(self.entries(), {})
+        self.assertFalse(worker.maintenance_pending(self.store))
+        self.assert_matching()
+        self.assertFalse(any(command[:2] == ["agent", "get"] for command in self.herdr.commands))
+
+    def test_successful_explicit_status_clears_existing_pending_repair(self):
+        self.initialize()
+        self.herdr.metadata_fails = True
+        with mock.patch("ham.ledger.status.time.time", return_value=200):
+            self.registry.set_status(self.agent(), phase="review", summary="Retry task")
+        self.assertTrue(worker.maintenance_pending(self.store))
+        self.herdr.metadata_fails = False
+        with mock.patch("ham.ledger.status.time.time", return_value=201):
+            result = self.registry.set_status(
+                self.agent(), phase="review", summary="Retry task", feature_invoked=True)
+        self.assertEqual(result["display"], {"updated": ["pane"], "failed": []})
+        self.assertEqual(self.entries(), {})
+        self.assertFalse(worker.maintenance_pending(self.store))
+
+    def test_failed_explicit_status_retains_attempt_cap(self):
+        self.initialize()
+        self.herdr.metadata_fails = True
+        for attempt in range(1, display_repair.MAX_ATTEMPTS + 1):
+            with mock.patch("ham.ledger.status.time.time", return_value=200 + attempt):
+                result = self.registry.set_status(
+                    self.agent(), phase="review", summary="Retry task", feature_invoked=True)
+            self.assertEqual(result["display"]["failed"], ["pane"])
+            entry = self.entries()["pane"]
+            self.assertEqual(entry["attempts"], attempt)
+            self.assertEqual(entry["next_try_at"],
+                             200 + attempt + display_repair.RETRY_SECONDS * 2 ** (attempt - 1))
+        self.assertEqual(entry["state"], "exhausted")
+        self.assertFalse(worker.maintenance_pending(self.store))
 
     def test_direct_status_failure_queues_worker_retry(self):
         self.initialize()

@@ -10,6 +10,7 @@ from ham.ledger import cli, devices, display_repair, worker
 from ham.ledger.settings import RepoSettings
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore
+from ham.ledger.worker import ensure_worker
 from tests.test_display_repair import EffectiveDisplay
 
 
@@ -92,6 +93,48 @@ class DisplayRepairLifecycleTest(ham_test_support.IsolatedLedgerTest):
             self.agent, "phone", "serial", label="Pixel", environment=self.environment)
         self.registry.reconcile(self.snapshot())
         self.assertFalse(worker.maintenance_pending(self.store))
+
+    def test_successful_public_status_matches_pre_repair_commit_and_bell_counts(self):
+        # b67b82b: store initialization, registry refresh, status, and border save.
+        self.cli_ensure.side_effect = lambda store, environment: self.assertEqual(
+            ensure_worker(store, environment), {"started": False, "reason": "no_pending_work"})
+        original_connect = LedgerStore.connect
+        for operation in ("set", "clear"):
+            with self.subTest(operation=operation):
+                commits = []
+
+                def connect(store):
+                    connection = original_connect(store)
+                    connection.set_trace_callback(
+                        lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+                    return connection
+
+                with mock.patch.object(LedgerStore, "connect", new=connect), \
+                        mock.patch.object(LedgerStore, "ring", autospec=True) as ring:
+                    result = self.status(operation)
+                self.assertEqual(result["display"], {"updated": ["pane"], "failed": []})
+                self.assertEqual(len(commits), 4)
+                self.assertEqual(ring.call_count, 3)
+                self.assertTrue(all(not call.args[1] for call in ring.call_args_list))
+                with self.store.read() as connection:
+                    self.assertEqual(display_repair.load(connection), {})
+                self.assertFalse(worker.maintenance_pending(self.store))
+                self.assert_ensured(self.cli_ensure)
+                self.cli_ensure.reset_mock()
+                self.device_ensure.assert_not_called()
+
+    def test_successful_public_device_claim_and_release_do_not_request_worker(self):
+        self.device_ensure.side_effect = lambda store, environment: self.assertEqual(
+            ensure_worker(store, environment), {"started": False, "reason": "no_pending_work"})
+        self.assertEqual(self.device("claim", "phone", "serial", "--label", "Pixel",
+                                     dispatch=True)["device"]["device_id"], "serial")
+        self.assertFalse(worker.maintenance_pending(self.store))
+        self.assertEqual(len(self.device("release", "phone", "serial")["released"]), 1)
+        with self.store.read() as connection:
+            self.assertEqual(display_repair.load(connection), {})
+        self.assertFalse(worker.maintenance_pending(self.store))
+        self.cli_ensure.assert_not_called()
+        self.assertEqual(self.device_ensure.call_count, 2)
 
     def test_public_status_display_failure_in_off_mode_ensures_after_commit(self):
         self.herdr.metadata_fails = True
