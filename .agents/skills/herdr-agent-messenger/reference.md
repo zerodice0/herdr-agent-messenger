@@ -661,6 +661,26 @@ holders are stale, independent of whether the physical device is attached.
   `release phone`, `release emu`, or a kind plus device narrows the selection.
   There is no release force option.
 
+New emulator claims have a host-wide limit across repositories.
+`HERDR_AGENT_EMU_LIMIT` is read at claim time (default `3`; `0` or negative means
+unlimited). A noninteger value returns `invalid_config` before probing processes
+or mutating claims; correct or unset the variable before retrying.
+Admission returns `emu_limit` when
+`max(claim_count, process_count) >= limit`: `claim_count` counts other live host
+emulator claims; `process_count` counts running Android qemu processes excluding
+the target `DEVICE`. The claim-count check and insertion are atomic. Your own
+live reclaims are exempt, and phones are unlimited. Only emulator claims run
+the bounded `ps` probe; failure yields `process_count:null` and admission uses
+the claim count alone. `--force` bypasses the limit **only on explicit user
+instruction**. On refusal, wait for capacity or do other work; never stop
+existing emulators to make room.
+
+The `emu_limit` JSON `error` contains `code`, `message`, `limit`, `claim_count`,
+`process_count`, `holders:[{alias,pane,device,label,claimed_at}]`, and
+`untracked_processes:[{pid,port}]`. These diagnostics describe live host holders
+and untracked qemu processes; refusal never stops processes or revokes claims.
+Storage schema 12 and protocol 1 are unchanged.
+
 | Operation | JSON result |
 | --- | --- |
 | claim | `{device:{...},replaced:{...}\|null,replaced_stale:bool}` |

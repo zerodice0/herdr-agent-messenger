@@ -343,6 +343,19 @@ device list
   사용하여 교체합니다. 비활성 소유자나 이전 generation의 점유는 stale이므로
   force 없이 교체할 수 있으며 `replaced_stale:true`를 반환합니다.
   stale 점유는 변경 경로에서만 정리하고 조회에서는 정리하지 않습니다.
+- 새 `emu` 점유에는 저장소와 관계없이 호스트 전체의 한도를 적용합니다. 점유 시점에
+  `HERDR_AGENT_EMU_LIMIT`를 읽으며 기본값은 `3`, `0` 이하는 무제한입니다.
+  정수가 아닌 값을 지정하면 프로세스 조회나 점유 변경 전에 `invalid_config`로
+  거부합니다. 다시 시도하기 전에 값을 수정하거나 환경 변수를 해제합니다.
+  `max(claim_count, process_count) >= limit`이면 `emu_limit`로 거부합니다.
+  `claim_count`는 같은 호스트의 다른 활성 에뮬레이터 점유 수이며, `process_count`는
+  대상 `DEVICE`를 제외하고 실행 중인 Android qemu 프로세스 수입니다. 점유 수 검사와
+  삽입은 원자적으로 처리합니다. 자신의 활성 점유를 다시 등록할 때는 한도를 적용하지
+  않으며, 실기기에는 한도가 없습니다. 실행 시간을 제한한 `ps` 조회는 에뮬레이터
+  점유 때만 수행합니다. 조회가 실패하면 `process_count`는 `null`이고 점유 수만으로
+  판단합니다. `--force`로 한도를 우회하는 것은 **사용자가 명시적으로 지시했을 때만**
+  허용합니다. 거부되면 여유가 생길 때까지 기다리거나 다른 일을 하며, 자리를 만들려고
+  실행 중인 에뮬레이터를 종료하지 않습니다.
 
 명령은 `-h` / `--help`를 지원하며 `--verbose`는 없습니다. JSON 객체 하나를 반환하고
 메일함 명령과 같은 도메인·사용법 오류 규칙을 따릅니다.
@@ -352,12 +365,17 @@ device list
 | `device claim` | `{device,replaced,replaced_stale}`이며 `replaced`는 이전 점유 또는 `null`입니다. |
 | `device release` | `{released:[...]}`입니다. |
 | `device list` | `{devices:[{device_id,kind,label,claimed_at,holder,stale,attached}]}`입니다. |
+| `emu_limit` 오류 | `error`에 `code`, `message`, `limit`, `claim_count`, `process_count`, `holders:[{alias,pane,device,label,claimed_at}]`, `untracked_processes:[{pid,port}]`가 있습니다. |
 
 `holder`에는 `{agent_id,alias,pane_id,terminal_id,generation,active,live}`가 있습니다.
 `attached`는 adb 연결 여부입니다. Android 상태가 `device`이면 `true`, 아니면
 `false`이며, adb를 사용할 수 없거나 iOS UDID처럼 adb 형식이 아닌 ID이면 `null`입니다.
 연결 여부는 점유 소유자의 활성 여부와 별개입니다. `device list`는 읽기 전용이므로
 레지스트리 갱신, 토큰 쓰기, stale 정리나 디렉터리 생성을 하지 않습니다.
+
+`emu_limit`의 진단 정보는 호스트의 활성 점유자와 점유 기록이 없는 qemu 프로세스를
+보여줄 뿐, 프로세스를 종료하거나 점유를 해제하지 않습니다. 저장소 스키마 12와
+프로토콜 1은 변경하지 않습니다.
 
 `status board`는 이 자원 필드를 요청하되 기본 출력에서는 목록을 개수로 표시합니다.
 `--verbose`로 읽기 전용 전체 행을 조회할 수 있습니다. Status-export는 wire payload에

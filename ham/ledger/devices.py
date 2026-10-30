@@ -1,6 +1,7 @@
 """Terminal-generation-owned device claims and read-only attachment observations."""
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import subprocess
@@ -62,6 +63,38 @@ class DeviceClaims:
         except (OSError, subprocess.SubprocessError):
             return None
 
+    def _emulator_processes(self) -> list[dict[str, Any]] | None:
+        # One local, bounded snapshot on Linux/macOS; read-only views never probe.
+        result = self._run(["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
+        if result is None:
+            return None
+        processes = []
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) != 3 or not fields[0].isdigit() or not fields[1].startswith("qemu-system-"):
+                continue
+            # ps joins argv without shell quoting. Quotes and SDK path spaces
+            # are literal data; ucomm identifies qemu even on truncated names.
+            executable_prefix = fields[2].split("qemu-system-", 1)[0]
+            argv = fields[2].split()
+            android = "/emulator/" in executable_prefix or any(
+                argument.split("=", 1)[0] in {"-avd", "-port", "-ports"} for argument in argv)
+            if not android:
+                continue
+            port = None
+            for index, argument in enumerate(argv[1:], 1):
+                flag, separator, value = argument.partition("=")
+                if flag not in {"-port", "-ports"}:
+                    continue
+                if not separator:
+                    value = argv[index + 1] if index + 1 < len(argv) else ""
+                console_port = value.split(",", 1)[0]
+                if console_port.isdigit():
+                    port = int(console_port)
+                    break
+            processes.append({"pid": int(fields[0]), "port": port})
+        return processes
+
     def list(self) -> dict[str, Any]:
         with self.store.read() as connection:
             rows = device_rows(connection)
@@ -83,10 +116,21 @@ class DeviceClaims:
                 result = self._run(["adb", "-s", device_id, "shell", "getprop", "ro.product.model"], timeout=10)
                 if result and result.stdout.strip():
                     label = result.stdout.strip()
+        limit = 0
+        processes = None
+        if kind == "emu" and not force:
+            values = os.environ if environment is None else environment
+            try:
+                limit = int(values.get("HERDR_AGENT_EMU_LIMIT", "3"))
+            except ValueError:
+                raise LedgerError("invalid_config", "HERDR_AGENT_EMU_LIMIT must be an integer.") from None
+            if limit > 0:
+                processes = self._emulator_processes()
         at = time.time() if now is None else now
         with self.store.transaction((agent["terminal_id"],)) as connection:
             current = check_generation(connection, self.store.host, agent["terminal_id"], agent["agent_id"], agent["generation"])
-            previous = next((row for row in device_rows(connection) if row["device_id"] == device_id), None)
+            rows = device_rows(connection)
+            previous = next((row for row in rows if row["device_id"] == device_id), None)
             other = previous is not None and previous["holder"]["agent_id"] != current["agent_id"]
             if other and not previous["stale"] and not force:
                 holder = previous["holder"]
@@ -94,6 +138,33 @@ class DeviceClaims:
                                     f"({holder['host']}/{holder['pane_id']}) since {previous['claimed_at']}.")
                 error.holder = {**holder, "claimed_at": previous["claimed_at"]}
                 raise error
+            own_reclaim = (previous is not None and not other and not previous["stale"]
+                           and previous["kind"] == "emu")
+            if kind == "emu" and limit > 0 and not own_reclaim:
+                claims = [row for row in rows if row["kind"] == "emu" and not row["stale"]
+                          and row["holder"]["host"] == self.store.host and row["device_id"] != device_id]
+                target_port = device_id.removeprefix("emulator-")
+                target_port = int(target_port) if device_id.startswith("emulator-") and target_port.isdigit() else None
+                others = ([process for process in processes
+                           if target_port is None or process["port"] != target_port]
+                          if processes is not None else None)
+                process_count = len(others) if others is not None else None
+                if max(len(claims), process_count or 0) >= limit:
+                    claimed_devices = {row["device_id"] for row in claims}
+                    error = LedgerError(
+                        "emu_limit", f"Host {self.store.host} has reached the emulator limit ({limit}). "
+                        "Wait for an emulator to be released/stopped, or do other work. "
+                        "Use --force only on explicit user instruction; existing emulators are not stopped.")
+                    error.details = {
+                        "limit": limit, "claim_count": len(claims), "process_count": process_count,
+                        "holders": [{"alias": row["holder"]["alias"], "pane": row["holder"]["pane_id"],
+                                     "device": row["device_id"], "label": row["label"],
+                                     "claimed_at": row["claimed_at"]} for row in claims],
+                        "untracked_processes": [process for process in others or []
+                                                if process["port"] is None
+                                                or f"emulator-{process['port']}" not in claimed_devices],
+                    }
+                    raise error
             panes = prune_stale(connection) | {current["pane_id"]}
             if other and previous["holder"]["live"]:
                 panes.add(previous["holder"]["pane_id"])

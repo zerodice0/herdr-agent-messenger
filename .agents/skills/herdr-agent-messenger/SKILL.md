@@ -70,7 +70,7 @@ Never replay uncertain `delivering` after crashes/session changes. User evidence
 
 ## Device claims
 
-Same launcher: `device claim phone|emu DEVICE [--label TEXT]` before use; `device release [phone|emu|all] [DEVICE]` after; `device list` to inspect. Release only your claims. `device_claimed`: stop; `--force` only on explicit user instruction. Reference **Device claims and resource fields**.
+Same launcher: `device claim phone|emu DEVICE [--label TEXT]` before use; `device release [phone|emu|all] [DEVICE]` after; `device list` to inspect. Release only your claims. `device_claimed`: do not use the device. New emulator claims have a host-wide limit: `HERDR_AGENT_EMU_LIMIT` is read at claim time (default `3`; `0` or negative is unlimited), using the greater of other live emulator claims and Android qemu processes excluding the target `DEVICE`. Your own live reclaims are exempt; phones are unlimited. `emu_limit` includes limit/count/holder/process diagnostics: wait or do other work, never stop existing emulators to make room. `--force` replaces a holder or bypasses the limit only on explicit user instruction. Reference **Device claims and resource fields** for atomic admission, bounded-probe fallback and the error payload.
 
 ## Spawn with first prompt
 

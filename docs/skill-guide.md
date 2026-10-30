@@ -317,6 +317,18 @@ device list
   explicitly instructs you to do so**. Inactive or old-generation holders are
   stale and can be replaced without force (`replaced_stale:true`).
   Stale claims are pruned only on mutation paths, never by reading a view.
+- New `emu` claims have a host-wide admission limit across repositories. Read
+  `HERDR_AGENT_EMU_LIMIT` at claim time: default `3`; `0` or negative is unlimited.
+  A noninteger value returns `invalid_config` before probing processes or mutating
+  claims; correct or unset the variable before retrying.
+  Refuse with `emu_limit` when `max(claim_count, process_count) >= limit`, where
+  `claim_count` counts other live emulator claims on this host and `process_count`
+  counts running Android qemu processes excluding the target `DEVICE`. The
+  claim-count check and insertion are atomic. Your own live reclaims are exempt;
+  phones are unlimited. Only emulator claims run the bounded `ps` probe; if it
+  fails, `process_count` is `null` and admission uses the claim count alone.
+  `--force` bypasses the limit **only on explicit user instruction**. On refusal,
+  wait for capacity or do other work; never stop existing emulators to make room.
 
 Commands accept `-h` / `--help`, not `--verbose`, and emit one JSON object with
 the same domain/usage error conventions as mailbox commands:
@@ -326,12 +338,17 @@ the same domain/usage error conventions as mailbox commands:
 | `device claim` | `{device,replaced,replaced_stale}`; `replaced` is the previous claim or `null`. |
 | `device release` | `{released:[...]}`. |
 | `device list` | `{devices:[{device_id,kind,label,claimed_at,holder,stale,attached}]}`. |
+| `emu_limit` error | `error` contains `code`, `message`, `limit`, `claim_count`, `process_count`, `holders:[{alias,pane,device,label,claimed_at}]`, and `untracked_processes:[{pid,port}]`. |
 
 `holder` contains `{agent_id,alias,pane_id,terminal_id,generation,active,live}`.
 `attached` is adb attachment (`true` only for Android state `device`, otherwise
 `false`); it is `null` if adb is unavailable or the ID is not adb-like, such as
 an iOS UDID. Attachment is not holder liveness. `device list` is read-only:
 no registry refresh, token writes, stale pruning or directory creation.
+
+`emu_limit` diagnostics describe live host holders and untracked qemu processes;
+they do not stop processes or revoke claims. Storage schema 12 and protocol 1
+are unchanged.
 
 `status board` requests these fields, projecting lists as counts by default;
 `--verbose` restores their full read-only records. Status-export includes

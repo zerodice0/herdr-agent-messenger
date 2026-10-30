@@ -1620,7 +1620,8 @@ def main(
     except (BatchDispatchError, SkillCommandError, SpawnError, LedgerError) as error:
         _write_json(
             {"error": {"code": error.code, "message": error.message,
-                       **({"holder": error.holder} if hasattr(error, "holder") else {})}},
+                       **({"holder": error.holder} if hasattr(error, "holder") else {}),
+                       **getattr(error, "details", {})}},
         )
         return 1
     except Exception as error:
