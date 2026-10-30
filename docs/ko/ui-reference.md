@@ -631,14 +631,17 @@ device list
 있으면 점유를 거부하며, `--force`는 사용자가 명시적으로 지시한 경우에만 사용합니다.
 Herdr 갱신 실패를 stale의 근거로 해석하지 않습니다. `device list`는 읽기 전용입니다.
 
-새 에뮬레이터 점유에는 저장소와 관계없이 호스트 전체의 한도를 적용합니다.
-`HERDR_AGENT_EMU_LIMIT`를 점유 시점에 읽으며 기본값은 `3`, `0` 이하는 무제한입니다.
-같은 호스트의 다른 활성 에뮬레이터 점유 수와 대상 `DEVICE`를 제외한 실행 중
+새 Android 에뮬레이터 점유(`emu`에 `emulator-<port>` 또는 포트 번호만 지정)에는
+저장소와 관계없이 호스트 전체의 한도를 적용합니다. `HERDR_AGENT_EMU_LIMIT`를
+점유 시점에 읽으며 기본값은 `3`, `0` 이하는 무제한입니다.
+같은 호스트의 다른 활성 Android 에뮬레이터 점유 수와 대상 `DEVICE`를 제외한 실행 중
 Android qemu 프로세스 수 중 큰 값이 한도에 도달하면 `emu_limit`로 거부합니다.
 점유 수 검사와 삽입은 원자적으로 처리합니다. 자신의 활성 점유를 다시 등록할 때는
-한도를 적용하지 않으며, 실기기에는 한도가 없습니다. 실행 시간을 제한한 `ps` 조회는
-에뮬레이터 점유 때만 수행하며, 실패하면 `process_count:null`로 표시하고 점유 수만으로
-판단합니다. JSON의 `error`에는 `limit`, `claim_count`, `process_count`,
+한도를 적용하지 않으며, 실기기와 iOS 시뮬레이터의 `emu` 점유에는 한도가 없습니다.
+iOS 시뮬레이터 점유는 한도 계산에 포함하지 않고 프로세스도 조회하지 않습니다.
+실행 시간을 제한한 `ps` 조회는 Android 에뮬레이터 점유 때만 수행하며, 실패하면
+`process_count:null`로 표시하고 점유 수만으로 판단합니다.
+JSON의 `error`에는 `limit`, `claim_count`, `process_count`,
 `holders:[{alias,pane,device,label,claimed_at}]`,
 `untracked_processes:[{pid,port}]`가 있습니다. 거부되면 여유가 생길 때까지 기다리거나
 다른 일을 하며, 자리를 만들려고 실행 중인 에뮬레이터를 종료하지 않습니다.

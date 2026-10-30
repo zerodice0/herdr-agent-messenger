@@ -78,6 +78,61 @@ class DeviceClaimsTest(unittest.TestCase):
             for index in range(count)
         ]
 
+    def seed_ios_simulators(self, count=3):
+        return [
+            self.emu_claim("b", f"4813019E-0000-4000-8000-{index:012X}",
+                           label=f"iPhone {index} sim", now=20 + index)["device"]
+            for index in range(count)
+        ]
+
+    def test_ios_simulator_claims_do_not_block_android_emulator_claim(self):
+        simulators = self.seed_ios_simulators()
+        self.runner.reset_mock()
+        self.runner.return_value = subprocess.CompletedProcess([], 0, "", "")
+        result = self.emu_claim()
+        self.assertEqual(result["device"]["device_id"], "emulator-5554")
+        self.runner.assert_called_once()
+        with self.store.read() as connection:
+            rows = device_rows(connection)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["holder"]["live"] for row in rows))
+        self.assertTrue({row["device_id"] for row in simulators}.issubset(
+            {row["device_id"] for row in rows}))
+
+    def test_ios_simulator_claims_ignore_android_limit_and_never_probe_processes(self):
+        for count in (3, 4):
+            with self.subTest(android_claims=count):
+                self.seed_emulators(count)
+                self.runner.reset_mock()
+                with mock.patch.object(self.claims, "_emulator_processes",
+                                       side_effect=AssertionError("iOS simulators must not probe")) as probe:
+                    result = self.emu_claim(
+                        device="4813019E-0000-4000-8000-000000000099",
+                        label="iPhone 17 sim")
+                self.assertEqual(result["device"]["device_id"],
+                                 "4813019E-0000-4000-8000-000000000099")
+                self.assertEqual(result["device"]["kind"], "emu")
+                probe.assert_not_called()
+                self.runner.assert_not_called()
+                self.claims.release(self.agent(), "emu")
+                self.claims.release(self.agent("b"), "emu")
+
+    def test_emu_limit_counts_and_reports_only_android_claims(self):
+        android = self.seed_emulators()
+        self.seed_ios_simulators()
+        self.runner.reset_mock()
+        self.runner.return_value = subprocess.CompletedProcess([], 0, "", "")
+        with self.assertRaises(LedgerError) as raised:
+            self.emu_claim(device="5560")
+        self.assertEqual(raised.exception.code, "emu_limit")
+        self.assertEqual(raised.exception.details["claim_count"], 3)
+        self.assertEqual(raised.exception.details["holders"], [
+            {"alias": "agent-b", "pane": "p-b", "device": row["device_id"],
+             "label": row["label"], "claimed_at": row["claimed_at"]}
+            for row in android
+        ])
+        self.runner.assert_called_once()
+
     def test_emu_under_limit_probes_once_before_transaction(self):
         with mock.patch.object(self.store, "transaction", wraps=self.store.transaction) as transaction:
             def probe(command, **kwargs):

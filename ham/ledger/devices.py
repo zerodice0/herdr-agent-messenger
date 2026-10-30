@@ -21,6 +21,12 @@ def normalize_device(kind: str, device: str) -> str:
     return "emulator-" + value if kind == "emu" and value.isdigit() else value
 
 
+def _android_emulator(device_id: str) -> bool:
+    """Android emulator serials are emulator-<port>; iOS simulator UUIDs are not limited."""
+    port = device_id.removeprefix("emulator-")
+    return device_id.startswith("emulator-") and port.isdigit()
+
+
 def device_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     # A pre-v6 peer/local ledger is unknown to callers, never migrated on a read.
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_claims'").fetchone() is None:
@@ -118,7 +124,7 @@ class DeviceClaims:
                     label = result.stdout.strip()
         limit = 0
         processes = None
-        if kind == "emu" and not force:
+        if kind == "emu" and _android_emulator(device_id) and not force:
             values = os.environ if environment is None else environment
             try:
                 limit = int(values.get("HERDR_AGENT_EMU_LIMIT", "3"))
@@ -141,8 +147,9 @@ class DeviceClaims:
             own_reclaim = (previous is not None and not other and not previous["stale"]
                            and previous["kind"] == "emu")
             if kind == "emu" and limit > 0 and not own_reclaim:
-                claims = [row for row in rows if row["kind"] == "emu" and not row["stale"]
-                          and row["holder"]["host"] == self.store.host and row["device_id"] != device_id]
+                claims = [row for row in rows if row["kind"] == "emu" and _android_emulator(row["device_id"])
+                          and not row["stale"] and row["holder"]["host"] == self.store.host
+                          and row["device_id"] != device_id]
                 target_port = device_id.removeprefix("emulator-")
                 target_port = int(target_port) if device_id.startswith("emulator-") and target_port.isdigit() else None
                 others = ([process for process in processes

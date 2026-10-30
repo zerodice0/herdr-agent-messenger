@@ -654,13 +654,15 @@ old-generation holders are stale, independent of adb attachment, and may be
 replaced; a different live holder blocks claiming unless the user explicitly
 instructs `--force`. Failed Herdr refresh does not imply a stale holder.
 
-New emulator claims are limited host-wide across repositories: `HERDR_AGENT_EMU_LIMIT`
-is read at claim time (default `3`; `0` or negative means unlimited). Admission
-returns `emu_limit` when the greater of other live host emulator claims and running
-Android qemu processes excluding the target `DEVICE` reaches the limit; the
-claim-count check and insertion are atomic. Your own live reclaims are exempt,
-and phones are unlimited. A bounded `ps` probe runs only on emulator claims;
-on failure, `process_count:null` falls back to the claim count. The JSON `error`
+New Android emulator claims (`emu` with `emulator-<port>` or a bare port) are limited
+host-wide across repositories: `HERDR_AGENT_EMU_LIMIT` is read at claim time
+(default `3`; `0` or negative means unlimited). Admission returns `emu_limit` when
+the greater of other live host Android emulator claims and running Android qemu
+processes excluding the target `DEVICE` reaches the limit; the claim-count check
+and insertion are atomic. Your own live reclaims are exempt; phones and iOS
+simulator `emu` claims are unlimited. iOS simulator claims never count toward the
+limit or run the process probe. A bounded `ps` probe runs only on Android emulator
+claims; on failure, `process_count:null` falls back to the claim count. The JSON `error`
 includes `limit`, `claim_count`, `process_count`,
 `holders:[{alias,pane,device,label,claimed_at}]`, and
 `untracked_processes:[{pid,port}]`. Wait for capacity or do other work after
