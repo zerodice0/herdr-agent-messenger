@@ -1147,6 +1147,8 @@ The [complete error code catalog](../.agents/skills/herdr-agent-messenger/refere
 | `agent_not_found`, `agent_ambiguous`, `invalid_route`, `route_expired`, `route_ambiguous`, `resolve_failed`, `recipient_is_sender` | Relist/reselect rather than guess. A post-submission resolution error means resume observation, not resubmit. Create only when asked. |
 | `host_not_configured`, `host_unavailable` | Restore authorized SSH/Herdr connectivity. Local sandbox/socket denial requires socket access; failed discovery does not mean missing agent. |
 | `sender_unavailable`, `sender_probe_failed` | Use the current Herdr agent pane. Probe failure is before submission; obtain local-socket access for sandbox/socket errors, then retry that exact undelivered request only. |
+| `sender_unresolved`, `sender_lookup_failed` | `sender_unresolved` is a genuine ancestry mismatch: run from the real agent pane, never use inherited pane guesses. `sender_lookup_failed` means `ps` or Herdr process info was unavailable, malformed, or timed out; the caller is still refused. Fix the lookup and rerun the same command; neither is a bypass. |
+| `ledger_busy`, `runtime_timeout` | Both come only from `ledger runtime register` and `inspect`: a lock wait or the shared deadline was exhausted. Not completed; rerun the call after a short pause and never touch database files. Other commands keep their existing wait and error handling. |
 | `prompt_failed` | Submission rejected; fix cause before retrying known-undelivered work. |
 | `prompt_acceptance_unknown`, `prompt_timeout`, `wait_timed_out`, `timeout` | Possibly delivered / completion unknown. Preserve ID and use `request-status`, or inspect recipient if no ID. Never blindly resend. |
 | `prompt_cancelled`, `cancelled` | Before submission: may retry; after submission: cancellation only stops waiting, not recipient work. Inspect `submitted`. |
@@ -1158,6 +1160,19 @@ The [complete error code catalog](../.agents/skills/herdr-agent-messenger/refere
 | `cli_not_found`, `internal_error`, `dispatch_failed`, `invalid_sender_result`, defensive `invalid_command` | Repair installation or investigate; unexpected failure is not evidence of non-delivery. |
 
 Local socket access is needed even for a remote request because HAM verifies the sender locally. For a batch `sender_probe_failed`, retry only those failed items after granting access; never replay delivered, submitted, unknown, or timed-out items. Do not bypass SSH host-key verification or alter trust settings to make a request succeed.
+
+### Sender identity, ledger and receiver diagnostics
+
+The sender and ledger commands fail closed when HAM cannot prove who is calling or cannot finish within its bounded wait. The outcomes differ, so do not treat them as one error:
+
+- `sender_unresolved` means the lookup finished and the process is genuinely not inside the claimed or any live Herdr terminal. Run from the real agent pane. Never copy another pane's IDs; HAM refuses inherited pane guesses.
+- `sender_lookup_failed` means the lookup itself could not finish: process ancestry (`ps`) or Herdr's process-info call was unavailable, malformed, or timed out. Identity is unknown, not disproven, and the caller is still refused. Fix the environment (tools, local socket and sandbox access) and rerun the same command. Never retry by relaxing the check.
+- `ledger_busy` means one SQLite or file-lock wait inside `ledger runtime register` or `inspect` (at most 2 seconds) ended, so the call did not complete. Rerun after a short pause, and inspect `ledger worker status` or `ledger doctor` if it persists. Never delete database or lock files. Other commands do not convert lock waits to this code.
+- `runtime_timeout` means the shared deadline of `ledger runtime register` or `inspect` was used up.
+
+`ledger runtime register` and `inspect` share one 12 second monotonic deadline, below the OMP extension's unchanged 15 second child timeout. Each lookup is limited by its usual cap or the remaining time, and each SQLite or file-lock wait there is limited to 2 seconds and the remaining time. Lock exhaustion becomes `ledger_busy` and an exhausted deadline becomes `runtime_timeout` in these two calls only. Other commands keep the existing 30 second SQLite wait and their existing error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged.
+
+When the OMP receiver cannot register or inspect, it shows `HAM: receiver unavailable` and a warning with the failing phase, exit code or signal, `timed_out`, elapsed time, stdout and stderr byte counts and a short stderr excerpt (stdout is counted but not quoted). The CLI error code (`sender_lookup_failed`, `sender_unresolved`, `ledger_busy`, `runtime_timeout`) appears in the message prefix of that excerpt and tells you which case applies. An identical report (same code and phase) is shown once and then suppressed for 10 minutes. A different code or phase is shown immediately. Recovery is tracked per phase (and root): a success clears only that phase's record, and the status stays while an error from another phase remains. The status clears, quietly and without a notification, only when every failing phase has recovered.
 
 ## Legacy lower-level send and read
 
@@ -1205,8 +1220,10 @@ Run the local Python and Bun suites with cwd set to the plugin checkout root:
 
 ```bash
 python3 -m unittest discover -s tests -t .
-bun test tests/omp_mailbox_runtime.test.ts
+python3 -m unittest tests.test_omp_runtime
 ```
+
+The wrapper `tests.test_omp_runtime` first initializes the protected-path list, then runs the whole Bun suite with `--timeout 15000`, and it has its own overall limit of 300 seconds, separate from the product's 15 second child timeout.
 
 Each Python test module imports `tests.ham_test_support as ham_test_support` before product modules. Its
 test-only tripwire rejects attempts to bootstrap the runner's default ledger

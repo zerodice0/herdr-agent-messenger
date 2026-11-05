@@ -15,7 +15,7 @@ import uuid
 import unicodedata
 
 from ham.agents.directory import agent_label, herdr_executable, run_bounded_command
-from ham.ledger.store import LedgerError, LedgerStore, save_receipt
+from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, save_receipt
 
 
 def sanitize_status_text(value: Any, limit: int) -> str:
@@ -67,8 +67,9 @@ def normalize_origin(origin: str) -> str:
 def _git(cwd: str, *args: str) -> str:
     try:
         result = subprocess.run(["git", "-C", cwd, *args], capture_output=True,
-                                text=True, timeout=5, check=False)
+                                text=True, timeout=budget_timeout(5), check=False)
     except (OSError, subprocess.TimeoutExpired):
+        budget_timeout(5)
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -101,9 +102,10 @@ def repository_identity(cwd: str, host: str) -> dict[str, Any]:
 def live_snapshot(environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     try:
         result = subprocess.run([herdr_executable(environment), "api", "snapshot"],
-                                capture_output=True, text=True, timeout=10, check=False,
+                                capture_output=True, text=True, timeout=budget_timeout(10), check=False,
                                 env=None if environment is None else dict(environment))
     except (OSError, subprocess.TimeoutExpired) as error:
+        budget_timeout(10)
         raise LedgerError("host_unavailable", str(error)) from None
     if result.returncode:
         raise LedgerError("host_unavailable", result.stderr.strip() or "Herdr snapshot failed.")
@@ -117,44 +119,79 @@ def live_snapshot(environment: Mapping[str, str] | None = None) -> dict[str, Any
     return container
 
 
+def _lookup_failed(lookup: str, reason: str, started: float) -> LedgerError:
+    elapsed = max(0, int((time.monotonic() - started) * 1000))
+    error = LedgerError("sender_lookup_failed",
+                        f"Caller verification failed: {lookup} lookup {reason} ({elapsed}ms); refusing caller.")
+    error.details = {"lookup": lookup, "reason": reason, "elapsed_ms": elapsed}
+    return error
+
+
 def process_ancestors() -> set[int]:
-    """Find the calling process tree even when every standard stream is piped."""
+    """Find the calling process tree; unavailable evidence never proves a mismatch."""
+    started = time.monotonic()
     try:
         result = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True,
-                                text=True, check=False, timeout=5)
-        if result.returncode:
-            return set()
-        parents = {int(parts[0]): int(parts[1]) for line in result.stdout.splitlines()
-                   if len(parts := line.split()) == 2}
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return set()
-    ancestors: set[int] = set()
-    current = os.getpid()
-    while current > 1 and current not in ancestors:
-        ancestors.add(current)
-        current = parents.get(current, 0)
-    return ancestors
+                                text=True, check=False, timeout=budget_timeout(5))
+    except subprocess.TimeoutExpired:
+        raise _lookup_failed("ps", "timeout", started) from None
+    except OSError:
+        raise _lookup_failed("ps", "spawn_failed", started) from None
+    if result.returncode:
+        raise _lookup_failed("ps", "nonzero_exit", started)
+    try:
+        parents = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError
+            pid, parent = map(int, parts)
+            if pid <= 0 or parent < 0 or pid in parents:
+                raise ValueError
+            parents[pid] = parent
+        ancestors: set[int] = set()
+        current = os.getpid()
+        while current > 1:
+            if current in ancestors or current not in parents:
+                raise ValueError
+            ancestors.add(current)
+            current = parents[current]
+        return ancestors
+    except (ValueError, TypeError, AttributeError):
+        raise _lookup_failed("ps", "invalid_output", started) from None
 
 
-def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -> int | None:
+def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -> int:
+    started = time.monotonic()
     try:
         result = subprocess.run([herdr_executable(environment), "pane", "process-info", "--pane", pane_id],
-                                capture_output=True, text=True, check=False, timeout=5,
+                                capture_output=True, text=True, check=False, timeout=budget_timeout(5),
                                 env=None if environment is None else dict(environment))
-        if result.returncode:
-            return None
-        data = json.loads(result.stdout[result.stdout.index('{'):])["result"]["process_info"]
-        if data["pane_id"] != pane_id:
-            return None
-        return int(data["shell_pid"])
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        return None
+    except subprocess.TimeoutExpired:
+        raise _lookup_failed("process-info", "timeout", started) from None
+    except OSError:
+        raise _lookup_failed("process-info", "spawn_failed", started) from None
+    if result.returncode:
+        raise _lookup_failed("process-info", "nonzero_exit", started)
+    try:
+        payload = json.loads(result.stdout[result.stdout.index('{'):])
+        data = payload["result"]["process_info"]
+        value = data["shell_pid"]
+        if (payload.get("error") or payload.get("ok") is False or data["pane_id"] != pane_id
+                or isinstance(value, bool) or not isinstance(value, (str, int))):
+            raise ValueError
+        pid = int(value)
+        if pid <= 0:
+            raise ValueError
+        return pid
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise _lookup_failed("process-info", "invalid_output", started) from None
 
 def _claude_ancestor_pid() -> int | None:
     """Return the nearest actual native root, not a foreground grandparent."""
     try:
         result = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="],
-                                capture_output=True, text=True, check=False, timeout=5)
+                                capture_output=True, text=True, check=False, timeout=budget_timeout(5))
         if result.returncode:
             return None
         processes = {int(parts[0]): (int(parts[1]), parts[2])
@@ -182,7 +219,7 @@ def claude_foreground_pid(agent: Mapping[str, Any],
     try:
         def query(*arguments: str) -> Mapping[str, Any]:
             result = run_bounded_command(
-                [herdr_executable(environment), *arguments], timeout=5, environment=environment)
+                [herdr_executable(environment), *arguments], timeout=budget_timeout(5), environment=environment)
             payload = json.loads(result.stdout[result.stdout.index('{'):])
             if result.returncode or payload.get("error") or payload.get("ok") is False:
                 raise ValueError("Unreadable native process")
@@ -530,11 +567,21 @@ class AgentRegistry:
                     (self.store.host, inherited_pane))}
             # Cached bindings prioritize probes but cannot establish identity.
             panes = sorted(snapshot["panes"], key=lambda raw: raw["terminal_id"] not in cached)
+            lookup_error = None
             for raw in panes:
-                if pane_shell_pid(raw["pane_id"], environment) in ancestors:
+                try:
+                    shell_pid = pane_shell_pid(raw["pane_id"], environment)
+                except LedgerError as error:
+                    if error.code != "sender_lookup_failed":
+                        raise
+                    lookup_error = error
+                    continue
+                if shell_pid in ancestors:
                     terminal = raw["terminal_id"]
                     break
             if not terminal:
+                if lookup_error is not None:
+                    raise lookup_error
                 raise LedgerError("sender_unresolved", "Cannot match this process to a live Herdr terminal; refusing inherited pane guesses.")
         with self.store.read() as connection:
             return current_agent(connection, self.store.host, terminal)
@@ -682,7 +729,7 @@ class AgentRegistry:
             runner = self.display_runner
             if runner is None:
                 runner = lambda command: run_bounded_command(
-                    [herdr_executable(environment), *command], timeout=10, environment=environment)
+                    [herdr_executable(environment), *command], timeout=budget_timeout(10), environment=environment)
             display = LedgerDisplay(self.store, runner=runner)
             # Include pending shell device cleanup even without registry changes.
             with self.store.read() as connection:

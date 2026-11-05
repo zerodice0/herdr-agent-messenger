@@ -6,12 +6,13 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from typing import Any, Mapping
 
 from ham.ledger.mail import Mailbox
 from ham.ledger.status import AgentRegistry, claude_foreground_pid, live_snapshot, repository_identity
-from ham.ledger.store import LedgerError, LedgerStore
+from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, runtime_budget
 from ham.ledger.remote import RemoteLedger, SSHTransport
 from ham.ledger.worker import ensure_after_mutation, ensure_worker, run_worker, worker_status
 
@@ -165,6 +166,32 @@ def _live_context(registry: AgentRegistry, snapshot: Mapping[str, Any],
 
 
 def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    bounded = (arguments.command == "ledger" and arguments.ledger_command == "runtime"
+               and arguments.runtime_command in {"register", "inspect"})
+    if not bounded:
+        return _dispatch_command(arguments, environment)
+    with runtime_budget():
+        try:
+            result = _dispatch_command(arguments, environment)
+            budget_timeout(12)
+            return result
+        except sqlite3.OperationalError as error:
+            # Python 3.10 exposes neither sqlite_errorcode nor SQLITE_* constants.
+            code = getattr(error, "sqlite_errorcode", None)
+            if code is None:
+                message = str(error).lower()
+                if message.startswith(("database is locked", "database table is locked", "database schema is locked")):
+                    code = 5
+                elif message == "interrupted":
+                    code = 9
+            if code is not None and code & 0xff in {5, 6}:  # SQLITE_BUSY / SQLITE_LOCKED
+                raise LedgerError("ledger_busy", "The ledger SQLite lock wait budget expired.") from None
+            if code is not None and code & 0xff == 9:  # SQLITE_INTERRUPT
+                raise LedgerError("runtime_timeout", "The native receiver's shared work deadline expired.") from None
+            raise
+
+
+def _dispatch_command(arguments: argparse.Namespace, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     if arguments.command == "device":
         from ham.ledger.devices import device_operation
         return device_operation(arguments, environment)

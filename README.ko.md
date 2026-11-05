@@ -189,8 +189,10 @@ python3 "$HAM_CLI" status board --repo --host local
 
 ```bash
 python3 -m unittest discover -s tests -t .
-bun test tests/omp_mailbox_runtime.test.ts
+python3 -m unittest tests.test_omp_runtime
 ```
+
+래퍼 `tests.test_omp_runtime`은 보호 경로 목록을 먼저 초기화한 뒤 `--timeout 15000`으로 Bun 전체 suite를 실행하며, 전체 실행에는 제품의 15초 자식 프로세스 제한과 별개로 300초 제한을 둡니다.
 
 테스트는 전용 HOME/XDG 또는 원장 fixture를 사용합니다.
 fixture를 추가하기 전에 [테스트 격리](docs/ko/skill-guide.md#테스트-격리)를 참고하세요.

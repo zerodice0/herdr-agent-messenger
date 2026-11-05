@@ -1,9 +1,10 @@
 /** HAM-owned opt-in receiver. No tools, nested agents, steering or provider ACK guesses. */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -99,35 +100,70 @@ export function parseReply<O extends Operation>(operation: O, raw: unknown): Rec
 }
 
 class ReceiverError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly phase: string) {
     super("HAM CLI: " + code + ": " + message);
   }
 }
 
-async function runJSON(program: string, args: string[], input?: Request, cwd?: string): Promise<unknown> {
+const diagnosticText = (value: string, limit: number) => value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
+
+async function runJSON(phase: string, program: string, args: string[], input?: Request, cwd?: string): Promise<unknown> {
+  const started = performance.now();
   const { promise, resolve, reject } = Promise.withResolvers<unknown>();
-  const child = spawn(program, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], timeout: 15000 });
-  let stdout = "", stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (data: string) => {
-    stdout += data;
-    if (Buffer.byteLength(stdout) > 1024 * 1024) child.kill();
+  let stdout = "", stderr = "", stdoutBytes = 0, stderrBytes = 0, timedOut = false, settled = false;
+  let spawnError: unknown;
+  const failure = (code: string, message: string, exitCode: number | null, signal: string | null) =>
+    new ReceiverError(diagnosticText(code, 80), diagnosticText(message, 240) +
+      ` phase=${phase} exit_code=${exitCode} signal=${signal} timed_out=${timedOut}` +
+      ` elapsed_ms=${Math.round(performance.now() - started)} stdout_bytes=${stdoutBytes} stderr_bytes=${stderrBytes}` +
+      ` stderr=${JSON.stringify(diagnosticText(stderr.trim(), Infinity).slice(-240))}`, phase);
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(program, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+  } catch (error) {
+    throw failure("cli_spawn_error", String(error), null, null);
+  }
+  // Keep the outer CLI deadline independent of Python's bounded internal work.
+  const timeout = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 15000);
+  const outputDecoder = new StringDecoder("utf8"), errorDecoder = new StringDecoder("utf8");
+  child.stdout.on("data", (data: Buffer) => {
+    stdoutBytes += data.length;
+    if (stdoutBytes <= 1024 * 1024) stdout += outputDecoder.write(data);
+    else child.kill("SIGKILL");
   });
-  child.stderr.on("data", (data: string) => { stderr = (stderr + data).slice(-4096); });
-  child.on("error", reject);
-  child.on("close", code => {
+  child.stderr.on("data", (data: Buffer) => {
+    stderrBytes += data.length; stderr = (stderr + errorDecoder.write(data)).slice(-4096);
+  });
+  const finish = (code: number | null, signal: string | null) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    stdout += outputDecoder.end(); stderr = (stderr + errorDecoder.end()).slice(-4096);
     try {
-      const result: unknown = JSON.parse(stdout), response = record(result);
-      if (code !== 0 || response.error !== undefined) {
+      if (spawnError !== undefined) throw failure("cli_spawn_error", String(spawnError), code, signal);
+      if (timedOut) throw failure("cli_timeout", "child exceeded 15000ms deadline", code, signal);
+      if (stdoutBytes > 1024 * 1024) throw failure("cli_output_limit", "child output exceeded 1MiB", code, signal);
+      if (!stdout.trim()) throw failure(code === 0 ? "cli_empty_output" : "cli_exit", "no JSON response", code, signal);
+      let result: unknown;
+      try { result = JSON.parse(stdout); }
+      catch (error) { throw failure(code === 0 ? "cli_invalid_json" : "cli_exit", String(error), code, signal); }
+      const response = record(result);
+      if (response.error !== undefined) {
         const error = record(response.error);
-        throw new ReceiverError(string(error.code), string(error.message));
+        throw failure(string(error.code), string(error.message), code, signal);
       }
+      if (code !== 0) throw failure("cli_exit", "child exited without a structured error", code, signal);
       resolve(result);
     } catch (error) {
-      reject(error instanceof ReceiverError ? error : new Error("HAM CLI: " + (stdout ? String(error) : stderr || "no JSON response")));
+      reject(error instanceof ReceiverError ? error : failure("cli_invalid_json", String(error), code, signal));
     }
+  };
+  child.on("error", error => {
+    spawnError = error;
+    // A failed spawn may never produce close; a running child still waits for close.
+    if (child.pid === undefined) finish(null, null);
   });
+  child.on("close", finish);
   child.stdin.on("error", () => undefined);
   child.stdin.end(input === undefined ? "" : JSON.stringify(input));
   return promise;
@@ -148,7 +184,7 @@ export async function findRoot(): Promise<string> {
     await access(path.join(bundled, "herdr-plugin.toml"));
     return bundled;
   } catch { /* Installed copies discover the CURRENT structured root on every operation. */ }
-  const result = record(await runJSON(process.env.HERDR_BIN_PATH || "herdr",
+  const result = record(await runJSON("root", process.env.HERDR_BIN_PATH || "herdr",
     ["plugin", "list", "--json", "--plugin", "herdr.agent-messenger"]));
   const payload = record(result.result);
   const root = record(array(payload.plugins)[0]).plugin_root;
@@ -161,7 +197,7 @@ export async function findRoot(): Promise<string> {
 export async function callReceiver<O extends Operation>(operation: O, data: Request): Promise<ReceiverReplies[O]> {
   const root = await findRoot();
   const args = operation === "release" ? ["ledger", "delivery", "release"] : ["ledger", "runtime", operation];
-  const response = await runJSON(process.env.HERDR_AGENT_PYTHON || "python3", ["-m", "ham", "cli", ...args], data, root);
+  const response = await runJSON(operation, process.env.HERDR_AGENT_PYTHON || "python3", ["-m", "ham", "cli", ...args], data, root);
   return parseReply(operation, response);
 }
 
@@ -213,7 +249,8 @@ export class MailboxAdapter {
   private blocked = 0;
   private compacting = false;
   private refreshNeeded = true;
-  private lastError = "";
+  private errors = new Map<string, { phase: string; reportedAt: number }>();
+  private errorPhases = new WeakMap<object, string>();
   private registrationFailures = 0;
 
   constructor(private pi: ExtensionAPI, private call: Call = callReceiver) {}
@@ -229,10 +266,34 @@ export class MailboxAdapter {
     return this.belongs(ctx) && epoch === this.epoch && !!this.registration &&
       ctx.sessionManager.getSessionFile() === this.registration.agent.session_ref;
   }
-  private report(ctx: ExtensionContext, error: unknown): void {
+  private report(ctx: ExtensionContext, error: unknown, phase: string): void {
     const text = String(error);
+    const code = error instanceof Error && "code" in error ? String(error.code) : text;
+    if (error instanceof ReceiverError) phase = error.phase;
+    else if (typeof error === "object" && error !== null) phase = this.errorPhases.get(error) ?? phase;
+    const key = JSON.stringify([code, phase]), previous = this.errors.get(key), now = Date.now();
     ctx.ui.setStatus("ham-mailbox", "HAM: receiver unavailable");
-    if (text !== this.lastError) { ctx.ui.notify(text, "warning"); this.lastError = text; }
+    if (!previous || now - previous.reportedAt >= 600000) {
+      ctx.ui.notify(diagnosticText(text, 1200), "warning");
+      this.errors.set(key, { phase, reportedAt: now });
+    }
+  }
+  private recover(ctx: ExtensionContext, phase: string): void {
+    for (const [key, failure] of this.errors) {
+      if (failure.phase === phase || failure.phase === "root") this.errors.delete(key);
+    }
+    if (!this.errors.size) ctx.ui.setStatus("ham-mailbox", undefined);
+  }
+  private async receiver<O extends Operation>(operation: O, data: Request, ctx: ExtensionContext): Promise<ReceiverReplies[O]> {
+    const epoch = this.epoch;
+    let result: ReceiverReplies[O];
+    try { result = await this.call(operation, data); }
+    catch (error) {
+      if (typeof error === "object" && error !== null && !(error instanceof ReceiverError)) this.errorPhases.set(error, operation);
+      throw error;
+    }
+    if (epoch === this.epoch && this.belongs(ctx)) this.recover(ctx, operation);
+    return result;
   }
   schedule(ctx: ExtensionContext, delay = 250): void {
     if (!this.belongs(ctx)) return;
@@ -265,6 +326,7 @@ export class MailboxAdapter {
     this.context = ctx;
     this.registration = undefined; this.registering = undefined;
     this.pending.clear();
+    this.errors.clear();
     this.registrationFailures = 0;
     this.active = this.continuation = this.retrying = this.failureBlocked = this.compacting = false;
     this.recheckAfterWork = undefined;
@@ -291,10 +353,9 @@ export class MailboxAdapter {
     const epoch = this.epoch;
     const operation = (async () => {
       try {
-        const result = await this.call("register", { session_ref: session, client: "omp" });
+        const result = await this.receiver("register", { session_ref: session, client: "omp" }, ctx);
         if (epoch !== this.epoch || !this.belongs(ctx) || ctx.sessionManager.getSessionFile() !== session) return undefined;
-        this.registration = result; this.refreshNeeded = false; this.lastError = ""; this.registrationFailures = 0;
-        ctx.ui.setStatus("ham-mailbox", undefined);
+        this.registration = result; this.refreshNeeded = false; this.registrationFailures = 0;
         for (const claim of result.pending_claims || []) {
           if (!this.pending.has(claim.claim_id)) this.pending.set(claim.claim_id, { ...claim, phase: "unknown" });
         }
@@ -306,8 +367,9 @@ export class MailboxAdapter {
               // Nameless events still conservatively recover a missed own-bell event.
               if (!filename || String(filename) === result.bell_name) this.schedule(ctx);
             });
-            this.watcher.on("error", error => { this.report(ctx, error); this.watcher?.close(); this.watcher = undefined; });
-          } catch (error) { this.report(ctx, error); }
+            this.watcher.on("error", error => { this.report(ctx, error, "watch"); this.watcher?.close(); this.watcher = undefined; });
+            this.recover(ctx, "watch");
+          } catch (error) { this.report(ctx, error, "watch"); }
         }
         return result;
       } catch (error) {
@@ -316,7 +378,7 @@ export class MailboxAdapter {
           if (error instanceof Error && "code" in error && error.code === "native_session_pending" &&
               this.registrationFailures < 10) {
             ctx.ui.setStatus("ham-mailbox", "HAM: waiting for native session");
-          } else this.report(ctx, error);
+          } else this.report(ctx, error, "register");
           if (this.registrationFailures < 10) this.schedule(ctx, Math.min(1000, 250 * this.registrationFailures));
         }
         return undefined;
@@ -328,10 +390,10 @@ export class MailboxAdapter {
   private async release(pending: Pending, disposition: "unknown" | "not_applied", evidence: string, ctx: ExtensionContext): Promise<void> {
     pending.phase = "unknown";
     try {
-      await this.call("release", { claim_id: pending.claim_id, agent_id: pending.agent_id,
-        generation: pending.generation, disposition, evidence });
+      await this.receiver("release", { claim_id: pending.claim_id, agent_id: pending.agent_id,
+        generation: pending.generation, disposition, evidence }, ctx);
       if (disposition === "not_applied") this.pending.delete(pending.claim_id);
-    } catch (error) { this.report(ctx, error); }
+    } catch (error) { this.report(ctx, error, "release"); }
   }
   async confirm(ctx: ExtensionContext): Promise<void> {
     if (!this.root(ctx) || this.acknowledging || !this.current(ctx)) return;
@@ -341,11 +403,11 @@ export class MailboxAdapter {
         const entry = acceptedEntry(ctx, pending);
         if (!entry) continue;
         try {
-          await this.call("applied", { claim_id: pending.claim_id, agent_id: pending.agent_id,
+          await this.receiver("applied", { claim_id: pending.claim_id, agent_id: pending.agent_id,
             generation: pending.generation, session_ref: pending.session_ref, marker: pending.marker,
-            content_sha256: pending.content_sha256, entry_id: entry });
+            content_sha256: pending.content_sha256, entry_id: entry }, ctx);
           this.pending.delete(pending.claim_id);
-        } catch (error) { this.report(ctx, error); }
+        } catch (error) { this.report(ctx, error, "applied"); }
       }
     } finally { this.acknowledging = false; }
   }
@@ -366,7 +428,7 @@ export class MailboxAdapter {
         if (pending.phase === "prepared" && pending.preparation === preparation && pending.message) return { message: pending.message };
         if (pending.phase === "prepared") await this.release(pending, "unknown", "different user submission after unconfirmed preparation", ctx);
       }
-      const claim = await this.call("claim", { ...identity(registration.agent), wake: false });
+      const claim = await this.receiver("claim", { ...identity(registration.agent), wake: false }, ctx);
       if (claim.claim_id === null) return undefined;
       const pending: Pending = { ...claim, phase: "prepared", preparation };
       this.pending.set(claim.claim_id, pending);
@@ -376,7 +438,7 @@ export class MailboxAdapter {
       }
       this.schedule(ctx);
       return { message: claim.message };
-    } catch (error) { if (epoch === this.epoch) this.report(ctx, error); return undefined; }
+    } catch (error) { if (epoch === this.epoch) this.report(ctx, error, "claim"); return undefined; }
     finally { if (epoch === this.epoch) this.preparing--; }
   }
   private quiet(ctx: ExtensionContext, thresholds: Thresholds, skipInputQuiet = false): boolean {
@@ -393,7 +455,7 @@ export class MailboxAdapter {
     const registration = await this.register(ctx);
     if (!registration || !this.current(ctx, epoch)) return;
     await this.confirm(ctx);
-    const state = await this.call("inspect", identity(registration.agent));
+    const state = await this.receiver("inspect", identity(registration.agent), ctx);
     if (!this.current(ctx, epoch)) return;
     const remaining = new Set(state.pending_claims.map(claim => claim.claim_id));
     for (const [id, pending] of this.pending) if (pending.phase === "unknown" && !remaining.has(id)) this.pending.delete(id);
@@ -409,7 +471,7 @@ export class MailboxAdapter {
     if (state.wake_count >= state.thresholds.wakes_per_hour) { this.schedule(ctx, 300000); return; }
     if (state.coalesce_until * 1000 > Date.now()) { this.schedule(ctx, state.coalesce_until * 1000 - Date.now()); return; }
     const serial = this.inputSerial;
-    const claim = await this.call("claim", { ...identity(registration.agent), wake: true });
+    const claim = await this.receiver("claim", { ...identity(registration.agent), wake: true }, ctx);
     if (claim.claim_id === null) return;
     const pending: Pending = { ...claim, phase: "prepared" };
     this.pending.set(claim.claim_id, pending);
@@ -428,7 +490,7 @@ export class MailboxAdapter {
     if (!this.belongs(ctx)) return;
     const epoch = this.epoch;
     if (this.work?.epoch === epoch) { this.recheckAfterWork = epoch; return; }
-    const operation = this.probe(ctx).catch(error => this.report(ctx, error));
+    const operation = this.probe(ctx).catch(error => this.report(ctx, error, "inspect"));
     const work = { epoch, operation };
     this.work = work;
     try { await operation; }

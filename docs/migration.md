@@ -104,6 +104,12 @@ required. Plugin-root discovery still runs per receiver operation so installatio
 changes are not hidden by a cached checkout; eliminating unrelated wake probes
 also eliminates their associated discovery subprocesses.
 
+## Sender lookup and ledger busy diagnostics
+
+The CLI now separates `sender_lookup_failed` (process ancestry or Herdr process info was unavailable, malformed or timed out; the caller is still refused) from `sender_unresolved` (a real ancestry mismatch). In `ledger runtime register|inspect` it also reports `ledger_busy` and `runtime_timeout` when a bounded wait ends. Those two calls share a 12 second deadline with at most 2 seconds per lock wait; other commands keep the 30 second SQLite wait and their existing error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged, and no identity is ever inferred from inherited pane IDs.
+
+The OMP receiver's extended failure report (phase, exit or signal, `timed_out`, elapsed time, stdout/stderr bytes and a stderr excerpt, with identical code and phase reports suppressed for 10 minutes) lives in the extension. Recovery is tracked per phase, so one phase succeeding does not clear the `HAM: receiver unavailable` status while another phase still has an error. Upgrade the CLI and copied skills first, then refresh the receiver with `runtime install omp` (with the user's consent, as for any runtime) and restart only the OMP sessions the user selects. Old extensions keep working and simply lack the extra detail. See [Sender identity, ledger and receiver diagnostics](skill-guide.md#sender-identity-ledger-and-receiver-diagnostics).
+
 ## Sticky auto main (schema v12)
 
 Schema v12 additively creates local-only `auto_main_incumbents`, keyed by

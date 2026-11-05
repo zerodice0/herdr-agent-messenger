@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, setSystemTime } from "bun:test";
-import { mkdtempSync, rmSync, watch, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,6 +103,7 @@ class Fixture {
   adapter: MailboxAdapter;
   afterClaim?: (data: Record<string, unknown>, result: ClaimBundle) => Promise<void>;
   beforeRegister?: (data: Record<string, unknown>) => Promise<void>;
+  beforeInspect?: () => Promise<void>;
   afterRegister?: (data: Record<string, unknown>) => Promise<void>;
   throwSend = false;
   onTimeout?: () => void;
@@ -149,6 +150,7 @@ class Fixture {
     this.adapter = new MailboxAdapter(extensionAPI, async (operation, data) => {
       this.operations.push(operation);
       if (operation === "register") await this.beforeRegister?.(data);
+      if (operation === "inspect") await this.beforeInspect?.();
       const raw = operation === "inspect" && this.cachedInspection ? this.cachedInspection
         : operation === "register" ? this.cacheRegistrations && this.registrationReply
           ? this.registrationReply : await this.fixture(operation, data) : await this.cli(operation, data);
@@ -341,6 +343,122 @@ test("receiver subprocess preserves structured pending code rather than interpre
   }
 });
 
+async function receiverFailure(f: Fixture, source: string | null, operation: keyof ReceiverReplies = "register"): Promise<Error> {
+  const executable = path.join(f.directory, "diagnostic-cli");
+  if (source !== null) writeFileSync(executable, "#!/usr/bin/env python3\n" + source, { mode: 0o700 });
+  const oldPython = process.env.HERDR_AGENT_PYTHON, oldRoot = process.env.HERDR_AGENT_MESSENGER_ROOT;
+  try {
+    process.env.HERDR_AGENT_PYTHON = executable;
+    process.env.HERDR_AGENT_MESSENGER_ROOT = root;
+    try { await callReceiver(operation, { session_ref: f.session, client: "omp" }); }
+    catch (error) {
+      if (!(error instanceof Error)) throw error;
+      return error;
+    }
+    throw new Error("receiver unexpectedly succeeded");
+  } finally {
+    if (oldPython === undefined) delete process.env.HERDR_AGENT_PYTHON; else process.env.HERDR_AGENT_PYTHON = oldPython;
+    if (oldRoot === undefined) delete process.env.HERDR_AGENT_MESSENGER_ROOT; else process.env.HERDR_AGENT_MESSENGER_ROOT = oldRoot;
+  }
+}
+
+test("empty receiver output includes every child diagnostic field", async () => {
+  const f = new Fixture();
+  const error = await receiverFailure(f, "pass\n");
+  expect(error).toHaveProperty("code", "cli_empty_output");
+  expect(error).toHaveProperty("phase", "register");
+  expect(error.message).toMatch(/phase=register exit_code=0 signal=null timed_out=false elapsed_ms=\d+ stdout_bytes=0 stderr_bytes=0 stderr=""/);
+  expect(error.message).not.toMatch(/[\r\n]/);
+});
+
+for (const scenario of [
+  { name: "invalid JSON", source: 'print("not JSON")\n', code: "cli_invalid_json", exit: "0", bytes: "9" },
+  { name: "nonzero exit", source: 'import sys\nprint("{}")\nsys.exit(7)\n', code: "cli_exit", exit: "7", bytes: "3" },
+  { name: "spawn error", source: null, code: "cli_spawn_error", exit: "-?\\d+|null", bytes: "0" },
+]) {
+  test(`receiver ${scenario.name} includes bounded single-line child diagnostics`, async () => {
+    const f = new Fixture();
+    const error = await receiverFailure(f, scenario.source, "inspect");
+    expect(error).toHaveProperty("code", scenario.code);
+    expect(error).toHaveProperty("phase", "inspect");
+    expect(error.message).toMatch(new RegExp(`phase=inspect exit_code=(${scenario.exit}) signal=null timed_out=false elapsed_ms=\\d+ stdout_bytes=${scenario.bytes} stderr_bytes=0 stderr=""`));
+    expect(error.message.length).toBeLessThanOrEqual(1200);
+    expect(error.message).not.toMatch(/[\r\n]/);
+  });
+}
+
+test("structured receiver failures retain code and bounded stderr byte diagnostics", async () => {
+  const f = new Fixture();
+  const error = await receiverFailure(f, 'import json,sys\nsys.stderr.buffer.write(b"\\x1b[31m" + b"x" * 5000 + b"\\ntrace\\n")\nprint(json.dumps({"error":{"code":"ledger_busy","message":"locked\\nretry"}}))\nsys.exit(1)\n');
+  expect(error).toHaveProperty("code", "ledger_busy");
+  expect(error.message).toMatch(/phase=register exit_code=1 signal=null timed_out=false elapsed_ms=\d+ stdout_bytes=\d+ stderr_bytes=5012 stderr="x+ trace"/);
+  expect(error.message.length).toBeLessThanOrEqual(1200);
+  expect(error.message).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+});
+
+test("receiver deadline kills the child and reports timeout signal and elapsed diagnostics", async () => {
+  const f = new Fixture(), pidFile = path.join(f.directory, "timeout-child.pid");
+  const error = await receiverFailure(f, `import os,signal,sys,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nwith open(${JSON.stringify(pidFile)}, "w") as output: output.write(str(os.getpid()))\nsys.stderr.write("waiting\\n"); sys.stderr.flush()\ntime.sleep(60)\n`);
+  expect(error).toHaveProperty("code", "cli_timeout");
+  expect(error.message).toMatch(/phase=register exit_code=null signal=SIGKILL timed_out=true elapsed_ms=\d+ stdout_bytes=0 stderr_bytes=8 stderr="waiting"/);
+  const elapsed = Number(/elapsed_ms=(\d+)/.exec(error.message)?.[1]);
+  expect(elapsed).toBeGreaterThanOrEqual(14500);
+  expect(elapsed).toBeLessThan(20000);
+  expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+}, 25000);
+
+test("registration diagnostics throttle each code and reset after successful recovery", async () => {
+  const now = Date.UTC(2026, 10, 5, 12);
+  setSystemTime(now);
+  const f = new Fixture();
+  f.clock = now;
+  let code = "sender_unresolved", detail = 0, recovering = false;
+  f.beforeRegister = async () => {
+    if (!recovering) throw Object.assign(new Error("lookup detail " + ++detail), { code });
+  };
+  await f.setup();
+  expect(f.warnings).toHaveLength(1);
+  for (const next of ["sender_unresolved", "sender_lookup_failed", "ledger_busy", "sender_unresolved"]) {
+    code = next; await f.adapter.kick(f.context);
+  }
+  expect(f.warnings).toHaveLength(3);
+  expect(f.sent).toHaveLength(0);
+  expect(f.operations).not.toContain("claim");
+  f.clock = now + 599999; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.warnings).toHaveLength(3);
+  f.clock = now + 600000; setSystemTime(f.clock); await f.adapter.kick(f.context);
+  expect(f.warnings).toHaveLength(4);
+  recovering = true;
+  await f.adapter.kick(f.context);
+  expect(f.statuses.has("ham-mailbox")).toBe(false);
+  recovering = false;
+  f.adapter.agentEnd({}, f.context);
+  await f.adapter.kick(f.context);
+  expect(f.warnings).toHaveLength(5);
+});
+
+test("successful registration cannot reset an unrecovered inspect diagnostic", async () => {
+  const f = new Fixture();
+  await f.setup();
+  let failing = true, detail = 0;
+  f.beforeInspect = async () => {
+    if (failing) throw Object.assign(new Error("busy detail " + ++detail), { code: "ledger_busy" });
+  };
+  await f.adapter.kick(f.context);
+  expect(f.warnings).toHaveLength(1);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    f.adapter.agentEnd({}, f.context);
+    await f.adapter.kick(f.context);
+  }
+  expect(f.operations.filter(operation => operation === "register").length).toBeGreaterThanOrEqual(3);
+  expect(f.warnings).toHaveLength(1);
+  expect(f.statuses.get("ham-mailbox")).toBe("HAM: receiver unavailable");
+  failing = false; await f.adapter.kick(f.context);
+  expect(f.statuses.has("ham-mailbox")).toBe(false);
+  failing = true; await f.adapter.kick(f.context);
+  expect(f.warnings).toHaveLength(2);
+});
+
 test("ordinary FYI uses singular context message, exact accepted branch ACK only", async () => {
   const f = new Fixture(); await f.setup(); await f.send();
   const result = await f.adapter.natural({ prompt: "actual user question" }, f.context);
@@ -426,9 +544,9 @@ test("idle-arrived FYI waits without polling then wakes through the second 300-s
   expect(f.warnings).toEqual([]);
 });
 
-test("young FYI avoids one-second draft and nonready polling: old versus conservative inspection counts", async () => {
-  const now = Date.UTC(2026, 9, 21, 12);
-  for (const gate of ["draft", "working"] as const) {
+for (const gate of ["draft", "working"] as const) {
+  test(`young FYI avoids one-second ${gate} polling: old versus conservative inspection counts`, async () => {
+    const now = Date.UTC(2026, 9, 21, 12);
     const counts: Record<string, number> = {};
     const boundaryCounts: Record<string, number> = {};
     for (const encoding of ["old", "conservative"] as const) {
@@ -472,8 +590,8 @@ test("young FYI avoids one-second draft and nonready polling: old versus conserv
     // 300 s safety callback); report the boundary separately.
     expect(counts).toEqual({ old: 601, conservative: 2 });
     expect(boundaryCounts).toEqual({ old: 1, conservative: 1 });
-  }
-});
+  });
+}
 
 test("done action claims a wake with quiet empty editor before user focus", async () => {
   const f = new Fixture(); await f.setup(); await f.send("action");

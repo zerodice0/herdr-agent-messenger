@@ -190,8 +190,10 @@ also supports Herdr without enabling the plugin, with documented limitations.
 
 ```bash
 python3 -m unittest discover -s tests -t .
-bun test tests/omp_mailbox_runtime.test.ts
+python3 -m unittest tests.test_omp_runtime
 ```
+
+The wrapper `tests.test_omp_runtime` first initializes the protected-path list, then runs the whole Bun suite with `--timeout 15000`, and it has its own overall limit of 300 seconds, separate from the product's 15 second child timeout.
 
 Tests use private HOME/XDG or ledger fixtures; see
 [test isolation](docs/skill-guide.md#test-isolation) before adding fixtures.

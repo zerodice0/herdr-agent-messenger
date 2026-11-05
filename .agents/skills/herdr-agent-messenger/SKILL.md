@@ -84,6 +84,13 @@ python3 scripts/herdr_agent_messenger.py spawn \
 
 `--message-file PATH` reads an assignment; no message creates only the session. `initial_prompt.acceptance=accepted|unknown|failed` is terminal acceptance, not delivery/response/understanding. Unknown may already be submitted: retain operation/pane evidence, inspect, never blindly resend/spawn a replacement. Each spawn is a new operation. Flags: reference **`spawn`**.
 
+## Identity and ledger errors
+
+- `sender_unresolved`: genuine ancestry mismatch. Run from the real agent pane; never copy inherited pane IDs or guess a terminal.
+- `sender_lookup_failed`: `ps` or Herdr process info was unavailable, malformed or timed out. Identity is unknown and the caller is still refused. Fix the environment (tools, local socket access), then rerun the same command. Never weaken the check.
+- `ledger_busy`: raised only by `ledger runtime register|inspect` when one SQLite or file-lock wait (at most 2 seconds) ends. Rerun after a short pause. Other commands keep their existing 30 second wait and existing error handling. `runtime_timeout`: the bounded `ledger runtime register|inspect` deadline (12 seconds, below the extension's 15 second child timeout) was used up.
+- The OMP receiver's `HAM: receiver unavailable` warning shows the failing phase, exit/signal, `timed_out`, elapsed time, stdout/stderr byte counts and a stderr-only excerpt; the CLI error code is in that excerpt's message prefix. The same code and phase is shown once per 10 minutes. A success clears only its own phase's record, and the status stays until every failing phase has recovered. Reference **Sender identity and ledger diagnostics**, **Receiver diagnostics**.
+
 ## Installing or updating HAM
 
 On each selected host, install/update plugin + skill, run read-only `runtime status`, explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude`. Never overwrite foreign/modified files; restart only user-selected sessions; confirm `extension_present=1` or report **installed, activation pending**. Codex needs no runtime install; its absence is normal. Reference **Client onboarding and installation**, **Receiving runtimes**.

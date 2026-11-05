@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import json
 import math
@@ -27,6 +28,71 @@ class LedgerError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+# Native receiver children have a 15-second parent timeout. Share one deadline
+# across bootstrap, SQL, registry locks and subprocess lookups, leaving JSON
+# serialization and process teardown outside the 12-second work budget.
+_runtime_deadline: ContextVar[float | None] = ContextVar("ham_runtime_deadline", default=None)
+
+
+@contextmanager
+def runtime_budget(seconds: float = 12) -> Iterator[None]:
+    token = _runtime_deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _runtime_deadline.reset(token)
+
+
+def budget_timeout(limit: float) -> float:
+    deadline = _runtime_deadline.get()
+    if deadline is None:
+        return limit
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise LedgerError("runtime_timeout", "The native receiver's shared work deadline expired.")
+    return min(limit, remaining)
+
+
+def _acquire_lock(descriptor: int) -> None:
+    if _runtime_deadline.get() is None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return
+    deadline = time.monotonic() + budget_timeout(2)
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LedgerError("ledger_busy", "The ledger lock wait budget expired.") from None
+            time.sleep(min(0.02, remaining))
+
+
+class _RuntimeConnection(sqlite3.Connection):
+    """Refresh SQLite's busy timeout before each statement, not per connection."""
+
+    def _budget(self) -> None:
+        milliseconds = max(1, int(budget_timeout(2) * 1000))
+        super().execute(f"PRAGMA busy_timeout={milliseconds}")
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        self._budget()
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
+        self._budget()
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql: str, /) -> sqlite3.Cursor:
+        self._budget()
+        return super().executescript(sql)
+
+    def commit(self) -> None:
+        self._budget()
+        super().commit()
 
 
 def json_text(value: Any) -> str:
@@ -207,7 +273,7 @@ class LedgerStore:
             raise LedgerError("invalid_host", "Canonical host must be a nonempty simple host name.")
         # Serialize the initial WAL switch as well as schema/identity setup.
         with os.fdopen(os.open(self.directory / "bootstrap.lock", os.O_CREAT | os.O_RDWR, 0o600), "r+b") as bootstrap:
-            fcntl.flock(bootstrap.fileno(), fcntl.LOCK_EX)
+            _acquire_lock(bootstrap.fileno())
             connection = self.connect()
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
@@ -339,14 +405,25 @@ class LedgerStore:
         return store
 
     def connect(self) -> sqlite3.Connection:
-        connection = (sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30,
-                                      isolation_level=None)
+        deadline = _runtime_deadline.get()
+        runtime = deadline is not None
+        timeout = budget_timeout(2) if runtime else 30
+        factory = _RuntimeConnection if runtime else sqlite3.Connection
+        connection = (sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=timeout,
+                                      isolation_level=None, factory=factory)
                       if getattr(self, "_readonly", False) else
-                      sqlite3.connect(str(self.path), timeout=30, isolation_level=None))
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA secure_delete=ON")
+                      sqlite3.connect(str(self.path), timeout=timeout, isolation_level=None, factory=factory))
+        try:
+            connection.row_factory = sqlite3.Row
+            if deadline is not None:
+                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            connection.execute("PRAGMA foreign_keys=ON")
+            if not runtime:
+                connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA secure_delete=ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
@@ -535,7 +612,7 @@ class LedgerStore:
             raise ValueError("invalid lock name")
         descriptor = os.open(self.directory / f"{name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            _acquire_lock(descriptor)
             yield
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
