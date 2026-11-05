@@ -213,6 +213,25 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                 self.assertEqual(public_cli.main(["ledger", "runtime", "inspect"], self.environment), 1)
                 self.assertEqual(json.loads(output.getvalue())["error"]["code"], expected)
 
+    def test_completed_dispatch_returns_its_committed_result_after_deadline(self):
+        clock = [100.0]
+        payload = {"completed": True}
+
+        def commit_then_finish(*args):
+            with self.store.transaction() as connection:
+                connection.execute("UPDATE agents SET extension_present=1 WHERE terminal_id='term-a'")
+            clock[0] = 112.1
+            return payload
+
+        with mock.patch.object(ledger_store.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch("ham.ledger.cli._dispatch_command", side_effect=commit_then_finish), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(public_cli.main(["ledger", "runtime", "register"], self.environment), 0)
+            self.assertEqual(json.loads(output.getvalue()), payload)
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT extension_present FROM agents WHERE terminal_id='term-a'").fetchone()[0], 1)
+
     def test_git_and_snapshot_timeouts_do_not_mask_shared_deadline_expiry(self):
         for probe, limit in (
             (lambda: ledger_status._git(str(self.root), "rev-parse", "--show-toplevel"), 5),
@@ -233,7 +252,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                     probe()
                 self.assertEqual(caught.exception.code, "runtime_timeout")
 
-    def test_flock_wait_is_capped_at_two_seconds_without_sleeping_in_real_time(self):
+    def test_flock_wait_uses_shared_deadline_minus_one_second_reserve(self):
         clock = [100.0]
         waits = []
 
@@ -248,8 +267,44 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                 with self.assertRaises(LedgerError) as caught:
                     ledger_store._acquire_lock(123)
         self.assertEqual(caught.exception.code, "ledger_busy")
-        self.assertAlmostEqual(sum(waits), 2)
+        self.assertAlmostEqual(sum(waits), 11)
         self.assertTrue(all(0 < seconds <= 0.02 for seconds in waits))
+
+    def test_registry_contention_over_two_seconds_succeeds_without_resetting_next_lock_budget(self):
+        clock = [100.0]
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+
+        def first_lock(*args):
+            if clock[0] < 103:
+                raise BlockingIOError
+
+        with mock.patch.object(ledger_store.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(ledger_store.time, "sleep", side_effect=sleep):
+            with runtime_budget():
+                with mock.patch.object(ledger_store.fcntl, "flock", side_effect=first_lock):
+                    ledger_store._acquire_lock(123)
+                self.assertGreaterEqual(sum(waits), 3)
+                clock[0] = 109
+                waits.clear()
+                with mock.patch.object(ledger_store.fcntl, "flock", side_effect=BlockingIOError):
+                    with self.assertRaises(LedgerError) as caught:
+                        ledger_store._acquire_lock(456)
+                self.assertEqual(caught.exception.code, "ledger_busy")
+                self.assertAlmostEqual(sum(waits), 2)
+                self.assertAlmostEqual(budget_timeout(12), 1)
+
+    def test_contended_file_lock_does_not_spend_the_reserved_second(self):
+        with runtime_budget(0.5), \
+                mock.patch.object(ledger_store.fcntl, "flock", side_effect=BlockingIOError), \
+                mock.patch.object(ledger_store.time, "sleep") as sleep:
+            with self.assertRaises(LedgerError) as caught:
+                ledger_store._acquire_lock(123)
+        self.assertEqual(caught.exception.code, "ledger_busy")
+        sleep.assert_not_called()
 
     def test_ps_lookup_failures_report_evidence_not_a_proven_mismatch(self):
         cases = (

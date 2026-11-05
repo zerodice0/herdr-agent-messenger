@@ -56,10 +56,14 @@ def budget_timeout(limit: float) -> float:
 
 
 def _acquire_lock(descriptor: int) -> None:
-    if _runtime_deadline.get() is None:
+    deadline = _runtime_deadline.get()
+    if deadline is None:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         return
-    deadline = time.monotonic() + budget_timeout(2)
+    # Registry refresh holds its lock across snapshot/Git/display lookups.
+    # Allow ordinary contention, sharing the original deadline across locks
+    # and leaving one second for the remaining work and JSON response.
+    deadline -= 1
     while True:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)

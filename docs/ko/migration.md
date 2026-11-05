@@ -97,7 +97,7 @@ python3 -m ham cli runtime install omp
 
 ## 송신자 확인과 원장 잠금 진단
 
-CLI는 이제 `sender_lookup_failed`(프로세스 계보나 Herdr 프로세스 정보를 쓸 수 없었거나, 형식이 잘못됐거나, 시간이 초과된 경우이며 호출자는 여전히 거부됩니다)와 `sender_unresolved`(실제 계보 불일치)를 구분합니다. `ledger runtime register|inspect`에서는 제한된 대기가 끝나면 `ledger_busy`나 `runtime_timeout`을 반환합니다. 이 두 호출은 12초의 전체 제한 시간을 공유하고 잠금 대기는 1회당 최대 2초입니다. 다른 명령은 기존의 30초 SQLite 대기와 기존 오류 처리를 유지합니다. 스키마 12, 프로토콜 1, 기존 여덟 가지 동작은 바뀌지 않으며, 상속된 pane ID로 신원을 추정하지 않습니다.
+CLI는 이제 `sender_lookup_failed`(프로세스 계보나 Herdr 프로세스 정보를 쓸 수 없었거나, 형식이 잘못됐거나, 시간이 초과된 경우이며 호출자는 여전히 거부됩니다)와 `sender_unresolved`(실제 계보 불일치)를 구분합니다. `ledger runtime register|inspect`에서는 제한된 대기가 끝나면 `ledger_busy`나 `runtime_timeout`을 반환합니다. 이 두 호출은 12초의 전체 제한 시간을 공유합니다. SQLite 대기는 문 하나당 최대 2초이고, bootstrap·registry 파일 잠금 대기는 공유 제한 시간의 남은 시간에서 1초 예비 시간을 뺀 만큼 기다리며 2초로 제한하지 않고 잠금마다 새로 시작하지도 않습니다. 이미 성공적으로 완료한 호출은 성공 그대로 반환하고 나중에 시간 초과로 바꾸지 않습니다. 다른 명령은 기존의 30초 SQLite 대기와 기존 오류 처리를 유지합니다. 스키마 12, 프로토콜 1, 기존 여덟 가지 동작은 바뀌지 않으며, 상속된 pane ID로 신원을 추정하지 않습니다.
 
 OMP 수신기의 확장된 실패 보고(단계, 종료 코드 또는 시그널, `timed_out`, 경과 시간, stdout·stderr 바이트 수와 stderr 발췌문, 같은 코드와 단계의 보고는 10분 동안 억제)는 확장에 들어 있습니다. 복구는 단계별로 기록하므로 한 단계가 성공해도 다른 단계의 오류가 남아 있으면 `HAM: receiver unavailable` 표시가 유지됩니다. 먼저 CLI와 복사한 스킬을 갱신하고, 사용자 동의를 받아 `runtime install omp`로 수신기를 갱신한 다음 사용자가 고른 OMP 세션만 다시 시작하세요. 이전 확장도 계속 동작하지만 추가 진단 정보는 표시하지 않습니다. 자세한 내용은 [송신자 확인, 원장 잠금, 수신기 진단](skill-guide.md#송신자-확인-원장-잠금-수신기-진단)을 참고하세요.
 

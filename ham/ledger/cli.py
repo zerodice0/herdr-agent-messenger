@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from ham.ledger.mail import Mailbox
 from ham.ledger.status import AgentRegistry, claude_foreground_pid, live_snapshot, repository_identity
-from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, runtime_budget
+from ham.ledger.store import LedgerError, LedgerStore, runtime_budget
 from ham.ledger.remote import RemoteLedger, SSHTransport
 from ham.ledger.worker import ensure_after_mutation, ensure_worker, run_worker, worker_status
 
@@ -172,9 +172,7 @@ def dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | Non
         return _dispatch_command(arguments, environment)
     with runtime_budget():
         try:
-            result = _dispatch_command(arguments, environment)
-            budget_timeout(12)
-            return result
+            return _dispatch_command(arguments, environment)
         except sqlite3.OperationalError as error:
             # Python 3.10 exposes neither sqlite_errorcode nor SQLITE_* constants.
             code = getattr(error, "sqlite_errorcode", None)
