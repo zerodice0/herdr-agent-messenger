@@ -371,6 +371,40 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [워커] review-worker")
         self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
 
+    def test_role_settings_contention_queues_current_projection_without_warnings(self):
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET workspace_id='w-main' WHERE terminal_id='worker'")
+            connection.execute("UPDATE terminal_slots SET workspace_id='w-main' WHERE terminal_id='worker'")
+        other = LedgerStore(self.store.directory, canonical_name=self.store.host)
+        settings = RepoSettings(other, display_runner=self.herdr)
+        for field, value, scope in (
+                ("mode", "auto", {}),
+                ("main", {"host": self.store.host, "terminal_id": "worker"},
+                 {"host": self.store.host, "workspace_id": "w-main"})):
+            with self.subTest(field=field):
+                self.herdr.commands.clear()
+                with self.store.display_lock(self.store.host, "p-main"):
+                    result = settings.mutate(self.repo_id, field, value, **scope)
+                self.assertNotIn("p-main", result["display"]["updated"])
+                self.assertEqual(result["display"]["failed"], [])
+                self.assertNotIn("warnings", result)
+                self.assertFalse(any(command[2] == "p-main" for command in self.herdr.commands))
+                agent = self.agent()
+                desired = display_repair.fingerprint(agent, self.display.projection(agent))
+                with self.store.read() as connection:
+                    pending = display_repair.load(connection)
+                self.assertEqual(set(pending), {"p-main"})
+                self.assertEqual(pending["p-main"]["fingerprint"], desired)
+                self.assertEqual(pending["p-main"]["attempts"], 0)
+                self.assertEqual(pending["p-main"]["state"], "pending")
+                self.assertEqual(other.notification_errors, [])
+                self.assertEqual(self.store.notification_errors, [])
+                refreshed = settings._refresh_display()
+                self.assertIn("p-main", refreshed["updated"])
+                self.assertEqual(refreshed["failed"], [])
+                with self.store.read() as connection:
+                    self.assertEqual(display_repair.load(connection), {})
+
     def test_registry_move_redraws_roles_in_both_old_and_new_workspaces(self):
         snapshot = copy.deepcopy(self.snapshot)
         for section in ("panes", "agents"):
@@ -585,6 +619,7 @@ class LedgerDisplayTest(unittest.TestCase):
                     self.assertEqual(entries["p-main"]["state"], state)
                     with self.store.transaction() as connection:
                         display_repair.save(connection, entries)
+                    entries["p-main"]["explicit_pending"] = desired
                     before = copy.deepcopy(self.herdr.metadata)
                     for _ in range(3):
                         self.herdr.commands.clear()
@@ -594,6 +629,82 @@ class LedgerDisplayTest(unittest.TestCase):
                     self.assertEqual(self.herdr.labels["p-main"], "User review border")
                     with self.store.read() as connection:
                         self.assertEqual(display_repair.load(connection), entries)
+
+    def test_label_metadata_contention_preserves_explicit_projection_and_deferred_result(self):
+        other = LedgerStore(self.store.directory, canonical_name=self.store.host)
+        agent = self.agent()
+        desired = self.display.projection(agent, alias="event-alias", marker="🧪", color="event-color")
+        self.herdr.commands.clear()
+        with (self.store.display_lock(self.store.host, "p-main"),
+              mock.patch.object(ledger_display, "LedgerStore", return_value=other),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: self.herdr(args)),
+              mock.patch.object(agent_labels, "report_command_failure") as failure):
+            self.assertIsNone(agent_labels.report_agent_label_metadata(
+                "p-main", "omp", "event-alias", "🧪", "event-color",
+                observed=self.snapshot["agents"][0]))
+        failure.assert_not_called()
+        self.assertEqual(self.herdr.commands, [])
+        with self.store.read() as connection:
+            pending = display_repair.load(connection)["p-main"]
+        self.assertEqual(pending["fingerprint"], display_repair.fingerprint(agent, desired))
+        self.assertNotEqual(pending["fingerprint"],
+                            display_repair.fingerprint(agent, self.display.projection(agent)))
+        self.assertEqual((pending["attempts"], pending["state"]), (0, "pending"))
+        self.assertEqual(other.notification_errors, [])
+        self.assertEqual(self.store.notification_errors, [])
+
+    def test_assigned_alias_contention_queues_retry_and_cli_accepts_deferral(self):
+        other = LedgerStore(self.store.directory, canonical_name=self.store.host)
+        info = {key: value for key, value in self.snapshot["agents"][0].items() if key != "name"}
+        identity = agent_labels.Alias("blue-otter", "🟦", "blue")
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET alias='' WHERE terminal_id='main'")
+
+        def run(*arguments):
+            if arguments[:2] == ("agent", "get"):
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({"result": {"agent": info}}), "")
+            if arguments[:2] == ("agent", "rename"):
+                info["name"] = arguments[3]
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            return self.herdr(arguments)
+
+        self.herdr.commands.clear()
+        with (self.store.display_lock(self.store.host, "p-main"),
+              mock.patch.object(ledger_display, "LedgerStore", return_value=other),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=run),
+              mock.patch.object(agent_labels, "candidates", return_value=iter([identity])),
+              mock.patch.object(agent_labels, "report_command_failure") as failure,
+              mock.patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(agent_labels.assign_label("p-main"), 0)
+        self.assertEqual(output.getvalue(), "blue-otter\n")
+        failure.assert_not_called()
+        self.assertEqual(self.herdr.commands, [])
+        agent = self.agent()
+        desired = self.display.projection(
+            agent, alias=identity.name, marker=identity.marker, color=identity.color)
+        with self.store.read() as connection:
+            pending = display_repair.load(connection)["p-main"]
+        self.assertEqual(pending["fingerprint"], display_repair.fingerprint(agent, desired))
+        self.assertEqual((pending["attempts"], pending["state"]), (0, "pending"))
+        self.assertEqual(other.notification_errors, [])
+        # The next registry observation adopts Herdr's assigned alias before retrying.
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET alias=? WHERE terminal_id='main'", (identity.name,))
+        refreshed = self.registry._refresh_display({"p-main"})
+        self.assertEqual(refreshed, {"updated": ["p-main"], "failed": []})
+        self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["alias"], identity.name)
+        with self.store.read() as connection:
+            self.assertEqual(display_repair.load(connection), {})
+
+    def test_successful_label_metadata_does_not_create_pending_retry(self):
+        identity = agent_labels.alias_identity(self.agent()["alias"])
+        with (mock.patch.object(ledger_display, "LedgerStore", return_value=self.store),
+              mock.patch.object(agent_labels, "run_herdr", side_effect=lambda *args: self.herdr(args))):
+            self.assertTrue(agent_labels.report_agent_label_metadata(
+                "p-main", "omp", identity.name, identity.marker, identity.color,
+                observed=self.snapshot["agents"][0]))
+        with self.store.read() as connection:
+            self.assertEqual(display_repair.load(connection), {})
 
     def test_name_taken_race_refreshes_the_winning_alias_metadata(self):
         info = {"agent": "codex", "terminal_id": "worker",

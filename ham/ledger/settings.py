@@ -79,9 +79,11 @@ class RepoSettings:
         self.display_runner = display_runner
 
     def _refresh_display(self, environment: Mapping[str, str] | None = None) -> dict[str, list[str]]:
-        from ham.ledger.display import refresh
-        return refresh(self.store, self.environment if environment is None else environment,
-                       runner=self.display_runner)
+        from ham.ledger.status import AgentRegistry
+        registry = AgentRegistry(self.store, display_runner=self.display_runner)
+        panes = {agent["pane_id"] for agent in registry.list() if agent["host"] == self.store.host}
+        return registry._refresh_display(
+            panes, environment=self.environment if environment is None else environment)
 
     def _display_result(self, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
         display = self._refresh_display(environment)

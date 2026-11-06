@@ -678,28 +678,34 @@ addressable alias; status still works in off mode without a role prefix.
 Registry refresh repairs drift in the recorded display without model tokens,
 wakes or mail; meaningful phase/summary changes still need explicit `status set`.
 Snapshot repairs wait for snapshot confirmation and stop after five attempts with
-exponential backoff starting at five seconds. Explicit projections queue failures
-and lock-deferred writes without consuming an attempt; a successful explicit write clears its pending repair. Diagnose exhausted targets with
+exponential backoff starting at five seconds. Explicit status, device, label and
+settings projections queue failures and lock-deferred writes without consuming an
+attempt; the explicit deferred mark survives a later snapshot sweep refund, and a
+successful explicit write clears its pending repair. Diagnose exhausted targets with
 `ledger doctor`'s `display_repair` mapping; unchanged status or worker restarts do
 not reset the cap. Border ownership carries across generations only on an exact
-match to the recorded prior `last_ham_label` within one host/workspace/pane/repo/
-client scope, never inferred from a role prefix or a pane match alone. On the
-same terminal binding that is enough; after a terminal rebind the prior row must
-also be inactive, and its terminal must be gone from the full Herdr pane list
-with no active row. The session may differ, and the most recent row wins. This
-transfers display ownership only, never status, session or mail identity.
-Projection takes a bounded shared per-pane lock and rereads the binding; a lock
-timeout skips the refresh quietly and a later one retries.
+match to the recorded prior `last_ham_label`, never inferred from a role prefix
+or a pane match alone. On the same terminal binding that needs only the same
+host, terminal and pane, an older generation and that exact label; workspace,
+client and repository are not compared. After a terminal rebind the prior row
+must also share the same host/workspace/pane/repository/client, be inactive, and
+its terminal must be gone from the full Herdr pane list with no active row. The
+session may differ, and the most recent row wins. This transfers display
+ownership only, never status, session or mail identity. Projection takes a
+bounded shared per-pane lock (lock files are hashed into a fixed set, so panes
+that rarely collide just take turns) and rereads the binding; a lock timeout
+skips the refresh quietly and a later one retries.
 `python3 -m ham display reclaim [--dry-run | --apply] [--pane PANE]...` defaults to a
 read-only dry run (no locks, registry refresh or writes) that prints JSON
 `{applied,panes,updated,failed,skipped}`; `--apply` rechecks under the per-pane
 lock, records recovered ownership and runs normal projection. Automatic recovery
 always requires the same repository. When a checkout's repository identity
-changed (for example a local checkout gained a remote), the dry run reports the
-pane as `explicit_only` with a reason and the previous and current repo IDs;
-`--apply` adopts it only for a pane selected with `--pane`, which relaxes only
-repository equality. Every other rule still applies, and this is not a general
-cross-repository transfer. Schema 12 has
+changed (for example a local checkout gained a remote), the unfiltered dry run
+still lists the pane as `explicit_only` with a reason and the previous and
+current repo IDs. `--apply` without `--pane` skips it, and with `--pane` it
+adopts only the selected pane, relaxing only repository equality. Every other
+rule still applies, and this is not a general cross-repository transfer. Schema
+12 has
 no new columns. See
 [display repair and border ownership](ui-reference.md#role-phase-and-border-ownership).
 `status list` without a filter lists stored local status; bare `--repo` selects

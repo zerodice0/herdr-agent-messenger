@@ -1161,11 +1161,16 @@ class RemoteLedgerTest(unittest.TestCase):
 
 
     def test_worker_observes_enabled_repo_after_designated_agent_returns_to_shell(self):
+        from tests.test_ledger_display import HerdrDisplay
+
         store = self.stores['alpha']
-        settings = self.settings_for('alpha')
-        settings.mutate(self.repo_id, 'mode', 'manual')
-        settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': 'term-alpha'},
-                        host='alpha', workspace_id='w1')
+        pane = self.agents['alpha']['pane_id']
+        display = HerdrDisplay([pane], terminals={pane: 'term-alpha'})
+        settings = RepoSettings(store, environment=self.environment, display_runner=display)
+        self.assertEqual(settings.mutate(self.repo_id, 'mode', 'manual')['display']['failed'], [])
+        result = settings.mutate(self.repo_id, 'main', {'host': 'alpha', 'terminal_id': 'term-alpha'},
+                                 host='alpha', workspace_id='w1')
+        self.assertEqual(result['display']['failed'], [])
         self.drain()
         AgentRegistry(store).reconcile({'panes': self.snapshots['alpha']['panes'], 'agents': []},
                                        refresh_display=False)
@@ -1211,8 +1216,10 @@ class RemoteLedgerTest(unittest.TestCase):
         store = self.stores['beta']
         observed = []
 
-        def project(ledger, environment=None, *, runner=None):
-            with ledger.read() as connection:
+        def project(registry, pane_ids, *, environment=None):
+            self.assertIs(registry.store, store)
+            self.assertEqual(pane_ids, {self.agents['beta']['pane_id']})
+            with registry.store.read() as connection:
                 observed.append(RepoSettings.fields(connection, self.repo_id)['mode']['value'])
             return {'updated': [], 'failed': ['isolated-pane']}
 
@@ -1226,7 +1233,7 @@ class RemoteLedgerTest(unittest.TestCase):
             'changed_at': time.time(),
         }
         envelope = self.services['alpha'].envelope(setting)
-        with mock.patch('ham.ledger.display.refresh', side_effect=project):
+        with mock.patch.object(AgentRegistry, '_refresh_display', autospec=True, side_effect=project):
             result = self.services['beta'].receive('setting', envelope)
         self.assertEqual(observed, ['manual'])
         self.assertEqual(result['display']['failed'], ['isolated-pane'])

@@ -772,8 +772,10 @@ HAM-owned borders show `[메인] alias · summary` or `[워커] alias · summary
 omitting absent parts; off-mode status has no role prefix. HAM updates only a
 blank border, a verified legacy border, or its exact last recorded border.
 Ownership carries across agent generations only on an exact match to the recorded
-prior-generation label within one host/workspace/pane/repository/client scope,
-either on the same terminal binding or under the terminal-rebind rule below. A
+prior-generation label. On the same terminal binding, a carry needs only the same
+host, terminal and pane, an older generation and that exact label; workspace,
+client and repository are not compared. After a terminal rebind the stricter
+rule below applies. A
 role prefix alone never proves ownership. A differing
 manual rename is preserved. If the border already equals the desired label,
 HAM records ownership again without renaming it. The old `user:pane-recap` token
@@ -800,8 +802,9 @@ border as its own only when all of these hold:
 
 If several rows qualify, the one with the most recent `last_seen`, then
 `first_seen`, wins. Same-terminal generation recovery is the one exception to
-the gone-terminal requirement: it needs no vanished terminal but keeps the same
-host/workspace/pane/repository/client scope and exact-label match. Adoption transfers
+the gone-terminal requirement: it needs no vanished terminal and keeps only the
+same-terminal scope above (host, terminal, pane, older generation, exact label),
+without the workspace, client or repository checks. Adoption transfers
 only the right to update that border. Status, phase and summary, session
 references, mail, receipts and delivery state, and device claims are not
 copied from the old row. Schema 12 is unchanged and no migration columns were
@@ -809,9 +812,11 @@ added; recovery reads the existing `last_ham_label` and terminal slot data.
 
 Display projection serializes per pane. The projector takes a bounded shared
 per-pane lock and, once it holds it, rereads the binding before deciding or
-writing, so a concurrent rebind cannot be projected over from a stale read. The
-display path never takes the registry lock. If the lock times out, that refresh
-is skipped silently with no diagnostic, and a later refresh or snapshot retries.
+writing, so a concurrent rebind cannot be projected over from a stale read. Lock
+files use a fixed number of hashed slots, so two panes can rarely share one and
+then simply take turns. The display path never takes the registry lock. If the
+lock times out, that refresh is skipped silently with no diagnostic, and a later
+refresh or snapshot retries.
 
 To inspect or restore a border that an earlier rebind left without a recorded
 owner, run `python3 -m ham display reclaim [--dry-run | --apply] [--pane PANE]...`.
@@ -845,9 +850,10 @@ pane whose lock was busy is `skipped` and can be retried.
 Automatic recovery, including the worker and reclaim without `--pane`, always
 requires the same repository. A repository identity can legitimately change
 for the same checkout, for example a local checkout that later gains a remote.
-In that case reclaim reports the pane in a dry run with status `explicit_only`,
-a `reason` describing both repositories, and `prior_repo_id` and `current_repo_id`, and never adopts it on
-its own. Only a pane you select with `--pane PANE` can relax repository
+In that case an unfiltered dry run still lists the pane, with status
+`explicit_only`, a `reason` describing both repositories, and `prior_repo_id` and
+`current_repo_id`. `--apply` without `--pane` skips such a pane and never adopts
+it on its own. Only a pane you select with `--pane PANE` can relax repository
 equality, and `--apply` records ownership for an `explicit_only` candidate only
 when that pane was selected explicitly. Every other rule is unchanged: same
 host, workspace, pane and client, an exact nonempty border equal to the
@@ -865,10 +871,13 @@ It restores recorded phase/summary; meaningful updates still require explicit
 worker snapshot, not treated as confirmation merely because the write succeeded.
 
 Snapshot-driven projection writes, whether they succeed or fail, wait for a later
-snapshot to confirm the desired display. Explicit status/device writes queue both
+snapshot to confirm the desired display. Explicit status, device, label and
+settings writes queue both
 failures and writes deferred by a busy pane lock. A deferred write is queued as
 pending with zero attempts, with no failure diagnostic and no retry or backoff
-consumed, and any concurrent worker reservation is preserved. A snapshot
+consumed, and any concurrent worker reservation is preserved. An explicit
+deferral also marks its target fingerprint as explicit, and that mark survives a
+later snapshot sweep refund, so the explicit retry is not lost. A snapshot
 projection skipped the same way refunds its own reservation instead of
 consuming an attempt. A successful explicit write clears pending repair, without
 an extra verification subprocess or worker request. Unconfirmed mismatches retry with exponential

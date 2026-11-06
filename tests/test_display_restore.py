@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import copy
 import json
 from pathlib import Path
+import subprocess
 import threading
 import tempfile
 import unittest
@@ -289,12 +290,12 @@ class DisplayRestoreTest(unittest.TestCase):
         other = LedgerStore(self.store.directory, canonical_name=self.store.host)
         contender = AgentRegistry(other, display_runner=self.herdr)
         self.herdr.commands.clear()
-        before = self.dump()
         with self.store.display_lock(self.store.host, "pane"):
             result = contender._refresh_display({"pane"}, feature_invoked=True, now=300)
         self.assertEqual(result, {"updated": [], "failed": []})
-        self.assertEqual(self.entries(), pending)
-        self.assertEqual(self.dump(), before)
+        marked = self.entries()
+        self.assertEqual(marked["pane"].pop("explicit_pending"), pending["pane"]["fingerprint"])
+        self.assertEqual(marked, pending)
         self.assertEqual(self.herdr.commands, [])
         self.assertEqual(other.notification_errors, [])
 
@@ -498,12 +499,12 @@ class DisplayRestoreTest(unittest.TestCase):
                 self.assertIsNone(recoverable_display_owner(
                     connection, wrong, owned, allow_repo_mismatch=True, live_terminals=set(),
                 ))
-        # Same-terminal generations never receive the repository exception.
+        # The legacy same-terminal proof needs no repository exception.
         same_terminal = {**current, "terminal_id": old["terminal_id"], "generation": 2}
         with self.store.read() as connection:
-            self.assertIsNone(recoverable_display_owner(
-                connection, same_terminal, owned, allow_repo_mismatch=True, live_terminals=set(),
-            ))
+            self.assertEqual(recoverable_display_owner(
+                connection, same_terminal, owned, live_terminals=set(),
+            )["agent_id"], old["agent_id"])
 
     def test_repeatable_reclaim_cli_forwards_only_explicit_panes(self):
         from ham.ledger import display as ledger_display
@@ -550,7 +551,99 @@ class DisplayRestoreTest(unittest.TestCase):
         self.registry.reconcile(self.snapshot(), now=pending["next_try_at"] + 1)
         self.assertEqual(self.entries(), {})
 
-    def test_named_label_projector_contention_exits_success_without_stderr_or_writes(self):
+    def test_real_sweep_refund_retains_status_deferred_during_its_metadata_write(self):
+        from ham.ledger import worker
+
+        self.initialize()
+        with mock.patch.object(self.registry, "_refresh_display"):
+            self.registry.set_status(self.agent(), phase="review", summary="First sweep target")
+        in_flight = []
+
+        def commit_new_status():
+            in_flight.append(copy.deepcopy(self.entries()["pane"]))
+            self.registry.set_status(
+                self.agent(), phase="review", summary="Explicit target during sweep",
+            )
+            in_flight.append(copy.deepcopy(self.entries()["pane"]))
+
+        # The real sweep owns the pane lock, not the test. Its own skipped
+        # refresh must refund its attempt after the nested status was deferred.
+        self.herdr.after_report = commit_new_status
+        self.registry.reconcile(self.snapshot(), now=200)
+        self.assertEqual(in_flight[0]["attempts"], 1)
+        self.assertNotIn("explicit_pending", in_flight[0])
+        self.assertIn("explicit_pending", in_flight[1])
+        pending = self.entries()["pane"]
+        desired = LedgerDisplay(self.store, runner=self.herdr).projection(self.agent())
+        fingerprint = display_repair.fingerprint(self.agent(), desired)
+        self.assertEqual(pending["explicit_pending"], fingerprint)
+        self.assertEqual(pending["fingerprint"], fingerprint)
+        self.assertEqual(pending["attempts"], 0)
+        self.assertEqual(pending["state"], "pending")
+        self.assertTrue(worker.maintenance_pending(self.store))
+        self.assertEqual(self.store.notification_errors, [])
+        self.registry.reconcile(self.snapshot(), now=pending["next_try_at"])
+        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Explicit target during sweep")
+        self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
+        self.registry.reconcile(self.snapshot(), now=pending["next_try_at"] + 1)
+        self.assertEqual(self.entries(), {})
+
+    def assert_explicit_completion_retains_newer_deferred_target(self, *, fail):
+        from ham.ledger import worker
+
+        self.initialize()
+        self.drift_for_retry()
+        self.registry.reconcile(self.snapshot(), now=200)
+        self.assertEqual(self.entries()["pane"]["attempts"], 1)
+        with mock.patch.object(self.registry, "_refresh_display"):
+            self.registry.set_status(self.agent(), phase="review", summary="Older explicit target")
+        interrupted = []
+
+        def project(command):
+            if command[:2] != ["pane", "rename"] or interrupted:
+                return self.herdr(command)
+            interrupted.append(True)
+            result = (subprocess.CompletedProcess(command, 1, "", "simulated rename failure")
+                      if fail else self.herdr(command))
+            self.registry.set_status(
+                self.agent(), phase="review", summary="New target while rename completes",
+            )
+            return result
+
+        self.registry = AgentRegistry(self.store, display_runner=project)
+        result = self.registry._refresh_display({"pane"}, feature_invoked=True, now=300)
+        self.assertEqual(result["failed"], ["pane"] if fail else [])
+        self.assertEqual(result["updated"], [] if fail else ["pane"])
+        self.assertTrue(interrupted)
+        pending = self.entries()["pane"]
+        projection = LedgerDisplay(self.store, runner=self.herdr).projection(self.agent())
+        self.assertEqual(pending["explicit_pending"], display_repair.fingerprint(self.agent(), projection))
+        self.assertTrue(worker.maintenance_pending(self.store))
+        self.registry.reconcile(self.snapshot(), now=400)
+        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · New target while rename completes")
+        self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
+        self.registry.reconcile(self.snapshot(), now=401)
+        self.assertEqual(self.entries(), {})
+
+    def test_successful_explicit_projection_keeps_newer_request_deferred_during_rename(self):
+        self.assert_explicit_completion_retains_newer_deferred_target(fail=False)
+
+    def test_failed_explicit_projection_keeps_newer_request_deferred_during_rename(self):
+        self.assert_explicit_completion_retains_newer_deferred_target(fail=True)
+
+    def test_reconcile_deduplicates_colliding_lock_slots(self):
+        snapshot = copy.deepcopy(self.template)
+        second_pane = {**snapshot["panes"][0], "pane_id": "second-pane",
+                       "terminal_id": "second-terminal"}
+        snapshot["panes"].append(second_pane)
+        snapshot["agents"].append({**snapshot["agents"][0], **second_pane})
+        with mock.patch.object(self.store, "display_lock_key", return_value="display-slot-00.lock"), \
+                mock.patch.object(self.store, "display_lock", wraps=self.store.display_lock) as lock:
+            self.registry.reconcile(snapshot, now=100, refresh_display=False)
+        self.assertEqual(lock.call_count, 1)
+        self.assertEqual(len(self.registry.list()), 2)
+
+    def test_named_label_projector_contention_defers_retry_without_stderr_or_writes(self):
         from ham.agents import labels
         import io
 
@@ -558,7 +651,6 @@ class DisplayRestoreTest(unittest.TestCase):
         observed = self.snapshot()["agents"][0]
         observed["display_agent"] = "Drifted source"
         other = LedgerStore(self.store.directory, canonical_name=self.store.host)
-        before = self.dump()
         with self.store.display_lock(self.store.host, "pane"), \
                 mock.patch("ham.ledger.display.LedgerStore", return_value=other), \
                 mock.patch.object(labels, "fetch_agent_info", return_value=observed), \
@@ -569,7 +661,10 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(self.herdr.commands, [])
-        self.assertEqual(self.dump(), before)
+        pending = self.entries()["pane"]
+        self.assertEqual(pending["state"], "pending")
+        self.assertEqual(pending["attempts"], 0)
+        self.assertEqual(pending["explicit_pending"], pending["fingerprint"])
         self.assertEqual(other.notification_errors, [])
 
 
@@ -674,14 +769,15 @@ class CapturedDisplayRestoreTest(unittest.TestCase):
                             for row in display.registry.list()
                         }
                         dry = display.reclaim(snapshot=snapshot)
-                        self.assertEqual({row["pane_id"] for row in dry["panes"]}, set(expected))
-                        self.assertEqual(len(dry["panes"]), len(expected))
+                        self.assertEqual({row["pane_id"] for row in dry["panes"]}, set(affected))
+                        self.assertEqual(len(dry["panes"]), len(affected))
                         for candidate in dry["panes"]:
-                            original = expected[candidate["pane_id"]]
+                            original = affected[candidate["pane_id"]]
                             self.assertEqual(candidate["agent_id"], original["agent_id"])
                             self.assertEqual(candidate["owner_agent_id"], original["owner_agent_id"])
                             self.assertEqual(candidate["before"], {"border": original["border"], "last_ham_label": None})
-                            self.assertEqual(candidate["status"], "candidate")
+                            self.assertEqual(candidate["status"],
+                                             "explicit_only" if candidate["pane_id"] in refused else "candidate")
                             projected = current_labels[candidate["pane_id"]]
                             self.assertEqual(candidate["after"], {
                                 "border": projected, "last_ham_label": projected,
@@ -692,7 +788,7 @@ class CapturedDisplayRestoreTest(unittest.TestCase):
                         applied = display.reclaim(apply=True, snapshot=snapshot)
                         self.assertEqual(set(applied["updated"]), set(expected))
                         self.assertEqual(applied["failed"], [])
-                        self.assertEqual(applied["skipped"], [])
+                        self.assertEqual(set(applied["skipped"]), refused)
                         with store.read() as connection:
                             current = {row["pane_id"]: dict(row) for row in connection.execute("SELECT * FROM agents WHERE active=1")}
                         for pane, original in expected.items():
@@ -705,7 +801,9 @@ class CapturedDisplayRestoreTest(unittest.TestCase):
                         herdr.commands.clear()
                         with store.read() as connection:
                             after = list(connection.iterdump())
-                        self.assertEqual(display.reclaim(apply=True, snapshot=snapshot)["panes"], [])
+                        remaining = display.reclaim(apply=True, snapshot=snapshot)
+                        self.assertEqual({row["pane_id"] for row in remaining["panes"]}, refused)
+                        self.assertTrue(all(row["status"] == "explicit_only" for row in remaining["panes"]))
                         with store.read() as connection:
                             self.assertEqual(list(connection.iterdump()), after)
                         self.assertEqual(herdr.commands, [])

@@ -338,10 +338,14 @@ class LedgerDisplay:
             if agent["host"] != self.store.host or (selected_panes and agent["pane_id"] not in selected_panes):
                 continue
             explicit = agent["pane_id"] in selected_panes
-            candidate = self._reclaim_candidate(agent, snapshot, allow_repo_mismatch=explicit)
+            candidate = self._reclaim_candidate(agent, snapshot)
+            if candidate is None:
+                candidate = self._reclaim_candidate(agent, snapshot, allow_repo_mismatch=True)
             if candidate is None:
                 continue
             owner, border = candidate
+            explicit_only = (owner["terminal_id"] != agent["terminal_id"]
+                             and owner["repo_id"] != agent["repo_id"])
             before = {"border": border, "last_ham_label": agent["last_ham_label"]}
             projected = self.projection(agent)
             entry = {
@@ -352,7 +356,7 @@ class LedgerDisplay:
             }
             entry["prior_repo_id"] = owner["repo_id"]
             entry["current_repo_id"] = agent["repo_id"]
-            if owner["repo_id"] != agent["repo_id"]:
+            if explicit_only:
                 entry["status"] = "explicit_only"
                 entry["reason"] = (
                     f"Prior HAM border ownership belongs to repo {owner['repo_id']!r}; "
@@ -362,6 +366,9 @@ class LedgerDisplay:
             if not apply:
                 continue
             entry["after"] = dict(before)
+            if explicit_only and not explicit:
+                result["skipped"].append(agent["pane_id"])
+                continue
             outcome: bool | None = None
             try:
                 with self.store.display_lock(agent["host"], agent["pane_id"]):
@@ -419,9 +426,12 @@ def report_agent_metadata(pane_id: str, agent: str, alias: str, marker: str, col
                     or len(repairs) >= display_repair.MAX_PANES):
                 # The ledger's resident sweep owns this retry budget. A second
                 # event handler must not bypass its backoff or exhausted cap.
-                return True
-        return display.refresh_agent(
+                return None if display.registry.defer_display(matches[0], desired) else False
+        refreshed = display.refresh_agent(
             matches[0], alias=alias, marker=marker, color=color, observed=observed, on_failure=on_failure)
+        if refreshed is None and not display.registry.defer_display(matches[0], desired):
+            return False
+        return refreshed
     desired = build_display(agent, alias, marker, color)
     if observed is not None and metadata_matches(desired, observed):
         return True

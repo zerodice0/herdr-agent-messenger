@@ -626,12 +626,17 @@ class LedgerStore:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
+    def display_lock_key(self, host: str, pane_id: str) -> str:
+        """Map pane writers onto a bounded, stable set of 256 lock files."""
+        slot = hashlib.sha256(json_text([host, pane_id]).encode("utf-8")).hexdigest()[:2]
+        return f"display-slot-{slot}.lock"
+
     @contextmanager
     def display_lock(self, host: str, pane_id: str, *, timeout: float | None = 0.25,
                      error_code: str = "display_busy") -> Iterator[None]:
-        """Serialize pane writers without ever acquiring the registry lock."""
-        key = hashlib.sha256(json_text([host, pane_id]).encode("utf-8")).hexdigest()
-        with self.lock(f"display-{key}", timeout=timeout, error_code=error_code):
+        """Serialize pane writers in bounded slots, never taking the registry lock."""
+        key = self.display_lock_key(host, pane_id)
+        with self.lock(key.removesuffix(".lock"), timeout=timeout, error_code=error_code):
             yield
 
 

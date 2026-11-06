@@ -271,34 +271,38 @@ def recoverable_display_owner(connection: sqlite3.Connection, agent: Mapping[str
                               allow_repo_mismatch: bool = False) -> dict[str, Any] | None:
     """Recover display ownership, never session/message identity, from exact HAM text.
 
-    Herdr restore preserves workspace/pane and border but allocates a new
-    terminal. A retired binding on the same host/workspace/pane/repo/client
-    proves ownership only while its entire terminal is gone. Session mismatch
-    is deliberately allowed: a later client can inherit this unchanged HAM
-    border after ownership was lost. Prefixes and pane numbers alone prove
-    nothing. Same-terminal older generations retain their existing recovery.
-    Only explicitly pane-selected reclaim may relax repository equality, for
-    example when a local checkout gained a remote. Even that exception requires
-    a different, gone terminal; automatic recovery never enables it.
+    Same-terminal older generations keep the original host/terminal/pane and
+    exact-label proof even if workspace, client or repository changed. Herdr
+    restore instead allocates a new terminal: this path additionally requires
+    the same workspace/repository/client and a vanished inactive terminal.
+    Session mismatch is allowed because this proves display ownership only.
+    Prefixes and pane numbers alone prove nothing. Only explicit pane-selected
+    reclaim may relax repository equality on the cross-terminal path.
     """
-    if not isinstance(border, str) or not border or agent.get("last_ham_label") is not None:
+    if not isinstance(border, str) or agent.get("last_ham_label") is not None:
+        return None
+    previous = connection.execute(
+        "SELECT * FROM agents WHERE host=? AND terminal_id=? AND pane_id=? "
+        "AND active=0 AND generation<? AND last_ham_label=? "
+        "ORDER BY last_seen DESC,first_seen DESC,agent_id DESC LIMIT 1",
+        (agent["host"], agent["terminal_id"], agent["pane_id"], agent["generation"], border)).fetchone()
+    if previous is not None:
+        return dict(previous)
+    if not border:
         return None
     if live_terminals is None:
         live_terminals = {row[0] for row in connection.execute(
             "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (agent["host"],))}
     query = ("SELECT * FROM agents WHERE host=? AND workspace_id=? AND pane_id=? "
-             "AND client=? AND active=0 AND last_ham_label=?")
-    parameters = [agent["host"], agent["workspace_id"], agent["pane_id"], agent["client"], border]
+             "AND client=? AND active=0 AND last_ham_label=? AND terminal_id<>?")
+    parameters = [agent["host"], agent["workspace_id"], agent["pane_id"], agent["client"],
+                  border, agent["terminal_id"]]
     if not allow_repo_mismatch:
         query += " AND repo_id=?"
         parameters.append(agent["repo_id"])
     candidates = connection.execute(
         query + " ORDER BY last_seen DESC,first_seen DESC,agent_id DESC", parameters)
     for row in candidates:
-        if row["terminal_id"] == agent["terminal_id"]:
-            if row["repo_id"] == agent["repo_id"] and row["generation"] < agent["generation"]:
-                return dict(row)
-            continue
         if row["terminal_id"] in live_terminals:
             continue
         if connection.execute("SELECT 1 FROM agents WHERE host=? AND terminal_id=? AND active=1",
@@ -409,13 +413,17 @@ class AgentRegistry:
                                   "native_session_pid": native_session_pid}
         wake_terminals: list[str] = []
         # Binding changes share the projector's pane lock. Never take registry
-        # from a projector: the order is registry -> sorted panes -> SQL.
+        # from a projector: the order is registry -> sorted lock slots -> SQL.
         with self.store.read() as connection:
             binding_panes = {row[0] for row in connection.execute(
                 "SELECT pane_id FROM agents WHERE host=? AND active=1", (self.store.host,))}
         binding_panes.update(value["pane_id"] for value in locations.values())
+        lock_panes = {self.store.display_lock_key(self.store.host, pane_id): pane_id
+                      for pane_id in binding_panes}
         with ExitStack() as locks:
-            for pane_id in sorted(binding_panes):
+            # Hash collisions share a bounded slot; acquire each slot once and
+            # in slot order, not pane order, to avoid recursive flock/deadlock.
+            for _key, pane_id in sorted(lock_panes.items()):
                 # Unlike an advisory display refresh, identity reconciliation
                 # must never report success with stale sessions after timeout.
                 locks.enter_context(self.store.display_lock(
@@ -773,6 +781,26 @@ class AgentRegistry:
             plan[pane_id] = (desired_key, raw)
         return plan, matching, set(panes)
 
+    def defer_display(self, agent: Mapping[str, Any], projection: Any, *,
+                      now: float | None = None) -> bool:
+        """Retain a contended explicit projection without claiming it finished."""
+        from ham.ledger import display_repair
+
+        with self.store.transaction() as connection:
+            current = connection.execute(
+                "SELECT agent_id,pane_id FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                (self.store.host, agent["terminal_id"])).fetchone()
+            if (current is None or agent["host"] != self.store.host
+                    or current["agent_id"] != agent["agent_id"] or current["pane_id"] != agent["pane_id"]):
+                return False
+            entries = display_repair.load(connection)
+            before = json.dumps(entries, sort_keys=True)
+            display_repair.defer(entries, agent["pane_id"], display_repair.fingerprint(agent, projection),
+                                 time.time() if now is None else now)
+            if json.dumps(entries, sort_keys=True) != before:
+                display_repair.save(connection, entries)
+            return agent["pane_id"] in entries
+
     def _refresh_display(self, pane_ids: set[str], *,
                          environment: Mapping[str, str] | None = None,
                          feature_invoked: bool = False,
@@ -843,16 +871,25 @@ class AgentRegistry:
                 with self.store.transaction() as connection:
                     entries = display_repair.load(connection)
                     before = json.dumps(entries, sort_keys=True)
-                    # Refund only this call's durable, unchanged reservation.
-                    # Explicit writes have not saved one, and a concurrent sweep
-                    # may already have advanced even the same fingerprint.
+                    # An explicit defer marks its desired fingerprint even on
+                    # our in-flight reservation. Refund this sweep's attempt,
+                    # but never discard that independently committed request.
                     for pane_id in (skipped if reserve_durably else ()):
-                        if entries.get(pane_id) == saved_reservations.get(pane_id):
+                        entry = entries.get(pane_id)
+                        if entry is None:
+                            continue
+                        expected = dict(saved_reservations[pane_id])
+                        observed = dict(entry)
+                        explicit = observed.pop("explicit_pending", None)
+                        expected.pop("explicit_pending", None)
+                        if observed == expected:
                             previous = prior_reservations[pane_id]
                             if previous is None:
                                 del entries[pane_id]
                             else:
-                                entries[pane_id] = previous
+                                entries[pane_id] = dict(previous)
+                            if explicit is not None:
+                                display_repair.defer(entries, pane_id, explicit, at)
                     if snapshot is None:
                         # Status can commit while another projector holds the
                         # pane lock. Keep its deferred display alive even when
@@ -862,13 +899,17 @@ class AgentRegistry:
                         for pane_id in result["updated"]:
                             entry = entries.get(pane_id)
                             previous = queued.get(pane_id, {})
-                            if entry and entry["fingerprint"] in (
-                                    attempts.get(pane_id), previous.get("fingerprint")):
+                            if (entry and entry["fingerprint"] in (
+                                    attempts.get(pane_id), previous.get("fingerprint"))
+                                    and entry.get("explicit_pending") in (None, attempts.get(pane_id))):
                                 del entries[pane_id]
                         for pane_id in result["failed"]:
                             if pane_id in attempts:
+                                explicit = entries.get(pane_id, {}).get("explicit_pending")
                                 display_repair.reserve(
                                     entries, pane_id, attempts[pane_id], at, force=True)
+                                if explicit is not None and explicit != attempts[pane_id]:
+                                    display_repair.defer(entries, pane_id, explicit, at)
                     for pane_id in result["failed"]:
                         entry = entries.get(pane_id)
                         if entry and entry["fingerprint"] == attempts.get(pane_id):

@@ -65,15 +65,22 @@ def reserve(entries: dict[str, dict[str, Any]], pane_id: str, desired: str,
 def defer(entries: dict[str, dict[str, Any]], pane_id: str, desired: str, now: float) -> None:
     """Keep a skipped explicit write pending without spending an attempt.
 
-    An existing reservation, even for another fingerprint, belongs to a
-    concurrent sweep. Leave it intact; the next snapshot replans current state.
+    Mark an existing reservation too: its sweep may later refund its own
+    skipped attempt, but must retain this independently committed request.
     """
-    if pane_id in entries:
-        return
-    allowed, _diagnostic = reserve(entries, pane_id, desired, now)
-    if allowed:
-        entries[pane_id]["attempts"] = 0
-        entries[pane_id]["next_try_at"] = now
+    entry = entries.get(pane_id)
+    if entry is None:
+        allowed, _diagnostic = reserve(entries, pane_id, desired, now)
+        if not allowed:
+            return
+        entry = entries[pane_id]
+        entry["attempts"] = 0
+        entry["next_try_at"] = now
+    elif entry["fingerprint"] != desired and entry["state"] == "exhausted":
+        # A changed explicit target needs a live worker to replan its new
+        # fingerprint. Do not reset attempts for an exhausted identical target.
+        entry["state"] = "pending"
+    entry["explicit_pending"] = desired
 
 
 def failed(entry: dict[str, Any], detail: str) -> str | None:

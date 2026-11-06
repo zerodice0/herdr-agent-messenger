@@ -223,13 +223,13 @@ def report_agent_label_metadata(
     color: str,
     *,
     observed: Mapping[str, Any] | None = None,
-) -> bool:
+) -> bool | None:
     return report_agent_metadata(
         pane_id, agent, alias, marker, color,
         runner=lambda command: run_herdr(*command),
         on_failure=report_command_failure,
         observed=observed,
-    ) is not False
+    )
 
 
 def candidates(seed: str) -> Iterator[Alias]:
@@ -254,7 +254,7 @@ def assign_label(pane_id: str) -> int:
             pane_id, agent, name,
             identity.marker, identity.color,
             observed=info,
-        ) else 1
+        ) is not False else 1
 
     session_data = info.get("agent_session")
     session = session_data if isinstance(session_data, dict) else {}
@@ -274,7 +274,7 @@ def assign_label(pane_id: str) -> int:
                 observed=info,
             )
             print(candidate.name)
-            return 0 if metadata_reported else 1
+            return 0 if metadata_reported is not False else 1
         if "agent_name_taken" in renamed.stderr:
             current = fetch_agent_info(pane_id)
             current_name = str(current.get("name") or current.get("agent_name") or "")
@@ -285,7 +285,7 @@ def assign_label(pane_id: str) -> int:
                     identity.marker, identity.color,
                     observed=current,
                 )
-                return 0 if reported else 1
+                return 0 if reported is not False else 1
             continue
         report_command_failure(f"agent rename {pane_id}", renamed)
         return 1

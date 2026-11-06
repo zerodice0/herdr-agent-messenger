@@ -573,9 +573,9 @@ class DisplayRepairTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["pane"], owned + " — human suffix")
         self.assertIsNone(self.agent()["last_ham_label"])
 
-    def test_historical_ownership_does_not_cross_host_workspace_pane_repo_or_client(self):
+    def test_same_terminal_generation_ownership_keeps_host_and_pane_boundaries(self):
         old, owned = self.lost_ownership()
-        for column in ("host", "workspace_id", "pane_id", "repo_id", "client"):
+        for column in ("host", "pane_id"):
             with self.subTest(binding=column):
                 with self.store.transaction() as connection:
                     original = connection.execute(
@@ -588,6 +588,25 @@ class DisplayRepairTest(unittest.TestCase):
                 self.assertIsNone(self.agent()["last_ham_label"])
                 with self.store.transaction() as connection:
                     connection.execute(f"UPDATE agents SET {column}=? WHERE agent_id=?", (original, old["agent_id"]))
+
+    def test_same_terminal_generation_carries_across_workspace_repo_and_client_change(self):
+        old = self.initialize()
+        self.registry.set_status(old, phase="review", summary="Previous client task")
+        owned = self.agent()["last_ham_label"]
+        self.identity["repo_id"] = "replacement-repository"
+        self.template["agents"][0]["agent"] = "codex"
+        self.template["agents"][0]["agent_session"] = {"value": "replacement-client"}
+        for row in (*self.template["panes"], *self.template["agents"]):
+            row["workspace_id"] = "replacement-workspace"
+        self.registry.reconcile(self.snapshot(), now=400, refresh_display=False)
+        current = self.agent()
+        self.assertEqual(current["terminal_id"], old["terminal_id"])
+        self.assertGreater(current["generation"], old["generation"])
+        self.assertEqual(current["client"], "codex")
+        self.assertEqual(current["repo_id"], "replacement-repository")
+        self.assertEqual(current["workspace_id"], "replacement-workspace")
+        self.assertEqual(current["last_ham_label"], owned)
+        self.assertEqual(self.herdr.labels["pane"], owned)
 
     def test_live_wrong_terminal_binding_never_recovers_or_renames(self):
         _, owned = self.lost_ownership()
