@@ -25,7 +25,8 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
   CLI sends default to `fyi`.
 - **Main and workers:** `off`, `manual`, and `auto` participation modes, with
   linked worktrees grouped under their main-checkout workspace. Roles and
-  summaries also appear in HAM-owned Herdr borders; manual names are preserved.
+  summaries also appear in HAM-owned Herdr borders with a color marker, and OMP
+  session names follow `alias · summary`; manual names are preserved.
 - **Mailbox TUI:** browse Agents and Threads, compose action/FYI mail, reply,
   and manage participation in Settings without leaving the terminal.
 - **Read-only status board:** see roles, turn states, phases, summaries, unread

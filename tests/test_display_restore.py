@@ -78,7 +78,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(current["last_ham_label"], owned)
         self.assertEqual(self.recover(owned), None)  # Ownership is already recorded.
         self.registry.set_status(current, phase="review", summary="Restored task")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Restored task")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Restored task")
         self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
         with self.store.read() as connection:
             retired = dict(connection.execute(
@@ -89,10 +89,51 @@ class DisplayRestoreTest(unittest.TestCase):
     def test_first_reconcile_recovers_and_projects_without_explicit_reclaim(self):
         self.restored(reconcile=False)
         self.registry.reconcile(self.snapshot(), now=300)
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
         self.registry.set_status(self.agent(), phase="review", summary="Automatic restored projection")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Automatic restored projection")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Automatic restored projection")
+
+    def test_markerless_historical_border_transfers_exactly_then_migrates_once(self):
+        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
+            _, owned = self.restored()
+        self.assertEqual(owned, "orange-rabbit · Historical task")
+        self.assertEqual(self.agent()["last_ham_label"], owned)
+        self.assertEqual(self.herdr.labels["pane"], owned)
+        self.registry.reconcile(self.snapshot(), now=400)
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
+        self.assertEqual([command for command in self.writes() if command[:2] == ["pane", "rename"]],
+                         [["pane", "rename", "pane", "🟧 orange-rabbit"]])
+        self.herdr.commands.clear()
+        self.registry.reconcile(self.snapshot(), now=401)
+        self.assertEqual(self.herdr.commands, [])
+
+    def test_restored_markerless_lookalike_is_not_exact_historical_ownership(self):
+        markerless = "orange-rabbit · Historical task"
+        self.restored(border=markerless)
+        self.assertIsNone(self.agent()["last_ham_label"])
+        display = LedgerDisplay(self.store, runner=self.herdr)
+        self.assertEqual(display.reclaim(apply=True, snapshot=self.snapshot())["panes"], [])
+        self.registry.reconcile(self.snapshot(), now=400)
+        self.assertEqual(self.herdr.labels["pane"], markerless)
+        self.assertIsNone(self.agent()["last_ham_label"])
+
+    def test_markerless_historical_border_reclaim_keeps_exact_before_and_marked_after(self):
+        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
+            _, owned = self.restored()
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET last_ham_label=NULL WHERE active=1")
+        display = LedgerDisplay(self.store, runner=self.herdr)
+        dry = display.reclaim(snapshot=self.snapshot())
+        self.assertEqual(dry["panes"][0]["before"], {"border": owned, "last_ham_label": None})
+        self.assertEqual(dry["panes"][0]["after"],
+                         {"border": "🟧 orange-rabbit", "last_ham_label": "🟧 orange-rabbit"})
+        applied = display.reclaim(apply=True, snapshot=self.snapshot())
+        self.assertEqual(applied["updated"], ["pane"])
+        self.assertEqual(applied["panes"][0]["before"], {"border": owned, "last_ham_label": None})
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
 
     def test_existing_null_restored_row_recovers_on_next_reconcile(self):
         _, owned = self.restored()
@@ -102,8 +143,8 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["pane"], owned)
         self.registry.reconcile(self.snapshot(), now=400)
         self.assertEqual(self.agent()["agent_id"], current_id)
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
 
     def test_changed_session_restores_display_only_not_session_or_status(self):
         old, owned = self.restored(session="entirely-new-session")
@@ -215,7 +256,7 @@ class DisplayRestoreTest(unittest.TestCase):
         old, owned = self.lost_ownership()
         self.assertEqual(self.recover(owned, live_terminals={"terminal"})["agent_id"], old["agent_id"])
         self.registry.reconcile(self.snapshot(), now=400)
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
 
     def test_display_lock_has_quarter_second_budget_and_distinct_pane_host_keys(self):
         with mock.patch.object(self.store, "lock") as lock:
@@ -352,7 +393,7 @@ class DisplayRestoreTest(unittest.TestCase):
             results = [future_first.result(timeout=5), future_second.result(timeout=5)]
         for result in results:
             self.assertEqual(result, {"updated": ["pane"], "failed": [], "skipped": []})
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Concurrent projection")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Concurrent projection")
         self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
         renames = [command for command in self.writes() if command[:2] == ["pane", "rename"]]
         self.assertEqual(len(renames), 1)
@@ -395,7 +436,7 @@ class DisplayRestoreTest(unittest.TestCase):
             self.assertIsNone(future.result(timeout=5))
         self.assertTrue(acquired.is_set(), "Exercise stale-binding refusal, not lock timeout")
         self.assertEqual(self.herdr.commands, [])
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
         self.assertEqual(self.agent()["agent_id"], "replacement")
         self.assertEqual(other.notification_errors, [])
 
@@ -417,7 +458,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(candidate["owner_agent_id"], old["agent_id"])
         self.assertEqual(candidate["status"], "candidate")
         self.assertEqual(candidate["before"], {"border": owned, "last_ham_label": None})
-        self.assertEqual(candidate["after"], {"border": "orange-rabbit", "last_ham_label": "orange-rabbit"})
+        self.assertEqual(candidate["after"], {"border": "🟧 orange-rabbit", "last_ham_label": "🟧 orange-rabbit"})
         self.assertEqual(self.dump(), before)
         self.assertEqual(self.herdr.metadata, metadata)
         self.assertEqual(self.herdr.commands, [])
@@ -435,8 +476,8 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(applied["updated"], ["pane"])
         self.assertEqual(applied["failed"], [])
         self.assertEqual(applied["panes"][0]["status"], "updated")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
         self.herdr.commands.clear()
         before = self.dump()
         again = display.reclaim(apply=True, snapshot=self.snapshot())
@@ -546,7 +587,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(self.agent()["summary"], "Latest committed status")
         self.assertEqual(self.store.notification_errors, [])
         self.registry.reconcile(self.snapshot(), now=pending["next_try_at"])
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Latest committed status")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Latest committed status")
         self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
         self.registry.reconcile(self.snapshot(), now=pending["next_try_at"] + 1)
         self.assertEqual(self.entries(), {})
@@ -583,7 +624,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertTrue(worker.maintenance_pending(self.store))
         self.assertEqual(self.store.notification_errors, [])
         self.registry.reconcile(self.snapshot(), now=pending["next_try_at"])
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Explicit target during sweep")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Explicit target during sweep")
         self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
         self.registry.reconcile(self.snapshot(), now=pending["next_try_at"] + 1)
         self.assertEqual(self.entries(), {})
@@ -620,7 +661,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(pending["explicit_pending"], display_repair.fingerprint(self.agent(), projection))
         self.assertTrue(worker.maintenance_pending(self.store))
         self.registry.reconcile(self.snapshot(), now=400)
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · New target while rename completes")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · New target while rename completes")
         self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["pane"])
         self.registry.reconcile(self.snapshot(), now=401)
         self.assertEqual(self.entries(), {})

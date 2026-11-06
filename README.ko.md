@@ -24,7 +24,8 @@ HAM은 터미널 스크롤백에 메시지를 묻어 두지 않고 코딩 에이
   안전 조건에 따라 그 턴 직후 전달합니다. CLI 전송의 기본값은 `fyi`입니다.
 - **Main과 worker:** `off`, `manual`, `auto` 참여 모드를 제공하며 연결된
   worktree를 메인 체크아웃 workspace 아래에 묶습니다. HAM이 관리하는 Herdr
-  테두리에도 역할과 요약을 표시하며, 사용자가 직접 붙인 이름은 유지합니다.
+  테두리에도 색상 표시, 역할, 요약을 함께 표시하고, OMP 세션 이름도
+  `alias · summary`로 맞추며, 사용자가 직접 붙인 이름은 유지합니다.
 - **Mailbox TUI:** 터미널에서 Agents·Threads를 살펴보고 action/FYI를 작성하거나
   답장하며, Settings에서 참여 설정을 관리합니다.
 - **읽기 전용 상태 보드:** 로컬 저장소와 등록된 peer의 역할·턴 상태·phase·요약,

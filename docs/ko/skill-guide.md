@@ -697,10 +697,14 @@ python3 "$HAM_CLI" repo show
 
 `status set PHASE --summary TEXT`는 호출자의 phase와 summary를 갱신하며 Herdr의
 `turn_state`는 바꾸지 않습니다. phase는 `$recap`에 표시합니다. HAM 소유 pane
-테두리는 `[메인] alias · summary` 또는 `[워커] alias · summary`로 표시하며,
-없는 부분은 생략합니다. 별칭을 요약 앞에 두므로 Herdr가 폭에 맞춰 내용을 자를 때
-요약이 먼저 잘립니다. `status clear`는 phase와 summary만 지우고 별칭과 현재
-역할은 유지합니다. 사용자가 지정한 기존 테두리는 보존합니다. Agents에서는 역할을
+테두리는 `<marker> [메인] alias · summary` 또는 `<marker> [워커] alias · summary`로
+표시하며(예: `⬜ [메인] white-rabbit · 메일함 경계를 검토하고 있습니다`),
+없는 부분은 생략합니다. `NO_COLOR`가 있거나 marker를 명시적으로 비우면
+`display_agent`와 테두리에서 똑같이 marker를 제거합니다. 별칭을 요약 앞에 두므로
+Herdr가 폭에 맞춰 내용을 자를 때 요약이 먼저 잘립니다. `status clear`는 phase와
+summary만 지우고 별칭과 현재 역할은 유지합니다. 사용자가 지정한 기존 테두리는
+보존합니다. OMP 세션에는 `<alias> · <summary>` 이름도 붙입니다.
+[OMP 세션 이름 동기화](#omp-세션-이름-동기화)를 참고하세요. Agents에서는 역할을
 주소로 쓸 별칭 앞에 표시하며, off에서도 역할 접두사 없이 상태 기능이 동작합니다.
 레지스트리를 갱신할 때 기록된 표시의 불일치를 모델 토큰·깨우기·메일 없이 복구합니다.
 의미 있는 phase·summary 변화는 여전히 `status set`으로 명시해야 합니다.
@@ -711,7 +715,9 @@ python3 "$HAM_CLI" repo show
 한도를 소진한 대상은 `ledger doctor`의 `display_repair` 맵에서
 진단하세요. 같은 상태를 반복해서 지정하거나 워커를 다시 시작해도 한도는 초기화되지
 않습니다. 테두리 소유권은 기록된 이전 `last_ham_label`과 정확히 같을 때만
-이어받으며, 역할 접두사나 pane 일치만으로 판단하지 않습니다. 같은 terminal
+이어받으며, 역할 접두사, marker, pane 일치만으로 판단하지 않습니다. 기록된 marker
+없는 legacy 라벨과 정확히 같은 테두리는 한 번 marker가 있는 형태로 이전합니다.
+같은 terminal
 연결에서는 같은 호스트·terminal·pane, 더 오래된 세대, 정확한 라벨 일치로
 충분하고 workspace, 클라이언트, 저장소는 비교하지 않습니다. terminal이 바뀐 뒤에는
 같은 호스트·workspace·pane·저장소·클라이언트의 이전 행이 비활성이어야 하고, 그
@@ -990,6 +996,71 @@ provider/세션 한도 실패도 별도입니다. 실제 OMP와 물리적인 호
 만들지 않으며, 자신에게 온 원문에 답장하면 원문을 원자적으로 handled로 바꿉니다.
 Codex에는 hook이나 확장 수신기가 없지만 워커가 유휴 세션을 깨울 수 있으며
 (**Claude Code·Codex 유휴 깨우기** 참고), 조회를 native delivery로 보고하지 마세요.
+
+#### OMP 세션 이름 동기화
+
+OMP에서만 HAM이 세션 이름을 `<alias> · <summary>`로 맞춥니다. 예를 들면
+`white-rabbit · 메일함 경계를 검토하고 있습니다`입니다. 테두리
+`⬜ [메인] white-rabbit · 메일함 경계를 검토하고 있습니다`와 달리 이름에는 emoji와
+역할이 없습니다. Claude Code와 Codex에는 토큰을 쓰지 않는 세션 이름 API가
+확인되지 않았으므로 동기화 대상에서 제외합니다.
+
+- **출처와 시점:** 기존 수신기 등록 응답과 `inspect` 응답에 선택 필드 `summary`가
+  추가됩니다. 프로토콜 1과 스키마 12는 그대로이며 새 폴링 루프나 타이머는 없습니다.
+  확장은 기존 갱신 주기와 자신의 `status set`·`status clear`가 끝난 시점에
+  동기화하며, 쓰기 횟수는 제한하고 같은 이름은 중복 적용하지 않습니다.
+  `summary`가 없는 이전 runtime 응답을 받으면 아무것도 하지 않습니다.
+- **길이 제한:** 이름은 UTF-8로 최대 96바이트입니다.
+- **소유권:** HAM은 비어 있는 제목이나 OMP가 만든 것으로 확인된 제목을 이어받을 수
+  있습니다. HAM보다 먼저 사용자가 정한 제목은 덮어쓰지 않으며, 이후 사용자가 이름을
+  바꾸면 그 OMP 세션의 동기화를 멈춥니다. HAM은 세션마다 마지막으로 쓴 이름과 세션
+  항목을 기록합니다.
+  이름이 실제로 바뀔 때마다 이름, 이전 자동 제목, 해당 `title_change` 항목 ID를
+  담은 `ham-session-name` custom 항목을 저장합니다. 재시작하거나 세션을 이어 열어도
+  현재 이름과 제목 항목이 이 기록과 모두 같으면 소유권을 복원합니다. 사용자가 이후
+  같은 문구로 이름을 다시 지정한 경우에도 사용자 변경을 보존합니다.
+  이름이 그대로이면 소유권 항목을 추가하지 않습니다.
+- **지우기:** `status clear`는 현재 제목을 HAM이 여전히 소유한 경우에만 이전의 자동
+  생성 이름으로 되돌립니다. 이전 제목이 없었다면 공개 API로 제목을 지울 수 없으므로
+  HAM이 마지막에 쓴 이름이 남습니다.
+- **비용:** 동기화 자체는 모델을 호출하지 않으며 대화 메시지도 추가하지 않습니다.
+  다만 OMP가 세션에서 원래 실행할 수 있는 제목 요청이나 다른 OMP 작업은 HAM의
+  동기화에 속하지 않으므로, OMP의 모든 활동에 토큰이 들지 않는다는 뜻은 아닙니다.
+
+OMP 18.16.0 기준으로 확인했습니다. 설치된 바이너리는 `omp/18.16.0`을 보고하지만,
+아래에 인용한 `v18.16.0` 태그가 그 바이너리와 바이트 단위로 같은지는 확인하지
+않았습니다.
+
+- 확장에는 공개 API `pi.getSessionName(): string | undefined`와
+  `pi.setSessionName(name): Promise<void>`가 있습니다
+  ([types.ts](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/extensibility/extensions/types.ts#L2103-L2107)).
+- `setSessionName`은 내부의 `sessionManager.setSessionName(name, "user")`를 호출합니다
+  ([extension-ui-controller.ts](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts#L1453-L1455)).
+  공개 API는 source를 받지 않으므로 HAM이 설정하는 이름은 모두 user source이며
+  OMP의 자동 제목과 갱신을 막습니다. 이전 이름으로 되돌리는 것도 user source이므로
+  auto source의 복원은 아닙니다.
+- 기존 source가 `user`이면 자동 제목은 거부됩니다. 제목이 바뀌면 `title_change`
+  항목(`previousTitle`, `source`), 헤더의 `title`과 `titleSource`, title slot이
+  저장됩니다. 읽기 전용 관리자는 `getHeader`와 `getEntries`를 공개합니다
+  ([session-manager.ts](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L3420-L3465),
+  [읽기 전용 접근자](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L735-L761)).
+- `cleanTitle`에는 코드 수준의 최대 길이가 없지만 title slot은 UTF-8 256바이트이며
+  코드 포인트 단위로 자릅니다
+  ([session-title-slot.ts](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-title-slot.ts#L115-L129)).
+  HAM의 96바이트 제한은 이보다 훨씬 작습니다.
+- 제목이 바뀌면 터미널 제목과 강조색이 갱신되고 입력창 띠에 이름이 표시됩니다
+  ([제목 콜백](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/interactive-mode.ts#L2644-L2668),
+  [띠](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/interactive-mode.ts#L1498-L1505)).
+  세션 선택기는 저장된 제목을 보여 줍니다
+  ([세션 전환과 최근 목록](https://github.com/can1357/oh-my-pi/blob/v18.16.0/docs/session-switching-and-recent-listing.md#L55-L65)).
+- 공개 API `pi.appendEntry(customType, data)`는 확장 상태를 저장하며 LLM에는
+  보내지 않습니다
+  ([API](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/extensibility/extensions/types.ts#L2064-L2065)).
+  저장 형식은 `custom` 항목이며
+  ([저장 경로](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L3735-L3738)),
+  모델 문맥 변환은 message, custom-message, branch-summary만 메시지로 바꾸므로
+  `custom` 상태 항목은 제외됩니다
+  ([변환 조건](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-context.ts#L425-L448)).
 
 ### Claude Code·Codex 유휴 깨우기
 

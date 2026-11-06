@@ -167,9 +167,22 @@ class DisplayRepairTest(unittest.TestCase):
             self.registry.set_status(self.agent(), phase="", summary="Changed border only")
         self.registry.reconcile(self.snapshot(), now=200)
         self.assertEqual(self.writes(), [[
-            "pane", "rename", "pane", "orange-rabbit · Changed border only",
+            "pane", "rename", "pane", "🟧 orange-rabbit · Changed border only",
         ]])
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Changed border only")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Changed border only")
+        self.herdr.commands.clear()
+        self.registry.reconcile(self.snapshot(), now=201)
+        self.assertEqual(self.herdr.commands, [])
+        self.assertEqual(self.entries(), {})
+
+    def test_markerless_owned_border_converges_once_without_metadata_rewrite(self):
+        current = self.initialize()
+        legacy = "orange-rabbit"
+        self.registry.set_display_label(current["agent_id"], current["last_ham_label"], legacy)
+        self.herdr.labels["pane"] = legacy
+        self.registry.reconcile(self.snapshot(), now=200)
+        self.assertEqual(self.writes(), [["pane", "rename", "pane", "🟧 orange-rabbit"]])
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
         self.herdr.commands.clear()
         self.registry.reconcile(self.snapshot(), now=201)
         self.assertEqual(self.herdr.commands, [])
@@ -534,7 +547,7 @@ class DisplayRepairTest(unittest.TestCase):
         self.assertEqual(current["generation"], 2)
         self.assertEqual(current["last_ham_label"], owned)
         self.registry.set_status(current, phase="review", summary="New generation task")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · New generation task")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · New generation task")
 
     def test_generation_does_not_carry_ownership_after_manual_rename(self):
         old = self.initialize(unreported=True)
@@ -561,10 +574,10 @@ class DisplayRepairTest(unittest.TestCase):
         _, owned = self.lost_ownership()
         self.assertEqual(self.herdr.labels["pane"], owned)
         self.registry.reconcile(self.snapshot(), now=400)
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
         self.registry.set_status(self.agent(), phase="review", summary="Recovered")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · Recovered")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Recovered")
 
     def test_prefix_only_historical_border_is_not_owned(self):
         _, owned = self.lost_ownership()
@@ -618,14 +631,14 @@ class DisplayRepairTest(unittest.TestCase):
 
     def test_current_equals_desired_records_null_ownership_without_rename(self):
         self.initialize()
-        self.herdr.labels["pane"] = "orange-rabbit"
+        self.herdr.labels["pane"] = "🟧 orange-rabbit"
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET last_ham_label=NULL WHERE active=1")
         self.assertTrue(LedgerDisplay(self.store, runner=self.herdr).refresh_agent(self.agent()))
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
         self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
         self.registry.set_status(self.agent(), phase="review", summary="CAS now owns this border")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit · CAS now owns this border")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · CAS now owns this border")
 
     def test_metadata_matches_accepts_herdr_normalized_text(self):
         from dataclasses import replace
@@ -661,7 +674,7 @@ class DisplayRepairTest(unittest.TestCase):
 
     def test_current_equals_desired_reloads_cas_owner_before_recording_without_rename(self):
         self.initialize()
-        desired = "orange-rabbit"
+        desired = "🟧 orange-rabbit"
         self.herdr.labels["pane"] = desired
         for competing_label, metadata_fails, expected in (
                 (desired, False, True), ("Other owner's border", False, True), (desired, True, False)):

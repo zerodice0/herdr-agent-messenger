@@ -138,6 +138,26 @@ class NativeReceiverTest(unittest.TestCase):
     def display_runner(command):
         return subprocess.CompletedProcess(list(command), 1, "", "isolated fixture")
 
+    def test_inspect_and_register_include_current_status_summary(self):
+        self.assertEqual(self.receiver.inspect(**self.identity)['summary'], '')
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE agent_status SET summary=? WHERE agent_id=?',
+                               ('한글\n작업\x00 요약', self.recipient['agent_id']))
+        self.assertEqual(self.receiver.inspect(**self.identity)['summary'], '한글 작업 요약')
+        registered = self.receiver.register(self.recipient, session_ref=self.session)
+        self.assertEqual(registered['summary'], '한글 작업 요약')
+        with self.store.transaction() as connection:
+            connection.execute('UPDATE agent_status SET summary=? WHERE agent_id=?',
+                               ('', self.recipient['agent_id']))
+        self.assertEqual(self.receiver.inspect(**self.identity)['summary'], '')
+
+    def test_inspect_without_status_row_has_empty_summary(self):
+        with self.store.transaction() as connection:
+            connection.execute('DELETE FROM agent_status WHERE agent_id=?', (self.recipient['agent_id'],))
+        inspection = self.receiver.inspect(**self.identity)
+        self.assertEqual(inspection['summary'], '')
+        self.assertEqual(inspection['turn_state'], 'unknown')
+
     def send(self,kind='fyi',body='Native receiver context 한글',**options):
         return self.mail.send(self.sender,self.recipient,kind=kind,body=body,**options)
 

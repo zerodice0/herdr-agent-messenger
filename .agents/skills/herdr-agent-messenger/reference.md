@@ -619,8 +619,11 @@ hosts may temporarily disagree until settings propagate; there is no home failov
 The stable terminal slot survives a pane move; roles follow its current scope,
 and displays in both the old and new scopes are refreshed. A new native
 session/client/repo changes generation. Agents keeps role before the addressable alias. HAM-owned
-borders show `[메인] alias · summary` or `[워커] alias · summary`, omitting
-missing parts and preserving manual user renames. Alias precedes summary so
+borders show `<marker> [메인] alias · summary` or `<marker> [워커] alias · summary`
+(for example `⬜ [메인] white-rabbit · Checking the mailbox boundary`), omitting
+missing parts and preserving manual user renames. The marker is the `alias_identity`
+color marker also used by `display_agent`; `NO_COLOR` (even empty) or an explicitly
+empty marker removes it from both consistently. Alias precedes summary so
 Herdr's width truncation clips the summary first. `status clear` removes
 phase/summary but retains alias and any active role. Phase supplies the HAM
 `recap` token. Herdr's turn state is stored unchanged.
@@ -630,8 +633,10 @@ leaves unrelated token keys untouched. Herdr's per-pane token map is flat;
 metadata sources do not isolate identically named keys.
 
 Border ownership carries across generations only on an exact match to the
-recorded prior `last_ham_label`; a role prefix or pane match alone never proves
-it. On the same terminal binding the carry needs only the same host, terminal and
+recorded prior `last_ham_label`; a role prefix, marker or pane match alone never proves
+it. A border exactly equal to a recorded markerless legacy label migrates once to
+the marked form. Restore and reclaim use the same exact prior-label tracking.
+On the same terminal binding the carry needs only the same host, terminal and
 pane, an older generation and that exact label: workspace, client and repo are
 not compared. After a terminal rebind (cross-terminal), the stricter scope
 applies: the same host/workspace/pane/repo/client, and HAM adopts a nonempty
@@ -1153,6 +1158,59 @@ proof does not become a wake. Bell events and a five-minute code-only safety
 check drive inspection. ACK requires exact marker/content hash in the same
 session's public active-branch journal; later provider transforms or model
 understanding are not asserted.
+
+**OMP session name sync:** only OMP has it; Claude Code and Codex lack an
+established token-free session-name API and are excluded. The existing runtime
+registration/`inspect` response gains an optional `summary` (protocol 1 and schema
+12 unchanged, no new polling loop). The extension sets the session name to
+`<alias> · <summary>` (no emoji, no role, at most 96 UTF-8 bytes) on its existing
+refresh and when the agent's own `status set`/`clear` completes, bounded and
+deduplicated. A response without `summary` (older runtime) does nothing. HAM may
+adopt an empty or known auto title, never overwrites a title the user set before
+it, and stops syncing an OMP session after a later user rename. It tracks its last
+title and session entry per session. `status clear` restores the prior auto name
+only while HAM still owns the current title; with no prior title the last HAM name
+stays because the public API cannot clear. The sync makes zero model calls and
+appends no conversation message; this does not make other OMP activity (including a
+title request OMP may already run) token-free.
+After each actual name change, a `ham-session-name` custom entry persists its
+name, prior auto name and matching `title_change` entry ID. Restart/resume restores
+ownership only while the current name and title entry still match that proof.
+A user rename, even to the same text, is preserved. Unchanged names append no
+ownership entry. These custom state entries are not conversation messages.
+
+Verified against OMP 18.16.0 (`omp/18.16.0`; the `v18.16.0` tag is not verified
+byte-identical to the binary):
+
+- Public `pi.getSessionName(): string | undefined` and
+  `pi.setSessionName(name): Promise<void>`:
+  [types.ts#L2103-L2107](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/extensibility/extensions/types.ts#L2103-L2107).
+- It calls internal `sessionManager.setSessionName(name, "user")`
+  ([extension-ui-controller.ts#L1453-L1455](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts#L1453-L1455)).
+  No source parameter exists, so HAM sets and restores are user-source: they
+  suppress OMP's auto title/refresh and are not a true auto-source restore.
+- An auto title is rejected when the existing source is `user`; changes persist a
+  `title_change` entry (`previousTitle`/`source`), header `title`/`titleSource` and
+  the title slot
+  ([session-manager.ts#L3420-L3465](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L3420-L3465)).
+  The readonly manager exposes `getHeader`/`getEntries`
+  ([#L735-L761](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L735-L761)).
+- `cleanTitle` has no code-level maximum, but the title slot is 256 UTF-8 bytes
+  and truncates by code point
+  ([session-title-slot.ts#L115-L129](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-title-slot.ts#L115-L129)).
+- A title change updates the terminal title/accent
+  ([interactive-mode.ts#L2644-L2668](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/interactive-mode.ts#L2644-L2668))
+  and the composer band name
+  ([#L1498-L1505](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/modes/interactive-mode.ts#L1498-L1505)).
+  The session picker uses the persisted title
+  ([session listing](https://github.com/can1357/oh-my-pi/blob/v18.16.0/docs/session-switching-and-recent-listing.md#L55-L65)).
+- Public `pi.appendEntry(customType, data)` stores extension state without sending
+  it to the LLM
+  ([API](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/extensibility/extensions/types.ts#L2064-L2065)).
+  It writes `custom` entries
+  ([storage](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-manager.ts#L3735-L3738)),
+  which model context conversion does not include
+  ([context whitelist](https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/session/session-context.ts#L425-L448)).
 
 **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit` context
 hooks only, with no Stop extension; idle wake is the worker-driven path below. Outside Herdr, the adapter

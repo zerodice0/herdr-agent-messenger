@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from ham.agents.labels import alias_identity
 from ham.ledger.display import SOURCE
 from ham.ledger.mail import Mailbox
 from ham.ledger.remote import RemoteLedger
@@ -449,19 +450,19 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         closed = copy.deepcopy(observed)
         closed["workspaces"] = closed["workspaces"][1:]
         self.register(closed, display=True)
-        self.assertTrue(all(self.herdr.labels["p-" + terminal].startswith("[메인]")
+        self.assertTrue(all(self.herdr.labels["p-" + terminal].startswith(alias_identity(terminal).marker + " [메인]")
                             for terminal in ("worker", "worker2")))
         self.herdr.commands.clear()
         self.register(observed, display=True)
         for terminal in ("worker", "worker2"):
             pane = "p-" + terminal
-            self.assertTrue(self.herdr.labels[pane].startswith("[워커]"))
+            self.assertTrue(self.herdr.labels[pane].startswith(alias_identity(terminal).marker + " [워커]"))
             self.assertIn("[워커]", self.herdr.metadata[pane][SOURCE]["display_agent"])
         self.assertEqual({command[2] for command in self.herdr.commands}, {"p-worker", "p-worker2"})
         self.herdr.commands.clear()
         self.register(closed, display=True)
         self.assertEqual({command[2] for command in self.herdr.commands}, {"p-worker", "p-worker2"})
-        self.assertTrue(all(self.herdr.labels["p-" + terminal].startswith("[메인]")
+        self.assertTrue(all(self.herdr.labels["p-" + terminal].startswith(alias_identity(terminal).marker + " [메인]")
                             for terminal in ("worker", "worker2")))
 
     def test_group_arrival_departure_and_missing_metadata_refresh_survivors_only(self):
@@ -479,7 +480,7 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         # Losing the main leaves surviving workers' effective output unchanged.
         self.assertEqual(self.herdr.commands, [])
         for terminal in agents:
-            self.assertTrue(self.herdr.labels["p-" + terminal].startswith("[워커]"))
+            self.assertTrue(self.herdr.labels["p-" + terminal].startswith(alias_identity(terminal).marker + " [워커]"))
             self.assertIn("[워커]", self.herdr.metadata["p-" + terminal][SOURCE]["display_agent"])
         self.herdr.commands.clear()
         agents = self.register(observed, display=True)
@@ -487,7 +488,7 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
                          {"main": "main", "worker": "worker", "worker2": "worker"})
         # The returning main's metadata and border already match as well.
         self.assertEqual(self.herdr.commands, [])
-        self.assertTrue(self.herdr.labels["p-main"].startswith("[메인]"))
+        self.assertTrue(self.herdr.labels["p-main"].startswith(alias_identity("main").marker + " [메인]"))
         self.assertIn("[메인]", self.herdr.metadata["p-main"][SOURCE]["display_agent"])
         without_metadata = copy.deepcopy(observed)
         without_metadata.pop("workspaces")
@@ -498,7 +499,7 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
                   if command[:2] in (["pane", "report-metadata"], ["pane", "rename"])]
         self.assertEqual({command[2] for command in writes}, {"p-worker", "p-worker2"})
         for terminal in agents:
-            self.assertTrue(self.herdr.labels["p-" + terminal].startswith("[메인]"))
+            self.assertTrue(self.herdr.labels["p-" + terminal].startswith(alias_identity(terminal).marker + " [메인]"))
             self.assertIn("[메인]", self.herdr.metadata["p-" + terminal][SOURCE]["display_agent"])
         self.assertEqual(self.show()["workspace_id"], "w1")
         self.assertEqual(self.show()["main"], self.target("worker"))

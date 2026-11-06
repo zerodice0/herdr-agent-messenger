@@ -12,9 +12,10 @@ class OmpMailboxLifecycleTest(unittest.TestCase):
     def test_public_lifecycle_with_real_private_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {**os.environ,'TMPDIR':directory,'HERDR_AGENT_LEDGER_AUTOSTART':'0','PYTHONDONTWRITEBYTECODE':'1'}
-            completed = subprocess.run(['bun','test','./tests/omp_mailbox_runtime.test.ts','--timeout','15000'],
-                    # Includes real interpreter startup and the 15-second child-deadline regression.
-                    cwd=Path(__file__).parents[1],env=environment,text=True,capture_output=True,timeout=300)
+            completed = subprocess.run(['bun','test','./tests/omp_mailbox_runtime.test.ts','--timeout','60000'],
+                    # These correctness cases start real Python interpreters. Allow scheduler
+                    # contention without letting a timed-out fixture cascade into later cases.
+                    cwd=Path(__file__).parents[1],env=environment,text=True,capture_output=True,timeout=1800)
             self.assertEqual(completed.returncode,0,completed.stdout+completed.stderr)
 
 

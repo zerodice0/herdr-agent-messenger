@@ -680,6 +680,30 @@ class ReadCliTest(unittest.TestCase):
         self.assertEqual([self.database_state(store) for store in (self.store, self.peer_store)], before)
         self.assertFalse(self.herdr_calls.exists(), "Stored-board reads must not inspect or mutate Herdr")
 
+    def test_board_keeps_alias_and_summary_separate_from_marked_owned_border(self):
+        registry = AgentRegistry(self.store)
+        agent = next(row for row in registry.list() if row["agent_id"] == self.sender["agent_id"])
+        projected = LedgerDisplay(self.store).projection({**agent, "role": "main"})
+        self.assertTrue(projected.label.endswith(agent["alias"] + " · Read-only summary"))
+        registry.set_display_label(agent["agent_id"], agent["last_ham_label"], projected.label)
+        before = self.database_state(self.store)
+        for options in ((), ("--verbose",)):
+            with self.subTest(options=options):
+                completed, board = self.cli("status", "board", "--host", "local", *options)
+                self.assertEqual(completed.returncode, 0)
+                if options:
+                    row = next(item for item in board["agents"] if item["agent_id"] == agent["agent_id"])
+                    self.assertEqual(row["alias"], agent["alias"])
+                else:
+                    row = next(item for item in board["agents"]
+                               if item["address"] == "alpha/" + agent["alias"])
+                    self.assertEqual(row["address"], "alpha/" + agent["alias"])
+                self.assertEqual(row["phase"], "review")
+                self.assertEqual(row["summary"], "Read-only summary")
+                self.assertNotIn(projected.label, (row.get("alias"), row.get("address"), row["summary"]))
+        self.assertEqual(self.database_state(self.store), before)
+        self.assertFalse(self.herdr_calls.exists())
+
     def test_board_compact_omits_workspace_metadata_that_verbose_and_api_keep(self):
         self.snapshot["workspaces"] = [{"workspace_id": "w1", "label": "main-workspace",
                                         "worktree": {"repo_key": "shared", "is_linked_worktree": False}}]

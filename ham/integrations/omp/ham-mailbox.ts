@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 type Request = Record<string, unknown>;
-export interface NativeAgent { terminal_id: string; agent_id: string; generation: number; session_ref: string }
+export interface NativeAgent { terminal_id: string; agent_id: string; generation: number; session_ref: string; alias?: string }
 export interface NativeClaim {
   claim_id: string; agent_id: string; generation: number; session_ref: string; marker: string; content_sha256: string;
 }
@@ -20,7 +20,7 @@ export interface NativeMessage {
 export interface ClaimBundle extends NativeClaim { message: NativeMessage; skip_input_quiet?: boolean }
 interface Thresholds { idle_minutes: number; coalesce_seconds: number; wakes_per_hour: number; max_hop: number }
 interface Inspection {
-  thresholds: Thresholds; role: "main" | "worker" | null; turn_state: string; wake_count: number;
+  thresholds: Thresholds; role: "main" | "worker" | null; turn_state: string; wake_count: number; summary?: string;
   pending_claims: NativeClaim[]; has_action: boolean; coalesce_until: number; skip_input_quiet?: boolean;
 }
 interface Registration extends Inspection { agent: NativeAgent; bell_directory: string; bell_name: string }
@@ -32,6 +32,39 @@ type Operation = keyof ReceiverReplies;
 type Call = <O extends Operation>(operation: O, data: Request) => Promise<ReceiverReplies[O]>;
 type Pending = NativeClaim & { phase: "prepared" | "sent" | "unknown"; preparation?: string; message?: NativeMessage };
 interface EndEvent { willContinue?: boolean; messages?: readonly { role: string; stopReason?: string }[] }
+interface SessionNameState { previous?: string; owned?: string; entryId?: string; relinquished?: boolean }
+interface SessionTitleEntry { id: string; title: string; source?: string }
+
+function sessionTitle(value: string): string {
+  const clean = value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").replace(/\s+/gu, " ").trim();
+  if (Buffer.byteLength(clean, "utf8") <= 96) return clean;
+  let title = "", bytes = 0;
+  for (const point of clean) {
+    const size = Buffer.byteLength(point, "utf8");
+    if (bytes + size > 93) break;
+    title += point; bytes += size;
+  }
+  return title.trimEnd() + "…";
+}
+
+function changesOwnStatus(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  // Recognize a leading HAM invocation, not echoed status text or a remote launch.
+  // Quoted shell words are inspected, never expanded or executed.
+  const words = command.match(/"(?:\\.|[^"\\])*"|'[^']*'|[^\s"';&|]+/g);
+  if (!words?.length) return false;
+  const tokens = words.map(word => /^["']/.test(word) ? word.slice(1, -1) : word);
+  let index = 0;
+  if (!/^(?:.*\/)?python(?:3(?:\.\d+)?)?$/.test(tokens[index++])) return false;
+  if (tokens[index] === "-m") {
+    index++;
+    const module = tokens[index++];
+    if (module !== "ham" && module !== "ham.cli") return false;
+    if (tokens[index] === "--cwd" && tokens[index + 1]) index += 2;
+    if (tokens[index] === "cli") index++;
+  } else if (!/(?:^|\/)herdr_agent_messenger\.py$/.test(tokens[index++] || "")) return false;
+  return tokens[index] === "status" && (tokens[index + 1] === "set" || tokens[index + 1] === "clear");
+}
 const WAKE_READY_STATES: Record<string, true> = { idle: true, done: true };
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const identity = (agent: NativeAgent) => ({ terminal_id: agent.terminal_id, agent_id: agent.agent_id, generation: agent.generation });
@@ -67,9 +100,10 @@ function inspection(value: Request): Inspection {
   const thresholds = record(value.thresholds);
   if (value.role !== null && value.role !== "main" && value.role !== "worker") throw new Error("Invalid HAM role");
   if (typeof value.has_action !== "boolean") throw new Error("Invalid HAM action eligibility");
+  if (value.summary !== undefined && typeof value.summary !== "string") throw new Error("Invalid HAM summary");
   return { thresholds: { idle_minutes: number(thresholds.idle_minutes), coalesce_seconds: number(thresholds.coalesce_seconds),
       wakes_per_hour: number(thresholds.wakes_per_hour), max_hop: number(thresholds.max_hop) },
-    role: value.role, turn_state: string(value.turn_state), wake_count: number(value.wake_count),
+    role: value.role, turn_state: string(value.turn_state), wake_count: number(value.wake_count), summary: value.summary,
     pending_claims: array(value.pending_claims).map(nativeClaim), has_action: value.has_action, coalesce_until: number(value.coalesce_until),
     skip_input_quiet: skipInputQuiet(value) };
 }
@@ -78,8 +112,9 @@ export function parseReply<O extends Operation>(operation: O, raw: unknown): Rec
   let parsed: ReceiverReplies[Operation];
   if (operation === "register") {
     const agent = record(value.agent);
+    if (agent.alias !== undefined && typeof agent.alias !== "string") throw new Error("Invalid HAM alias");
     parsed = { ...inspection(value), agent: { terminal_id: string(agent.terminal_id), agent_id: string(agent.agent_id),
-      generation: number(agent.generation), session_ref: string(agent.session_ref) },
+      generation: number(agent.generation), session_ref: string(agent.session_ref), alias: agent.alias },
       bell_directory: string(value.bell_directory), bell_name: string(value.bell_name) };
   } else if (operation === "inspect") parsed = inspection(value);
   else if (operation === "claim") {
@@ -252,6 +287,9 @@ export class MailboxAdapter {
   private errors = new Map<string, { phase: string; reportedAt: number }>();
   private errorPhases = new WeakMap<object, string>();
   private registrationFailures = 0;
+  private sessionNames = new Map<string, SessionNameState>();
+  private nameWork: Promise<void> = Promise.resolve();
+  private statusToolCalls = new Set<string>();
 
   constructor(private pi: ExtensionAPI, private call: Call = callReceiver) {}
 
@@ -266,6 +304,88 @@ export class MailboxAdapter {
     return this.belongs(ctx) && epoch === this.epoch && !!this.registration &&
       ctx.sessionManager.getSessionFile() === this.registration.agent.session_ref;
   }
+  private titleEntry(ctx: ExtensionContext): SessionTitleEntry | undefined {
+    const entries = ctx.sessionManager.getEntries();
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (entry.type === "title_change") return entry;
+    }
+    return undefined;
+  }
+  private syncName(state: Inspection, registration: Registration, ctx: ExtensionContext, epoch: number): Promise<void> {
+    // Old ledgers cannot express an explicit clear. Never interpret omission as one.
+    if (state.summary === undefined) return Promise.resolve();
+    const operation = this.nameWork.then(async () => {
+      if (!this.current(ctx, epoch)) return;
+      const session = ctx.sessionManager.getSessionFile(), id = ctx.sessionManager.getSessionId();
+      const key = JSON.stringify([session, id]);
+      const name = this.pi.getSessionName(), entry = this.titleEntry(ctx);
+      const source = entry ? entry.title === name ? entry.source : undefined : ctx.sessionManager.getHeader()?.titleSource;
+      let ownership = this.sessionNames.get(key);
+      if (!ownership) {
+        const entries = ctx.sessionManager.getEntries();
+        for (let index = entries.length - 1; index >= 0; index--) {
+          const saved = entries[index];
+          if (saved.type !== "custom" || saved.customType !== "ham-session-name" ||
+              typeof saved.data !== "object" || saved.data === null || Array.isArray(saved.data)) continue;
+          const data = record(saved.data);
+          if (data.version !== 1 || data.session_id !== id || typeof data.name !== "string" || !data.name ||
+              typeof data.title_entry_id !== "string" || !data.title_entry_id ||
+              typeof data.at !== "number" || !Number.isFinite(data.at) ||
+              (data.previous !== undefined && typeof data.previous !== "string")) continue;
+          ownership = { previous: data.previous, owned: data.name, entryId: data.title_entry_id };
+          this.sessionNames.set(key, ownership);
+          break;
+        }
+      }
+      if (ownership?.relinquished) return;
+      if (ownership?.owned !== undefined) {
+        if (name !== ownership.owned || entry?.id !== ownership.entryId) {
+          ownership.relinquished = true;
+          return;
+        }
+      } else {
+        // Public setSessionName writes user-source titles. Only exact, journal-
+        // correlated HAM ownership permits later edits of such a title.
+        if (name && source !== "auto") return;
+        ownership = { previous: name || undefined };
+        this.sessionNames.set(key, ownership);
+      }
+      const summary = sessionTitle(state.summary!);
+      const alias = sessionTitle(registration.agent.alias || "");
+      if (summary && !alias) return;
+      const target = summary && alias ? sessionTitle(alias + " · " + summary) : ownership.previous;
+      // OMP has no public clear-name API; retain the last owned name if unnamed before HAM.
+      if (!target || target === name) return;
+      const setting = this.pi.setSessionName(target);
+      let writtenEntry: SessionTitleEntry | undefined;
+      // Even if the journal getter fails, consume a possible async setter
+      // rejection rather than leaving an unhandled promise behind.
+      try { writtenEntry = this.titleEntry(ctx); }
+      finally { await setting; }
+      if (!this.current(ctx, epoch) || ctx.sessionManager.getSessionFile() !== session ||
+          ctx.sessionManager.getSessionId() !== id) return;
+      if (!writtenEntry || writtenEntry.id === entry?.id || writtenEntry.title !== target || writtenEntry.source !== "user" ||
+          this.pi.getSessionName() !== target || this.titleEntry(ctx)?.id !== writtenEntry.id) {
+        ownership.relinquished = true;
+        return;
+      }
+      ownership.owned = target; ownership.entryId = writtenEntry?.id;
+      // Custom state is journal-only, not model context. Persist only a real,
+      // correlated write; repeated inspections must not grow session history.
+      this.pi.appendEntry("ham-session-name", { version: 1, session_id: id, name: target,
+        ...(ownership.previous ? { previous: ownership.previous } : {}),
+        title_entry_id: writtenEntry.id, at: Date.now() });
+    });
+    // Naming is cosmetic: neither host API failures nor persistence errors may
+    // interrupt registration, natural receipt, or the existing wake gates.
+    this.nameWork = operation.then(() => {
+      if (this.current(ctx, epoch)) this.recover(ctx, "name", false);
+    }, error => {
+      if (this.current(ctx, epoch)) this.report(ctx, error, "name");
+    });
+    return this.nameWork;
+  }
   private report(ctx: ExtensionContext, error: unknown, phase: string): void {
     const text = String(error);
     const code = error instanceof Error && "code" in error ? String(error.code) : text;
@@ -278,9 +398,9 @@ export class MailboxAdapter {
       this.errors.set(key, { phase, reportedAt: now });
     }
   }
-  private recover(ctx: ExtensionContext, phase: string): void {
+  private recover(ctx: ExtensionContext, phase: string, includeRoot = true): void {
     for (const [key, failure] of this.errors) {
-      if (failure.phase === phase || failure.phase === "root") this.errors.delete(key);
+      if (failure.phase === phase || (includeRoot && failure.phase === "root")) this.errors.delete(key);
     }
     if (!this.errors.size) ctx.ui.setStatus("ham-mailbox", undefined);
   }
@@ -333,6 +453,7 @@ export class MailboxAdapter {
     this.blocked = this.preparing = 0; this.retryHoldUntil = 0;
     this.lastKey = Date.now(); this.inputSerial++;
     this.refreshNeeded = true;
+    this.statusToolCalls.clear();
     if (ctx.mode === "tui" && ctx.hasUI) {
       this.unsubscribe = ctx.ui.onTerminalInput(data => {
         // Focus is not a wake-defer rule. Actual typing/paste still resets quiet time.
@@ -371,6 +492,8 @@ export class MailboxAdapter {
             this.recover(ctx, "watch");
           } catch (error) { this.report(ctx, error, "watch"); }
         }
+        await this.syncName(result, result, ctx, epoch);
+        if (!this.current(ctx, epoch)) return undefined;
         return result;
       } catch (error) {
         if (epoch === this.epoch && this.belongs(ctx)) {
@@ -457,6 +580,8 @@ export class MailboxAdapter {
     await this.confirm(ctx);
     const state = await this.receiver("inspect", identity(registration.agent), ctx);
     if (!this.current(ctx, epoch)) return;
+    await this.syncName(state, registration, ctx, epoch);
+    if (!this.current(ctx, epoch)) return;
     const remaining = new Set(state.pending_claims.map(claim => claim.claim_id));
     for (const [id, pending] of this.pending) if (pending.phase === "unknown" && !remaining.has(id)) this.pending.delete(id);
     if (!this.idle(ctx)) { if (!this.active && !this.retrying && !this.failureBlocked) this.schedule(ctx, 1000); return; }
@@ -490,7 +615,9 @@ export class MailboxAdapter {
     if (!this.belongs(ctx)) return;
     const epoch = this.epoch;
     if (this.work?.epoch === epoch) { this.recheckAfterWork = epoch; return; }
-    const operation = this.probe(ctx).catch(error => this.report(ctx, error, "inspect"));
+    const operation = this.probe(ctx).catch(error => {
+      if (this.current(ctx, epoch)) this.report(ctx, error, "inspect");
+    });
     const work = { epoch, operation };
     this.work = work;
     try { await operation; }
@@ -544,6 +671,14 @@ export class MailboxAdapter {
     if (!this.belongs(ctx) || event.toolName !== "ask") return;
     this.blocked = Math.max(0, this.blocked + (start ? 1 : -1)); this.schedule(ctx);
   }
+  toolResult(event: { toolName: string; toolCallId: string; input: Record<string, unknown>; isError: boolean },
+             ctx: ExtensionContext): void {
+    if (!this.belongs(ctx) || event.toolName !== "bash" || event.isError ||
+        !changesOwnStatus(event.input.command) || this.statusToolCalls.has(event.toolCallId)) return;
+    this.statusToolCalls.add(event.toolCallId);
+    if (this.statusToolCalls.size > 128) this.statusToolCalls.delete(this.statusToolCalls.values().next().value!);
+    this.schedule(ctx, 0);
+  }
   compact(start: boolean, event: { type: string; willRetry?: boolean }, ctx: ExtensionContext): void {
     if (!this.belongs(ctx)) return;
     this.compacting = start;
@@ -575,6 +710,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("auto_retry_end", (event, ctx) => adapter.retry(false, event, ctx));
   pi.on("tool_execution_start", (event, ctx) => adapter.tool(true, event, ctx));
   pi.on("tool_execution_end", (event, ctx) => adapter.tool(false, event, ctx));
+  pi.on("tool_result", (event, ctx) => adapter.toolResult(event, ctx));
   pi.on("auto_compaction_start", (event, ctx) => adapter.compact(true, event, ctx));
   pi.on("auto_compaction_end", (event, ctx) => adapter.compact(false, event, ctx));
   pi.on("session_shutdown", (_event, ctx) => adapter.shutdown(ctx));

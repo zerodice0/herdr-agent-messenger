@@ -12,7 +12,7 @@ import uuid
 
 from ham.ledger.mail import Mailbox, safe_label, sender_address
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
-from ham.ledger.status import AgentRegistry, check_generation
+from ham.ledger.status import AgentRegistry, check_generation, sanitize_status_text
 from ham.ledger.store import LedgerError, LedgerStore
 
 MESSAGE_BYTES = 2048
@@ -146,12 +146,13 @@ class NativeReceiver:
                                        (agent['agent_id'],now-3600)).fetchone()[0]
         reservations = connection.execute("SELECT count(DISTINCT claim_id) FROM deliveries WHERE claimed_agent_id=? "
                 "AND via='wake' AND state='delivering' AND updated_at>?",(agent['agent_id'],now-3600)).fetchone()[0]
-        status = connection.execute('SELECT turn_state FROM agent_status WHERE agent_id=?',(agent['agent_id'],)).fetchone()
+        status = connection.execute('SELECT turn_state,summary FROM agent_status WHERE agent_id=?',(agent['agent_id'],)).fetchone()
         pending_claims = [dict(row) for row in connection.execute(
                 "SELECT DISTINCT n.*,d.claimed_agent_id AS agent_id,d.claimed_generation AS generation FROM native_claims n "
                 "JOIN deliveries d USING(claim_id) WHERE d.state='delivering' AND d.claimed_agent_id=?",
                 (agent['agent_id'],))]
         return {'thresholds':thresholds,'mode':mode,'role':role,'turn_state':status[0] if status else 'unknown',
+                'summary':sanitize_status_text(status[1], 200) if status else '',
                 'wake_count':wake_count+reservations,'pending_claims':pending_claims}
 
     def _eligible(self,connection: Any,agent: Mapping[str, Any],maximum_hop: int,*,wake: bool,

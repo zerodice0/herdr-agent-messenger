@@ -123,7 +123,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
             self.assertEqual((rows[0]["phase"], rows[0]["summary"]),
                              ("review", "Inspect committed status"), command)
         self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "review")
-        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Inspect committed status")
+        self.assertEqual(self.herdr.labels["p-current"], "🟧 orange-rabbit · Inspect committed status")
         with self.store.read() as connection:
             status = [tuple(row) for row in connection.execute(
                 "SELECT field,value FROM status_log WHERE field IN ('phase','summary') ORDER BY seq"
@@ -197,7 +197,7 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         result = self.registry.set_status(agent, phase="review", summary="Moved task")
         self.assertEqual(result["display"], {"updated": ["p-moved"], "failed": []})
         self.assertTrue(all(command[2] == "p-moved" for command in self.herdr.commands))
-        self.assertEqual(self.herdr.labels["p-moved"], "orange-rabbit · Moved task")
+        self.assertEqual(self.herdr.labels["p-moved"], "🟧 orange-rabbit · Moved task")
 
     def test_session_replacement_redraw_sees_only_new_committed_generation(self):
         old = self.seed()
@@ -429,22 +429,22 @@ class LedgerStatusDisplayTest(unittest.TestCase):
         self.herdr.labels["p-current"] = "Human title"
         self.registry.set_status(agent, phase="review", summary="New HAM title")
         self.assertEqual(self.herdr.labels["p-current"], "Human title")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit · HAM title")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "🟧 orange-rabbit · HAM title")
         self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "review")
 
     def test_cleared_status_retains_identity_and_exact_cas_value(self):
         agent = self.seed()
         self.registry.set_status(agent, phase="review", summary="HAM title")
         self.registry.set_status(agent, phase="", summary="")
-        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.herdr.labels["p-current"], "🟧 orange-rabbit")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "🟧 orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-current"]["tokens"]["recap"], "")
         self.registry.set_status(agent, phase="review", summary="Owned after clear")
-        self.assertEqual(self.herdr.labels["p-current"], "orange-rabbit · Owned after clear")
+        self.assertEqual(self.herdr.labels["p-current"], "🟧 orange-rabbit · Owned after clear")
         self.herdr.labels["p-current"] = "Later human rename"
         self.registry.set_status(agent, phase="review", summary="Do not replace human title")
         self.assertEqual(self.herdr.labels["p-current"], "Later human rename")
-        self.assertEqual(self.registry.list()[0]["last_ham_label"], "orange-rabbit · Owned after clear")
+        self.assertEqual(self.registry.list()[0]["last_ham_label"], "🟧 orange-rabbit · Owned after clear")
 
 
 if __name__ == "__main__":

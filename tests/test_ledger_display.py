@@ -22,6 +22,7 @@ from ham.ledger.display import (LEGACY_SOURCE, RECAP_SOURCE, SOURCE, LedgerDispl
 from ham.ledger.settings import RepoSettings
 from ham.ledger.status import AgentRegistry, repository_identity
 from ham.ledger.store import LedgerStore
+from ham.ui.terminal_text import display_width, pad_display_text, truncate_display_text
 
 
 class HerdrDisplay:
@@ -277,7 +278,7 @@ class LedgerDisplayTest(unittest.TestCase):
         result = self.registry.set_status(self.agent(), phase="구현 중", summary="Status service route",
                                           feature_invoked=True)
         self.assertEqual(result["display"]["failed"], [])
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Status service route")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Status service route")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_pure_builder_keeps_role_before_address_suffix(self):
@@ -287,12 +288,72 @@ class LedgerDisplayTest(unittest.TestCase):
             self.assertEqual(projected.display_agent, f"🟧 {prefix}orange-rabbit")
             self.assertTrue(projected.display_agent.endswith(" orange-rabbit"))
             self.assertEqual((projected.recap, projected.label),
-                             ("검토 중", f"{prefix}orange-rabbit · Mailbox implementation"))
+                             ("검토 중", f"🟧 {prefix}orange-rabbit · Mailbox implementation"))
             command = projected.metadata_command("p")
             self.assertEqual(command[3:5], ["--source", SOURCE])
             self.assertEqual(command[5:9], ["--agent", "omp", "--display-agent", projected.display_agent])
             self.assertEqual(command[9:], ["--token", "alias=orange-rabbit", "--token", "color=orange",
                                           "--token", "recap=검토 중"])
+
+    def test_border_and_agents_share_explicit_marker_disable_and_no_color(self):
+        for marker, environment in (("", {}), ("🟧", {"NO_COLOR": ""}), ("🟧", {"NO_COLOR": "1"})):
+            with self.subTest(marker=marker, environment=environment), mock.patch.dict(
+                    "os.environ", environment, clear=True):
+                projected = build_display("omp", "orange-rabbit", marker, "orange",
+                                          role="main", summary="한글 요약")
+                self.assertEqual(projected.display_agent, "[메인] orange-rabbit")
+                self.assertEqual(projected.label, "[메인] orange-rabbit · 한글 요약")
+                self.assertEqual(projected.color, "orange")
+
+    def test_border_marker_uses_alias_identity_for_palette_and_custom_aliases(self):
+        agent = self.agent()
+        for alias in ("white-rabbit", "readzone-sol", "blue-custom-project", "한글-작업"):
+            with self.subTest(alias=alias):
+                identity = agent_labels.alias_identity(alias)
+                projected = self.display.projection({**agent, "alias": alias, "role": "main",
+                                                     "summary": "한글 요약 🐇"})
+                self.assertEqual(projected.label, f"{identity.marker} [메인] {alias} · 한글 요약 🐇")
+                self.assertEqual(projected.display_agent, f"{identity.marker} [메인] {alias}")
+                self.assertEqual(display_width(projected.label),
+                                 display_width(projected.label.removeprefix(identity.marker + " ")) + 3)
+                for width in (1, 2, 3, 8, 20, display_width(projected.label)):
+                    clipped = truncate_display_text(projected.label, width)
+                    self.assertLessEqual(display_width(clipped), width)
+                    self.assertEqual(display_width(pad_display_text(projected.label, width)), width)
+
+    def test_markerless_owned_border_migrates_once_and_keeps_exact_cas(self):
+        self.status()
+        previous = "orange-rabbit · Implement mailbox"
+        self.registry.set_display_label(self.agent()["agent_id"], None, previous)
+        self.herdr.labels["p-main"] = previous
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        expected = "🟧 " + previous
+        self.assertEqual(self.herdr.labels["p-main"], expected)
+        self.assertEqual(self.agent()["last_ham_label"], expected)
+        self.herdr.commands.clear()
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
+
+    def test_markerless_user_border_is_not_adopted_by_marker_migration(self):
+        self.status()
+        previous = "orange-rabbit · Implement mailbox"
+        self.herdr.labels["p-main"] = previous
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], previous)
+        self.assertIsNone(self.agent()["last_ham_label"])
+        self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
+        self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
+
+    def test_no_color_removes_and_restores_marker_only_on_owned_border(self):
+        self.status()
+        self.display.refresh("p-main")
+        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
+            self.assertEqual(self.display.refresh("p-main")["failed"], [])
+            self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
+            self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["p-main"])
+            self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "orange-rabbit")
+        self.assertEqual(self.display.refresh("p-main")["failed"], [])
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Implement mailbox")
 
     def test_border_builder_omits_missing_parts_and_keeps_alias_before_long_summary(self):
         for role, alias, summary, expected in (
@@ -318,8 +379,8 @@ class LedgerDisplayTest(unittest.TestCase):
             agent["agent_id"], agent["last_ham_label"], previous)["updated"])
         self.herdr.labels["p-main"] = previous
         self.assertEqual(self.display.refresh("p-main")["failed"], [])
-        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
-        self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 [메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 [메인] orange-rabbit · Implement mailbox")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["alias"], "orange-rabbit")
 
     def test_auto_roles_give_main_and_worktree_workspaces_their_own_main(self):
@@ -336,9 +397,9 @@ class LedgerDisplayTest(unittest.TestCase):
                          {"alias": "orange-rabbit", "color": "orange", "recap": "구현 중", "other": "keep"})
         self.assertEqual(self.herdr.metadata["p-worker"]["tokens"],
                          {"alias": "review-worker", "color": "brown", "recap": "", "other": "keep"})
-        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
-        self.assertEqual(self.agent()["last_ham_label"], "[메인] orange-rabbit · Implement mailbox")
-        self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 [메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 [메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-worker"], "🟫 [메인] review-worker")
         for metadata in self.herdr.metadata.values():
             self.assertNotIn("phone", metadata["tokens"])
             self.assertNotIn("emu", metadata["tokens"])
@@ -369,7 +430,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.display.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [워커] review-worker")
-        self.assertEqual(self.herdr.labels["p-worker"], "[워커] review-worker")
+        self.assertEqual(self.herdr.labels["p-worker"], "🟫 [워커] review-worker")
 
     def test_role_settings_contention_queues_current_projection_without_warnings(self):
         with self.store.transaction() as connection:
@@ -420,8 +481,8 @@ class LedgerDisplayTest(unittest.TestCase):
             self.registry.refresh()
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-worker"][SOURCE]["display_agent"], "🟫 [메인] review-worker")
-        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit")
-        self.assertEqual(self.herdr.labels["p-worker"], "[메인] review-worker")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 [메인] orange-rabbit")
+        self.assertEqual(self.herdr.labels["p-worker"], "🟫 [메인] review-worker")
         self.assertEqual({agent["terminal_id"]: (agent["agent_id"], agent["generation"])
                           for agent in self.registry.list()}, identities)
 
@@ -440,11 +501,11 @@ class LedgerDisplayTest(unittest.TestCase):
         self.display.refresh("p-main")
         self.status(summary="Second task")
         self.display.refresh("p-main")
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Second task")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Second task")
         self.status(phase="", summary="")
         self.display.refresh("p-main")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "")
         self.status(summary="Third task")
         self.display.refresh("p-main")
@@ -452,7 +513,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.status(summary="Fourth task")
         self.display.refresh("p-main")
         self.assertEqual(self.herdr.labels["p-main"], "My manual title")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit · Third task")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit · Third task")
 
     def test_legacy_token_is_not_border_ownership_confirmation(self):
         self.status()
@@ -462,8 +523,8 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertIsNone(self.agent()["last_ham_label"])
         result = refresh_pane("p-main", self.store, runner=self.herdr, legacy_label="Old recap border")
         self.assertEqual(result["failed"], [])
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit · Implement mailbox")
 
     def test_border_ownership_distinguishes_null_and_empty(self):
         self.assertFalse(border_owned("manual", None))
@@ -494,8 +555,8 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(before, {"pane_id": "p-main", "terminal_id": "main"})
         self.status()
         self.assertEqual(self.display.refresh("p-main")["failed"], [])
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit · Implement mailbox")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
 
     def test_invalid_or_wrong_binding_fails_closed_before_any_metadata_or_rename(self):
@@ -813,7 +874,7 @@ class LedgerDisplayTest(unittest.TestCase):
         metadata = self.herdr.metadata["p-main"][SOURCE]
         self.assertEqual(metadata["display_agent"], "🟧 [메인] orange-rabbit")
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["recap"], "구현 중")
-        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 [메인] orange-rabbit · Implement mailbox")
 
     def test_metadata_failures_are_returned_without_dropping_other_reports(self):
         self.herdr.metadata_fails = True
@@ -835,8 +896,8 @@ class LedgerDisplayTest(unittest.TestCase):
         with mock.patch.object(self.display.registry, "set_display_label",
                                return_value={"updated": False, "last_ham_label": None}) as save:
             self.assertEqual(self.display.refresh("p-main")["failed"], ["p-main"])
-        save.assert_called_once_with(self.agent()["agent_id"], None, "orange-rabbit · Implement mailbox")
-        self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
+        save.assert_called_once_with(self.agent()["agent_id"], None, "🟧 orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Implement mailbox")
         self.assertIsNone(self.agent()["last_ham_label"])
 
     def test_released_agent_clears_flat_display_tokens_but_not_resources(self):
@@ -854,7 +915,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.status(summary="Do not recapture manually cleared border")
         self.display.refresh("p-main")
         self.assertEqual(self.herdr.labels["p-main"], "")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit · Implement mailbox")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit · Implement mailbox")
 
 
     def test_metadata_side_effect_manual_rename_is_preserved_by_fresh_read(self):
@@ -922,7 +983,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()),
                          {"result": {"updated": ["p-main"], "failed": [], "skipped": []}})
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
-        self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
+        self.assertEqual(self.herdr.labels["p-main"], "🟧 [메인] orange-rabbit · Implement mailbox")
 
 
     def test_refresh_entrypoints_forward_exact_environment_to_runner(self):

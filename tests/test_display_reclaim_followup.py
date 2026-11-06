@@ -104,7 +104,7 @@ class DisplayReclaimFollowupTest(unittest.TestCase):
         self.assertEqual(entries["pane"]["status"], "explicit_only")
         self.assertEqual(entries["normal-pane"]["status"], "updated")
         self.assertEqual(self.herdr.labels["pane"], owned)
-        self.assertEqual(self.herdr.labels["normal-pane"], "orange-rabbit")
+        self.assertEqual(self.herdr.labels["normal-pane"], "🟧 orange-rabbit")
         with self.store.read() as connection:
             self.assertIsNone(connection.execute("SELECT last_ham_label FROM agents WHERE agent_id=?",
                                                 (current["agent_id"],)).fetchone()[0])
@@ -120,8 +120,8 @@ class DisplayReclaimFollowupTest(unittest.TestCase):
         self.assertEqual(result["failed"], [])
         self.assertEqual(result["skipped"], [])
         self.assertEqual(result["panes"][0]["status"], "updated")
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
-        self.assertEqual(self.herdr.labels["pane"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
+        self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit")
         self.herdr.commands.clear()
         self.assertEqual(display.reclaim(apply=True, snapshot=self.snapshot(), pane_ids=selected)["panes"], [])
         self.assertEqual(self.herdr.commands, [])
@@ -139,7 +139,7 @@ class DisplayReclaimFollowupTest(unittest.TestCase):
         result = display.reclaim(apply=True, snapshot=self.snapshot())
         self.assertEqual(result["updated"], ["pane"])
         self.assertEqual(result["skipped"], [])
-        self.assertEqual(self.agent()["last_ham_label"], "orange-rabbit")
+        self.assertEqual(self.agent()["last_ham_label"], "🟧 orange-rabbit")
 
     def test_repo_mismatch_discovery_still_requires_exact_scope_and_label(self):
         old, owned = self.repo_mismatch()

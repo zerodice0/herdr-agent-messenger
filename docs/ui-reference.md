@@ -759,7 +759,8 @@ A palette-color first hyphen segment chooses that color; otherwise a stable
 SHA-256-derived palette color is used on every host. This identity cue does not
 change Mailbox/status-board turn-state colors or routing addresses.
 
-HAM displays roles before the alias, for example `🟧 [메인] orange-rabbit`, so
+HAM displays the color marker and role before the alias, for example
+`🟧 [메인] orange-rabbit`, so
 the alias remains addressable. A shared projection reports alias, color,
 display name, phase (`recap`) and ledger-backed device tokens under metadata
 source `herdr.agent-messenger`. Exact values are `phone=📱 <labels space-joined>`
@@ -768,19 +769,36 @@ Status projection preserves these claims, and force replacement reprojects the
 previous live holder too. Herdr uses a flat per-pane token map: metadata sources
 do not isolate keys. HAM leaves unrelated token keys untouched.
 
-HAM-owned borders show `[메인] alias · summary` or `[워커] alias · summary`,
-omitting absent parts; off-mode status has no role prefix. HAM updates only a
+HAM-owned borders show `<marker> [메인] alias · summary` or
+`<marker> [워커] alias · summary`, for example
+`⬜ [메인] white-rabbit · Checking the mailbox boundary`, omitting absent parts;
+off-mode status has no role prefix. The marker is the color marker from the alias
+identity (`alias_identity`), the same one `display_agent` uses, so the Agents name
+and the border agree. `NO_COLOR` (even an empty value) or an explicitly empty
+marker removes it from `display_agent` and the border alike, leaving
+`[메인] alias · summary`. HAM updates only a
 blank border, a verified legacy border, or its exact last recorded border.
+`NO_COLOR` is read from the projecting HAM process, so CLI, hook and resident-worker
+environments should agree when they update the same pane.
+Borders written before the marker existed have no marker. A border that exactly
+equals the recorded markerless `last_ham_label` is still HAM's own and is
+rewritten once with the marker; nothing else is migrated.
 Ownership carries across agent generations only on an exact match to the recorded
 prior-generation label. On the same terminal binding, a carry needs only the same
 host, terminal and pane, an older generation and that exact label; workspace,
 client and repository are not compared. After a terminal rebind the stricter
 rule below applies. A
-role prefix alone never proves ownership. A differing
+role prefix alone never proves ownership, and neither does a marker alone. A differing
 manual rename is preserved. If the border already equals the desired label,
-HAM records ownership again without renaming it. The old `user:pane-recap` token
+HAM records ownership again without renaming it. Restore and reclaim keep using
+exact prior-label tracking: they compare the current border with the exact label
+HAM last recorded. The old `user:pane-recap` token
 is cleared only when the new status/role feature is invoked; this UI does not
 deploy or remove global recap rules.
+
+For OMP sessions, HAM also keeps the session name at `<alias> · <summary>` with
+no emoji or role. This is separate from the border and follows its own ownership
+rules; see [OMP session name sync](skill-guide.md#omp-session-name-sync).
 
 #### Border recovery after a terminal rebind
 

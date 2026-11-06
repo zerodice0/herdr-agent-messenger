@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -49,12 +50,13 @@ def build_display(agent: str, alias: str, marker: str = "", color: str = "", *,
                   role: str | None = None, phase: str = "", summary: str = "",
                   phone: str | None = None, emu: str | None = None) -> DisplayProjection:
     """Keep Agents addressable by suffix and put border identity before status."""
+    marker = "" if "NO_COLOR" in os.environ else marker
     phase = sanitize_status_text(phase, 64)
     summary = sanitize_status_text(summary, 200)
     role_label = {"main": "[메인]", "worker": "[워커]"}.get(role, "")
     display = " ".join(part for part in (marker, role_label, alias) if part)
     content = " · ".join(part for part in (alias, summary) if part)
-    label = " ".join(part for part in (role_label, content) if part)
+    label = " ".join(part for part in (marker, role_label, content) if part)
     return DisplayProjection(agent, display, alias, color, phase, label, phone, emu)
 
 
@@ -215,7 +217,8 @@ class LedgerDisplay:
         role = agent["role"] if "role" in agent else self.settings.role(agent)
         pane_id = str(agent["pane_id"])
         invoked = feature_invoked or role is not None or bool(
-            display.recap or agent.get("summary") or agent.get("last_ham_label") not in (None, name))
+            display.recap or agent.get("summary")
+            or agent.get("last_ham_label") not in (None, name, display.display_agent))
         if self._border_label(agent) is None:
             return False
         succeeded = True

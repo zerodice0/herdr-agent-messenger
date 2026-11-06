@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 from ham.agents.directory import AgentRecord, SendResult
 from tests.curses_snapshot_harness import DrawCall, FakeCursesWindow
 from ham.ui.key_input import ESCAPE, F1, NEWLINE, SHIFT_TAB, MouseEvent
+from ham.ledger.display import build_display
 from ham.ledger.mail import Mailbox
 from ham.ledger.settings import RepoSettings
 from ham.ledger.status import AgentRegistry
@@ -231,6 +232,29 @@ class MailboxUiTest(unittest.TestCase):
             'stale_devices': [{'device_id': 'retired-phone'}], 'error': None,
         }
         return app
+
+    def test_agents_table_does_not_reuse_marked_border_for_alias_or_summary(self):
+        for no_color in (False, True):
+            with self.subTest(no_color=no_color):
+                app = self.app()
+                if no_color:
+                    app.environment['NO_COLOR'] = ''
+                with patch.dict('os.environ', {}, clear=True):
+                    border = build_display('codex', 'orange-rabbit', '🟧', 'orange',
+                                           role='main', summary='한글 작업 요약').label
+                agent = {**app.local['agents'][0], 'alias': 'orange-rabbit', 'role': 'main',
+                         'phase': '검토 중', 'summary': '한글 작업 요약',
+                         'last_ham_label': border, 'label': border,
+                         'display_agent': '🟧 [메인] orange-rabbit'}
+                app.local['agents'] = [agent]
+                app.screen = Screen(10, 200)
+                app.render_agents((0, 0, 10, 200))
+                text = '\n'.join(app.screen.snapshot().lines())
+                self.assertEqual(text.count('orange-rabbit'), 1)
+                self.assertEqual(text.count('검토 중 · 한글 작업 요약'), 1)
+                self.assertNotIn('🟧', text)
+                self.assertNotIn('[메인]', text)
+                self.assertEqual(app.screen.out_of_bounds, [])
 
     def test_resource_presence_captures_at_40_and_200_columns(self):
         for width in (40, 200):
