@@ -735,6 +735,68 @@ groups Devices and Servers under Devices & servers, with `📱 label` (for examp
 `📱 SM-A245N`) before technical IDs. Empty lists and resource errors stay explicit.
 This listing does not claim servers or change device ownership.
 
+### Device board
+
+```text
+device board [--json]
+```
+
+Read-only, cross-host reconciliation of device claims with what each owning host
+observes. It covers this host plus each registered peer (one hop, no transitive
+peers) and accepts no other flags (no `--verbose`, `--repo`, `--host`). Without
+`--json` it prints text grouped by host and platform. It never claims, releases,
+prunes, refreshes the registry, writes tokens or creates directories, and it does
+not touch device ownership. Protocol 1 and schema 12 are unchanged.
+
+`--json` emits `{hosts:[{host,fresh,error,emu_limit,counts,devices}]}`:
+
+- `fresh`: boolean, `false` when the host was not read now. `error` is `null`,
+  a string or `{code,message}`; a failed peer does not fail the command.
+- `emu_limit`: `{limit,in_use,claim_count,process_count,known}` (each number may be
+  `null`). `in_use` is `max(live Android emulator claims, running Android qemu
+  processes)` compared with the host-configured limit; iOS simulators are not
+  restricted or counted. `known:false` means the process probe failed and `in_use`
+  fell back to the claim count, as in emulator admission. `limit:null` means unknown or
+  not reported, never unlimited; unlimited is a configured `0` or negative limit.
+- `counts`: per platform `android-device`, `android-emulator`, `ios-device`,
+  `ios-simulator`, `unknown`; a value is `null` when unknown.
+- `devices[]`: union of claims and observations with `host`, `platform` (one of the
+  five count keys), `device_id` and `label` (`string|null`), `holder` (the holder
+  identity record or `null`: agent, alias, pane, terminal, generation, host, repository, workspace, active/live), `claimed_at` (number|null), `age`
+  (seconds|null), `claim_state` (`held`, `stale` or `null`), `observed_state`
+  (`attached`, `booted`, `running`, `offline`, `not seen`, `unknown`), `finding`
+  and optional `process_pid`. A running qemu process without a parsable port is
+  an `unknown` row with `device_id:null` and `process_pid`.
+- `finding`: `null` or `unclaimed` (observed, no claim), `missing` (nonstale claim
+  absent from a **known** successful probe of its host) or `stale` (holder
+  generation inactive; the claim `device claim` may replace without `--force`).
+
+Host `resources` carries the optional additive keys `devices_observed`,
+`device_claims` and `emu_limit` for this view; each is independent, and a peer
+that omits any is unknown (`null`, `?`), never zero or empty. Claim rows carry holder
+identity metadata (agent, alias, pane, terminal, generation, host, repository, workspace, active/live), never session references or transcript paths.
+
+Probing is bounded and owner-host only, and runs only when resources are
+requested: `adb devices`, a `ps` scan for emulator processes and, on macOS,
+`simctl list devices booted -j`, in parallel with a 2-second timeout each. A probe
+that fails or times out yields unknown observation and no `missing` finding for its
+platform. Physical iOS discovery is skipped on purpose (`ios_devices:null`): this
+implementation does not run `devicectl`, to avoid its report-file output, its dependence
+on pairing and access state, and its extra overhead. Registered iOS phone claims are
+still listed with
+`observed_state:"unknown"`.
+
+Agent use: run `device board --json` on the owning host to choose a device, prefer a
+row with no holder whose `observed_state` is `attached`, `booted` or `running`, and
+check `emu_limit` headroom before starting an Android emulator. `unclaimed` is a
+snapshot hint, **never permission**: run `device claim` before any use, treat
+`device_claimed` / `emu_limit` as refusals (wait or do other work; never stop another
+agent's emulators) and use `--force` only on explicit user instruction. `missing`
+and `stale` rows are not free until a claim succeeds.
+
+The Mailbox **Devices** tab renders the same board read-only (see
+**Mailbox TUI and operator recovery**); claim and release remain CLI-only.
+
 ### Mailbox TUI and operator recovery
 
 Open the plugin action without changing a global binding:
@@ -784,30 +846,30 @@ allows dimensions only for `popup`. The minimum remains Herdr **0.8.0** because
 the [v0.8.0 schema](https://github.com/herdrdev/herdr/blob/v0.8.0/src/api/schema/plugins.rs)
 already supports `Overlay`.
 
-Responsive **Agents**, **Threads**, **Detail** regions use stacked lists above
+Responsive **Agents**, **Threads**, **Devices**, **Detail** regions use stacked lists above
 full-width Detail with at least 80 columns and 18 available body rows. Lists
 are side by side only when each half fits the complete Agents column model,
 including PHN/EMU/SRV and the 16-cell summary minimum. The threshold derives
 from current alias/role widths, gaps and borders (158 columns for a 15-cell alias
 and minimum four-cell ROLE), not a fixed breakpoint. Otherwise one full-width
-list has `Agents │ Threads` tabs: active is accent/bold, inactive dim.
+list has `Agents │ Threads │ Devices` tabs: active is accent/bold, inactive dim.
 Click a tab label to switch without opening input. Each tab preserves selection
 and scroll. Detail gets about 40% of usable body height, at least nine outer
 rows (six content rows, notice, borders), leaving eight outer rows for the list/tab bar.
 Header, footer, status and full-width INPUT below Detail are excluded first.
-Below 80 columns or 18 body rows, only the focused region appears; the unchanged
-Agents → Threads → Detail cycle replaces the list with Detail and retains the
+Below 80 columns or 18 body rows, only the focused region appears; the
+Agents → Threads → Devices → Detail cycle replaces the list with Detail and retains the
 tabs for returning to a list. Below 32 columns or 10 terminal rows, resize
 instructions appear without losing mode, focus, selections, text or cursor.
 NAV keys: Tab/Shift+Tab, ←/→ or h/l changes focus and the active list tab;
-Detail retains the last list's tab. ↑/↓ or j/k selects rows;
-PgUp/PgDn/Home/End pages or jumps. Press `Space` on an Agents or Threads item,
+Detail retains the last list's tab. `d` jumps to the read-only Devices tab. ↑/↓ or j/k selects rows;
+PgUp/PgDn/Home/End pages or jumps. Press `Space` on an Agents, Threads or Devices item,
 including DIRECT/OUTBOX, to open a centered read-only Detail viewer (~90% screen,
 maximum 100×40). Arrows, PgUp/PgDn, Home/End and wheel scroll; `t` toggles
 technical information. It opens at the latest message and follows new arrivals
 only while at that position. If the item disappears on refresh, it closes with
 a status message. Esc, q, Space, or outside click closes; inside click and Enter
-are inert. Viewing never ACKs. Detail Enter otherwise does nothing. Digits never
+are inert. Viewing never ACKs. Detail Enter otherwise does nothing (Enter on Devices focuses its Detail). Digits never
 navigate; `s` opens Settings, `?` help, `e` diagnostics and `r` refresh.
 
 Agents groups single-line table rows under host headers, showing turn, alias,
@@ -824,6 +886,19 @@ observation timestamps. Mail contains counts and the Threads/Space reading hint,
 not bodies. Thread Detail keeps message history and optional technical fields.
 Threads includes messages, direct submissions and OUTBOX.
 **Viewing is read-only and never ACKs, delivers, handles or resolves mail.**
+
+**Devices** (`d`) is the read-only Mailbox view of `device board`: all hosts and
+repositories, claims unioned with owner-host observations, no claim/release/force/prune
+action. Selecting it uses a full-width list even when Agents/Threads would be side by side. Host
+headings show `emu in_use/limit` (`?`, including `limit:null`, is unknown or not reported, never unlimited; unlimited is a configured `0` or negative; `(claims only)` when the process probe
+failed), finding counts (`unclaimed`, `missing`, `stale`), `stale host` and `! probe`.
+Columns: `PLATFORM`/`PLAT`, `DEVICE` (label then ID, or `PID n`), `HOLDER` (alias or a
+dash), `AGE` (dropped first when narrow), `STATE` (`claim/observed`, narrow: observed
+value or `stale`) and `!` (a finding exists). Platforms read `Android`, `Android emu`,
+`iOS`, `iOS sim`, `unknown` (narrow `Andr`, `A-emu`, `iOS`, `i-sim`, `?`). Enter
+focuses Detail (Device and Holder fields, host snapshot freshness, host error); Space opens
+the viewer; `r`/`Ctrl+R` refreshes. Legacy peers and skipped physical-iOS
+discovery are unknown, never zero devices. Reference **Device board**.
 
 Agents Enter opens inline mail input; Threads Enter opens a reply to its latest
 message, resolving the recipient by host/terminal to a live, non-stale agent.

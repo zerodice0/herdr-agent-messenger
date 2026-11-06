@@ -522,6 +522,11 @@ collaboration-policy consumers confirmed these dependencies; removing session
 references would cause safe preflight/direct delivery to fail, not improve
 authentication. Origin-computed roles/group IDs remain unchanged. Optional
 server and host resource diagnostics retain their existing protocol-1 shapes.
+Host `resources` may add the optional, additive keys `devices_observed`,
+`device_claims` and `emu_limit` for the read-only `device board`; protocol 1 and
+schema 12 are unchanged, and older peers that omit them are shown as unknown, not
+zero. `device_claims` carries the holder's identity record (agent, alias, pane,
+terminal, generation, host, repository, workspace and active/live flags), never session references or transcript paths.
 
 ## Local content retention and test-state protection
 

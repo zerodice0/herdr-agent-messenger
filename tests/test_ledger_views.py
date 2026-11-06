@@ -165,7 +165,8 @@ class StatusBoardTest(unittest.TestCase):
         self.assertEqual(board["hosts"], [{
             "host": "alpha", "uuid": self.local.host_uuid, "local": True, "stale": False,
             "error": None, "unread": 0, "agents": board["agents"],
-            "resources": {"servers_unowned": [], "dead_serve": [], "stale_devices": [], "error": None},
+            "resources": {"servers_unowned": [], "dead_serve": [], "stale_devices": [], "error": None,
+                          "device_claims": [], "devices_observed": None, "emu_limit": 3},
         }])
         self.assertIsNone(board["repo_id"])
         self.assertEqual(self.transport.calls, [])

@@ -602,6 +602,39 @@ class DeviceClaimsTest(unittest.TestCase):
             self.assertEqual(device_rows(connection), [])
             self.assertEqual(connection.execute("PRAGMA foreign_key_list(device_claims)").fetchone()[2], "agents")
 
+    def test_claim_and_nonresource_status_never_run_inventory_probes(self):
+        from ham.ledger.remote import RemoteLedger
+        with mock.patch("ham.ledger.devices.scan_devices", side_effect=AssertionError("inventory probe")), \
+             mock.patch("ham.ops.resource_scan.scan_host_resources", side_effect=AssertionError("resource scan")):
+            self.claim()
+            self.emu_claim()
+            exported = RemoteLedger(self.store, self.environment).status_export()
+        self.assertNotIn("resources", exported)
+
+    def test_device_board_retains_stale_public_holders_without_mutation(self):
+        from ham.ledger.device_board import device_board
+        self.claim()
+        self.claim("b", device="stale")
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE agents SET active=0 WHERE terminal_id='b'")
+        with self.store.read() as connection:
+            before = list(connection.iterdump())
+        scanned = {"listeners": [], "serve": [], "error": None,
+                   "devices_observed": {"adb": [], "emulator_processes": [],
+                                        "ios_simulators_booted": None, "ios_devices": None, "error": None}}
+        with mock.patch.object(AgentRegistry, "refresh", side_effect=AssertionError("registry mutation")), \
+             mock.patch.object(AgentRegistry, "_refresh_display", side_effect=AssertionError("tokens")):
+            status = status_board(self.store, resource_scanner=lambda: scanned)
+        host = device_board(status, now=100)["hosts"][0]
+        stale = next(row for row in host["devices"] if row["device_id"] == "stale")
+        self.assertEqual(stale["finding"], "stale")
+        self.assertEqual(stale["holder"]["alias"], "agent-b")
+        self.assertEqual(stale["holder"]["repo_id"], self.agent("a")["repo_id"])
+        self.assertTrue({"session_ref", "cwd", "native_session_pid", "last_ham_label"}.isdisjoint(stale["holder"]))
+        self.assertEqual(len(status["hosts"][0]["resources"]["device_claims"]), 2)
+        with self.store.read() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+
     def test_board_resources_are_readonly_and_old_peers_remain_unknown(self):
         self.claim()
         self.claim("b", device="stale")

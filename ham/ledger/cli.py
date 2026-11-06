@@ -31,6 +31,8 @@ def add_parsers(subparsers: Any) -> None:
     release.add_argument("kind", choices=("phone", "emu", "all"), nargs="?", default="all")
     release.add_argument("device", nargs="?")
     devices.add_parser("list", help="Read claims and adb attachment without changing ledger or tokens.")
+    board = devices.add_parser("board", help="Read local and one-hop peer device occupancy without registry mutation.")
+    board.add_argument("--json", action="store_true", help="Emit the full device board as JSON instead of grouped text.")
     installer = subparsers.add_parser("runtime", help="Explicit ownership-checked opt-in runtime installation.")
     install_commands = installer.add_subparsers(dest="runtime_operation", required=True)
     for operation in ("install", "uninstall", "status"):

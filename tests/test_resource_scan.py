@@ -332,14 +332,16 @@ class ServeScanTest(unittest.TestCase):
         for error in (decode_error, RuntimeError("unexpected scanner failure")):
             with self.subTest(error=error), \
                  mock.patch.object(resource_scan, "scan_listeners", side_effect=error), \
-                 mock.patch.object(resource_scan, "scan_serve", return_value=[{"url": "/live"}]):
+                 mock.patch.object(resource_scan, "scan_serve", return_value=[{"url": "/live"}]), \
+                 mock.patch("ham.ledger.devices.scan_devices", return_value={"error": None}):
                 result = resource_scan.scan_host_resources()
             self.assertEqual(result["listeners"], [])
             self.assertEqual(result["serve"], [{"url": "/live"}])
             self.assertIn("listeners:", result["error"])
             self.assertIn(str(error), result["error"])
         with mock.patch.object(resource_scan, "scan_listeners", return_value=[]), \
-             mock.patch.object(resource_scan, "scan_serve", side_effect=RuntimeError("bad serve")):
+             mock.patch.object(resource_scan, "scan_serve", side_effect=RuntimeError("bad serve")), \
+             mock.patch("ham.ledger.devices.scan_devices", return_value={"error": None}):
             result = resource_scan.scan_host_resources()
         self.assertIn("serve: bad serve", result["error"])
 

@@ -347,7 +347,9 @@ the same domain/usage error conventions as mailbox commands:
 `attached` is adb attachment (`true` only for Android state `device`, otherwise
 `false`); it is `null` if adb is unavailable or the ID is not adb-like, such as
 an iOS UDID. Attachment is not holder liveness. `device list` is read-only:
-no registry refresh, token writes, stale pruning or directory creation.
+no registry refresh, token writes, stale pruning or directory creation. To see
+which devices are free across hosts before claiming one, use the read-only
+[device board](#device-board).
 
 `emu_limit` diagnostics describe live host Android emulator holders and untracked
 Android qemu processes; they do not stop processes or revoke claims. Storage
@@ -369,6 +371,10 @@ the default export, send/policy checks and recipient lookup do not scan servers.
   `dead_serve` lists proxy routes without a backend listener, including listeners
   owned by other users in the liveness check; `stale_devices`
   reports stale claims. A discovery error is reported in `resources.error`.
+  Resource requests from the device board may add the optional keys
+  `devices_observed`, `device_claims` and `emu_limit`; protocol 1 and schema 12
+  are unchanged, and a peer without them is unknown, not empty. See
+  [Device board](#device-board).
 
 Each resource field is optional independently. If an older peer omits `devices`,
 `servers` or `resources`, only that field is unknown (`?`), never silently empty.
@@ -382,6 +388,67 @@ Claim/release and status projection keep these values synchronized, including a
 live previous holder after force replacement. Herdr tokens are a flat per-pane
 map, not isolated by metadata source. Product code does not import the legacy
 device JSON; any one-time rollout migration is external.
+
+### Device board
+
+`device board [--json]` is a read-only, cross-host view of device ownership and
+what the owning hosts actually observe. Use it to choose a free device, then
+claim that device with `device claim`; it never claims, releases, prunes,
+refreshes the registry or writes tokens. It covers this host plus each directly
+registered peer (one hop, no transitive peers) and accepts no other flags. Without
+`--json` it prints text grouped by host and platform; with `--json` it emits one object:
+
+```text
+{hosts:[{host,fresh,error,emu_limit,counts,devices:[...]}]}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `fresh` | `false` when the host could not be read now; `error` is `null`, a string or `{code,message}`. |
+| `emu_limit` | `{limit,in_use,claim_count,process_count,known}`. `in_use` is `max(live Android emulator claims, running Android qemu processes)`, compared with the host's configured limit (`HERDR_AGENT_EMU_LIMIT`). `limit:null` means unknown or not reported (for example an older peer), never unlimited; unlimited is a configured `0` or negative limit. `known:false` means the process probe failed and `in_use` fell back to the claim count. iOS simulators are never counted. |
+| `counts` | Devices per platform: `android-device`, `android-emulator`, `ios-device`, `ios-simulator`, `unknown`. |
+| `devices[]` | One row per device in the union of claims and observations: `host`, `platform`, `device_id`, `label`, `holder`, `claimed_at`, `age` (seconds), `claim_state` (`held`, `stale` or `null`), `observed_state`, `finding` and, for a qemu process without a port, `process_pid`. |
+
+`platform` is one of the five count keys. `holder` is the claim's holder identity record
+(agent ID, alias, pane, terminal, generation, host, repository, workspace, `active`/`live`) or `null`; `age` is the claim age. `observed_state` is
+`attached`, `booted`, `running`, `offline`, `not seen` or `unknown`. A running qemu
+process whose port cannot be determined becomes an `unknown` row with
+`device_id:null` and `process_pid`.
+
+`finding` is `null` or one of:
+
+- `unclaimed`: the host observes the device but nobody claims it.
+- `missing`: a nonstale claim exists, but the device is absent from a successful
+  probe of its host.
+- `stale`: the holder's generation is inactive (`claim_state:"stale"`). This is
+  the same stale claim that `device claim` may replace without `--force`.
+
+The reconciliation is deliberately bounded and read-only:
+
+- Only the owning host probes its own devices, and only while resources are
+  requested: `adb devices`, a `ps` scan for emulator processes and, on macOS,
+  `xcrun simctl list devices booted -j`. The probes run in parallel with a
+  2-second timeout each, so one hung tool cannot stall the board.
+- Physical iOS discovery is skipped on purpose. This implementation does not run
+  `devicectl`, to avoid its report-file output, its dependence on pairing and access
+  state, and its extra overhead,
+  so `ios_devices` is `null`. A registered iOS phone claim is still listed, with
+  `observed_state:"unknown"`, never `missing`.
+- `null` means unknown, not zero. An older peer without the device-board fields, or
+  a field that is `null` in a row, is shown as unknown; do not read it as "no
+  devices" or "free". A failed probe yields no `missing` finding for that platform.
+
+**Choosing a device as an agent.** Run `device board --json` on the host that
+owns the device, prefer a row with no holder and `observed_state` of `attached`,
+`booted` or `running`, and check the `emu_limit` headroom before starting a new
+Android emulator. Then run `device claim phone|emu DEVICE` before you touch it.
+An `unclaimed` row is a hint from one snapshot, not permission: another agent may
+claim it in between, and only the claim result is authoritative. On
+`device_claimed` or `emu_limit`, do not use the device and do not stop other
+emulators; wait or do other work. Never add `--force` unless the user explicitly
+instructs it. `stale` and `missing` rows are not free devices either, until a claim
+succeeds. The Mailbox shows the same data in its
+[Devices tab](ui-reference.md#devices-tab-and-device-board).
 
 ### Mailbox terminology
 
@@ -642,14 +709,18 @@ overlay, restoring prior focus/zoom on close. HAM sets no width/height or layout
 probe; the minimum stays Herdr 0.8.0. Existing `mailbox-popup` IDs are unchanged.
 See [placement rationale and upstream sources](ui-reference.md#herdr-overlay-placement).
 
-Responsive **Agents**, **Threads**, and read-only **Detail** regions replace
-exclusive screens. Below 80 columns or 18 rows only the focused region appears;
-80–139 columns stacks lists beside Detail, and 140+ shows three columns.
+Responsive **Agents**, **Threads**, **Devices**, and read-only **Detail** regions
+replace exclusive screens. Detail sits below the lists, never in a third column.
+With at least 80 columns and 18 body rows, Agents and Threads share the top row only
+when each half fits the full Agents column model; otherwise one full-width list
+shows `Agents │ Threads │ Devices` tabs. Devices always uses the full-width list.
+Below 80 columns or 18 rows only the focused region appears.
 Below 32 columns or 10 rows a resize notice appears without losing drafts,
-cursor, mode or selections. In NAV, Tab/Shift+Tab, ←/→ or h/l changes focus;
+cursor, mode or selections. In NAV, Tab/Shift+Tab, ←/→ or h/l cycles
+Agents → Threads → Devices → Detail, and `d` jumps to the read-only Devices tab;
 ↑/↓ or j/k selects rows; PgUp/PgDn/Home/End pages or jumps. Detail arrows scroll.
 Digits never navigate. `s` opens Settings, `?` help, `e` diagnostics in Detail,
-and `r` refreshes. Detail Enter does nothing.
+and `r` refreshes. Enter on Devices focuses its Detail; Detail Enter does nothing.
 
 Agents groups by host with stale/error headings. Alias, turn, unread and native
 receiver readiness share a row with a dim role/phase/summary line beneath.

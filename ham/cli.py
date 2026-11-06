@@ -1596,6 +1596,10 @@ def main(
                 "deferred": 3,
                 "awaiting_decision": 3,
             }[payload["state"]]
+        if command == "device" and arguments.device_command == "board" and not arguments.json:
+            from ham.ledger.device_board import format_device_board
+            sys.stdout.write(format_device_board(payload) + "\n")
+            return exit_code
         if not getattr(arguments, "verbose", False):
             operation = getattr(arguments, "status_operation", None)
             if command == "status" and operation in {"list", "board"}:

@@ -361,5 +361,7 @@ def scan_host_resources(*, runner: Callable = subprocess.run, platform: str | No
             result[key] = scan(runner=runner, platform=platform, now=now, **extra)
         except Exception as error:
             errors.append(f"{key}: {error}")
+    from ham.ledger.devices import scan_devices
+    result["devices_observed"] = scan_devices(runner=runner, platform=platform)
     result["error"] = "; ".join(errors) or None
     return result

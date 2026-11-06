@@ -1341,6 +1341,7 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertEqual(calls, [{"repo_id": None}])
 
     def test_status_wire_resources_are_explicitly_opted_in(self):
+        from ham.ledger.devices import emulator_limit
         service = self.services["beta"]
         scanned = {"listeners": [], "serve": [], "error": "fixture scan failure"}
         with mock.patch("ham.ops.resource_scan.scan_host_resources", return_value=scanned) as scanner:
@@ -1349,6 +1350,8 @@ class RemoteLedgerTest(unittest.TestCase):
         scanner.assert_called_once_with()
         self.assertEqual(exported["resources"], {
             "servers_unowned": [], "dead_serve": [], "stale_devices": [],
+            "device_claims": [], "devices_observed": None,
+            "emu_limit": emulator_limit(service.environment),
             "error": "fixture scan failure"})
         self.assertEqual(exported["agents"][0]["servers"], [])
 

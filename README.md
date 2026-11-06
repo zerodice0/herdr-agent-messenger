@@ -32,6 +32,8 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
   mail, and receiver health across local repositories and registered peers.
 - **Resource presence:** claim phones or emulators before use and release them
   afterward; inspect discovered servers separately from device ownership.
+  `device board` and the Mailbox Devices tab show, read-only, which devices are
+  claimed, observed, or inconsistent across hosts.
 - **Three clients:** bundled skills for omp, Claude Code, and Codex. OMP and
   Claude receiving runtimes are opt-in; the ledger worker also wakes idle Claude
   Code and Codex sessions, and Codex needs no runtime and pulls at work boundaries.
@@ -167,6 +169,24 @@ The default board includes all local repositories and registered peers. Bare
 `--verbose` for full diagnostics. A peer failure can still return exit code 0:
 inspect host errors, stale flags, and unread `?`, not just the command's exit code.
 Board reads do not refresh status, registry entries, or device claims.
+
+## Device board
+
+```bash
+python3 "$HAM_CLI" device board
+python3 "$HAM_CLI" device board --json
+```
+
+The board lists devices from this host and each registered peer (one hop), joining
+claims with what the owning host observes (`adb`, emulator processes, and
+`simctl` on macOS). Rows carry the holder, claim age, observed state and a finding:
+`unclaimed` (seen, no claim), `missing` (claimed but absent from a successful
+probe) or `stale` (the holder is no longer active). Unknown is not zero: older
+peers and the skipped physical-iOS (`devicectl`) discovery show as unknown. Reads
+never claim, release, prune, or refresh anything. An `unclaimed` device is not
+permission to use it: run `device claim` first and never use `--force` unless the
+user says so. The same view is the Mailbox **Devices** tab (`d`). See the
+[skill guide](docs/skill-guide.md#device-board).
 
 ## Documentation
 

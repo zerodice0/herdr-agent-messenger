@@ -87,8 +87,8 @@ separate detail line.
 
 ### Responsive regions and navigation
 
-The body contains **Agents**, **Threads**, and **Detail**. Detail is always below
-the lists when there is room; it is never a third column on the right.
+The body contains **Agents**, **Threads**, **Devices**, and **Detail**. Detail is
+always below the lists when there is room; it is never a third column on the right.
 
 - **Stacked, side by side:** with at least 80 columns and 18 available body rows,
   the lists share the top row only if each half can fit the complete Agents
@@ -97,8 +97,8 @@ the lists when there is room; it is never a third column on the right.
   widths, column gaps and borders, not a fixed terminal width (for example,
   158 columns with a 15-cell alias and the four-cell ROLE minimum).
 - **Tabbed:** below that split threshold, the top list uses the full width.
-  Its border shows `Agents │ Threads`; the active tab is accent-coloured and
-  bold, and the inactive tab is dim. Click a label to select its list.
+  Its border shows `Agents │ Threads │ Devices`; the active tab is accent-coloured and
+  bold, and the inactive tabs are dim. Click a label to select its list.
   Detail stays full width below. Long aliases/roles give up spare width before
   the full-width Agents table drops resource columns.
 - Detail's outer height is `round(available_body * 0.4)`, with at least nine
@@ -108,8 +108,8 @@ the lists when there is room; it is never a third column on the right.
   INPUT stays full width below Detail; opening or growing it can force the
   single-region fallback.
 - **Single:** below 80 columns or 18 available body rows, the focused region
-  fills the body. The list tab bar remains on its top border. The unchanged
-  focus cycle `Agents → Threads → Detail → Agents` reaches Detail by replacing
+  fills the body. The list tab bar remains on its top border. The
+  focus cycle `Agents → Threads → Devices → Detail → Agents` reaches Detail by replacing
   the list; its border retains the tabs plus a Detail label. Clicking a tab
   returns to its list. INPUT remains a separate full-width panel below.
 - `Tab`/`Shift+Tab`, `←`/`→` and `h`/`l` follow that focus cycle in every layout,
@@ -120,7 +120,7 @@ the lists when there is room; it is never a third column on the right.
 
 ```text
 Tabbed (split Agents columns would not fit)
-+-- Agents | Threads -------------------------------+
++-- Agents | Threads | Devices ---------------------+
 | Active list                                       | remaining rows, min 8
 +---------------------------------------------------+
 | Detail                                            | about 40%, min 9 rows
@@ -143,7 +143,7 @@ message history and optional technical information.
 The header names the current mode (`NAV`, `INPUT`, `CONFIRM`, `SETTINGS`, `HELP`,
 or `EVIDENCE`); the footer shows contextual keys. In **NAV**:
 
-In **NAV**, press `Space` on an Agents or Threads item (including DIRECT and
+In **NAV**, press `Space` on an Agents, Threads or Devices item (including DIRECT and
 OUTBOX entries) to open a centered, read-only Detail viewer. The viewer is about
 90% of the screen, capped at 100×40 cells. `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`
 and the wheel scroll; `t` toggles technical information as in Detail. It anchors
@@ -154,9 +154,10 @@ nothing. Viewing never ACKs. Space remains text in INPUT and retains its existin
 CONFIRM/Settings picker bindings.
 | Key | Action |
 | --- | --- |
-| `Space` | Open the selected Agents or Threads item in the read-only viewer. |
+| `Space` | Open the selected Agents, Threads or Devices item in the read-only viewer. |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump within the focused region. Detail pages use the actual visible content rows, with one row of overlap; Home/End jump to its first/last page. |
-| `Enter` | Agents: open inline input; Threads: open a reply; Detail: no action. |
+| `Enter` | Agents: open inline input; Threads: open a reply; Devices: focus its read-only Detail; Detail: no action. |
+| `d` | Switch to the read-only **Devices** tab; see [Devices tab and device board](#devices-tab-and-device-board). |
 | `f` | Agents only: request the selected local agent's queued FYI without the FYI delay or input quiet wait (no prompt typed, no confirmation); see [Deliver FYI now](#deliver-fyi-now). Remote and inactive rows show a reason without changing anything. |
 | `m` | Agents only: confirm pinning the selected live local role-group agent as main; if already explicitly pinned, confirm clearing the pin. Remote, inactive and other-group rows show a reason without changing settings. |
 | `t` | Detail: expand/collapse technical information for a native thread, DIRECT submission or OUTBOX entry; return to the latest native message (the top for single items). Threads: retain the existing OUTBOX retry confirmation. Not a toggle in agent details or diagnostics; in INPUT, `t` is text. |
@@ -169,9 +170,9 @@ CONFIRM/Settings picker bindings.
 
 ### Mouse
 
-- Click a region to focus it, or click an Agents or Threads row to select it.
+- Click a region to focus it, or click an Agents, Threads or Devices row to select it.
   Clicking the already selected row acts like `Enter`: Agents opens input;
-  Threads opens a reply.
+  Threads opens a reply; Devices focuses its Detail.
   Press and release act once even when the terminal delivers both together;
   queued mouse reports are drained before processing the next click or wheel.
 - The wheel scrolls the region under the pointer without moving focus.
@@ -672,6 +673,70 @@ only on explicit user instruction.
 `device list` is read-only. See the [skill guide](skill-guide.md#device-claims-and-resource-presence)
 for command results and device details. Product code imports no legacy device
 JSON.
+
+### Devices tab and device board
+
+The **Devices** tab is the Mailbox view of `device board`. Press `d` in NAV, or
+cycle with `Tab`/`Shift+Tab`, `←`/`→` or `h`/`l` (`Agents → Threads → Devices →
+Detail`). Selecting Devices uses the full-width tabbed list even where Agents and
+Threads would sit side by side. It is read-only: there are no claim, release,
+force or prune actions, so use the bundled CLI for those. It shows all hosts and
+repositories, never filtered to the opener's repository, and is the union of device
+claims and what each owning host observes.
+
+| Key | Action in Devices |
+| --- | --- |
+| `d` | Switch to Devices. |
+| `↑` / `↓`, `j` / `k` | Select a row. |
+| `PgUp` / `PgDn`, `Home` / `End` | Page or jump to the list bounds. |
+| `Enter` | Focus Detail for the selected row (a click on the selected row does the same). |
+| `Space` | Open the read-only viewer; `Esc`, `q`, `Space` or an outside click closes it, and `Enter` inside does nothing. |
+| `r` / `Ctrl+R` | Refresh; like the other lists, it bypasses the 30-second host-resource cache. |
+| `q` | Quit, as in other NAV views. |
+
+The footer's `d` Devices hint is the first hint dropped when the line is short, so
+it never pushes out the Main and FYI-now hints; the `d` key itself always works.
+
+Rows sit under host headings such as `▾ host · emu 2/3`, where the cue is the
+Android emulator `in_use`/configured limit; `(claims only)` means the process probe
+failed and the count fell back to claims. A configured limit of `0` or negative
+(unlimited) shows as `N/∞`, for example `emu 2/∞`. `?`, including a `null` limit,
+means unknown or not reported, never unlimited. The heading adds
+finding counts (`unclaimed 1 · missing 1 · stale 1`), `stale host` when that
+host's snapshot is not fresh and `! probe` for a host error, wrapping onto its own
+line when it does not fit. iOS simulators are never counted toward the limit.
+
+| Column | Meaning |
+| --- | --- |
+| `PLATFORM` (`PLAT` when narrow) | `Android`, `Android emu`, `iOS`, `iOS sim` or `unknown`; narrow forms are `Andr`, `A-emu`, `iOS`, `i-sim` and `?`. |
+| `DEVICE` | Label followed by the device ID, or the ID alone. A qemu process without a port shows `PID n`. |
+| `HOLDER` | The claiming agent's alias, or `—` when unclaimed. |
+| `AGE` | Relative claim age such as `2m`. It is the first column dropped on narrow terminals, before other columns shrink. |
+| `STATE` | `claim/observed`, for example `held/attached` or `stale/not seen`; narrow terminals show the observed state, or `stale`. Observed states are `attached`, `booted`, `running`, `offline`, `not seen` and `unknown`. |
+| `!` | `!` when the row has a finding, otherwise `·`. Detail names it. |
+
+Findings are `unclaimed` (observed, no claim), `missing` (a nonstale claim absent
+from a known, successful probe of its host) and `stale` (the holder's generation is
+inactive). Detail shows Device (platform, label, ID, process PID, host, snapshot
+freshness, claim, observed state, finding, Claimed at as a Unix timestamp plus UTC time, and a relative Age such as `2m`), Holder (alias, pane,
+repository, terminal, agent, workspace) and any host error. An empty known host shows
+`No devices.`; a host that reported nothing shows `Device inventory unknown.`
+
+Reconciliation is read-only and bounded. Only the owning host probes: `adb devices`,
+a `ps` scan for emulator processes and, on macOS, `simctl list devices booted -j`, in
+parallel with a 2-second timeout each. Physical iOS discovery is skipped on purpose:
+this implementation does not run `devicectl`, to avoid its report-file output, its
+dependence on pairing and access state, and its extra overhead. A registered iOS
+phone claim shows `unknown` and is never
+`missing`. Peers that predate the optional `resources.devices_observed`,
+`resources.device_claims` and `resources.emu_limit` fields appear as unknown, not
+as zero devices. Viewing never refreshes the registry, prunes claims, changes tokens
+or acknowledges mail; protocol 1 and schema 12 are unchanged.
+
+An `unclaimed` row is not permission to use a device. Agents should run
+`device board [--json]`, claim with `device claim`, and never use `--force` unless
+the user explicitly instructs it; see the
+[skill guide](skill-guide.md#device-board).
 
 ### Role, phase and border ownership
 

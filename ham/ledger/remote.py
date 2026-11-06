@@ -228,7 +228,7 @@ class RemoteLedger:
                       resource_scanner: Any = None, wire: bool = False) -> dict[str, Any]:
         all_agents = AgentRegistry(self.store).list()
         agents = [agent for agent in all_agents if repo_id is None or agent["repo_id"] == repo_id]
-        from ham.ledger.devices import device_rows
+        from ham.ledger.devices import device_rows, emulator_limit
         servers: dict[str, list[dict[str, Any]]] = {}
         host_resources = None
         if resources:
@@ -258,9 +258,23 @@ class RemoteLedger:
         result = {"host": {"canonical_name": self.store.host, "uuid": self.store.host_uuid},
                   "agents": exported, "workspaces": workspaces}
         if host_resources is not None:
+            device_observations = scanned.get("devices_observed")
+            try:
+                limit = emulator_limit(self.environment)
+            except LedgerError as error:
+                if error.code != "invalid_config":
+                    raise
+                limit = None
+                device_observations = {**(device_observations or {}),
+                                       "error": "; ".join(filter(None, (
+                                           (device_observations or {}).get("error"),
+                                           f"{error.code}: {error.message}")))}
             result["resources"] = {"servers_unowned": host_resources["unowned_served"],
                                    "dead_serve": host_resources["dead_serve"],
                                    "stale_devices": [row for row in claims if row["stale"]],
+                                   "device_claims": claims,
+                                   "devices_observed": device_observations,
+                                   "emu_limit": limit,
                                    "error": scanned["error"]}
         return result
 

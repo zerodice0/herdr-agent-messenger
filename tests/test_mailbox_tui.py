@@ -883,6 +883,13 @@ class MailboxUiTest(unittest.TestCase):
                     self.assertEqual(snapshot['resources'], resources)
 
     def mouse_at_text(self, app, needle, action='press', offset=0):
+        if action in {'wheel_up', 'wheel_down'}:
+            region = next((rect for rect, target, value in app.hit_map
+                           if target == 'region' and value == needle.strip().lower()), None)
+            if region is not None:
+                row, column = region[0] + 1, region[1] + 1
+                app.key(MouseEvent(row, column + offset, action))
+                return row, column + offset
         tab = next((rect for rect, target, value in app.hit_map
                     if target == 'list-tab' and value == needle.strip().lower()), None)
         if tab is not None:
@@ -2730,16 +2737,22 @@ class MailboxUiTest(unittest.TestCase):
                     threads_scroll = app.scrolls['threads']
                     app.key(forward)
                     self.capture(app, height, 100)
-                    self.assertEqual((app.focus, app.preview), ('detail', 'threads'))
+                    self.assertEqual((app.focus, app.preview), ('devices', 'devices'))
+                    app.key(forward)
+                    self.capture(app, height, 100)
+                    self.assertEqual((app.focus, app.preview), ('detail', 'devices'))
                     if height < 18:
                         self.assertEqual({value for _, kind, value in app.hit_map if kind == 'region'}, {'detail'})
+                    app.key(backward)
+                    self.capture(app, height, 100)
+                    self.assertEqual(app.focus, 'devices')
                     app.key(backward)
                     self.capture(app, height, 100)
                     self.assertEqual(app.focus, 'threads')
                     app.key(backward)
                     self.capture(app, height, 100)
                     self.assertEqual((app.focus, app.preview), ('agents', 'agents'))
-                    self.assertEqual(app.selections, {'agents': 20, 'threads': 15})
+                    self.assertEqual(app.selections, {'agents': 20, 'threads': 15, 'devices': 0})
                     self.assertEqual((app.scrolls['agents'], app.scrolls['threads']),
                                      (agents_scroll, threads_scroll))
 
@@ -2764,7 +2777,7 @@ class MailboxUiTest(unittest.TestCase):
                     rect = next(rect for rect, kind, value in app.hit_map if kind == 'list-tab' and value == tab)
                     app.key(MouseEvent(rect[0], rect[1], 'press'))
                     self.assertEqual((app.mode, app.focus, app.preview), ('nav', tab, tab))
-                    self.assertEqual(app.selections, {'agents': 1, 'threads': 1})
+                    self.assertEqual(app.selections, {'agents': 1, 'threads': 1, 'devices': 0})
 
     def test_layout_reserves_visible_footer_and_status_before_body(self):
         for status in ('', 'Notice'):
@@ -3079,7 +3092,8 @@ class MailboxUiTest(unittest.TestCase):
         for digit in '1234567890':
             app.key(digit)
             self.assertEqual((app.focus, app.mode), ('agents', 'nav'))
-        for key, focus in [('\t', 'threads'), ('l', 'detail'), (SHIFT_TAB, 'threads'),
+        for key, focus in [('\t', 'threads'), ('l', 'devices'), ('l', 'detail'),
+                           (SHIFT_TAB, 'devices'), (SHIFT_TAB, 'threads'),
                            (curses.KEY_LEFT, 'agents'), ('h', 'detail')]:
             app.key(key)
             self.assertEqual(app.focus, focus)
@@ -4602,7 +4616,8 @@ class MailboxUiTest(unittest.TestCase):
                 app.focus = app.preview = 'threads'
                 app.selections['threads'] = next(index for index, item in enumerate(app.items('threads'))
                                                   if item['thread_id'] == sent['thread_id'])
-                app.key('\t')
+                self.capture(app, height, width)
+                self.mouse_at_text(app, ' Detail ')
                 self.capture(app, height, width)
                 app.key(curses.KEY_END)
                 snapshot = self.capture(app, height, width)
@@ -4709,13 +4724,15 @@ class MailboxUiTest(unittest.TestCase):
             app.key('t')
             self.assertIn('Message 3/3', '\n'.join(visible()[2]))
         app.key(SHIFT_TAB)
+        app.key(SHIFT_TAB)
         app.key('j')
-        app.key('\t')
+        self.mouse_at_text(app, ' Detail ')
         self.assertIn('Message 1/1', visible()[2][0])
         self.assertEqual(app.scrolls['detail'], 0)
         app.key(SHIFT_TAB)
+        app.key(SHIFT_TAB)
         app.key('k')
-        app.key('\t')
+        self.mouse_at_text(app, ' Detail ')
         self.assertIn('Message 3/3', '\n'.join(visible()[2]))
         self.assertFalse(app.detail_technical)
         self.assertEqual(app.jobs, {})
@@ -5073,8 +5090,9 @@ class MailboxUiTest(unittest.TestCase):
         self.assertEqual(app.scrolls['detail'], 0)
         app.key('t')
         app.key(SHIFT_TAB)
+        app.key(SHIFT_TAB)
         app.key('j')
-        app.key('\t')
+        self.mouse_at_text(app, ' Detail ')
         self.capture(app, 35, 110)
         self.assertEqual(app.detail['thread_id'], 'other')
         self.assertFalse(app.detail_technical)
@@ -6121,7 +6139,8 @@ class MailboxUiTest(unittest.TestCase):
         sent = self.mail.send_user(self.repo_id, self.recipient, body='Read-only detail')
         app = self.app()
         app.key('\t')
-        app.key('\t')
+        app.focus = 'detail'
+        app.refresh_detail()
         self.assertEqual(app.focus, 'detail')
         with patch.object(Mailbox, 'claim', side_effect=AssertionError('inspection claimed mail')), \
              patch.object(Mailbox, 'read', side_effect=AssertionError('inspection read inbox')), \

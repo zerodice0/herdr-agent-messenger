@@ -31,11 +31,13 @@ from typing import Any, Mapping, Sequence
 
 from ham.agents.directory import (dispatch_user_prompts, herdr_executable, query_local_agents,
                              query_remote_agents, ssh_config_path, user_prompt_text)
+from ham.agents.labels import alias_identity
 from ham.ui import messenger as agent_messenger
 from ham.ui.messenger import focused_pane_id, terminal_flow_control_disabled
 from ham.ui import key_input as key_input
 from ham.ledger.runtime import NativeReceiver
 from ham.ledger.mail import Mailbox, sender_address
+from ham.ledger.device_board import device_board
 from ham.ledger.remote import RemoteLedger
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import repository_identity
@@ -335,6 +337,7 @@ def local_snapshot(store: LedgerStore, repo_id: str | None,
                 "submissions": mail.list_direct(repo_id)["submissions"],
                 "scope": settings_scope(store, repo_id, environment if environment is not None else os.environ, panes),
                 "panes": panes,
+                "hosts": board.get("hosts", []),
                 "workspaces": workspaces,
                 "settings": None,
                 "repo_modes": {repo: settings.show(repo)["mode"]
@@ -927,13 +930,14 @@ def wrap_summary(value: str, width: int) -> list[str]:
     return result
 
 
-def status_time(value: float | None, now: float) -> str:
+def status_time(value: float | None, now: float, *, relative: bool = False) -> str:
     if value is None:
         return "—"
     age = max(0, int(now - value))
     amount, unit = ((age, "s") if age < 60 else (age // 60, "m") if age < 3600 else
                     (age // 3600, "h") if age < 86400 else (age // 86400, "d"))
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value)) + f" ({amount}{unit} ago)"
+    elapsed = f"{amount}{unit}"
+    return elapsed if relative else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value)) + f" ({elapsed} ago)"
 
 
 def yes_no(value: Any) -> str:
@@ -942,7 +946,8 @@ def yes_no(value: Any) -> str:
 
 class MailboxApp:
     """Responsive regions, ephemeral drafts, and bounded asynchronous mutations."""
-    REGIONS = ("agents", "threads", "detail")
+    LIST_REGIONS = ("agents", "threads", "devices")
+    REGIONS = (*LIST_REGIONS, "detail")
     SETTINGS = ("mode", "main", "members", *DEFAULT_THRESHOLDS)
 
     def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job,
@@ -954,6 +959,7 @@ class MailboxApp:
         self.snapshot_worker = SnapshotWorker(environment) if job_factory is Job else None
         self.snapshot_force = False
         self.jobs: dict[str, Any] = {}
+        self.local_snapshot_error: str | None = None
         self.local: dict[str, Any] = {"agents": [], "threads": [], "submissions": [], "peers": [], "outbox": []}
         self.remote: dict[str, Any] = {}
         self.remote_errors: dict[str, str] = {}
@@ -964,8 +970,8 @@ class MailboxApp:
         self.detail_age_deadlines: dict[str, float] | None = None
         self.focus, self.mode, self.layout = "agents", "nav", "single"
         self.preview = "agents"
-        self.selections = {"agents": 0, "threads": 0}
-        self.scrolls = {"agents": 0, "threads": 0, "detail": 0}
+        self.selections = {region: 0 for region in self.LIST_REGIONS}
+        self.scrolls = {region: 0 for region in self.REGIONS}
         self.detail: dict[str, Any] | None = None
         self.detail_identity: Any = None
         self.detail_technical = False
@@ -1038,6 +1044,13 @@ class MailboxApp:
     def identity(item: Mapping[str, Any] | None) -> Any:
         if not item:
             return None
+        if item.get("type") == "device":
+            device_id = item.get("device_id")
+            if device_id is None:
+                return "device", item["host"], "process", item.get("process_pid")
+            if item["platform"] in {"ios-device", "ios-simulator"}:
+                device_id = device_id.lower()
+            return "device", item["host"], item["platform"], device_id
         if item.get("type"):
             field = {"thread": "thread_id", "direct": "submission_id", "outbox": "item_id"}[item["type"]]
             return item["type"], item[field]
@@ -1066,6 +1079,38 @@ class MailboxApp:
             agent.get("workspace_id") != self.role_workspace(agent),
             agent.get("workspace_id") or "",
             agent.get("alias") or "", agent["terminal_id"]))
+
+    def device_hosts(self) -> list[dict[str, Any]]:
+        """Project the existing bounded snapshots, never the Agents repo view."""
+        local_host = self.local.get("host")
+        hosts = [dict(item) for item in self.local.get("hosts", []) if item["host"] == local_host]
+        if not hosts and local_host:
+            hosts = [{"host": local_host, "stale": False}]
+        if hosts and "resources" in self.local:
+            hosts[0]["resources"] = self.local["resources"]
+        if hosts and self.local_snapshot_error:
+            hosts[0].update(stale=True, error=self.local_snapshot_error)
+        agents = list(self.local.get("agents", []))
+        for peer in self.local.get("peers", []):
+            host = peer["canonical_name"]
+            snapshot = self.remote.get(host, {})
+            state = next((item for item in snapshot.get("hosts", [])
+                          if item["host"] == host and item["uuid"] == peer["uuid"]), None)
+            if state is None:
+                hosts.append({"host": host, "stale": True, "error": self.remote_errors.get(host)
+                              or "Waiting for host snapshot."})
+                continue
+            state = dict(state)
+            if host in self.remote_errors:
+                state.update(stale=True, error=self.remote_errors[host])
+            hosts.append(state)
+            agents.extend(item for item in snapshot.get("agents", []) if item["host"] == host)
+        board = device_board({"hosts": hosts, "agents": agents}, now=self.wall_clock())
+        return sorted(board["hosts"], key=lambda item: (item["host"] != local_host, item["host"]))
+
+    def devices(self) -> list[dict[str, Any]]:
+        return [{"type": "device", **device, "fresh": host["fresh"], "host_error": host.get("error")}
+                for host in self.device_hosts() for device in host["devices"]]
 
     def agents_workspace(self) -> str | None:
         # settings_scope() resolves this alongside the local snapshot. Keep its
@@ -1161,6 +1206,8 @@ class MailboxApp:
         region = region or (self.preview if self.focus == "detail" else self.focus)
         if region == "agents":
             return self.agents()
+        if region == "devices":
+            return self.devices()
         values = ([{"type": "thread", **item} for item in self.local.get("threads", [])] +
                   [{"type": "direct", **item} for item in self.local.get("submissions", [])] +
                   [{"type": "outbox", **item} for item in self.local.get("outbox", [])
@@ -1217,7 +1264,7 @@ class MailboxApp:
             job.close()
             del self.jobs[key]
             self.dirty = True
-            identities = {region: self.identity(self.selected(region)) for region in ("agents", "threads")}
+            identities = {region: self.identity(self.selected(region)) for region in self.LIST_REGIONS}
             error = value.get("error") if isinstance(value, dict) else None
             if key.startswith("remote:"):
                 host = key.split(":", 1)[1]
@@ -1233,8 +1280,10 @@ class MailboxApp:
             elif key == "snapshot":
                 if error:
                     self.set_status(f"Local ledger: {error.get('code')}: {error.get('message')}", "error")
+                    self.local_snapshot_error = str(error.get("message", error))
                 else:
                     self.local = value
+                    self.local_snapshot_error = None
                     if not self.matches_settings_scope(self.local.get("settings")):
                         self.local["settings"] = None
                     peers = {peer["canonical_name"] for peer in value.get("peers", [])}
@@ -1917,7 +1966,7 @@ class MailboxApp:
                 self.save_draft()
 
     def open_viewer(self) -> None:
-        if self.mode != "nav" or self.focus not in {"agents", "threads"}:
+        if self.mode != "nav" or self.focus not in self.LIST_REGIONS:
             return
         item = self.selected(self.focus)
         if item is None:
@@ -2002,6 +2051,10 @@ class MailboxApp:
             if self.focus != "detail":
                 self.preview, self.diagnostics = self.focus, False
             self.refresh_detail()
+        elif key == "d":
+            self.focus = self.preview = "devices"
+            self.diagnostics = False
+            self.refresh_detail()
         elif key in (curses.KEY_UP, curses.KEY_DOWN, "j", "k", curses.KEY_PPAGE,
                      curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
             direction = -1 if key in (curses.KEY_UP, "k", curses.KEY_PPAGE) else 1
@@ -2028,6 +2081,9 @@ class MailboxApp:
                 self.choose_agent()
             elif self.focus == "threads":
                 self.reply()
+            elif self.focus == "devices":
+                self.focus = "detail"
+                self.refresh_detail()
         elif key == "m" and self.focus == "agents":
             self.agent_main()
         elif key == "f" and self.focus == "agents":
@@ -2167,7 +2223,12 @@ class MailboxApp:
             if region == "agents":
                 self.result_tags.pop(self.identity(self.selected("agents")), None)
             if activate:
-                self.choose_agent() if region == "agents" else self.reply()
+                if region == "agents":
+                    self.choose_agent()
+                elif region == "threads":
+                    self.reply()
+                else:
+                    self.focus = "detail"
 
     def initialize_colors(self) -> None:
         self.theme = Theme(self.environment)
@@ -2221,7 +2282,9 @@ class MailboxApp:
 
     def footer_hints(self) -> list[Hint]:
         if self.mode == "viewer":
-            return [Hint("↑↓", "Scroll"), Hint("t", "Technical"), Hint("Esc", "Close", 0)]
+            return [Hint("↑↓", "Scroll")] + ([Hint("t", "Technical")]
+                if (self.detail or {}).get("type") != "device" else []) + [
+                Hint("Esc", "Close", 0)]
         if self.mode == "input":
             return [Hint("Enter", "Send", 0), Hint("Shift+Enter", "Newline", 1),
                     Hint("Ctrl+G", "Action/FYI", 3), Hint("Ctrl+D", "Direct"),
@@ -2247,10 +2310,11 @@ class MailboxApp:
                    if self.focus == "agents" else
                    [Hint("Space", "View"), Hint("Enter", "Reply"), Hint("w", "Withdraw"),
                     Hint("t", "Retry"), Hint("a/n", "Recover")] if self.focus == "threads" else
+                   [Hint("Space", "View"), Hint("Enter", "Detail")] if self.focus == "devices" else
                    [Hint("↑↓", "Scroll"), Hint("PgUp/PgDn", "Page")] +
                    ([Hint("t", "Technical")] if self.technical_supported() else []))
         return [Hint("Tab", "Focus")] + context + [
-            Hint("s", "Settings"), Hint("r", "Refresh"), Hint("e", "Errors"),
+            Hint("d", "Devices", 140), Hint("s", "Settings"), Hint("r", "Refresh"), Hint("e", "Errors"),
             Hint("F1", "Help", 1), Hint("q", "Close", 0)]
 
     def side_by_side_width(self) -> int:
@@ -2270,6 +2334,10 @@ class MailboxApp:
             detail_height = min(detail_height, 9)
         top_height = height - detail_height
         detail = (top + top_height, 0, detail_height, width)
+        active = self.focus if self.focus != "detail" else self.preview
+        if active == "devices":
+            self.layout = "tabbed"
+            return {"devices": (top, 0, top_height, width), "detail": detail}
         if width < self.side_by_side_width():
             self.layout = "tabbed"
             active = self.focus if self.focus != "detail" else self.preview
@@ -2284,10 +2352,12 @@ class MailboxApp:
         y, x, _, width = rect
         active = self.focus if self.focus != "detail" else self.preview
         column = x + 2
-        for index, region in enumerate(("agents", "threads")):
+        compact = detail and width < 39
+        separator = "│" if compact else " │ "
+        for index, region in enumerate(self.LIST_REGIONS):
             if index:
-                self.put(y, column, " │ ", curses.A_DIM)
-                column += 3
+                self.put(y, column, separator, curses.A_DIM)
+                column += display_width(separator)
             label = ("› " if self.quick_send and self.mode == "nav" and region == self.focus else "") + region.title()
             attr = self.style("accent", curses.A_BOLD) if region == active and not (
                 self.quick_send and self.mode == "input") else curses.A_DIM
@@ -2295,19 +2365,20 @@ class MailboxApp:
             self.add_hit((y, column, 1, len(label)), "list-tab", region)
             column += len(label)
         if detail:
-            self.put(y, column, " · Detail", self.style("accent", curses.A_BOLD) if not (
-                self.quick_send and self.mode == "input") else curses.A_DIM)
+            self.put(y, column, " Detail" if compact else " · Detail",
+                     self.style("accent", curses.A_BOLD) if not (
+                         self.quick_send and self.mode == "input") else curses.A_DIM)
 
-    def format_time(self, value: float | None, now: float) -> str:
+    def format_time(self, value: float | None, now: float, *, relative: bool = False) -> str:
         """Repaint relative ages only when their displayed unit changes."""
-        formatted = status_time(value, now)
+        formatted = status_time(value, now, relative=relative)
         if value is not None:
             age = max(0, int(now - value))
             unit = 1 if age < 60 else 60 if age < 3600 else 3600 if age < 86400 else 86400
             deadline = math.ceil(value + (age // unit + 1) * unit)
             self.next_age_refresh = min(self.next_age_refresh, deadline)
             if self.detail_age_deadlines is not None:
-                suffix = formatted[formatted.rfind("("):]
+                suffix = formatted if relative else formatted[formatted.rfind("("):]
                 self.detail_age_deadlines[suffix] = min(
                     self.detail_age_deadlines.get(suffix, float("inf")), deadline)
         return formatted
@@ -2387,7 +2458,8 @@ class MailboxApp:
                 input_rect = (bottom, 0, input_height, width)
             for region, rect in self.region_rects(content_top, max(0, bottom - content_top), width).items():
                 self.add_hit(rect, "region", region)
-                tabs = self.layout == "single" or (self.layout == "tabbed" and region != "detail")
+                tabs = (self.layout == "single" or (self.layout == "tabbed" and region != "detail")
+                        or self.layout == "stacked" and region == "agents")
                 title = "" if tabs else region.title()
                 active = self.focus == region and not (self.quick_send and self.mode == "input")
                 if self.quick_send and self.mode == "nav" and active and title:
@@ -2399,6 +2471,8 @@ class MailboxApp:
                     self.render_agents(inner)
                 elif region == "threads":
                     self.render_threads(inner)
+                elif region == "devices":
+                    self.render_devices(inner)
                 elif self.mode != "viewer":
                     self.render_detail(inner)
             if input_rect:
@@ -2512,7 +2586,7 @@ class MailboxApp:
                         scroll -= 1
             elif visible_end > scroll + height:
                 scroll = max(0, visible_end - height)
-            if region == "agents":
+            if region in {"agents", "devices"}:
                 section = next((index for index in range(chosen, -1, -1)
                                 if lines[index][1] == -2), chosen)
                 first_agent = section
@@ -2678,6 +2752,127 @@ class MailboxApp:
                     offset += size + 2
             if _index >= 0:
                 self.add_hit((row, x, 1, width), "list-row", _index)
+
+    @staticmethod
+    def device_holder(device: Mapping[str, Any]) -> str:
+        holder = device.get("holder")
+        if not holder:
+            return "—"
+        alias = holder.get("alias") or holder.get("terminal_id") or holder.get("pane_id") or "unknown"
+        marker = alias_identity(alias).marker if holder.get("alias") else ""
+        return (marker + " " if marker else "") + alias
+
+    @staticmethod
+    def device_columns(width: int) -> list[tuple[str, int, bool]]:
+        # Drop AGE first; retain every identity/state/finding column at 32 cells.
+        wide = width >= 75
+        platform, holder, state = (12, 18, 17) if wide else (5, 7, 7)
+        columns = [("platform", platform, False), ("device", 12 if wide else 6, False),
+                   ("holder", holder, False)]
+        if wide:
+            columns.append(("age", 5, False))
+        columns.extend([("state", state, False), ("finding", 1, True)])
+        required = sum(size for _, size, _ in columns) + 2 * (len(columns) - 1)
+        if required > width:
+            for name in ("holder", "platform", "state", "device"):
+                index = next(index for index, column in enumerate(columns) if column[0] == name)
+                key, size, centered = columns[index]
+                minimum = {"holder": 5, "platform": 4, "state": 5, "device": 4}[name]
+                reduction = min(required - width, max(0, size - minimum))
+                columns[index] = key, size - reduction, centered
+                required -= reduction
+        if required < width:
+            key, size, centered = columns[1]
+            columns[1] = key, size + width - required, centered
+        return columns
+
+    @staticmethod
+    def device_platform(platform: str, *, narrow: bool = False) -> str:
+        labels = {"android-device": ("Android", "Andr"), "android-emulator": ("Android emu", "A-emu"),
+                  "ios-device": ("iOS", "iOS"), "ios-simulator": ("iOS sim", "i-sim"),
+                  "unknown": ("unknown", "?")}
+        return labels.get(platform, (platform, platform))[int(narrow)]
+
+    @staticmethod
+    def device_name(device: Mapping[str, Any]) -> str:
+        identifier = device.get("device_id")
+        if identifier is None:
+            identifier = f"PID {device['process_pid']}" if device.get("process_pid") else "unknown ID"
+        label = device.get("label")
+        return f"{label} · {identifier}" if label and label != identifier else str(identifier)
+
+    def render_devices(self, rect: tuple[int, int, int, int]) -> None:
+        y, x, height, width = rect
+        if height <= 0 or width <= 0:
+            return
+        hosts = self.device_hosts()
+        devices = [{"type": "device", **device} for host in hosts for device in host["devices"]]
+        columns = self.device_columns(max(0, width - 2))
+        headers = {"platform": "PLATFORM" if columns[0][1] >= 8 else "PLAT", "device": "DEVICE",
+                   "holder": "HOLDER", "age": "AGE", "state": "STATE", "finding": "!"}
+        lines: list[tuple[str, int, int, bool]] = []
+        index = 0
+        for host in hosts:
+            limit = host.get("emu_limit", {})
+            used = limit.get("in_use")
+            maximum = limit.get("limit")
+            limit_label = "?" if maximum is None else "∞" if maximum <= 0 else str(maximum)
+            cue = f"emu {used if used is not None else '?'}/{limit_label}"
+            if used is not None and not limit.get("known", True):
+                cue += " (claims only)"
+            findings = [f"{finding} {sum(device.get('finding') == finding for device in host['devices'])}"
+                        for finding in ("unclaimed", "missing", "stale")
+                        if any(device.get("finding") == finding for device in host["devices"])]
+            if not host["fresh"]:
+                findings.insert(0, "stale host")
+            if host.get("error"):
+                findings.append("! probe")
+            suffix = " · " + cue
+            heading = "▾ " + truncate_display_text(host["host"], max(0, width - display_width(suffix) - 2)) + suffix
+            findings_text = " · ".join(findings)
+            if findings_text and display_width(heading + " · " + findings_text) <= width:
+                heading += " · " + findings_text
+                findings_text = ""
+            lines.append((heading, -2, curses.A_BOLD, False))
+            if findings_text:
+                lines.extend((line, -3, self.style("warning"), False)
+                             for line in wrap_summary(findings_text, width))
+            if host["devices"]:
+                lines.append(("  " + self.column_text(headers, columns), -3,
+                              self.style("accent", curses.A_BOLD), False))
+            if host.get("error"):
+                error = host["error"]
+                message = error.get("message", str(error)) if isinstance(error, Mapping) else str(error)
+                lines.append((message, -1, self.style("warning"), False))
+            if not host["devices"]:
+                known = any(value is not None for value in host.get("counts", {}).values())
+                lines.append(("  No devices." if known else "  Device inventory unknown.", -1, curses.A_DIM, False))
+            for device in host["devices"]:
+                claim = device.get("claim_state")
+                observed = device.get("observed_state") or "unknown"
+                narrow = not any(name == "age" for name, _, _ in columns)
+                state = (("stale" if claim == "stale" else observed) if narrow else
+                         f"{claim}/{observed}" if claim else observed)
+                values = {"platform": self.device_platform(device["platform"], narrow=narrow),
+                          "device": self.device_name(device),
+                          "holder": self.device_holder(device),
+                          "age": self.format_time(device.get("claimed_at"), self.wall_clock(), relative=True),
+                          "state": state, "finding": "!" if device.get("finding") else "·"}
+                chosen = index == self.selections["devices"]
+                lines.append(("  " + self.column_text(values, columns), index,
+                              self.selection_style() if chosen else 0, True))
+                index += 1
+        if not hosts:
+            lines.append((" No host snapshot. r refresh", -1, curses.A_DIM, False))
+        for row, (text, index, attr, _primary) in enumerate(self.list_window("devices", lines, height), y):
+            if index >= 0 and index == self.selections["devices"]:
+                self.theme.draw_selected_row(self.screen, row, text[1:], width, x, marker="›")
+            else:
+                self.put(row, x, pad_display_text(truncate_display_text(text, width), width), attr)
+            if index >= 0:
+                if devices[index].get("finding"):
+                    self.put(row, x + width - 1, "!", attr | curses.A_BOLD)
+                self.add_hit((row, x, 1, width), "list-row", index)
 
     def thread_state(self, state: str, *, direct: bool = False) -> tuple[str, str]:
         """Use one-cell ASCII cues; direct acceptance is never a native receipt."""
@@ -2995,17 +3190,50 @@ class MailboxApp:
             f"User border: {yes_no(item.get('user_border'))}"], dim=True)
         return result
 
+    def device_detail(self) -> list[tuple[str, int]]:
+        item = self.detail or {}
+        holder = item.get("holder") or {}
+        claimed_at = item.get("claimed_at")
+        timestamp = ("—" if claimed_at is None else
+                     f"{claimed_at} ({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(claimed_at))})")
+        fields = [
+            "Device",
+            f"Platform: {item.get('platform') or 'unknown'}",
+            f"Label: {item.get('label') or '—'}",
+            f"Device ID: {item.get('device_id') or 'unknown'}",
+            *([f"Process PID: {item['process_pid']}"] if item.get("process_pid") else []),
+            f"Host: {item.get('host') or '—'}",
+            f"Host snapshot: {'fresh' if item.get('fresh') else 'stale'}",
+            f"Claim: {item.get('claim_state') or 'unclaimed'}",
+            f"Observed: {item.get('observed_state') or 'unknown'}",
+            f"Finding: {item.get('finding') or 'none'}",
+            f"Claimed at: {timestamp}",
+            f"Age: {self.format_time(claimed_at, self.wall_clock(), relative=True)}",
+            "",
+            "Holder",
+            f"Alias: {self.device_holder(item)}",
+            f"Pane: {holder.get('pane_id') or '—'}",
+            f"Repo ID: {holder.get('repo_id') or '—'}",
+            f"Terminal ID: {holder.get('terminal_id') or '—'}",
+            f"Agent ID: {holder.get('agent_id') or '—'}",
+            f"Workspace: {holder.get('workspace_id') or '—'}"]
+        if item.get("host_error"):
+            fields.append(f"Host error: {item['host_error']}")
+        return [(line, curses.A_BOLD if line in {"Device", "Holder"} else 0) for line in fields]
+
     def detail_lines(self) -> list[str]:
         if self.diagnostics:
             return ["Diagnostics", json.dumps({"connection_errors": self.remote_errors,
                     "pending_operations": list(self.jobs), "status": self.status, "last_error": self.last_error,
                     "repo_id": self.repo_id}, ensure_ascii=False, indent=2)]
         item = self.detail or {}
+        if item.get("type") == "device":
+            return [text for text, _attribute in self.device_detail()]
         if item.get("type") in {"thread", "direct", "outbox"}:
             return [text for text, _attribute in self.thread_detail()]
         if item.get("host") and item.get("terminal_id") and not item.get("type"):
             return [text for text, _attribute in self.agent_detail()]
-        return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent or thread to preview."]
+        return [json.dumps(item, ensure_ascii=False, indent=2)] if item else ["Select an agent, thread or device to preview."]
 
     def viewer_rect(self) -> tuple[int, int, int, int]:
         height, width = self.screen.getmaxyx()
@@ -3023,6 +3251,8 @@ class MailboxApp:
         if item.get("type") == "thread":
             body = (item.get("messages") or [{}])[-1].get("body") or ""
             title = item.get("subject") or (body.splitlines() or ["Thread"])[0]
+        elif item.get("type") == "device":
+            title = self.device_name(item)
         elif item.get("type"):
             title = item["type"].upper() + (" · " + item["subject"] if item.get("subject") else "")
         else:
@@ -3030,7 +3260,8 @@ class MailboxApp:
         self.box((y, x, height, width), title, True)
         if height > 3:
             self.put(y + height - 2, x + 1,
-                     truncate_display_text("↑↓ scroll · t technical · Esc close", max(0, width - 2)),
+                     truncate_display_text("↑↓ scroll · " + ("t technical · " if item.get("type") != "device" else "") +
+                                           "Esc close", max(0, width - 2)),
                      curses.A_DIM)
         self.cursor_position = None
 
@@ -3052,7 +3283,8 @@ class MailboxApp:
         age_deadlines: dict[str, float] = {}
         self.detail_age_deadlines = age_deadlines
         try:
-            entries = (self.thread_detail(width, message_starts=message_starts)
+            entries = (self.device_detail() if not self.diagnostics and (self.detail or {}).get("type") == "device" else
+                       self.thread_detail(width, message_starts=message_starts)
                        if not self.diagnostics and (self.detail or {}).get("type") else
                        self.agent_detail(width) if agent and not self.diagnostics else
                        [(line, 0) for line in self.detail_lines()])
@@ -3205,19 +3437,22 @@ class MailboxApp:
         if self.mode == "help":
             context = ["INPUT: Enter send · Ctrl+G action/fyi · Shift+Enter / Alt+Enter newline · Esc keep draft · Ctrl+D direct · Ctrl+R refresh"
                        if self.help_return == "input" else " / ".join(self.footer_hints_for_nav())]
-            lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region",
+            lines = context + ["", "NAV: Tab / Shift+Tab, ←→, h/l change region · d Devices",
                     "↑↓ / j/k select or scroll · PgUp/PgDn · Home/End",
-                    "Agents Enter: quick send · Threads Enter: reply · Detail: read-only",
+                    "Agents Enter: quick send · Threads Enter: reply · Devices Enter: Detail (read-only)",
                     "Agents [m] Main: confirm pin for a live local role-group agent; press again on the pin to clear it.",
                     "Clearing a Main pin may restore the auto incumbent or a uniquely elected main.",
                     "Agents [f] FYI now: skip the FYI delay and input quiet wait; no prompt typed.",
                     "Quiet skip expires in 10 min or on delivery; a working agent waits until after its turn.",
                     "Other gates remain: participant, empty editor, idle runtime/turn, holds and hop limit.",
                     "Hourly limit and coalescing (default 60 s) still apply.",
-                    "Agents / Threads Space view: read-only modal; Enter inside does nothing.",
+                    "Agents / Threads / Devices Space view: read-only modal; Enter inside does nothing.",
                     "Viewer: ↑↓ / PgUp/PgDn / Home/End / wheel scroll · t technical · Esc/q/Space close.",
                     "Viewer: outside click closes; inside click is inert. Live arrivals follow only at latest.",
                     "Detail: t toggles technical source; threads reopen latest, single items reopen top.",
+                    "Devices: all hosts/repositories; PLATFORM · DEVICE · HOLDER · AGE · STATE · !",
+                    "Narrow Devices: PLAT; AGE is hidden. ! means unclaimed / missing / stale; Detail explains.",
+                    "Host emu N/3 is host-wide admission usage, not the number of rows; ? means unknown.",
                     "Detail PgUp/PgDn: viewport page with one row overlap; range + ↑/↓ show more.",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
@@ -3344,6 +3579,8 @@ class MailboxApp:
             return ["Agents: Space view; Enter opens quick send; [f] FYI now; [m] Main pin/unpin"]
         if self.focus == "threads":
             return ["Threads: Space view; Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
+        if self.focus == "devices":
+            return ["Devices: Space view; Enter Detail; read-only, all hosts/repositories"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (
             ["t technical details (opens latest message)"] if self.technical_supported() else [])
 

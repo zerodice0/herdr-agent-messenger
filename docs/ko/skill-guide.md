@@ -374,7 +374,8 @@ device list
 `attached`는 adb 연결 여부입니다. Android 상태가 `device`이면 `true`, 아니면
 `false`이며, adb를 사용할 수 없거나 iOS UDID처럼 adb 형식이 아닌 ID이면 `null`입니다.
 연결 여부는 점유 소유자의 활성 여부와 별개입니다. `device list`는 읽기 전용이므로
-레지스트리 갱신, 토큰 쓰기, stale 정리나 디렉터리 생성을 하지 않습니다.
+레지스트리 갱신, 토큰 쓰기, stale 정리나 디렉터리 생성을 하지 않습니다. 호스트 전체에서
+사용할 수 있는 기기를 점유 전에 확인하려면 읽기 전용 [기기 보드](#기기-보드)를 사용합니다.
 
 `emu_limit`의 진단 정보는 호스트의 활성 Android 에뮬레이터 점유자와 점유 기록이 없는
 Android qemu 프로세스를 보여줄 뿐, 프로세스를 종료하거나 점유를 해제하지 않습니다.
@@ -396,6 +397,10 @@ Android qemu 프로세스를 보여줄 뿐, 프로세스를 종료하거나 점�
   `dead_serve`는 대상 리스너가 없는 프록시 경로, `stale_devices`는 stale 점유입니다.
   대상 리스너의 활성 여부를 확인할 때는 다른 사용자의 리스너도 포함합니다.
   탐색 오류는 `resources.error`에 기록합니다.
+  기기 보드가 자원을 요청하면 선택 키 `devices_observed`, `device_claims`,
+  `emu_limit`이 추가될 수 있습니다. 프로토콜 1과 스키마 12는 바뀌지 않으며, 이 키가
+  없는 peer는 비어 있는 것이 아니라 알 수 없는 상태입니다.
+  [기기 보드](#기기-보드)를 참고하세요.
 
 각 자원 필드는 서로 독립적인 선택 필드입니다. 이전 peer에 `devices`, `servers`,
 `resources` 중 어느 필드가 없으면 해당 정보만 알 수 없음(`?`)으로 표시하며,
@@ -408,6 +413,67 @@ HAM의 사이드바 값은 정확히 `phone=📱 <공백으로 연결한 라벨>
 점유·해제와 상태 표시는 강제 교체된 이전 활성 소유자를 포함해 이 값을 맞춥니다.
 Herdr 토큰은 source별로 격리되지 않은 pane 단위의 평면 맵입니다.
 제품은 기존 기기 JSON을 가져오지 않으며 일회성 이전은 제품 밖에서 수행합니다.
+
+### 기기 보드
+
+`device board [--json]`은 기기 소유 현황과 각 호스트가 실제로 관찰한 기기를 호스트
+전체에 걸쳐 보여 주는 읽기 전용 조회입니다. 사용할 수 있는 기기를 고를 때 쓰며,
+고른 기기는 반드시 `device claim`으로 점유합니다. 이 명령은 점유, 해제, 정리,
+레지스트리 갱신, 토큰 쓰기를 하지 않습니다. 대상은 이 호스트와 직접 등록된 peer
+(한 단계까지, 다른 peer를 거치는 조회는 없음)이며 다른 플래그는 없습니다.
+`--json` 없이 실행하면 호스트와 플랫폼별로 묶은 텍스트를, `--json`을 붙이면 다음
+객체 하나를 출력합니다.
+
+```text
+{hosts:[{host,fresh,error,emu_limit,counts,devices:[...]}]}
+```
+
+| 필드 | 의미 |
+| --- | --- |
+| `fresh` | 지금 호스트를 읽지 못했으면 `false`입니다. `error`는 `null`, 문자열 또는 `{code,message}`입니다. |
+| `emu_limit` | `{limit,in_use,claim_count,process_count,known}`입니다. `in_use`는 `max(활성 Android 에뮬레이터 점유 수, 실행 중인 Android qemu 프로세스 수)`이며 호스트에 설정된 한도(`HERDR_AGENT_EMU_LIMIT`)와 비교합니다. `limit:null`은 이전 peer처럼 값을 알 수 없거나 보고되지 않았다는 뜻이며 무제한이 아닙니다. 무제한은 설정된 한도가 `0` 이하일 때입니다. `known:false`이면 프로세스 조회가 실패하여 `in_use`가 점유 수로 대체됐다는 뜻입니다. iOS 시뮬레이터는 세지 않습니다. |
+| `counts` | 플랫폼별 기기 수입니다. 키는 `android-device`, `android-emulator`, `ios-device`, `ios-simulator`, `unknown`입니다. |
+| `devices[]` | 점유와 관찰을 합친 기기마다 한 행입니다. 필드는 `host`, `platform`, `device_id`, `label`, `holder`, `claimed_at`, `age`(초), `claim_state`(`held`, `stale`, `null`), `observed_state`, `finding`이며, 포트가 없는 qemu 프로세스에는 `process_pid`가 추가됩니다. |
+
+`platform`은 위 다섯 가지 키 중 하나입니다. `holder`는 점유자의 식별 정보(에이전트 ID, alias,
+pane, terminal, generation, 호스트, 저장소, workspace, `active`·`live`) 또는 `null`이고 `age`는 점유 경과 시간입니다. `observed_state`는 `attached`,
+`booted`, `running`, `offline`, `not seen`, `unknown` 중 하나입니다. 실행 중인
+qemu 프로세스의 포트를 알 수 없으면 `device_id:null`과 `process_pid`가 있는
+`unknown` 행으로 표시합니다.
+
+`finding`은 `null`이거나 다음 중 하나입니다.
+
+- `unclaimed`: 호스트에서 기기가 관찰되지만 점유한 에이전트가 없습니다.
+- `missing`: 유효한 점유가 있는데, 성공한 조회에서 그 호스트에 기기가 없습니다.
+- `stale`: 소유자의 generation이 비활성입니다(`claim_state:"stale"`). `device claim`이
+  `--force` 없이 교체할 수 있는 바로 그 stale 점유입니다.
+
+대조는 의도적으로 시간과 범위를 제한한 읽기 전용 동작입니다.
+
+- 기기를 소유한 호스트만 자기 기기를 조회하며, 자원 정보를 요청받았을 때만 수행합니다.
+  조회 대상은 `adb devices`, 에뮬레이터 프로세스를 찾는 `ps`, macOS에서는
+  `xcrun simctl list devices booted -j`입니다. 조회는 병렬로 실행하고 각각 2초로
+  제한하므로 도구 하나가 멈춰도 보드 전체가 지연되지 않습니다.
+- 실제 iOS 기기 탐색은 의도적으로 건너뜁니다. 이번 구현은 `devicectl`의 report-file
+  출력, 페어링·접근 상태에 대한 의존, 추가 부하를 피하려고 이 도구를 실행하지
+  않습니다. 따라서 `ios_devices`는 `null`입니다. 등록된 iOS 실기기
+  점유는 그대로 표시하되 `observed_state:"unknown"`이며 `missing`으로 판단하지
+  않습니다.
+- `null`은 0이 아니라 알 수 없음을 뜻합니다. 기기 보드 필드가 없는 이전 peer나 행에서
+  `null`인 필드는 알 수 없음으로 표시하며, 기기가 없거나 비어 있다는 뜻으로 읽으면
+  안 됩니다. 조회가 실패한 플랫폼에는 `missing` 발견 사항을 만들지 않습니다.
+
+**에이전트가 기기를 고르는 방법.** 기기를 소유한 호스트에서 `device board --json`을
+실행하고, 소유자가 없으면서 `observed_state`가 `attached`, `booted`, `running`인
+행을 우선합니다. 새 Android 에뮬레이터를 띄우기 전에는 `emu_limit`의 여유를
+확인합니다. 그다음 기기를 쓰기 전에 `device claim phone|emu DEVICE`로 점유합니다.
+`unclaimed` 행은 한 시점의 스냅샷에서 얻은 참고 정보일 뿐 사용 허가가 아닙니다.
+그 사이에 다른 에이전트가 점유할 수 있으며, 최종 판단 근거는 점유 명령의 결과뿐입니다.
+`device_claimed`나 `emu_limit`로 거부되면 그 기기를 쓰지 말고 다른 에뮬레이터를
+종료하지 않은 채 기다리거나 다른 일을 합니다. 사용자가 명시적으로 지시하지 않았다면
+`--force`를 쓰지 않습니다. `stale`이나 `missing` 행도 점유에 성공하기 전에는
+자유로운 기기가 아닙니다. Mailbox의
+[Devices 탭](ui-reference.md#devices-탭과-기기-보드)에서도 같은 정보를 볼 수 있습니다.
 
 ### 메일함 용어
 
@@ -669,15 +735,20 @@ pane action **HAM: Deliver queued FYI now**(`fyi-now`)는 별개이며 메일함
 조회하지 않습니다. 최소 버전은 Herdr 0.8.0이며 기존 `mailbox-popup` ID를 유지합니다.
 [배치 선택 이유와 원본 근거](ui-reference.md#herdr-오버레이-배치)를 참고하세요.
 
-Agents, Threads, 읽기 전용 Detail 영역은 화면 크기에 맞춰 배치합니다.
-80열 미만이거나 18행 미만이면 포커스가 있는 영역만 표시하며, 80~139열이면
-목록을 위아래로 쌓고 Detail을 옆에 배치합니다. 140열 이상이면 세 열로 표시합니다.
-32열 미만이거나 10행 미만이면 크기 변경 안내를 표시하되 초안, 커서, 모드와
-선택 항목은 보존합니다. NAV에서 Tab·Shift+Tab, ←·→ 또는 h/l로 포커스를 옮기고
-↑·↓ 또는 j/k로 행을 고릅니다. PgUp·PgDn·Home·End로 페이지를 넘기거나
-처음·끝으로 이동합니다. Detail에서는 방향키로 스크롤합니다. 숫자는 탐색 키가
-아닙니다. `s`는 Settings, `?`는 도움말, `e`는 Detail의 진단 정보를 열고
-`r`은 새로고침합니다. Detail에서는 Enter가 동작하지 않습니다.
+Agents, Threads, Devices, 읽기 전용 Detail 영역은 화면 크기에 맞춰 배치합니다.
+Detail은 목록 아래에 두며 오른쪽의 세 번째 열로 배치하지 않습니다.
+너비가 80열 이상이고 본문이 18행 이상이면, 각 절반에 Agents의 모든 열을 표시할 수
+있을 때만 Agents와 Threads를 위쪽에 나란히 배치합니다. 그렇지 않으면 목록 하나를
+전체 너비로 표시하고 `Agents │ Threads │ Devices` 탭을 제공합니다. Devices는 항상
+전체 너비 목록을 사용합니다. 80열 미만이거나 18행 미만이면 포커스가 있는 영역만
+표시합니다. 32열 미만이거나 10행 미만이면 크기 변경 안내를 표시하되 초안, 커서,
+모드와 선택 항목은 보존합니다. NAV에서 Tab·Shift+Tab, ←·→ 또는 h/l로
+`Agents → Threads → Devices → Detail` 순서로 포커스를 옮기고, `d`로 읽기 전용
+Devices 탭으로 바로 이동합니다. ↑·↓ 또는 j/k로 행을 고릅니다.
+PgUp·PgDn·Home·End로 페이지를 넘기거나 처음·끝으로 이동합니다. Detail에서는
+방향키로 스크롤합니다. 숫자는 탐색 키가 아닙니다. `s`는 Settings, `?`는 도움말,
+`e`는 Detail의 진단 정보를 열고 `r`은 새로고침합니다. Devices에서 Enter는 Detail로
+포커스를 옮기며, Detail에서는 Enter가 동작하지 않습니다.
 
 Agents는 호스트별로 묶고 헤더에 stale·오류 상태를 표시합니다. 별칭, 턴 상태,
 unread와 native 수신 준비 상태 아래에 흐린 역할·phase·요약 한 줄을 표시합니다.

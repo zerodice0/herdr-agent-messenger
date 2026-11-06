@@ -1,12 +1,17 @@
 """Terminal-generation-owned device claims and read-only attachment observations."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import re
 import sqlite3
 import subprocess
 import time
+import sys
 from typing import Any, Mapping
+
+from ham.ledger.device_board import HOLDER_FIELDS
 
 from ham.ledger.status import AgentRegistry, check_generation
 from ham.ledger.store import LedgerError, LedgerStore
@@ -32,13 +37,13 @@ def device_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_claims'").fetchone() is None:
         return []
     rows = connection.execute(
-        "SELECT d.*,a.alias,a.pane_id,a.terminal_id,a.generation,a.active,a.host,"
+        "SELECT d.*,a.alias,a.pane_id,a.terminal_id,a.generation,a.active,a.host,a.repo_id,a.workspace_id,"
         "(a.active=1 AND a.generation=(SELECT max(b.generation) FROM agents b "
         "WHERE b.host=a.host AND b.terminal_id=a.terminal_id)) AS live "
         "FROM device_claims d JOIN agents a USING(agent_id) ORDER BY d.kind,d.device_id")
     return [{"device_id": row["device_id"], "kind": row["kind"], "label": row["label"],
              "claimed_at": row["claimed_at"],
-             "holder": {**{key: row[key] for key in ("agent_id", "alias", "pane_id", "terminal_id", "generation", "host")},
+             "holder": {**{key: row[key] for key in HOLDER_FIELDS},
                         "active": bool(row["active"]), "live": bool(row["live"])},
              "stale": not bool(row["live"]), "attached": None} for row in rows]
 
@@ -55,8 +60,73 @@ def _adb_like(device: str) -> bool:
     return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})", device) is None
 
 
+def emulator_limit(environment: Mapping[str, str] | None = None) -> int:
+    values = os.environ if environment is None else environment
+    try:
+        return int(values.get("HERDR_AGENT_EMU_LIMIT", "3"))
+    except ValueError:
+        raise LedgerError("invalid_config", "HERDR_AGENT_EMU_LIMIT must be an integer.") from None
+
+
+def scan_devices(*, runner=None, platform: str | None = None) -> dict[str, Any]:
+    """Probe independent observation sources concurrently, each bounded to two seconds.
+
+    Physical iOS devices remain unknown: devicectl can start CoreDevice services,
+    request pairing/access, and has no uniform bounded, read-only availability.
+    """
+    platform = sys.platform if platform is None else platform
+    probes = DeviceClaims(None, runner=runner)
+    errors = []
+
+    def adb():
+        result = probes._run(["adb", "devices"])
+        if result is None:
+            return None
+        rows = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and not line.startswith(("List of devices", "*")):
+                rows.append({"serial": fields[0], "state": fields[1]})
+        return rows
+
+    def simulators():
+        result = probes._run(["xcrun", "simctl", "list", "devices", "booted", "--json"])
+        if result is None:
+            return None
+        try:
+            devices = json.loads(result.stdout)["devices"]
+            if not isinstance(devices, dict) or any(not isinstance(rows, list) for rows in devices.values()):
+                return None
+            rows = [row for group in devices.values() for row in group]
+            if any(not isinstance(row, dict) or not isinstance(row.get("udid"), str)
+                   or not isinstance(row.get("name"), str) for row in rows):
+                return None
+            return [{"udid": row["udid"], "name": row["name"]}
+                    for row in rows if row.get("state") == "Booted"]
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    sources = {"adb": adb, "emulator_processes": probes._emulator_processes}
+    if platform == "darwin":
+        sources["ios_simulators_booted"] = simulators
+    observed = {"adb": None, "emulator_processes": None,
+                "ios_simulators_booted": None, "ios_devices": None, "error": None}
+    with ThreadPoolExecutor(max_workers=len(sources), thread_name_prefix="ham-devices") as executor:
+        futures = {key: executor.submit(probe) for key, probe in sources.items()}
+        for key, future in futures.items():
+            try:
+                observed[key] = future.result()
+            except Exception as error:
+                errors.append(f"{key}: {error}")
+                continue
+            if observed[key] is None:
+                errors.append(f"{key}: observation unavailable")
+    observed["error"] = "; ".join(errors) or None
+    return observed
+
+
 class DeviceClaims:
-    def __init__(self, store: LedgerStore, *, registry: AgentRegistry | None = None,
+    def __init__(self, store: LedgerStore | None, *, registry: AgentRegistry | None = None,
                  runner=None) -> None:
         self.store = store
         self.registry = registry or AgentRegistry(store)
@@ -70,7 +140,7 @@ class DeviceClaims:
             return None
 
     def _emulator_processes(self) -> list[dict[str, Any]] | None:
-        # One local, bounded snapshot on Linux/macOS; read-only views never probe.
+        # The admission check and opt-in host resource snapshot share this parser.
         result = self._run(["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
         if result is None:
             return None
@@ -125,11 +195,7 @@ class DeviceClaims:
         limit = 0
         processes = None
         if kind == "emu" and _android_emulator(device_id) and not force:
-            values = os.environ if environment is None else environment
-            try:
-                limit = int(values.get("HERDR_AGENT_EMU_LIMIT", "3"))
-            except ValueError:
-                raise LedgerError("invalid_config", "HERDR_AGENT_EMU_LIMIT must be an integer.") from None
+            limit = emulator_limit(environment)
             if limit > 0:
                 processes = self._emulator_processes()
         at = time.time() if now is None else now
@@ -203,6 +269,10 @@ class DeviceClaims:
 
 
 def device_operation(arguments, environment=None) -> dict[str, Any]:
+    if arguments.device_command == "board":
+        from ham.ledger.cli import status_operation
+        from ham.ledger.device_board import device_board
+        return device_board(status_operation("board", environment=environment))
     if arguments.device_command == "list":
         try:
             store = LedgerStore.open_readonly(environment)
