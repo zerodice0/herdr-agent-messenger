@@ -223,11 +223,12 @@ class LedgerDisplayTest(unittest.TestCase):
         self.claim("device-a", "phone", "Stale phone")
         former_holder = self.agent()
         self.herdr.labels["p-main"] = "Manual border"
+        before = copy.deepcopy(self.herdr.metadata)
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET active=0 WHERE agent_id=?", (former_holder["agent_id"],))
-        self.assertTrue(self.display.refresh_agent(former_holder))
-        self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
-        self.assertNotIn("emu", self.herdr.metadata["p-main"]["tokens"])
+        self.assertIsNone(self.display.refresh_agent(former_holder))
+        self.assertEqual(self.herdr.metadata, before)
+        self.assertEqual(self.herdr.commands, [])
         with self.store.read() as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM device_claims").fetchone()[0], 1)
 
@@ -237,7 +238,7 @@ class LedgerDisplayTest(unittest.TestCase):
         self.herdr.labels["p-main"] = "Shell border"
         before = copy.deepcopy(self.herdr.metadata["p-worker"])
         result = self.display.refresh("p-main")
-        self.assertEqual(result, {"updated": ["p-main"], "failed": []})
+        self.assertEqual(result, {"updated": ["p-main"], "failed": [], "skipped": []})
         self.assertEqual(self.herdr.commands, [
             ["pane", "report-metadata", "p-main", "--source", SOURCE,
              "--clear-token", "phone", "--clear-token", "emu"],
@@ -251,7 +252,7 @@ class LedgerDisplayTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET host='remote' WHERE pane_id='p-main'")
         result = self.display.refresh("p-main")
-        self.assertEqual(result, {"updated": ["p-main"], "failed": []})
+        self.assertEqual(result, {"updated": ["p-main"], "failed": [], "skipped": []})
         self.assertNotIn("phone", self.herdr.metadata["p-main"]["tokens"])
         self.assertNotIn("emu", self.herdr.metadata["p-main"]["tokens"])
 
@@ -259,16 +260,16 @@ class LedgerDisplayTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET active=0 WHERE pane_id='p-main'")
         self.herdr.metadata_fails = True
-        self.assertEqual(self.display.refresh("p-main"), {"updated": [], "failed": ["p-main"]})
+        self.assertEqual(self.display.refresh("p-main"), {"updated": [], "failed": ["p-main"], "skipped": []})
         for error in (OSError("offline"), subprocess.TimeoutExpired("herdr", 10)):
             with self.subTest(error=type(error).__name__):
                 display = LedgerDisplay(self.store, runner=mock.Mock(side_effect=error))
-                self.assertEqual(display.refresh("p-main"), {"updated": [], "failed": ["p-main"]})
+                self.assertEqual(display.refresh("p-main"), {"updated": [], "failed": ["p-main"], "skipped": []})
 
     def test_unscoped_refresh_does_not_clear_inactive_panes(self):
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET active=0 WHERE pane_id='p-main'")
-        self.assertEqual(self.display.refresh(), {"updated": ["p-worker"], "failed": []})
+        self.assertEqual(self.display.refresh(), {"updated": ["p-worker"], "failed": [], "skipped": []})
         self.assertEqual(self.herdr.metadata["p-main"]["tokens"]["phone"], "serial")
         self.assertFalse(any(command[2] == "p-main" for command in self.herdr.commands))
 
@@ -807,7 +808,8 @@ class LedgerDisplayTest(unittest.TestCase):
                                 side_effect=lambda command, **kwargs: self.herdr(command[1:])),
               mock.patch("sys.stdout", new_callable=io.StringIO) as output):
             self.assertEqual(ledger_display.main(["--pane", "p-main"]), 0)
-        self.assertEqual(json.loads(output.getvalue()), {"result": {"updated": ["p-main"], "failed": []}})
+        self.assertEqual(json.loads(output.getvalue()),
+                         {"result": {"updated": ["p-main"], "failed": [], "skipped": []}})
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 [메인] orange-rabbit")
         self.assertEqual(self.herdr.labels["p-main"], "[메인] orange-rabbit · Implement mailbox")
 

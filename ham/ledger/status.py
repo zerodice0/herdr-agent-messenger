@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -264,6 +265,48 @@ def check_generation(connection: sqlite3.Connection, host: str, terminal_id: str
     return agent
 
 
+def recoverable_display_owner(connection: sqlite3.Connection, agent: Mapping[str, Any],
+                              border: str, *,
+                              live_terminals: set[str] | None = None,
+                              allow_repo_mismatch: bool = False) -> dict[str, Any] | None:
+    """Recover display ownership, never session/message identity, from exact HAM text.
+
+    Herdr restore preserves workspace/pane and border but allocates a new
+    terminal. A retired binding on the same host/workspace/pane/repo/client
+    proves ownership only while its entire terminal is gone. Session mismatch
+    is deliberately allowed: a later client can inherit this unchanged HAM
+    border after ownership was lost. Prefixes and pane numbers alone prove
+    nothing. Same-terminal older generations retain their existing recovery.
+    Only explicitly pane-selected reclaim may relax repository equality, for
+    example when a local checkout gained a remote. Even that exception requires
+    a different, gone terminal; automatic recovery never enables it.
+    """
+    if not isinstance(border, str) or not border or agent.get("last_ham_label") is not None:
+        return None
+    if live_terminals is None:
+        live_terminals = {row[0] for row in connection.execute(
+            "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (agent["host"],))}
+    query = ("SELECT * FROM agents WHERE host=? AND workspace_id=? AND pane_id=? "
+             "AND client=? AND active=0 AND last_ham_label=?")
+    parameters = [agent["host"], agent["workspace_id"], agent["pane_id"], agent["client"], border]
+    if not allow_repo_mismatch:
+        query += " AND repo_id=?"
+        parameters.append(agent["repo_id"])
+    candidates = connection.execute(
+        query + " ORDER BY last_seen DESC,first_seen DESC,agent_id DESC", parameters)
+    for row in candidates:
+        if row["terminal_id"] == agent["terminal_id"]:
+            if row["repo_id"] == agent["repo_id"] and row["generation"] < agent["generation"]:
+                return dict(row)
+            continue
+        if row["terminal_id"] in live_terminals:
+            continue
+        if connection.execute("SELECT 1 FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                              (agent["host"], row["terminal_id"])).fetchone() is None:
+            return dict(row)
+    return None
+
+
 class AgentRegistry:
     def __init__(self, store: LedgerStore, *,
                  display_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None) -> None:
@@ -365,6 +408,28 @@ class AgentRegistry:
                                   "turn_state": str(raw.get("agent_status") or 'unknown'),
                                   "native_session_pid": native_session_pid}
         wake_terminals: list[str] = []
+        # Binding changes share the projector's pane lock. Never take registry
+        # from a projector: the order is registry -> sorted panes -> SQL.
+        with self.store.read() as connection:
+            binding_panes = {row[0] for row in connection.execute(
+                "SELECT pane_id FROM agents WHERE host=? AND active=1", (self.store.host,))}
+        binding_panes.update(value["pane_id"] for value in locations.values())
+        with ExitStack() as locks:
+            for pane_id in sorted(binding_panes):
+                # Unlike an advisory display refresh, identity reconciliation
+                # must never report success with stale sessions after timeout.
+                locks.enter_context(self.store.display_lock(
+                    self.store.host, pane_id, timeout=30, error_code="ledger_busy"))
+            result = self._reconcile_bindings(
+                observed, locations, workspaces, borders, at, changed_panes, wake_terminals,
+                prune_device_claims=prune_device_claims)
+        return result
+
+    def _reconcile_bindings(self, observed: Mapping[str, Any], locations: Mapping[str, Any],
+                            workspaces: Mapping[str, Any], borders: Mapping[str, Any],
+                            at: float, changed_panes: set[str], wake_terminals: list[str], *,
+                            prune_device_claims: bool) -> dict[str, Any]:
+        live_terminals = set(locations)
         with self.store.transaction(wake_terminals) as connection:
             from ham.ledger.settings import RepoSettings
             settings = RepoSettings(self.store)
@@ -451,16 +516,12 @@ class AgentRegistry:
                          generation, value["client"], value["repo_id"], value["is_main_checkout"], value["alias"], at, at))
                     connection.execute("INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,?,?)",
                                        (agent_id, "unknown", at))
-                # The border belongs to the terminal binding, not the session
-                # generation. Reclaim only exact labels previously written by
-                # HAM on this host/terminal/pane; a role prefix proves nothing.
                 current_border = borders[terminal]
                 if current_border is not None and (not same or old["last_ham_label"] is None):
-                    previous = connection.execute(
-                        "SELECT 1 FROM agents WHERE host=? AND terminal_id=? AND pane_id=? "
-                        "AND active=0 AND generation<(SELECT generation FROM agents WHERE agent_id=?) "
-                        "AND last_ham_label=? LIMIT 1",
-                        (self.store.host, terminal, value["pane_id"], agent_id, current_border)).fetchone()
+                    current = dict(connection.execute(
+                        "SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone())
+                    previous = recoverable_display_owner(
+                        connection, current, current_border, live_terminals=live_terminals)
                     if previous is not None:
                         connection.execute("UPDATE agents SET last_ham_label=? WHERE agent_id=?",
                                            (current_border, agent_id))
@@ -693,10 +754,10 @@ class AgentRegistry:
                         continue
                     current = pane.get("label", "")
                     owned = isinstance(current, str) and border_owned(current, agent["last_ham_label"])
-                    if metadata_matches(desired, raw) and (current == desired.label or not owned):
+                    if (metadata_matches(desired, raw)
+                            and ((current == desired.label and agent["last_ham_label"] == desired.label)
+                                 or (current != desired.label and not owned))):
                         matching.add(pane_id)
-                        if current == desired.label and agent["last_ham_label"] != desired.label:
-                            self.set_display_label(agent["agent_id"], agent["last_ham_label"], desired.label)
                         continue
                 desired_key = fingerprint(agent, desired)
             else:
@@ -722,6 +783,9 @@ class AgentRegistry:
         from ham.ledger import display_repair
         result: dict[str, list[str]] = {"updated": [], "failed": []}
         attempts: dict[str, str] = {}
+        skipped: set[str] = set()
+        prior_reservations: dict[str, dict[str, Any] | None] = {}
+        saved_reservations: dict[str, dict[str, Any]] = {}
         diagnostics: list[str] = []
         at = time.time() if now is None else now
         try:
@@ -744,12 +808,15 @@ class AgentRegistry:
                     if pane_id in matching or (snapshot is not None and pane_id not in present):
                         del entries[pane_id]
                 for pane_id, (desired, _raw) in sorted(plan.items()):
+                    previous = entries.get(pane_id)
+                    prior_reservations[pane_id] = None if previous is None else dict(previous)
                     allowed, diagnostic = display_repair.reserve(
                         entries, pane_id, desired, at, force=snapshot is None)
                     if diagnostic:
                         diagnostics.append(diagnostic)
                     if allowed:
                         attempts[pane_id] = desired
+                        saved_reservations[pane_id] = dict(entries[pane_id])
                     elif snapshot is None:
                         # An explicit caller must not mistake an exhausted or
                         # capacity-blocked projection for a successful redraw.
@@ -764,18 +831,34 @@ class AgentRegistry:
                     refreshed = display.refresh(pane_id, **arguments)
                     for key in result:
                         result[key].extend(refreshed[key])
+                    skipped.update(refreshed.get("skipped", ()))
                 except Exception as error:
                     result["failed"].append(pane_id)
                     diagnostics.append(str(error))
             detail = "Could not refresh panes: " + ", ".join(result["failed"])
             if result["failed"]:
                 diagnostics.append(detail)
-            if result["failed"] or (snapshot is None and any(
+            if skipped or result["failed"] or (snapshot is None and any(
                     pane_id in queued for pane_id in result["updated"])):
                 with self.store.transaction() as connection:
                     entries = display_repair.load(connection)
                     before = json.dumps(entries, sort_keys=True)
+                    # Refund only this call's durable, unchanged reservation.
+                    # Explicit writes have not saved one, and a concurrent sweep
+                    # may already have advanced even the same fingerprint.
+                    for pane_id in (skipped if reserve_durably else ()):
+                        if entries.get(pane_id) == saved_reservations.get(pane_id):
+                            previous = prior_reservations[pane_id]
+                            if previous is None:
+                                del entries[pane_id]
+                            else:
+                                entries[pane_id] = previous
                     if snapshot is None:
+                        # Status can commit while another projector holds the
+                        # pane lock. Keep its deferred display alive even when
+                        # that older projector also detects the changed status.
+                        for pane_id in skipped:
+                            display_repair.defer(entries, pane_id, attempts[pane_id], at)
                         for pane_id in result["updated"]:
                             entry = entries.get(pane_id)
                             previous = queued.get(pane_id, {})

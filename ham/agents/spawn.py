@@ -190,7 +190,8 @@ def _report_metadata(
                        for row in registry.list()):
                 return False
             refreshed = LedgerDisplay(store, runner=run).refresh(pane_id)
-            return pane_id in refreshed["updated"] and not refreshed["failed"]
+            return ((pane_id in refreshed["updated"] or pane_id in refreshed.get("skipped", []))
+                    and not refreshed["failed"])
         peer = RemoteLedger(store, environment).peer(host)
         if not peer["remote_ham_root"]:
             return False
@@ -212,7 +213,8 @@ def _report_metadata(
         if _failed(result):
             return False
         refreshed = _payload(result.stdout).get("result")
-        return (isinstance(refreshed, dict) and pane_id in refreshed.get("updated", [])
+        return (isinstance(refreshed, dict)
+                and (pane_id in refreshed.get("updated", []) or pane_id in refreshed.get("skipped", []))
                 and not refreshed.get("failed"))
     except (LedgerError, OSError, subprocess.SubprocessError):
         return False

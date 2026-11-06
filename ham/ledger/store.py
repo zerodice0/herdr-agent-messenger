@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -55,15 +56,16 @@ def budget_timeout(limit: float) -> float:
     return min(limit, remaining)
 
 
-def _acquire_lock(descriptor: int) -> None:
-    deadline = _runtime_deadline.get()
+def _acquire_lock(descriptor: int, *, deadline: float | None = None,
+                  error_code: str = "ledger_busy") -> None:
+    runtime_deadline = _runtime_deadline.get()
+    if runtime_deadline is not None:
+        # Preserve the original shared deadline and its response reserve.
+        runtime_deadline -= 1
+        deadline = runtime_deadline if deadline is None else min(deadline, runtime_deadline)
     if deadline is None:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         return
-    # Registry refresh holds its lock across snapshot/Git/display lookups.
-    # Allow ordinary contention, sharing the original deadline across locks
-    # and leaving one second for the remaining work and JSON response.
-    deadline -= 1
     while True:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -71,7 +73,7 @@ def _acquire_lock(descriptor: int) -> None:
         except BlockingIOError:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise LedgerError("ledger_busy", "The ledger lock wait budget expired.") from None
+                raise LedgerError(error_code, "The ledger lock wait budget expired.") from None
             time.sleep(min(0.02, remaining))
 
 
@@ -611,16 +613,26 @@ class LedgerStore:
         return result
 
     @contextmanager
-    def lock(self, name: str) -> Iterator[None]:
-        if not re.fullmatch(r"[a-z-]+", name):
+    def lock(self, name: str, *, timeout: float | None = None,
+             error_code: str = "ledger_busy") -> Iterator[None]:
+        if not re.fullmatch(r"[a-z0-9-]+", name):
             raise ValueError("invalid lock name")
         descriptor = os.open(self.directory / f"{name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            _acquire_lock(descriptor)
+            _acquire_lock(descriptor, deadline=None if timeout is None else time.monotonic() + timeout,
+                          error_code=error_code)
             yield
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
+
+    @contextmanager
+    def display_lock(self, host: str, pane_id: str, *, timeout: float | None = 0.25,
+                     error_code: str = "display_busy") -> Iterator[None]:
+        """Serialize pane writers without ever acquiring the registry lock."""
+        key = hashlib.sha256(json_text([host, pane_id]).encode("utf-8")).hexdigest()
+        with self.lock(f"display-{key}", timeout=timeout, error_code=error_code):
+            yield
 
 
 def receipt(connection: sqlite3.Connection, message_id: str) -> dict[str, Any]:

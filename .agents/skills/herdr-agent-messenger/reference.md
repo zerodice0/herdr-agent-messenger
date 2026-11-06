@@ -629,6 +629,34 @@ removes the obsolete `user:pane-recap` token, preserves device projection and
 leaves unrelated token keys untouched. Herdr's per-pane token map is flat;
 metadata sources do not isolate identically named keys.
 
+Border ownership carries across generations only on an exact match to the
+recorded prior `last_ham_label` within one host/workspace/pane/repo/client
+scope; a role prefix or pane match alone never proves it. On the same terminal
+binding that suffices. After a terminal rebind, HAM adopts a nonempty border only
+when the prior row is inactive and its terminal is absent from the full current
+Herdr pane list with no active row. Same-terminal recovery is the one exception
+to the gone-terminal requirement. A session mismatch is allowed (exact
+historical text plus a gone terminal proves display ownership, not mail
+identity), and the most recent `last_seen`/`first_seen` row wins. Status,
+session and mail identity are not transferred, and schema 12 gains no columns.
+Projection takes a bounded shared per-pane lock and rereads the binding; a
+timeout skips the refresh quietly and a later one retries.
+`python3 -m ham display reclaim [--dry-run | --apply] [--pane PANE]...` defaults to
+a read-only dry run (no locks, registry refresh or writes) that prints JSON
+`{applied,panes:[{host,pane_id,agent_id,owner_agent_id,before,after,status}],updated,failed,skipped}`
+with `status` `candidate|explicit_only|updated|failed|skipped`; `--apply` rechecks under the
+per-pane lock, records recovered ownership and runs normal projection. It only
+covers active agents on this host with no recorded border label whose current
+border passes the exact-match rules; `display --pane PANE` refresh is unchanged.
+Automatic recovery, including reclaim without `--pane`, always requires the same
+repository. If the repository identity changed (for example a local checkout
+gained a remote), the dry run reports the pane as `explicit_only` with a reason
+and the previous and current repo IDs, and `--apply` adopts it only for a pane
+selected with `--pane`. Selection relaxes only repository equality; same
+host/workspace/pane/client, exact nonempty border equal to the inactive prior
+label, and a gone terminal with no active row are still required. This is not a
+general cross-repository transfer.
+
 ### Device claims and resource fields
 
 ```text

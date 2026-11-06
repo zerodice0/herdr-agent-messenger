@@ -62,6 +62,20 @@ def reserve(entries: dict[str, dict[str, Any]], pane_id: str, desired: str,
     return True, None
 
 
+def defer(entries: dict[str, dict[str, Any]], pane_id: str, desired: str, now: float) -> None:
+    """Keep a skipped explicit write pending without spending an attempt.
+
+    An existing reservation, even for another fingerprint, belongs to a
+    concurrent sweep. Leave it intact; the next snapshot replans current state.
+    """
+    if pane_id in entries:
+        return
+    allowed, _diagnostic = reserve(entries, pane_id, desired, now)
+    if allowed:
+        entries[pane_id]["attempts"] = 0
+        entries[pane_id]["next_try_at"] = now
+
+
 def failed(entry: dict[str, Any], detail: str) -> str | None:
     entry["last_error"] = detail
     if entry["attempts"] >= MAX_ATTEMPTS:

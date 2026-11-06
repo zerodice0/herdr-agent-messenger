@@ -172,12 +172,44 @@ class LedgerDisplay:
             emu=f"🤖 {emulators}" if emulators else "",
         )
 
+    def _active_agent(self, agent: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Resolve the current binding while the caller holds its pane lock."""
+        if agent.get("host") != self.store.host:
+            return None
+        rows = [row for row in self.registry.list()
+                if row["host"] == agent["host"] and row["pane_id"] == agent["pane_id"]]
+        if len(rows) != 1:
+            return None
+        current = rows[0]
+        identity = ("agent_id", "host", "terminal_id", "pane_id", "workspace_id", "repo_id", "client")
+        return current if all(current.get(key) == agent.get(key) for key in identity) else None
+
     def refresh_agent(self, agent: Mapping[str, Any], *, alias: str | None = None,
                       marker: str | None = None, color: str | None = None,
                       legacy_label: str | None = None,
                       feature_invoked: bool = False,
                       observed: Mapping[str, Any] | None = None,
-                      on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool:
+                      on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool | None:
+        try:
+            with self.store.display_lock(str(agent["host"]), str(agent["pane_id"])):
+                return self._refresh_agent_locked(
+                    agent, alias=alias, marker=marker, color=color, legacy_label=legacy_label,
+                    feature_invoked=feature_invoked, observed=observed, on_failure=on_failure)
+        except LedgerError as error:
+            if error.code != "display_busy":
+                raise
+            return None
+
+    def _refresh_agent_locked(self, agent: Mapping[str, Any], *, alias: str | None = None,
+                              marker: str | None = None, color: str | None = None,
+                              legacy_label: str | None = None,
+                              feature_invoked: bool = False,
+                              observed: Mapping[str, Any] | None = None,
+                              on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool | None:
+        current_agent = self._active_agent(agent)
+        if current_agent is None:
+            return None
+        agent = current_agent
         display = self.projection(agent, alias=alias, marker=marker, color=color)
         name = display.alias
         role = agent["role"] if "role" in agent else self.settings.role(agent)
@@ -194,17 +226,29 @@ class LedgerDisplay:
             succeeded = report_metadata(
                 self.runner, pane_id, display, clear_legacy_recap=invoked and observed is None,
                 clear_legacy_identity=observed is None, on_failure=on_failure)
+        latest = self._active_agent(agent)
+        if latest is None:
+            return None
+        if latest != agent:
+            # Status or ownership changed during metadata I/O. Do not rename
+            # from the old projection; the next refresh uses the latest state.
+            return None
+        agent = latest
         # Read the actual border after all metadata commands, immediately before
         # the ownership decision. Legacy ownership requires explicit confirmation.
         current = self._border_label(agent)
         if current is None:
             return False
         if current == display.label:
+            if self._active_agent(agent) != agent:
+                return None
             saved = self.registry.set_display_label(
                 agent["agent_id"], agent.get("last_ham_label"), display.label)
             return succeeded and saved["updated"]
         if not border_owned(current, agent.get("last_ham_label"), legacy_label=legacy_label):
             return succeeded
+        if self._active_agent(agent) != agent:
+            return None
         command = ["pane", "rename", pane_id, display.label] if display.label else ["pane", "rename", pane_id, "--clear"]
         try:
             renamed = self.runner(command)
@@ -214,6 +258,9 @@ class LedgerDisplay:
             if on_failure is not None:
                 on_failure(f"rename status border for {pane_id}", renamed)
             return False
+        latest = self._active_agent(agent)
+        if latest is None or latest["last_ham_label"] != agent["last_ham_label"]:
+            return None
         saved = self.registry.set_display_label(
             agent["agent_id"], agent.get("last_ham_label"), display.label)
         return succeeded and saved["updated"]
@@ -222,29 +269,138 @@ class LedgerDisplay:
                 legacy_labels: Mapping[str, str] | None = None,
                 feature_invoked: bool = False,
                 observed: Mapping[str, Any] | None = None) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {"updated": [], "failed": []}
+        result: dict[str, list[str]] = {"updated": [], "failed": [], "skipped": []}
         for agent in self.registry.list():
             if agent["host"] != self.store.host or (pane_id is not None and agent["pane_id"] != pane_id):
                 continue
             confirmed = None if legacy_labels is None else legacy_labels.get(agent["pane_id"])
-            key = "updated" if self.refresh_agent(
-                agent, legacy_label=confirmed, feature_invoked=feature_invoked, observed=observed) else "failed"
+            refreshed = self.refresh_agent(
+                agent, legacy_label=confirmed, feature_invoked=feature_invoked, observed=observed)
+            key = "skipped" if refreshed is None else "updated" if refreshed else "failed"
             result[key].append(agent["pane_id"])
-        if pane_id is not None and not result["updated"] and not result["failed"]:
-            command = ["pane", "report-metadata", pane_id, "--source", SOURCE,
-                       "--clear-token", "phone", "--clear-token", "emu"]
+        if pane_id is not None and not any(result.values()):
             try:
-                cleared = _succeeded(self.runner(command))
-            except (OSError, subprocess.SubprocessError):
-                cleared = False
-            result["updated" if cleared else "failed"].append(pane_id)
+                with self.store.display_lock(self.store.host, pane_id):
+                    # A new binding may have appeared after the outer list.
+                    if any(row["host"] == self.store.host and row["pane_id"] == pane_id
+                           for row in self.registry.list()):
+                        result["skipped"].append(pane_id)
+                        return result
+                    command = ["pane", "report-metadata", pane_id, "--source", SOURCE,
+                               "--clear-token", "phone", "--clear-token", "emu"]
+                    try:
+                        cleared = _succeeded(self.runner(command))
+                    except (OSError, subprocess.SubprocessError):
+                        cleared = False
+                    result["updated" if cleared else "failed"].append(pane_id)
+            except LedgerError as error:
+                if error.code != "display_busy":
+                    raise
+                result["skipped"].append(pane_id)
+        return result
+
+    def _reclaim_candidate(self, agent: Mapping[str, Any], snapshot: Mapping[str, Any], *,
+                           allow_repo_mismatch: bool = False) -> tuple[dict[str, Any], str] | None:
+        from ham.ledger.status import recoverable_display_owner
+
+        if agent.get("last_ham_label") is not None:
+            return None
+        panes = snapshot.get("panes")
+        if not isinstance(panes, list):
+            raise LedgerError("invalid_snapshot", "Reclaim requires a complete Herdr pane snapshot.")
+        matches = [pane for pane in panes if pane.get("pane_id") == agent["pane_id"]]
+        if len(matches) != 1 or matches[0].get("terminal_id") != agent["terminal_id"]:
+            return None
+        border = matches[0].get("label", "")
+        if not isinstance(border, str) or not border:
+            return None
+        terminals = {pane["terminal_id"] for pane in panes if pane.get("terminal_id")}
+        with self.store.read() as connection:
+            owner = recoverable_display_owner(
+                connection, agent, border, live_terminals=terminals,
+                allow_repo_mismatch=allow_repo_mismatch)
+        return None if owner is None else (owner, border)
+
+    def reclaim(self, *, apply: bool = False, snapshot: Mapping[str, Any] | None = None,
+                pane_id: str | None = None, pane_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        """Recover only historical HAM display ownership, never mail identity."""
+        from ham.ledger.status import live_snapshot
+
+        selected_panes = set(pane_ids or ())
+        if pane_id is not None:
+            selected_panes.add(pane_id)
+        supplied_snapshot = snapshot
+        snapshot = live_snapshot() if snapshot is None else snapshot
+        result: dict[str, Any] = {
+            "applied": apply, "panes": [], "updated": [], "failed": [], "skipped": [],
+        }
+        for agent in self.registry.list():
+            if agent["host"] != self.store.host or (selected_panes and agent["pane_id"] not in selected_panes):
+                continue
+            explicit = agent["pane_id"] in selected_panes
+            candidate = self._reclaim_candidate(agent, snapshot, allow_repo_mismatch=explicit)
+            if candidate is None:
+                continue
+            owner, border = candidate
+            before = {"border": border, "last_ham_label": agent["last_ham_label"]}
+            projected = self.projection(agent)
+            entry = {
+                "host": agent["host"], "pane_id": agent["pane_id"], "agent_id": agent["agent_id"],
+                "owner_agent_id": owner["agent_id"], "before": before,
+                "after": {"border": projected.label, "last_ham_label": projected.label},
+                "status": "candidate",
+            }
+            entry["prior_repo_id"] = owner["repo_id"]
+            entry["current_repo_id"] = agent["repo_id"]
+            if owner["repo_id"] != agent["repo_id"]:
+                entry["status"] = "explicit_only"
+                entry["reason"] = (
+                    f"Prior HAM border ownership belongs to repo {owner['repo_id']!r}; "
+                    f"the current agent belongs to repo {agent['repo_id']!r}. "
+                    "Cross-repository recovery requires explicit --pane selection.")
+            result["panes"].append(entry)
+            if not apply:
+                continue
+            entry["after"] = dict(before)
+            outcome: bool | None = None
+            try:
+                with self.store.display_lock(agent["host"], agent["pane_id"]):
+                    current = self._active_agent(agent)
+                    latest_snapshot = live_snapshot() if supplied_snapshot is None else supplied_snapshot
+                    latest = None if current is None else self._reclaim_candidate(
+                        current, latest_snapshot, allow_repo_mismatch=explicit)
+                    # The real border must still equal the exact historical
+                    # label; even a fresh snapshot can race a manual rename.
+                    if latest is not None and self._border_label(current) == latest[1]:
+                        entry["owner_agent_id"] = latest[0]["agent_id"]
+                        entry["prior_repo_id"] = latest[0]["repo_id"]
+                        entry["before"] = {
+                            "border": latest[1], "last_ham_label": current["last_ham_label"],
+                        }
+                        if self._active_agent(current) == current:
+                            saved = self.registry.set_display_label(current["agent_id"], None, latest[1])
+                            if saved["updated"]:
+                                outcome = self._refresh_agent_locked(current)
+                            else:
+                                outcome = None
+                    refreshed = self._active_agent(agent)
+                    entry["after"] = {
+                        "border": self._border_label(refreshed) if refreshed is not None else None,
+                        "last_ham_label": refreshed["last_ham_label"] if refreshed is not None else None,
+                    }
+            except LedgerError as error:
+                if error.code != "display_busy":
+                    raise
+            key = "skipped" if outcome is None else "updated" if outcome else "failed"
+            entry["status"] = key
+            result[key].append(agent["pane_id"])
         return result
 
 
 def report_agent_metadata(pane_id: str, agent: str, alias: str, marker: str, color: str, *,
                           runner: HerdrRunner = _run_herdr, store: LedgerStore | None = None,
                           observed: Mapping[str, Any] | None = None,
-                          on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool:
+                          on_failure: Callable[[str, subprocess.CompletedProcess[str]], None] | None = None) -> bool | None:
     """Refresh a named local agent, including a session not yet in the registry."""
     ledger = LedgerStore() if store is None else store
     display = LedgerDisplay(ledger, runner=runner)
@@ -294,15 +450,30 @@ def refresh_pane(pane_id: str, store: LedgerStore | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Refresh authoritative HAM role and status on this host.")
-    parser.add_argument("--pane", required=True)
+    parser = argparse.ArgumentParser(description="Refresh or reclaim HAM-owned pane borders on this host.")
+    parser.add_argument("operation", nargs="?", choices=("refresh", "reclaim"), default="refresh")
+    parser.add_argument("--pane", action="append",
+                        help="Select a pane explicitly; repeat to reclaim multiple panes.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="Apply proven historical border ownership.")
+    mode.add_argument("--dry-run", action="store_true", help="List reclaim candidates without writes (default).")
     arguments = parser.parse_args(argv)
+    if arguments.operation == "refresh" and (
+            not arguments.pane or len(arguments.pane) != 1 or arguments.apply or arguments.dry_run):
+        parser.error("refresh requires exactly one --pane; --apply and --dry-run are reclaim options")
     try:
+        if arguments.operation == "reclaim":
+            store = LedgerStore() if arguments.apply else LedgerStore.open_readonly()
+            result = ({"applied": False, "panes": [], "updated": [], "failed": [], "skipped": []}
+                      if store is None else LedgerDisplay(store).reclaim(
+                          apply=arguments.apply, pane_ids=arguments.pane))
+            print(json.dumps({"result": result}, ensure_ascii=False))
+            return 1 if result["failed"] else 0
         store = LedgerStore()
         AgentRegistry(store).refresh()
-        result = refresh_pane(arguments.pane, store)
+        result = refresh_pane(arguments.pane[0], store)
         print(json.dumps({"result": result}, ensure_ascii=False))
-        return 0 if arguments.pane in result["updated"] and not result["failed"] else 1
+        return 1 if result["failed"] else 0
     except (LedgerError, OSError, subprocess.SubprocessError) as error:
         print(json.dumps({"error": {"code": getattr(error, "code", "display_refresh_failed"),
                                   "message": str(error)}}, ensure_ascii=False))

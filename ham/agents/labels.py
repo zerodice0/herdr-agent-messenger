@@ -229,7 +229,7 @@ def report_agent_label_metadata(
         runner=lambda command: run_herdr(*command),
         on_failure=report_command_failure,
         observed=observed,
-    )
+    ) is not False
 
 
 def candidates(seed: str) -> Iterator[Alias]:

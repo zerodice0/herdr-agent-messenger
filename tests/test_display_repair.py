@@ -573,9 +573,9 @@ class DisplayRepairTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["pane"], owned + " — human suffix")
         self.assertIsNone(self.agent()["last_ham_label"])
 
-    def test_historical_ownership_does_not_cross_host_terminal_or_pane(self):
+    def test_historical_ownership_does_not_cross_host_workspace_pane_repo_or_client(self):
         old, owned = self.lost_ownership()
-        for column in ("host", "terminal_id", "pane_id"):
+        for column in ("host", "workspace_id", "pane_id", "repo_id", "client"):
             with self.subTest(binding=column):
                 with self.store.transaction() as connection:
                     original = connection.execute(
@@ -640,12 +640,12 @@ class DisplayRepairTest(unittest.TestCase):
                         observed["tokens"][field] = normalized + "!"
                     self.assertFalse(metadata_matches(desired, observed))
 
-    def test_current_equals_desired_concurrent_cas_save_uses_actual_saved_owner(self):
+    def test_current_equals_desired_reloads_cas_owner_before_recording_without_rename(self):
         self.initialize()
         desired = "orange-rabbit"
         self.herdr.labels["pane"] = desired
         for competing_label, metadata_fails, expected in (
-                (desired, False, True), ("Other owner's border", False, False), (desired, True, False)):
+                (desired, False, True), ("Other owner's border", False, True), (desired, True, False)):
             with self.subTest(competing_label=competing_label, metadata_fails=metadata_fails):
                 with self.store.transaction() as connection:
                     connection.execute("UPDATE agents SET last_ham_label=NULL WHERE active=1")
@@ -657,7 +657,11 @@ class DisplayRepairTest(unittest.TestCase):
                     stale["agent_id"], stale["last_ham_label"], competing_label)
                 self.assertTrue(committed["updated"])
                 self.assertEqual(display.refresh_agent(stale), expected)
-                self.assertEqual(self.agent()["last_ham_label"], competing_label)
+                # The projector reloads ownership under its pane lock. An
+                # exact desired live border is recorded against that latest
+                # CAS value, rather than the stale caller's NULL ownership.
+                self.assertEqual(self.agent()["last_ham_label"], desired)
+                self.assertEqual(self.herdr.labels["pane"], desired)
                 self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
 
     def test_full_one_pass_worker_uses_one_snapshot_and_only_repairs_drift(self):

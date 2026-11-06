@@ -771,13 +771,90 @@ do not isolate keys. HAM leaves unrelated token keys untouched.
 HAM-owned borders show `[메인] alias · summary` or `[워커] alias · summary`,
 omitting absent parts; off-mode status has no role prefix. HAM updates only a
 blank border, a verified legacy border, or its exact last recorded border.
-Ownership carries across agent generations only on the same host and exact
-terminal/pane binding. Recovery requires an exact match to the recorded
-prior-generation label; a role prefix alone never proves ownership. A differing
+Ownership carries across agent generations only on an exact match to the recorded
+prior-generation label within one host/workspace/pane/repository/client scope,
+either on the same terminal binding or under the terminal-rebind rule below. A
+role prefix alone never proves ownership. A differing
 manual rename is preserved. If the border already equals the desired label,
 HAM records ownership again without renaming it. The old `user:pane-recap` token
 is cleared only when the new status/role feature is invoked; this UI does not
 deploy or remove global recap rules.
+
+#### Border recovery after a terminal rebind
+
+A pane can come back under a new terminal ID, for example after a restart. The
+same-terminal carry above no longer applies, so HAM adopts the existing
+border as its own only when all of these hold:
+
+- The current border is nonempty and exactly equals the `last_ham_label` of an
+  earlier **inactive** agent row. Comparison is exact text; there is no prefix,
+  role-only or fuzzy match, and a pane match alone never adopts a border.
+- That row has the same host, workspace, pane, repository and client as the
+  agent being projected.
+- The row's terminal differs from the current one, is absent from the full
+  current Herdr pane list, and has no active agent row. Any active row on that
+  terminal rejects the candidate.
+- A session mismatch is allowed. The exact historical HAM text plus a vanished
+  terminal proves who owned the display, not who owns mail, so the session
+  reference is not compared.
+
+If several rows qualify, the one with the most recent `last_seen`, then
+`first_seen`, wins. Same-terminal generation recovery is the one exception to
+the gone-terminal requirement: it needs no vanished terminal but keeps the same
+host/workspace/pane/repository/client scope and exact-label match. Adoption transfers
+only the right to update that border. Status, phase and summary, session
+references, mail, receipts and delivery state, and device claims are not
+copied from the old row. Schema 12 is unchanged and no migration columns were
+added; recovery reads the existing `last_ham_label` and terminal slot data.
+
+Display projection serializes per pane. The projector takes a bounded shared
+per-pane lock and, once it holds it, rereads the binding before deciding or
+writing, so a concurrent rebind cannot be projected over from a stale read. The
+display path never takes the registry lock. If the lock times out, that refresh
+is skipped silently with no diagnostic, and a later refresh or snapshot retries.
+
+To inspect or restore a border that an earlier rebind left without a recorded
+owner, run `python3 -m ham display reclaim [--dry-run | --apply] [--pane PANE]...`.
+The plain `python3 -m ham display --pane PANE` refresh is unchanged.
+
+Reclaim considers only this host's active agents whose recorded border label is
+still empty, whose current terminal is the one on that pane, and whose current
+border is nonempty and passes the exact-match rules above against the full live
+Herdr pane list. `--pane` limits the scan to one pane and may be repeated to
+select several; selected panes are the only ones that can use the repository
+exception described below.
+
+Dry run is the default (`--dry-run` states it explicitly). It opens the ledger
+read-only and reads the live pane list; it takes no locks, does not refresh the
+registry and writes nothing to the ledger or Herdr. `--apply` takes the per-pane
+lock for each candidate, rechecks the active agent, the live snapshot and the
+exact current border, records the recovered label with a compare-and-set, and
+then runs the normal display refresh. If the border was renamed or the binding
+changed meanwhile, nothing is recorded.
+
+The JSON result is `{applied, panes, updated, failed, skipped}`. Each `panes`
+entry has `host`, `pane_id`, `agent_id` (the active agent that receives
+ownership), `owner_agent_id` (the inactive prior row that proves it),
+`before` and `after` (each `{border, last_ham_label}`) and a `status` of
+`candidate`, `explicit_only`, `updated`, `failed` or `skipped`. `updated`, `failed` and `skipped`
+list pane IDs. In a dry run every entry stays `candidate` or `explicit_only`: `before` is the
+current state and `after` is the projected border and `last_ham_label` that
+`--apply` would produce, so it can differ from `before`. Nothing is changed. A
+pane whose lock was busy is `skipped` and can be retried.
+
+Automatic recovery, including the worker and reclaim without `--pane`, always
+requires the same repository. A repository identity can legitimately change
+for the same checkout, for example a local checkout that later gains a remote.
+In that case reclaim reports the pane in a dry run with status `explicit_only`,
+a `reason` describing both repositories, and `prior_repo_id` and `current_repo_id`, and never adopts it on
+its own. Only a pane you select with `--pane PANE` can relax repository
+equality, and `--apply` records ownership for an `explicit_only` candidate only
+when that pane was selected explicitly. Every other rule is unchanged: same
+host, workspace, pane and client, an exact nonempty border equal to the
+inactive prior row's last label, and a different prior terminal that is gone
+from the full live pane list with no active row. This is not a general
+cross-repository transfer: an unselected pane, or a different pane in another
+repository, is never adopted, and review the dry run before applying.
 
 Registry refresh compares the already-fetched Herdr snapshot with HAM's desired
 `display_agent`, alias/color/recap/phone/emu tokens and owned border. Drift repair
@@ -788,9 +865,13 @@ It restores recorded phase/summary; meaningful updates still require explicit
 worker snapshot, not treated as confirmation merely because the write succeeded.
 
 Snapshot-driven projection writes, whether they succeed or fail, wait for a later
-snapshot to confirm the desired display. Explicit status/device writes queue only
-failures and clear pending repair on success, without an extra verification
-subprocess or worker request. Unconfirmed mismatches retry with exponential
+snapshot to confirm the desired display. Explicit status/device writes queue both
+failures and writes deferred by a busy pane lock. A deferred write is queued as
+pending with zero attempts, with no failure diagnostic and no retry or backoff
+consumed, and any concurrent worker reservation is preserved. A snapshot
+projection skipped the same way refunds its own reservation instead of
+consuming an attempt. A successful explicit write clears pending repair, without
+an extra verification subprocess or worker request. Unconfirmed mismatches retry with exponential
 backoff starting at five seconds, up to five attempts including the initial
 write. The queue holds at most 256 panes; overflow reports a diagnostic without
 writing the overflowing pane. Pending entries keep the existing maintenance

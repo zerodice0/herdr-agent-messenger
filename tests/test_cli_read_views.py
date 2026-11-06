@@ -698,8 +698,14 @@ class ReadCliTest(unittest.TestCase):
         # Receipt formatting is independent of display repair. Report truthful,
         # already-matching effective metadata and borders from the private fake.
         display = LedgerDisplay(self.store)
-        projections = {agent["pane_id"]: display.projection(agent)
-                       for agent in AgentRegistry(self.store).list()}
+        registry = AgentRegistry(self.store)
+        agents = registry.list()
+        projections = {agent["pane_id"]: display.projection(agent) for agent in agents}
+        # A matching snapshot is not authority for an ownership write. Model an
+        # already-owned border so receipt tests need no live pane-get support.
+        for agent in agents:
+            registry.set_display_label(
+                agent["agent_id"], agent["last_ham_label"], projections[agent["pane_id"]].label)
         for pane in self.snapshot["panes"]:
             pane["label"] = projections[pane["pane_id"]].label
         for agent in self.snapshot["agents"]:
