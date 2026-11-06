@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -50,7 +49,6 @@ def build_display(agent: str, alias: str, marker: str = "", color: str = "", *,
                   role: str | None = None, phase: str = "", summary: str = "",
                   phone: str | None = None, emu: str | None = None) -> DisplayProjection:
     """Keep Agents addressable by suffix and put border identity before status."""
-    marker = "" if "NO_COLOR" in os.environ else marker
     phase = sanitize_status_text(phase, 64)
     summary = sanitize_status_text(summary, 200)
     role_label = {"main": "[메인]", "worker": "[워커]"}.get(role, "")

@@ -34,10 +34,16 @@ class DisplayRestoreTest(unittest.TestCase):
     initialize = repair_tests.DisplayRepairTest.initialize
     lost_ownership = repair_tests.DisplayRepairTest.lost_ownership
 
-    def restored(self, *, reconcile=True, session="restored-session", border=None):
+    def restored(self, *, reconcile=True, session="restored-session", border=None,
+                 historical_markerless=False):
         old = self.initialize()
         self.registry.set_status(old, phase="review", summary="Historical task")
         owned = self.agent()["last_ham_label"]
+        if historical_markerless:
+            legacy = "orange-rabbit · Historical task"
+            self.registry.set_display_label(old["agent_id"], owned, legacy)
+            self.herdr.labels["pane"] = legacy
+            owned = legacy
         for row in (*self.template["panes"], *self.template["agents"]):
             row["terminal_id"] = "restored-terminal"
         self.template["agents"][0]["agent_session"] = {"value": session}
@@ -95,8 +101,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertEqual(self.herdr.labels["pane"], "🟧 orange-rabbit · Automatic restored projection")
 
     def test_markerless_historical_border_transfers_exactly_then_migrates_once(self):
-        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
-            _, owned = self.restored()
+        _, owned = self.restored(historical_markerless=True)
         self.assertEqual(owned, "orange-rabbit · Historical task")
         self.assertEqual(self.agent()["last_ham_label"], owned)
         self.assertEqual(self.herdr.labels["pane"], owned)
@@ -120,8 +125,7 @@ class DisplayRestoreTest(unittest.TestCase):
         self.assertIsNone(self.agent()["last_ham_label"])
 
     def test_markerless_historical_border_reclaim_keeps_exact_before_and_marked_after(self):
-        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
-            _, owned = self.restored()
+        _, owned = self.restored(historical_markerless=True)
         with self.store.transaction() as connection:
             connection.execute("UPDATE agents SET last_ham_label=NULL WHERE active=1")
         display = LedgerDisplay(self.store, runner=self.herdr)
@@ -710,6 +714,11 @@ class DisplayRestoreTest(unittest.TestCase):
 
 
 class CapturedDisplayRestoreTest(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
+
     def test_all_24_original_first_loss_bindings_are_reclaimable(self):
         # The same read-only 2026-11-06 affected reports retain first_unowned_row
         # and prior_owned_row. Reconstruct those historical bindings as active

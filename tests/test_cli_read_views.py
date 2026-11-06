@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReadCliTest(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
         helper = Path.home() / ".config/herdr/scripts/agent_work.py"
         if helper.is_file():
             work = Path(subprocess.run(

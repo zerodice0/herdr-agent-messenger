@@ -622,9 +622,11 @@ session/client/repo changes generation. Agents keeps role before the addressable
 borders show `<marker> [메인] alias · summary` or `<marker> [워커] alias · summary`
 (for example `⬜ [메인] white-rabbit · Checking the mailbox boundary`), omitting
 missing parts and preserving manual user renames. The marker is the `alias_identity`
-color marker also used by `display_agent`; `NO_COLOR` (even empty) or an explicitly
-empty marker removes it from both consistently. Alias precedes summary so
-Herdr's width truncation clips the summary first. `status clear` removes
+emoji marker also used by `display_agent`. This is stable alias identity, not ANSI
+color, so `NO_COLOR` does not remove it from either projection. Only an explicitly
+empty marker disables it in both. Mailbox TUI's own `NO_COLOR` color and marker
+rendering is unchanged. Alias precedes summary so Herdr's width truncation clips
+the summary first. `status clear` removes
 phase/summary but retains alias and any active role. Phase supplies the HAM
 `recap` token. Herdr's turn state is stored unchanged.
 `status set`/`clear` also work off, without a role prefix; invoking this feature

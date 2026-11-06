@@ -52,6 +52,9 @@ class EffectiveDisplay(HerdrDisplay):
 
 class DisplayRepairTest(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory(prefix="ham-display-repair-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

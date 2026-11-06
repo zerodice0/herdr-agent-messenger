@@ -37,6 +37,9 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
             cls.work.mkdir(parents=True, exist_ok=True)
 
     def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory(dir=self.work)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

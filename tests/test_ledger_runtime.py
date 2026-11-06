@@ -112,6 +112,9 @@ class RenderBundleTest(unittest.TestCase):
 
 class NativeReceiverTest(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

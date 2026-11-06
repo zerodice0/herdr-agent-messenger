@@ -751,10 +751,12 @@ HAM 소유 테두리는 `<marker> [메인] alias · summary` 또는
 `⬜ [메인] white-rabbit · 메일함 경계를 검토하고 있습니다`입니다. 없는 부분은 생략하며
 off 모드에서는 역할 접두사가 없습니다. marker는 `display_agent`가 쓰는 것과 같은
 alias 정체성(`alias_identity`)의 색상 표시이므로 Agents 이름과 테두리가 일치합니다.
-`NO_COLOR`가 있으면 값이 비어 있어도, 또는 marker를 명시적으로 비우면 `display_agent`와
-테두리에서 똑같이 marker를 제거하고 `[메인] alias · summary`만 남깁니다.
-`NO_COLOR`는 표시를 갱신하는 HAM 프로세스의 환경에서 읽습니다. 같은 pane을 갱신하는
-CLI, hook, 상주 worker에는 같은 환경 설정을 적용해야 합니다.
+이모지 marker는 ANSI 색상이 아니라 별칭을 식별하는 표시이므로 `NO_COLOR` 값이
+비어 있거나 `1`이어도 두 곳에 모두 유지합니다. marker를 명시적으로 비울 때만
+`display_agent`와 테두리에서 모두 제거하고 `[메인] alias · summary`만 남깁니다.
+따라서 이 표시를 맞추기 위해 CLI, hook, 상주 worker의 `NO_COLOR` 설정을
+일치시킬 필요는 없습니다. Mailbox TUI 자체의 `NO_COLOR`에 따른 색상과 marker
+렌더링은 바뀌지 않습니다.
 HAM은 비어 있는 테두리, 출처가 확인된 legacy 테두리, 또는 자기가 마지막으로
 기록한 값과 정확히 같은 테두리만 바꿉니다. marker가 생기기 전에 쓴 테두리에는
 marker가 없습니다. 기록된 marker 없는 `last_ham_label`과 정확히 같은 테두리는 여전히

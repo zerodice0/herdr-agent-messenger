@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, expect, test, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, expect, test, setSystemTime, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { MailboxAdapter, callReceiver, parseReply, type ClaimBundle, type NativeMessage, type ReceiverReplies } from "../ham/integrations/omp/ham-mailbox";
+import type { ExtensionAPI, ExtensionContext, ToolExecutionStartEvent, ToolExecutionEndEvent } from "@oh-my-pi/pi-coding-agent";
+import installMailbox, { MailboxAdapter, callReceiver, parseReply, type ClaimBundle, type NativeMessage, type ReceiverReplies } from "../ham/integrations/omp/ham-mailbox";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -42,6 +42,14 @@ type AcceptedMessage = NativeMessage & { type: "custom_message"; id: string; par
 interface TitleEntry { type: "title_change"; id: string; title: string; source: "auto" | "user" }
 interface SavedNameEntry { type: "custom"; id: string; customType: string; data: unknown }
 interface TitleState { name?: string; source?: "auto" | "user"; entries: (TitleEntry | SavedNameEntry)[] }
+
+function toolExecution(toolCallId: string, command: string, toolName = "bash"):
+    { start: ToolExecutionStartEvent; end: ToolExecutionEndEvent } {
+  return {
+    start: { type: "tool_execution_start", toolCallId, toolName, args: { command } },
+    end: { type: "tool_execution_end", toolCallId, toolName, result: { content: [], details: {} }, isError: false },
+  };
+}
 
 function ledgerView(value: unknown): View {
   if (typeof value !== "object" || value === null || !("messages" in value) || !Array.isArray(value.messages) ||
@@ -967,8 +975,9 @@ test("willContinue, ask and pending native messages hold wake until genuine idle
   f.adapter.agentStart(f.context); f.adapter.agentEnd({ willContinue: true }, f.context);
   await f.adapter.kick(f.context); expect(f.sent).toHaveLength(0);
   f.adapter.agentStart(f.context); f.adapter.agentEnd({ willContinue: false }, f.context);
-  f.adapter.tool(true, { toolName: "ask" }, f.context); await f.adapter.kick(f.context); expect(f.sent).toHaveLength(0);
-  f.adapter.tool(false, { toolName: "ask" }, f.context); f.queued = true;
+  const ask = toolExecution("ask-1", "", "ask");
+  f.adapter.tool(ask.start, f.context); await f.adapter.kick(f.context); expect(f.sent).toHaveLength(0);
+  f.adapter.tool(ask.end, f.context); f.queued = true;
   await f.adapter.kick(f.context); expect(f.sent).toHaveLength(0);
   f.queued = false; await f.adapter.kick(f.context); expect(f.sent).toHaveLength(1);
 });
@@ -1150,40 +1159,69 @@ test("explicit clear leaves an originally unnamed session's last owned name with
   expect(f.nameWrites).toHaveLength(1);
 });
 
-test("own successful status commands refresh once during a turn and unrelated results do not refresh", async () => {
+test("registered execution events refresh successful own status once without a tool_result subscription", async () => {
+  const now = Date.now(); setSystemTime(now);
   const f = new Fixture(); await f.setup(); await f.runNextTimeout();
-  f.adapter.agentStart(f.context);
-  await f.fixture("summary", { summary: "Prompt status update" });
-  const event = { toolName: "bash", toolCallId: "status-1", isError: false,
-    input: { command: 'python3 "$HOME/.omp/agent/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py" status set review --summary "Prompt status update"' } };
-  f.operations.length = 0;
-  expect(f.adapter.toolResult(event, f.eventContext())).toBeUndefined();
-  expect(f.operations).toEqual([]);
-  expect(f.timeoutTokens.size).toBe(1);
-  await f.runNextTimeout();
-  expect(f.operations).toEqual(["inspect"]);
-  expect(f.titleState().name).toBe(f.registrationReply!.agent.alias + " · Prompt status update");
-  await f.adapter.toolResult(event, f.eventContext());
-  expect(f.operations).toEqual(["inspect"]);
-  for (const command of ["echo 'python3 -m ham cli status set review --summary text'",
-    "python3 -m ham cli status board", "python3 -m ham cli mail send --to someone",
-    "ssh other python3 -m ham cli status clear", "python3 unrelated.py status clear"]) {
-    await f.adapter.toolResult({ ...event, toolCallId: command, input: { command } }, f.context);
-  }
-  await f.adapter.toolResult({ ...event, toolCallId: "failed", isError: true }, f.context);
-  await f.adapter.toolResult({ ...event, toolCallId: "not-bash", toolName: "read" }, f.context);
-  f.kind = "sub";
-  await f.adapter.toolResult({ ...event, toolCallId: "nested" }, f.context);
-  f.kind = "main";
-  expect(f.operations).toEqual(["inspect"]);
-  await f.fixture("summary", { summary: "" });
-  await f.adapter.toolResult({ ...event, toolCallId: "clear",
-    input: { command: "python3 -m ham --cwd /some/repo cli status clear" } }, f.context);
-  expect(f.operations).toEqual(["inspect"]);
-  expect(f.timeoutTokens.size).toBe(1);
-  await f.runNextTimeout();
-  expect(f.operations).toEqual(["inspect", "inspect"]);
-  expect(f.sent).toEqual([]);
+  const handlers = new Map<string, (event: ToolExecutionStartEvent | ToolExecutionEndEvent, ctx: ExtensionContext) => unknown>();
+  installMailbox({ on: (type: string, handler: (event: ToolExecutionStartEvent | ToolExecutionEndEvent, ctx: ExtensionContext) => unknown) => {
+    handlers.set(type, handler);
+  } } as unknown as ExtensionAPI);
+  expect(handlers.has("tool_result")).toBe(false);
+  expect(handlers.has("tool_execution_start")).toBe(true);
+  expect(handlers.has("tool_execution_end")).toBe(true);
+  // Route the installed callbacks through the fixture's isolated receiver.
+  const handleTool = f.adapter.tool.bind(f.adapter);
+  const tool = spyOn(MailboxAdapter.prototype, "tool").mockImplementation(handleTool);
+  const dispatch = (event: ToolExecutionStartEvent | ToolExecutionEndEvent, ctx = f.eventContext()) =>
+    handlers.get(event.type)!(event, ctx);
+  try {
+    f.adapter.agentStart(f.context);
+    await f.fixture("summary", { summary: "Prompt status update" });
+    const event = toolExecution("status-1",
+      'python3 "$HOME/.omp/agent/skills/herdr-agent-messenger/scripts/herdr_agent_messenger.py" status set review --summary "Prompt status update"');
+    f.operations.length = 0;
+    expect(dispatch(event.start)).toBeUndefined();
+    expect(f.operations).toEqual([]);
+    expect([...f.timeoutTokens].map(token => f.timerDueAt.get(token))).toEqual([now + 250]);
+    expect(dispatch(event.end)).toBeUndefined();
+    expect(f.operations).toEqual([]);
+    expect([...f.timeoutTokens].map(token => f.timerDueAt.get(token))).toEqual([now]);
+    await f.runNextTimeout();
+    expect(f.operations).toEqual(["inspect"]);
+    expect(f.titleState().name).toBe(f.registrationReply!.agent.alias + " · Prompt status update");
+    dispatch(event.end);
+    dispatch(event.start); dispatch(event.end);
+    expect(f.timeoutTokens.size).toBe(0);
+    for (const command of ["echo 'python3 -m ham cli status set review --summary text'",
+      "python3 -m ham cli status board", "python3 -m ham cli mail send --to someone",
+      "ssh other python3 -m ham cli status clear", "python3 unrelated.py status clear"]) {
+      const unrelated = toolExecution(command, command);
+      dispatch(unrelated.start); dispatch(unrelated.end);
+    }
+    const failed = toolExecution("failed", "python3 -m ham cli status clear");
+    dispatch(failed.start); dispatch({ ...failed.end, isError: true });
+    dispatch(failed.start); dispatch(failed.end);
+    const notBash = toolExecution("not-bash", "python3 -m ham cli status clear", "read");
+    dispatch(notBash.start); dispatch(notBash.end);
+    dispatch(toolExecution("unmatched-end", "python3 -m ham cli status clear").end);
+    f.kind = "sub";
+    const nested = toolExecution("nested", "python3 -m ham cli status clear");
+    dispatch(nested.start); dispatch(nested.end);
+    f.kind = "main";
+    dispatch(nested.end);
+    const invalidArgs = toolExecution("invalid-args", "");
+    dispatch({ ...invalidArgs.start, args: null }); dispatch(invalidArgs.end);
+    expect(f.operations).toEqual(["inspect"]);
+    expect(f.timeoutTokens.size).toBe(0);
+    await f.fixture("summary", { summary: "" });
+    const clear = toolExecution("clear", "python3 -m ham --cwd /some/repo cli status clear");
+    dispatch(clear.start); dispatch(clear.end);
+    expect(f.operations).toEqual(["inspect"]);
+    expect([...f.timeoutTokens].map(token => f.timerDueAt.get(token))).toEqual([now]);
+    await f.runNextTimeout();
+    expect(f.operations).toEqual(["inspect", "inspect"]);
+    expect(f.sent).toEqual([]);
+  } finally { tool.mockRestore(); }
 });
 
 test("status refresh during an existing probe requests one serialized trailing inspection", async () => {
@@ -1194,10 +1232,10 @@ test("status refresh during an existing probe requests one serialized trailing i
   f.operations.length = 0;
   const first = f.adapter.kick(f.context);
   await entered.promise;
-  const event = { toolName: "bash", toolCallId: "coalesced-status", isError: false,
-    input: { command: "python3 -m ham.cli status set review --summary coalesced" } };
-  await f.adapter.toolResult(event, f.context);
-  await f.adapter.toolResult(event, f.context);
+  const event = toolExecution("coalesced-status", "python3 -m ham.cli status set review --summary coalesced");
+  expect(f.adapter.tool(event.start, f.context)).toBeUndefined();
+  expect(f.adapter.tool(event.end, f.context)).toBeUndefined();
+  f.adapter.tool(event.start, f.context); f.adapter.tool(event.end, f.context);
   expect(f.timeoutTokens.size).toBe(1);
   await f.runNextTimeout(); // Busy kick only records one trailing probe.
   expect(f.operations).toEqual(["inspect"]);
@@ -1205,6 +1243,59 @@ test("status refresh during an existing probe requests one serialized trailing i
   f.beforeInspect = undefined;
   await f.runNextTimeout();
   expect(f.operations).toEqual(["inspect", "inspect"]);
+  expect(f.timeoutTokens.size).toBe(0);
+});
+
+test("status call tracking evicts the oldest ID and still refreshes the newest completion", async () => {
+  const f = new Fixture(); await f.setup(); await f.runNextTimeout();
+  const command = "python3 -m ham cli status set review --summary bounded";
+  for (let index = 0; index < 129; index++)
+    f.adapter.tool(toolExecution("bounded-" + index, command).start, f.context);
+  f.operations.length = 0;
+  f.adapter.tool(toolExecution("bounded-0", command).end, f.context);
+  expect(f.timeoutTokens.size).toBe(0);
+  expect(f.operations).toEqual([]);
+  f.cachedInspection = { ...f.registrationReply!, summary: "Bounded status history" };
+  const newest = toolExecution("bounded-128", command);
+  f.adapter.tool(newest.end, f.context);
+  expect(f.timeoutTokens.size).toBe(1);
+  expect(f.operations).toEqual([]);
+  await f.runNextTimeout();
+  expect(f.operations).toEqual(["inspect"]);
+  expect(f.titleState().name).toBe(f.registrationReply!.agent.alias + " · Bounded status history");
+  f.adapter.tool(newest.start, f.context); f.adapter.tool(newest.end, f.context);
+  expect(f.timeoutTokens.size).toBe(0);
+});
+
+test("session switches discard pending status calls and reject stale execution contexts", async () => {
+  const f = new Fixture(); await f.setup(); await f.runNextTimeout();
+  const firstSession = f.session;
+  const staleContext = Object.create(f.context) as ExtensionContext;
+  Object.defineProperty(staleContext, "sessionManager", { value: {
+    ...f.context.sessionManager, getSessionFile: () => firstSession,
+  } });
+  const event = toolExecution("switched-status", "python3 -m ham cli status set review --summary switched");
+  f.adapter.tool(event.start, staleContext);
+  f.session = path.join(f.directory, "status-next-session.jsonl");
+  await f.fixture("session", { session_ref: f.session });
+  await f.adapter.start(f.context);
+  await f.runNextTimeout();
+  f.operations.length = 0;
+  f.adapter.tool(event.end, f.eventContext());
+  f.adapter.tool(event.start, staleContext); f.adapter.tool(event.end, staleContext);
+  expect(f.timeoutTokens.size).toBe(0);
+  expect(f.operations).toEqual([]);
+  await f.fixture("summary", { summary: "Current session status" });
+  f.adapter.tool(event.start, f.eventContext());
+  f.adapter.tool(event.end, staleContext);
+  expect(f.timeoutTokens.size).toBe(0);
+  f.adapter.tool(event.end, f.eventContext());
+  expect(f.operations).toEqual([]);
+  expect(f.timeoutTokens.size).toBe(1);
+  await f.runNextTimeout();
+  expect(f.operations).toEqual(["inspect"]);
+  expect(f.titleState().name).toBe(f.registrationReply!.agent.alias + " · Current session status");
+  expect(f.nameWrites.every(row => row.session === f.session)).toBe(true);
 });
 
 test("session switches isolate ownership and preserve it when returning to an owned session", async () => {

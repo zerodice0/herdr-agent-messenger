@@ -699,9 +699,11 @@ python3 "$HAM_CLI" repo show
 `turn_state`는 바꾸지 않습니다. phase는 `$recap`에 표시합니다. HAM 소유 pane
 테두리는 `<marker> [메인] alias · summary` 또는 `<marker> [워커] alias · summary`로
 표시하며(예: `⬜ [메인] white-rabbit · 메일함 경계를 검토하고 있습니다`),
-없는 부분은 생략합니다. `NO_COLOR`가 있거나 marker를 명시적으로 비우면
-`display_agent`와 테두리에서 똑같이 marker를 제거합니다. 별칭을 요약 앞에 두므로
-Herdr가 폭에 맞춰 내용을 자를 때 요약이 먼저 잘립니다. `status clear`는 phase와
+없는 부분은 생략합니다. 이모지 marker는 ANSI 색상이 아니라 별칭을 식별하는
+표시이므로 `NO_COLOR`와 관계없이 `display_agent`와 테두리에 유지합니다.
+marker를 명시적으로 비울 때만 두 곳에서 모두 제거합니다. Mailbox TUI 자체의
+`NO_COLOR` 렌더링은 바뀌지 않습니다. 별칭을 요약 앞에 두므로 Herdr가 폭에 맞춰
+내용을 자를 때 요약이 먼저 잘립니다. `status clear`는 phase와
 summary만 지우고 별칭과 현재 역할은 유지합니다. 사용자가 지정한 기존 테두리는
 보존합니다. OMP 세션에는 `<alias> · <summary>` 이름도 붙입니다.
 [OMP 세션 이름 동기화](#omp-세션-이름-동기화)를 참고하세요. Agents에서는 역할을

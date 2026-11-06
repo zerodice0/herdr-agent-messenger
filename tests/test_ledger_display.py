@@ -87,6 +87,9 @@ class HerdrDisplay:
 
 class LedgerDisplayTest(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict("os.environ")
+        environment.start().pop("NO_COLOR", None)
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -295,15 +298,37 @@ class LedgerDisplayTest(unittest.TestCase):
             self.assertEqual(command[9:], ["--token", "alias=orange-rabbit", "--token", "color=orange",
                                           "--token", "recap=검토 중"])
 
-    def test_border_and_agents_share_explicit_marker_disable_and_no_color(self):
-        for marker, environment in (("", {}), ("🟧", {"NO_COLOR": ""}), ("🟧", {"NO_COLOR": "1"})):
-            with self.subTest(marker=marker, environment=environment), mock.patch.dict(
+    def test_border_and_agents_share_explicit_marker_disable(self):
+        for environment in ({}, {"NO_COLOR": ""}, {"NO_COLOR": "1"}):
+            with self.subTest(environment=environment), mock.patch.dict(
                     "os.environ", environment, clear=True):
-                projected = build_display("omp", "orange-rabbit", marker, "orange",
+                projected = build_display("omp", "orange-rabbit", "", "orange",
                                           role="main", summary="한글 요약")
                 self.assertEqual(projected.display_agent, "[메인] orange-rabbit")
                 self.assertEqual(projected.label, "[메인] orange-rabbit · 한글 요약")
                 self.assertEqual(projected.color, "orange")
+
+    def test_no_color_does_not_change_builder_or_alias_identity_projection(self):
+        agent = {**self.agent(), "role": "main", "summary": "한글 요약"}
+        for alias in ("orange-rabbit", "readzone-sol", "한글-작업"):
+            with self.subTest(alias=alias):
+                identity = agent_labels.alias_identity(alias)
+                expected = self.display.projection({**agent, "alias": alias})
+                built = build_display("omp", alias, identity.marker, identity.color,
+                                      role="main", summary="한글 요약")
+                self.assertEqual(expected.label, f"{identity.marker} [메인] {alias} · 한글 요약")
+                self.assertEqual(expected.display_agent, f"{identity.marker} [메인] {alias}")
+                for value in ("", "1"):
+                    with self.subTest(no_color=value), mock.patch.dict("os.environ", {"NO_COLOR": value}):
+                        self.assertEqual(agent_labels.alias_identity(alias), identity)
+                        projected = self.display.projection({**agent, "alias": alias})
+                        self.assertEqual((projected.label, projected.display_agent),
+                                         (expected.label, expected.display_agent))
+                        self.assertEqual(
+                            build_display("omp", alias, identity.marker, identity.color,
+                                          role="main", summary="한글 요약"),
+                            built,
+                        )
 
     def test_border_marker_uses_alias_identity_for_palette_and_custom_aliases(self):
         agent = self.agent()
@@ -344,14 +369,20 @@ class LedgerDisplayTest(unittest.TestCase):
         self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "🟧 orange-rabbit")
         self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
 
-    def test_no_color_removes_and_restores_marker_only_on_owned_border(self):
+    def test_no_color_keeps_owned_border_and_metadata_without_rewrites(self):
         self.status()
         self.display.refresh("p-main")
-        with mock.patch.dict("os.environ", {"NO_COLOR": ""}):
-            self.assertEqual(self.display.refresh("p-main")["failed"], [])
-            self.assertEqual(self.herdr.labels["p-main"], "orange-rabbit · Implement mailbox")
-            self.assertEqual(self.agent()["last_ham_label"], self.herdr.labels["p-main"])
-            self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"], "orange-rabbit")
+        expected_label = self.herdr.labels["p-main"]
+        expected_display_agent = self.herdr.metadata["p-main"][SOURCE]["display_agent"]
+        self.herdr.commands.clear()
+        for value in ("", "1"):
+            with self.subTest(no_color=value), mock.patch.dict("os.environ", {"NO_COLOR": value}):
+                self.assertEqual(self.display.refresh("p-main")["failed"], [])
+                self.assertEqual(self.herdr.labels["p-main"], expected_label)
+                self.assertEqual(self.agent()["last_ham_label"], expected_label)
+                self.assertEqual(self.herdr.metadata["p-main"][SOURCE]["display_agent"],
+                                 expected_display_agent)
+                self.assertFalse(any(command[:2] == ["pane", "rename"] for command in self.herdr.commands))
         self.assertEqual(self.display.refresh("p-main")["failed"], [])
         self.assertEqual(self.herdr.labels["p-main"], "🟧 orange-rabbit · Implement mailbox")
 

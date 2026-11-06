@@ -6,7 +6,7 @@ import { access } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolExecutionStartEvent, ToolExecutionEndEvent } from "@oh-my-pi/pi-coding-agent";
 
 type Request = Record<string, unknown>;
 export interface NativeAgent { terminal_id: string; agent_id: string; generation: number; session_ref: string; alias?: string }
@@ -289,7 +289,7 @@ export class MailboxAdapter {
   private registrationFailures = 0;
   private sessionNames = new Map<string, SessionNameState>();
   private nameWork: Promise<void> = Promise.resolve();
-  private statusToolCalls = new Set<string>();
+  private statusToolCalls = new Map<string, boolean>();
 
   constructor(private pi: ExtensionAPI, private call: Call = callReceiver) {}
 
@@ -667,17 +667,25 @@ export class MailboxAdapter {
     else { this.failureBlocked = event.success !== true; if (event.success) this.retryHoldUntil = 0; }
     this.refreshNeeded = true; this.schedule(ctx);
   }
-  tool(start: boolean, event: { toolName: string }, ctx: ExtensionContext): void {
-    if (!this.belongs(ctx) || event.toolName !== "ask") return;
-    this.blocked = Math.max(0, this.blocked + (start ? 1 : -1)); this.schedule(ctx);
-  }
-  toolResult(event: { toolName: string; toolCallId: string; input: Record<string, unknown>; isError: boolean },
-             ctx: ExtensionContext): void {
-    if (!this.belongs(ctx) || event.toolName !== "bash" || event.isError ||
-        !changesOwnStatus(event.input.command) || this.statusToolCalls.has(event.toolCallId)) return;
-    this.statusToolCalls.add(event.toolCallId);
-    if (this.statusToolCalls.size > 128) this.statusToolCalls.delete(this.statusToolCalls.values().next().value!);
-    this.schedule(ctx, 0);
+  tool(event: ToolExecutionStartEvent | ToolExecutionEndEvent, ctx: ExtensionContext): void {
+    if (!this.belongs(ctx)) return;
+    const start = event.type === "tool_execution_start";
+    if (event.toolName === "ask") {
+      this.blocked = Math.max(0, this.blocked + (start ? 1 : -1)); this.schedule(ctx);
+    } else if (event.toolName === "bash") {
+      if (event.type === "tool_execution_start") {
+        const command = typeof event.args === "object" && event.args !== null && "command" in event.args
+          ? event.args.command : undefined;
+        if (changesOwnStatus(command) && !this.statusToolCalls.has(event.toolCallId)) {
+          this.statusToolCalls.set(event.toolCallId, true);
+          if (this.statusToolCalls.size > 128) this.statusToolCalls.delete(this.statusToolCalls.keys().next().value!);
+        }
+      } else if (this.statusToolCalls.get(event.toolCallId)) {
+        // Consume before scheduling so duplicate starts or ends cannot refresh twice.
+        this.statusToolCalls.set(event.toolCallId, false);
+        if (event.isError === false) this.schedule(ctx, 0);
+      }
+    }
   }
   compact(start: boolean, event: { type: string; willRetry?: boolean }, ctx: ExtensionContext): void {
     if (!this.belongs(ctx)) return;
@@ -708,9 +716,8 @@ export default function (pi: ExtensionAPI): void {
   pi.on("turn_end", (_event, ctx) => adapter.schedule(ctx));
   pi.on("auto_retry_start", (event, ctx) => adapter.retry(true, event, ctx));
   pi.on("auto_retry_end", (event, ctx) => adapter.retry(false, event, ctx));
-  pi.on("tool_execution_start", (event, ctx) => adapter.tool(true, event, ctx));
-  pi.on("tool_execution_end", (event, ctx) => adapter.tool(false, event, ctx));
-  pi.on("tool_result", (event, ctx) => adapter.toolResult(event, ctx));
+  pi.on("tool_execution_start", (event, ctx) => adapter.tool(event, ctx));
+  pi.on("tool_execution_end", (event, ctx) => adapter.tool(event, ctx));
   pi.on("auto_compaction_start", (event, ctx) => adapter.compact(true, event, ctx));
   pi.on("auto_compaction_end", (event, ctx) => adapter.compact(false, event, ctx));
   pi.on("session_shutdown", (_event, ctx) => adapter.shutdown(ctx));

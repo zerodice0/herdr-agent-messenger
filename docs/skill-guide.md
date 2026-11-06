@@ -672,9 +672,11 @@ agent's host-local anchor role group.
 change Herdr's `turn_state`. Phase is projected to `$recap`. HAM-owned pane
 borders show `<marker> [메인] alias · summary` or `<marker> [워커] alias · summary`
 (for example `⬜ [메인] white-rabbit · Checking the mailbox boundary`), omitting
-missing parts. `NO_COLOR` or an explicitly empty marker drops the marker from
-`display_agent` and the border alike. The alias precedes the summary so Herdr's
-width truncation clips the summary first. `status clear` removes phase/summary,
+missing parts. The emoji marker is stable alias identity, not ANSI color, so
+`NO_COLOR` does not remove it from `display_agent` or the border. Only an explicitly
+empty marker disables it in both; Mailbox TUI's own `NO_COLOR` rendering is unchanged.
+The alias precedes the summary so Herdr's width truncation clips the summary first.
+`status clear` removes phase/summary,
 not alias or active role. OMP sessions also get a name `<alias> · <summary>`; see
 [OMP session name sync](#omp-session-name-sync).
 An existing user border is preserved. Agents keeps the role before the

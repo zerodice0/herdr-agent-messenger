@@ -774,12 +774,13 @@ HAM-owned borders show `<marker> [메인] alias · summary` or
 `⬜ [메인] white-rabbit · Checking the mailbox boundary`, omitting absent parts;
 off-mode status has no role prefix. The marker is the color marker from the alias
 identity (`alias_identity`), the same one `display_agent` uses, so the Agents name
-and the border agree. `NO_COLOR` (even an empty value) or an explicitly empty
-marker removes it from `display_agent` and the border alike, leaving
-`[메인] alias · summary`. HAM updates only a
-blank border, a verified legacy border, or its exact last recorded border.
-`NO_COLOR` is read from the projecting HAM process, so CLI, hook and resident-worker
-environments should agree when they update the same pane.
+and the border agree. The emoji marker is stable alias identity, not ANSI color:
+`NO_COLOR`, whether empty or `1`, does not remove it from either projection.
+Only an explicitly empty marker removes it from both, leaving
+`[메인] alias · summary`. CLI, hook and resident-worker `NO_COLOR` settings need not
+agree for these projections. Mailbox TUI's own `NO_COLOR` color and marker rendering
+is unchanged. HAM updates only a blank border, a verified legacy border, or its
+exact last recorded border.
 Borders written before the marker existed have no marker. A border that exactly
 equals the recorded markerless `last_ham_label` is still HAM's own and is
 rewritten once with the marker; nothing else is migrated.
