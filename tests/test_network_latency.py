@@ -226,27 +226,34 @@ class NetworkLatencyTest(unittest.TestCase):
     def test_pump_refills_completed_slots_while_another_peer_remains_in_flight(self):
         slow = self.queue("beta", count=2)
         healthy = self.queue("gamma", count=2) + self.queue("zeta", count=2)
-        release = threading.Event()
+        healthy_finished = threading.Event()
         finished = threading.Event()
+        completed_calls = []
+        lock = threading.Lock()
 
         class MixedTransport:
             def call(inner, peer, command, payload):
                 if peer["canonical_name"] == "beta":
                     try:
-                        release.wait(2)
+                        self.assertTrue(healthy_finished.wait(3), "Healthy peers must refill before beta completes")
+                        raise LedgerError("busy", "Isolated held peer")
                     finally:
                         finished.set()
+                with lock:
+                    completed_calls.append((peer["canonical_name"], payload["fixture"]))
+                    if len(completed_calls) == len(healthy):
+                        healthy_finished.set()
                 return {}
 
         remote = RemoteLedger(self.store, self.environment, MixedTransport())
         try:
-            self.assertEqual(remote.pump(budget_seconds=0.15),
+            self.assertEqual(remote.pump(budget_seconds=5),
                              {"sent": 4, "failed": 0, "deferred": 1})
             items = {item["item_id"]: item for item in remote.outbox()}
             self.assertTrue(all(items[item]["state"] == "sent" for item in healthy))
             self.assertEqual([items[item]["attempts"] for item in slow], [1, 0])
         finally:
-            release.set()
+            healthy_finished.set()
             self.assertTrue(finished.wait(1))
 
     def test_many_transient_head_attempts_remain_visible_and_retry_original_identity(self):
