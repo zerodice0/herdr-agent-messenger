@@ -1332,7 +1332,8 @@ class RemoteLedgerTest(unittest.TestCase):
                                 **display.metadata[pane].get(SOURCE, {}),
                                 'tokens': dict(display.metadata[pane]['tokens'])}]}
 
-        settings.accept(self.incoming_setting(), 'alpha')
+        with mock.patch.object(settings, '_publish'):
+            settings.accept(self.incoming_setting(), 'alpha')
         registry.reconcile(snapshot())
         self.assertIn('[메인]', display.labels[pane])
         with store.read() as connection:
@@ -1346,7 +1347,8 @@ class RemoteLedgerTest(unittest.TestCase):
         def accept_off_after_plan(*args):
             result = plan(*args)
             planned.append(result)
-            accepted.append(settings.accept(self.incoming_setting(value='off', version=2), 'alpha'))
+            with mock.patch.object(settings, '_publish'):
+                accepted.append(settings.accept(self.incoming_setting(value='off', version=2), 'alpha'))
             return result
 
         display.commands.clear()
@@ -1363,6 +1365,7 @@ class RemoteLedgerTest(unittest.TestCase):
         expected = {pane: {**queued[pane], 'explicit_pending': desired}}
         with store.read() as connection:
             self.assertEqual(display_repair.load(connection), expected)
+            self.assertEqual(connection.execute("SELECT count(*) FROM outbox WHERE state='pending'").fetchone()[0], 0)
         self.assertTrue(maintenance_pending(store))
 
         with mock.patch('ham.ledger.status.live_snapshot', side_effect=snapshot):
