@@ -291,19 +291,41 @@ class RepoSettings:
         return {**self.show(repo_id, host, workspace_id), **self._display_result()}
 
     def accept(self, setting: Mapping[str, Any], source: str) -> dict[str, Any]:
+        from ham.ledger import display_repair
+        from ham.ledger.display import LedgerDisplay
+        from ham.ledger.status import AgentRegistry
+
         incoming = validate_setting(setting, allow_oversized_version=True)
         if incoming["field"] in LEGACY_FIELDS:
             return {"applied": False, "ignored": "workspace_local", **self.show(incoming["repo_id"])}
         if incoming["repo_id"].startswith("local:"):
             raise LedgerError("local_repo", "Host-local repositories do not propagate settings.")
         terminals: list[str] = []
+        failed: list[str] = []
         with self.store.transaction(terminals) as connection:
             changed = self._apply(connection, incoming, source=source)
-            if changed and incoming["field"] in {"mode", "thresholds"}:
-                terminals.extend(row["terminal_id"] for row in connection.execute(
-                    "SELECT terminal_id FROM agents WHERE repo_id=? AND host=? AND active=1",
-                    (incoming["repo_id"], self.store.host)))
-        return {"applied": changed, **self.show(incoming["repo_id"]), **self._display_result()}
+            if changed:
+                registry = AgentRegistry(self.store)
+                display = LedgerDisplay(self.store)
+                entries = display_repair.load(connection)
+                at = time.time()
+                for agent in registry.list(incoming["repo_id"], connection=connection):
+                    if agent["host"] != self.store.host:
+                        continue
+                    if incoming["field"] in {"mode", "thresholds"}:
+                        terminals.append(agent["terminal_id"])
+                    projection = display.projection(agent, connection=connection)
+                    display_repair.defer(entries, agent["pane_id"],
+                                         display_repair.fingerprint(agent, projection), at)
+                    if agent["pane_id"] not in entries:
+                        failed.append(agent["pane_id"])
+                display_repair.save(connection, entries)
+        result = {"applied": changed, **self.show(incoming["repo_id"])}
+        if failed:
+            for pane_id in failed:
+                registry._display_failure("Display repair queue full; projection deferred for " + pane_id)
+            result["warnings"] = [{"code": "display_refresh_failed", "panes": failed}]
+        return result
 
     @staticmethod
     def _computed_from(agents: Sequence[Mapping[str, Any]], host: str, anchor: str) -> dict[str, str] | None:

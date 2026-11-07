@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import json
 import os
 from pathlib import Path
@@ -602,8 +602,9 @@ class AgentRegistry:
             return True
         return False
 
-    def list(self, repo_id: str | None = None) -> list[dict[str, Any]]:
-        with self.store.read() as connection:
+    def list(self, repo_id: str | None = None, *,
+             connection: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+        with self.store.read() if connection is None else nullcontext(connection) as connection:
             query = ("SELECT a.*,s.turn_state,s.phase,s.summary,s.updated_at AS status_updated_at "
                      "FROM agents a JOIN agent_status s USING(agent_id) WHERE a.active=1")
             parameters: tuple[Any, ...] = ()
@@ -833,7 +834,9 @@ class AgentRegistry:
                 entries = display_repair.load(connection)
                 before = json.dumps(entries, sort_keys=True)
                 for pane_id in list(entries):
-                    if pane_id in matching or (snapshot is not None and pane_id not in present):
+                    # A stale snapshot cannot confirm a concurrently deferred request.
+                    if (entries[pane_id] == queued.get(pane_id)
+                            and (pane_id in matching or (snapshot is not None and pane_id not in present))):
                         del entries[pane_id]
                 for pane_id, (desired, _raw) in sorted(plan.items()):
                     previous = entries.get(pane_id)

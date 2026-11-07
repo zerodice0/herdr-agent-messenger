@@ -16,6 +16,9 @@ import unittest
 from unittest import mock
 import uuid
 
+from ham.agents.labels import alias_identity
+from ham.ledger import display_repair
+from ham.ledger.display import LedgerDisplay, build_display
 from ham.ledger.mail import Mailbox, payload_hash, validate_payload
 from ham.ledger.remote import RemoteLedger, SSHTransport
 from ham.ledger.runtime import NativeReceiver
@@ -109,6 +112,10 @@ class RemoteLedgerTest(unittest.TestCase):
     def settings_for(self, host):
         return RepoSettings(self.stores[host], environment=self.environment,
                             display_runner=self.display_runner)
+
+    def incoming_setting(self, *, field='mode', value='auto', version=1):
+        return {'repo_id': self.repo_id, 'field': field, 'value': value, 'version': version,
+                'origin_host': 'alpha', 'changed_by': 'user', 'changed_at': time.time()}
 
     @staticmethod
     def display_runner(command):
@@ -1212,32 +1219,329 @@ class RemoteLedgerTest(unittest.TestCase):
         self.assertTrue(result['display']['failed'])
         self.assertEqual(result['warnings'][0]['code'], 'display_refresh_failed')
 
-    def test_remote_setting_receipt_projects_after_commit(self):
+    def test_remote_setting_receipt_defers_committed_projection_and_duplicate_does_nothing(self):
         store = self.stores['beta']
-        observed = []
-
-        def project(registry, pane_ids, *, environment=None):
-            self.assertIs(registry.store, store)
-            self.assertEqual(pane_ids, {self.agents['beta']['pane_id']})
-            with registry.store.read() as connection:
-                observed.append(RepoSettings.fields(connection, self.repo_id)['mode']['value'])
-            return {'updated': [], 'failed': ['isolated-pane']}
-
-        setting = {
-            'repo_id': self.repo_id,
-            'field': 'mode',
-            'value': 'manual',
-            'version': 1,
-            'origin_host': 'alpha',
-            'changed_by': 'user',
-            'changed_at': time.time(),
-        }
-        envelope = self.services['alpha'].envelope(setting)
-        with mock.patch.object(AgentRegistry, '_refresh_display', autospec=True, side_effect=project):
+        agent = self.agents['beta']
+        pane = agent['pane_id']
+        with store.transaction() as connection:
+            connection.execute("UPDATE agent_status SET phase=?,summary=? WHERE agent_id=?",
+                               ('Working', 'Peer setting', agent['agent_id']))
+            connection.execute("INSERT INTO device_claims VALUES (?,?,?,?,?)",
+                               ('phone-beta', 'phone', 'Pixel', agent['agent_id'], 1.0))
+        envelope = self.services['alpha'].envelope(self.incoming_setting())
+        project = LedgerDisplay.projection
+        with (mock.patch.object(AgentRegistry, '_refresh_display') as refresh,
+              mock.patch.object(LedgerDisplay, 'projection', autospec=True, side_effect=project) as projection):
             result = self.services['beta'].receive('setting', envelope)
-        self.assertEqual(observed, ['manual'])
-        self.assertEqual(result['display']['failed'], ['isolated-pane'])
-        self.assertEqual(result['warnings'][0]['code'], 'display_refresh_failed')
+            projection.assert_called_once()
+            self.assertIsNotNone(projection.call_args.kwargs['connection'])
+            self.assertTrue(result['applied'])
+            self.assertEqual(result['mode'], 'auto')
+            self.assertNotIn('display', result)
+            with store.read() as connection:
+                pending = display_repair.load(connection)
+                self.assertEqual(RepoSettings.fields(connection, self.repo_id)['mode']['value'], 'auto')
+            identity = alias_identity(agent['alias'])
+            expected = build_display('codex', agent['alias'], identity.marker, identity.color,
+                                     role='main', phase='Working', summary='Peer setting',
+                                     phone='📱 Pixel', emu='')
+            desired = display_repair.fingerprint(agent, expected)
+            self.assertEqual(pending, {pane: {
+                'fingerprint': desired, 'explicit_pending': desired, 'attempts': 0,
+                'next_try_at': pending[pane]['next_try_at'], 'state': 'pending', 'last_error': '',
+            }})
+            projection.reset_mock()
+            duplicate = self.services['beta'].receive('setting', envelope)
+            self.assertFalse(duplicate['applied'])
+            self.assertNotIn('display', duplicate)
+            projection.assert_not_called()
+            refresh.assert_not_called()
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), pending)
+
+    def test_setting_projection_reuses_caller_transaction_without_closing_it(self):
+        store = self.stores['beta']
+        registry = AgentRegistry(store)
+        display = LedgerDisplay(store)
+        with store.transaction() as connection:
+            self.settings_for('beta')._apply(connection, self.incoming_setting(), source='alpha')
+            connection.execute("INSERT INTO device_claims VALUES (?,?,?,?,?)",
+                               ('phone-beta', 'phone', 'Pixel', self.agents['beta']['agent_id'], 1.0))
+            with mock.patch.object(store, 'read', side_effect=AssertionError('Must reuse transaction')):
+                agent = registry.list(self.repo_id, connection=connection)[0]
+                projection = display.projection(agent, connection=connection)
+            self.assertEqual(agent['role'], 'main')
+            self.assertIn('[메인]', projection.display_agent)
+            self.assertEqual(projection.phone, '📱 Pixel')
+            self.assertEqual(connection.execute('SELECT 1').fetchone()[0], 1)
+
+    def test_remote_mode_off_keeps_worker_pending_until_fresh_snapshot_confirms_repair(self):
+        from tests.test_ledger_display import HerdrDisplay
+        from ham.ledger.display import SOURCE
+
+        store = self.stores['beta']
+        pane = self.agents['beta']['pane_id']
+        display = HerdrDisplay([pane], terminals={pane: 'term-beta'})
+        registry = AgentRegistry(store, display_runner=display)
+        settings = self.settings_for('beta')
+
+        def snapshot(*_args):
+            return {'panes': [{**self.snapshots['beta']['panes'][0], 'label': display.labels[pane]}],
+                    'agents': [{**self.snapshots['beta']['agents'][0],
+                                **display.metadata[pane].get(SOURCE, {}),
+                                'tokens': dict(display.metadata[pane]['tokens'])}]}
+
+        with mock.patch.object(settings, '_publish'):
+            settings.accept(self.incoming_setting(), 'alpha')
+            registry.reconcile(snapshot())
+            registry.reconcile(snapshot())
+            self.assertIn('[메인]', display.labels[pane])
+            result = settings.accept(self.incoming_setting(value='off', version=2), 'alpha')
+        self.assertTrue(result['applied'])
+        self.assertEqual(result['mode'], 'off')
+        self.assertTrue(maintenance_pending(store))
+        with store.read() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM outbox WHERE state='pending'").fetchone()[0], 0)
+            self.assertEqual(display_repair.load(connection)[pane]['attempts'], 0)
+        with mock.patch('ham.ledger.status.live_snapshot', side_effect=snapshot):
+            registry.refresh(self.environment)
+            self.assertNotIn('[메인]', display.labels[pane])
+            self.assertNotIn('[메인]', display.metadata[pane][SOURCE]['display_agent'])
+            self.assertTrue(maintenance_pending(store))
+            display.commands.clear()
+            registry.refresh(self.environment)
+        self.assertEqual(display.commands, [])
+        self.assertFalse(maintenance_pending(store))
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), {})
+
+    def test_stale_matching_snapshot_preserves_concurrent_mode_off_repair(self):
+        from tests.test_ledger_display import HerdrDisplay
+        from ham.ledger.display import SOURCE
+
+        store = self.stores['beta']
+        agent = self.agents['beta']
+        pane = agent['pane_id']
+        display = HerdrDisplay([pane], terminals={pane: 'term-beta'})
+        registry = AgentRegistry(store, display_runner=display)
+        settings = self.settings_for('beta')
+
+        def snapshot(*_args):
+            return {'panes': [{**self.snapshots['beta']['panes'][0], 'label': display.labels[pane]}],
+                    'agents': [{**self.snapshots['beta']['agents'][0],
+                                **display.metadata[pane].get(SOURCE, {}),
+                                'tokens': dict(display.metadata[pane]['tokens'])}]}
+
+        settings.accept(self.incoming_setting(), 'alpha')
+        registry.reconcile(snapshot())
+        self.assertIn('[메인]', display.labels[pane])
+        with store.read() as connection:
+            queued = display_repair.load(connection)
+        self.assertEqual(queued[pane]['state'], 'pending')
+        self.assertEqual(queued[pane]['attempts'], 1)
+        plan = registry._display_plan
+        planned = []
+        accepted = []
+
+        def accept_off_after_plan(*args):
+            result = plan(*args)
+            planned.append(result)
+            accepted.append(settings.accept(self.incoming_setting(value='off', version=2), 'alpha'))
+            return result
+
+        display.commands.clear()
+        with mock.patch.object(registry, '_display_plan', side_effect=accept_off_after_plan):
+            registry.reconcile(snapshot())
+        self.assertEqual(len(planned), 1)
+        self.assertIn(pane, planned[0][1])
+        self.assertTrue(accepted[0]['applied'])
+        self.assertEqual(accepted[0]['mode'], 'off')
+        self.assertEqual(display.commands, [])
+        self.assertIn('[메인]', display.labels[pane])
+        desired = display_repair.fingerprint(agent, LedgerDisplay(store).projection(agent))
+        self.assertNotEqual(desired, queued[pane]['fingerprint'])
+        expected = {pane: {**queued[pane], 'explicit_pending': desired}}
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), expected)
+        self.assertTrue(maintenance_pending(store))
+
+        with mock.patch('ham.ledger.status.live_snapshot', side_effect=snapshot):
+            registry.refresh(self.environment)
+            self.assertNotIn('[메인]', display.labels[pane])
+            self.assertNotIn('[메인]', display.metadata[pane][SOURCE]['display_agent'])
+            self.assertTrue(maintenance_pending(store))
+            display.commands.clear()
+            registry.refresh(self.environment)
+        self.assertEqual(display.commands, [])
+        self.assertFalse(maintenance_pending(store))
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), {})
+
+    def test_stale_snapshot_preserves_new_repair_for_matching_or_absent_pane(self):
+        from tests.test_ledger_display import HerdrDisplay
+        from ham.ledger.display import SOURCE
+
+        store = self.stores['beta']
+        agent = self.agents['beta']
+        pane = agent['pane_id']
+        display = HerdrDisplay([pane], terminals={pane: 'term-beta'})
+        registry = AgentRegistry(store, display_runner=display)
+        settings = self.settings_for('beta')
+
+        def snapshot():
+            return {'panes': [{**self.snapshots['beta']['panes'][0], 'label': display.labels[pane]}],
+                    'agents': [{**self.snapshots['beta']['agents'][0],
+                                **display.metadata[pane].get(SOURCE, {}),
+                                'tokens': dict(display.metadata[pane]['tokens'])}]}
+
+        for index, observation in enumerate(('matching', 'absent')):
+            with self.subTest(observation=observation):
+                settings.accept(self.incoming_setting(version=2 * index + 1), 'alpha')
+                registry.reconcile(snapshot())
+                registry.reconcile(snapshot())
+                with store.read() as connection:
+                    self.assertEqual(display_repair.load(connection), {})
+                entries = {}
+                display_repair.defer(entries, 'departed-pane', 'departed-projection', 10.0)
+                with store.transaction() as connection:
+                    display_repair.save(connection, entries)
+                stale = snapshot() if observation == 'matching' else {'panes': [], 'agents': []}
+                plan = registry._display_plan
+                planned = []
+                accepted = []
+
+                def accept_off_after_plan(*args):
+                    result = plan(*args)
+                    planned.append(result)
+                    accepted.append(settings.accept(
+                        self.incoming_setting(value='off', version=2 * index + 2), 'alpha'))
+                    return result
+
+                display.commands.clear()
+                with mock.patch.object(registry, '_display_plan', side_effect=accept_off_after_plan):
+                    result = registry._refresh_display(set(), snapshot=stale)
+                self.assertEqual(len(planned), 1)
+                if observation == 'matching':
+                    self.assertIn(pane, planned[0][1])
+                else:
+                    self.assertNotIn(pane, planned[0][2])
+                self.assertTrue(accepted[0]['applied'])
+                self.assertEqual(accepted[0]['mode'], 'off')
+                self.assertEqual(result, {'updated': [], 'failed': []})
+                self.assertEqual(display.commands, [])
+                desired = display_repair.fingerprint(agent, LedgerDisplay(store).projection(agent))
+                with store.read() as connection:
+                    pending = display_repair.load(connection)
+                self.assertEqual(set(pending), {pane})
+                self.assertEqual(pending[pane]['fingerprint'], desired)
+                self.assertEqual(pending[pane]['explicit_pending'], desired)
+                self.assertEqual(pending[pane]['attempts'], 0)
+                self.assertEqual(pending[pane]['state'], 'pending')
+                self.assertTrue(maintenance_pending(store))
+
+    def test_remote_setting_ack_does_not_wait_for_or_fail_with_display_runner(self):
+        release = threading.Event()
+
+        def slow_failure(command):
+            release.wait(5)
+            raise OSError('Herdr unavailable')
+
+        runner = mock.Mock(side_effect=slow_failure)
+        settings = RepoSettings(self.stores['beta'], display_runner=runner)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(settings.accept, self.incoming_setting(), 'alpha')
+            try:
+                result = future.result(timeout=1)
+            finally:
+                release.set()
+        self.assertTrue(result['applied'])
+        runner.assert_not_called()
+        with self.stores['beta'].read() as connection:
+            self.assertIn(self.agents['beta']['pane_id'], display_repair.load(connection))
+
+    def test_remote_setting_and_deferred_repairs_roll_back_together(self):
+        store = self.stores['beta']
+        save = display_repair.save
+
+        def fail_after_saving(connection, entries):
+            save(connection, entries)
+            raise RuntimeError('Injected failure before commit')
+
+        with store.read() as connection:
+            before = display_repair.load(connection)
+            outbox = connection.execute('SELECT count(*) FROM outbox').fetchone()[0]
+        with mock.patch.object(display_repair, 'save', side_effect=fail_after_saving):
+            with self.assertRaisesRegex(RuntimeError, 'before commit'):
+                self.settings_for('beta').accept(self.incoming_setting(), 'alpha')
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), before)
+            self.assertNotIn('mode', RepoSettings.fields(connection, self.repo_id))
+            self.assertEqual(connection.execute('SELECT count(*) FROM outbox').fetchone()[0], outbox)
+
+    def test_remote_setting_same_projection_preserves_backoff_and_exhaustion(self):
+        store = self.stores['beta']
+        agent = self.agents['beta']
+        pane = agent['pane_id']
+        desired = display_repair.fingerprint(agent, LedgerDisplay(store).projection(agent))
+        for version, attempts in ((1, 2), (2, display_repair.MAX_ATTEMPTS)):
+            with self.subTest(attempts=attempts):
+                entries = {}
+                for _ in range(attempts):
+                    display_repair.reserve(entries, pane, desired, 100.0, force=True)
+                    display_repair.failed(entries[pane], 'Unchanged display failure')
+                with store.transaction() as connection:
+                    display_repair.save(connection, entries)
+                result = self.settings_for('beta').accept(
+                    self.incoming_setting(value='off', version=version), 'alpha')
+                self.assertTrue(result['applied'])
+                entries[pane]['explicit_pending'] = desired
+                with store.read() as connection:
+                    self.assertEqual(display_repair.load(connection), entries)
+
+    def test_remote_setting_defers_only_active_local_agents_in_its_repository(self):
+        store = self.stores['beta']
+        second = self.add_agent('beta', 'second', 'second-workspace')
+        remote = self.add_agent('beta', 'remote', 'remote-workspace')
+        inactive = self.add_agent('beta', 'inactive', 'inactive-workspace')
+        other_repo = self.new_repository('other', 'git:example.test/team/other')
+        other = self.add_agent('beta', 'other', 'other-workspace', repo=other_repo)
+        existing = {}
+        display_repair.defer(existing, other['pane_id'], 'unrelated-projection', 10.0)
+        with store.transaction() as connection:
+            connection.execute("UPDATE agents SET host='alpha' WHERE agent_id=?", (remote['agent_id'],))
+            connection.execute("UPDATE agents SET active=0 WHERE agent_id=?", (inactive['agent_id'],))
+            display_repair.save(connection, existing)
+        project = LedgerDisplay.projection
+        with mock.patch.object(LedgerDisplay, 'projection', autospec=True, side_effect=project) as projection:
+            result = self.settings_for('beta').accept(self.incoming_setting(), 'alpha')
+        self.assertTrue(result['applied'])
+        expected = {self.agents['beta']['pane_id'], second['pane_id']}
+        self.assertEqual({call.args[1]['pane_id'] for call in projection.call_args_list}, expected)
+        self.assertEqual(projection.call_count, len(expected))
+        with store.read() as connection:
+            pending = display_repair.load(connection)
+        self.assertEqual(set(pending), expected | {other['pane_id']})
+        self.assertEqual(pending[other['pane_id']], existing[other['pane_id']])
+
+    def test_remote_setting_queue_full_warns_without_rolling_back_setting(self):
+        store = self.stores['beta']
+        entries = {}
+        display_repair.defer(entries, 'already-pending', 'existing-projection', 10.0)
+        with store.transaction() as connection:
+            display_repair.save(connection, entries)
+        with mock.patch.object(display_repair, 'MAX_PANES', 1):
+            result = self.settings_for('beta').accept(self.incoming_setting(), 'alpha')
+        self.assertTrue(result['applied'])
+        self.assertEqual(result['mode'], 'auto')
+        self.assertNotIn('display', result)
+        self.assertEqual(result['warnings'], [{
+            'code': 'display_refresh_failed', 'panes': [self.agents['beta']['pane_id']],
+        }])
+        with store.read() as connection:
+            self.assertEqual(display_repair.load(connection), entries)
+            self.assertEqual(RepoSettings.fields(connection, self.repo_id)['mode']['value'], 'auto')
+            diagnostics = [row[0] for row in connection.execute('SELECT detail FROM notification_failures')]
+        self.assertTrue(any('Display repair queue full' in detail for detail in diagnostics))
 
     def test_workspace_settings_mutation_projects_after_commit(self):
         store = self.stores['beta']

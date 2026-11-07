@@ -432,6 +432,19 @@ them. Lower/reordered receipts never regress
 state, a final state cannot conflict-transition, and a resolved recipient
 terminal/address cannot change. Internal `delivering` is published as queued.
 
+Default outbox sweeps admit calls for three seconds, with at most four peers in
+flight and 100 attempts total. Each admitted SSH call has up to the existing
+20-second transport timeout within a shared 23-second completion deadline.
+Explicit numeric `pump(budget_seconds=...)` calls retain a strict total deadline.
+Transient errors name the blocked item, attempt and original-item retry command.
+Repeated timeouts retain FIFO, with backoff measured from the observed failure.
+
+Peer settings commit display-repair reservations atomically with their values.
+ACKs perform no Herdr display I/O; the worker projects the affected local panes
+afterward, including mode-off role removal. Already-applied settings return
+without projection or another reservation. Local settings mutations retain their
+immediate best-effort display attempt.
+
 A bell write can fail **after** a successful DB commit. Such a command still
 succeeds, with `warnings:[{code:"notification_failed",committed:true,...}]`;
 `doctor.notification_failures` retains the diagnosis. Do not resend with a new

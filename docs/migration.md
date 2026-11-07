@@ -569,12 +569,34 @@ redirecting storage or deleting pre-existing live fixture files.
 
 The host worker refreshes its local registry, observes Claude acceptance and
 attempts eligible Claude/Codex wakes before remote transport. Each outbox sweep
-has a three-second elapsed budget, at most four simultaneous peers and at most
-100 attempts total. A peer has only its oldest pending item in flight; transient
-failure defers that peer for the sweep and retains its FIFO. Healthy peers can
-send while another peer is unavailable. A timeout can mean the remote commit
-succeeded but its acknowledgement was lost; retries keep the original identity
-and are deduplicated rather than creating another message.
+admits new calls for three seconds, with at most four simultaneous peers and
+100 attempts total. Each admitted SSH call has up to the existing 20-second
+transport timeout, bounded by a shared 23-second completion deadline. An explicit
+`pump(budget_seconds=...)` remains a strict total deadline. Only calls with an
+available execution slot count as attempts. The longer completion allowance can
+delay the next local maintenance pass, but never extends the sweep without bound.
+A peer has only its oldest pending item in flight. Transient failure retains its
+FIFO and starts backoff when the failure is observed. Its visible error names the
+peer, item, attempt and original-item retry command; repeated timeouts do not
+silently skip the head. Healthy peers can send while another peer is unavailable.
+A timeout can mean the remote commit succeeded but its acknowledgement was lost.
+Retries keep the original identity and are deduplicated rather than creating
+another message.
+
+Incoming settings commit their display-repair reservations with the setting.
+The ACK does not wait for Herdr display reads or writes. The existing host worker
+projects the committed setting afterward, including removal of roles in `off`
+mode. An already-applied setting returns its current state without another
+projection or reservation. Local user setting changes retain their immediate
+display attempt.
+
+To recover a setting head stuck after a lost ACK, upgrade the receiver checkout
+and the sender checkout. Restart their long-lived workers through the normal
+deployment procedure so both adopt the new code. Existing pending items retry
+automatically after their saved backoff, which can be up to five minutes.
+Do not resend mail already delivered at the destination or replace the pending
+setting. A receiver-only upgrade removes synchronous display work, but leaves
+the old sender's three-second SSH deadline in place.
 
 CLI board peer reads use a four-query maximum and one shared 20-second deadline,
 not a separate wait per peer. Host ordering, verified-UUID stale snapshots and

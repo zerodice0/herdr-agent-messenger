@@ -891,21 +891,27 @@ worker snapshot, not treated as confirmation merely because the write succeeded.
 
 Snapshot-driven projection writes, whether they succeed or fail, wait for a later
 snapshot to confirm the desired display. Explicit status, device, label and
-settings writes queue both
-failures and writes deferred by a busy pane lock. A deferred write is queued as
-pending with zero attempts, with no failure diagnostic and no retry or backoff
-consumed, and any concurrent worker reservation is preserved. An explicit
+local settings writes queue failures and writes deferred by a busy pane lock.
+Incoming peer settings reserve the affected repository's displays in the setting
+transaction instead. Their ACK never waits for Herdr display I/O. The worker
+projects those reservations afterward, even when the new mode is off. Replayed
+settings that are already applied do not refresh or reserve displays again.
+A deferred write is queued as pending with zero attempts and no failure diagnostic.
+It consumes no retry or backoff and preserves concurrent worker reservations. An explicit
 deferral also marks its target fingerprint as explicit, and that mark survives a
 later snapshot sweep refund, so the explicit retry is not lost. A snapshot
 projection skipped the same way refunds its own reservation instead of
-consuming an attempt. A successful explicit write clears pending repair, without
-an extra verification subprocess or worker request. Unconfirmed mismatches retry with exponential
+consuming an attempt. A successful explicit local write clears pending repair,
+without an extra verification subprocess or worker request. Unconfirmed mismatches retry with exponential
 backoff starting at five seconds, up to five attempts including the initial
 write. The queue holds at most 256 panes; overflow reports a diagnostic without
 writing the overflowing pane. Pending entries keep the existing maintenance
 worker alive even before their retry is due; exhausted entries alone do not.
 Retry state persists across events and worker instances until the desired output
 or terminal/pane binding changes, or a snapshot matches.
+Snapshot confirmation removes only the reservation observed before planning.
+A request added or changed during that planning survives both matching-display
+confirmation and absent-pane cleanup.
 
 For persistent conflicts, run `python3 -m ham cli ledger doctor` and inspect the
 pane-keyed `display_repair` mapping: `state` (`pending` or `exhausted`), `attempts`,

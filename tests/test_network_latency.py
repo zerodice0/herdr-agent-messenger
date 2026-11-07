@@ -2,6 +2,7 @@
 import tests.ham_test_support as ham_test_support  # Seal live roots before product imports.
 
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +15,7 @@ from unittest import mock
 from types import SimpleNamespace
 import uuid
 
-from ham.ledger import views, worker
+from ham.ledger import remote as remote_module, views, worker
 from ham import paths
 from ham.agents import directory
 from ham.ledger.wake_codex import find_codex_binary
@@ -42,8 +43,11 @@ class NetworkLatencyTest(unittest.TestCase):
 
     def queue(self, host, *, count=1):
         with self.store.transaction() as connection:
-            return [queue_outbox(connection, host, "setting", {"fixture": index})
-                    for index in range(count)]
+            items = [queue_outbox(connection, host, "setting", {"fixture": index})
+                     for index in range(count)]
+            connection.executemany("UPDATE outbox SET next_try_at=0 WHERE item_id=?",
+                                   [(item,) for item in items])
+            return items
 
     def test_two_hung_board_peers_share_one_deadline_and_keep_verified_stale_rows(self):
         release = threading.Event()
@@ -110,6 +114,198 @@ class NetworkLatencyTest(unittest.TestCase):
         finally:
             release.set()
 
+    def test_default_pump_accepts_ack_after_admission_closes_without_starting_follower(self):
+        queued = self.queue("beta", count=2)
+        transport = mock.Mock()
+
+        def delayed_ack(peer, command, payload):
+            time.sleep(0.1)
+            return {}
+
+        transport.call.side_effect = delayed_ack
+        remote = RemoteLedger(self.store, self.environment, transport)
+        with mock.patch.object(remote_module, "PUMP_ADMISSION_SECONDS", 0.05), \
+                mock.patch.object(remote_module, "SSH_TIMEOUT_SECONDS", 0.2):
+            result = remote.pump()
+        self.assertEqual(result, {"sent": 1, "failed": 0, "deferred": 0})
+        items = {item["item_id"]: item for item in remote.outbox()}
+        self.assertEqual(items[queued[0]]["state"], "sent")
+        self.assertIsNone(items[queued[0]]["last_error"])
+        self.assertEqual((items[queued[1]]["state"], items[queued[1]]["attempts"]), ("pending", 0))
+        self.assertEqual(transport.call.call_count, 1)
+
+    def test_default_pump_hard_total_is_admission_plus_transport_and_ignores_late_ack(self):
+        queued = self.queue("beta", count=2)
+        release = threading.Event()
+        finished = threading.Event()
+
+        class HungTransport:
+            def call(inner, peer, command, payload):
+                try:
+                    release.wait(2)
+                    return {}
+                finally:
+                    finished.set()
+
+        remote = RemoteLedger(self.store, self.environment, HungTransport())
+        try:
+            with mock.patch.object(remote_module, "PUMP_ADMISSION_SECONDS", 0.05), \
+                    mock.patch.object(remote_module, "SSH_TIMEOUT_SECONDS", 0.1):
+                before = time.monotonic()
+                result = remote.pump()
+                elapsed = time.monotonic() - before
+            self.assertGreaterEqual(elapsed, 0.13)
+            self.assertLess(elapsed, 0.28)
+            self.assertEqual(result, {"sent": 0, "failed": 0, "deferred": 1})
+            snapshot = remote.outbox()
+            head = next(item for item in snapshot if item["item_id"] == queued[0])
+            self.assertEqual(head["state"], "pending")
+            error = json.loads(head["last_error"])
+            self.assertEqual(error["code"], "transport_unavailable")
+            for detail in ("beta", queued[0], "attempt 1", "Remote commit is uncertain",
+                           "ledger retry --item " + queued[0]):
+                self.assertIn(detail, error["message"])
+        finally:
+            release.set()
+            self.assertTrue(finished.wait(1))
+        self.assertEqual(remote.outbox(), snapshot)
+
+    def test_pump_ssh_timeout_is_capped_by_transport_and_explicit_remaining_budget(self):
+        transport = SSHTransport(self.store, self.environment)
+        remote = RemoteLedger(self.store, self.environment, transport)
+        for budget, expected_timeout in ((None, 20), (25, 20), (0.25, 0.25)):
+            with self.subTest(budget=budget):
+                item = self.queue("beta")[0]
+                with mock.patch.object(remote_module.time, "monotonic", return_value=100), \
+                        mock.patch.object(transport, "call", return_value={}) as call:
+                    self.assertEqual(remote.pump(limit=1, budget_seconds=budget),
+                                     {"sent": 1, "failed": 0, "deferred": 0})
+                self.assertEqual(call.call_args.kwargs["timeout"], expected_timeout)
+                self.assertEqual(next(row for row in remote.outbox() if row["item_id"] == item)["state"], "sent")
+
+    def test_pump_does_not_prequeue_or_mark_attempts_beyond_four_slots(self):
+        peers = ("beta", "delta", "epsilon", "gamma", "theta", "zeta")
+        with self.store.transaction() as connection:
+            for peer in ("delta", "epsilon", "theta"):
+                connection.execute("INSERT INTO peers VALUES (?,?,?,?)",
+                                   (peer, str(uuid.uuid4()), peer, str(self.root)))
+        for peer in peers:
+            self.queue(peer, count=2)
+        release = threading.Event()
+        finished = [threading.Event() for _ in range(4)]
+        lock = threading.Lock()
+        calls = []
+
+        class HungTransport:
+            def call(inner, peer, command, payload):
+                with lock:
+                    done = finished[len(calls)]
+                    calls.append(peer["canonical_name"])
+                try:
+                    release.wait(2)
+                    return {}
+                finally:
+                    done.set()
+
+        remote = RemoteLedger(self.store, self.environment, HungTransport())
+        try:
+            result = remote.pump(budget_seconds=0.15)
+            self.assertEqual(result, {"sent": 0, "failed": 0, "deferred": 4})
+            items = remote.outbox()
+            for peer in peers:
+                rows = [row for row in items if row["target_host"] == peer]
+                self.assertEqual([row["attempts"] for row in rows],
+                                 [1, 0] if peer in peers[:4] else [0, 0])
+                self.assertTrue(all(row["state"] == "pending" for row in rows))
+            self.assertEqual(set(calls), set(peers[:4]))
+        finally:
+            release.set()
+            for done in finished:
+                self.assertTrue(done.wait(1))
+
+    def test_pump_refills_completed_slots_while_another_peer_remains_in_flight(self):
+        slow = self.queue("beta", count=2)
+        healthy = self.queue("gamma", count=2) + self.queue("zeta", count=2)
+        release = threading.Event()
+        finished = threading.Event()
+
+        class MixedTransport:
+            def call(inner, peer, command, payload):
+                if peer["canonical_name"] == "beta":
+                    try:
+                        release.wait(2)
+                    finally:
+                        finished.set()
+                return {}
+
+        remote = RemoteLedger(self.store, self.environment, MixedTransport())
+        try:
+            self.assertEqual(remote.pump(budget_seconds=0.15),
+                             {"sent": 4, "failed": 0, "deferred": 1})
+            items = {item["item_id"]: item for item in remote.outbox()}
+            self.assertTrue(all(items[item]["state"] == "sent" for item in healthy))
+            self.assertEqual([items[item]["attempts"] for item in slow], [1, 0])
+        finally:
+            release.set()
+            self.assertTrue(finished.wait(1))
+
+    def test_many_transient_head_attempts_remain_visible_and_retry_original_identity(self):
+        head, follower = self.queue("beta", count=2)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE outbox SET attempts=100 WHERE item_id=?", (head,))
+        transport = mock.Mock()
+        transport.call.side_effect = LedgerError("busy", "Receiver is still finishing its commit.")
+        remote = RemoteLedger(self.store, self.environment, transport)
+        original = remote.outbox()[0]
+        for attempt in (101, 102, 103):
+            at = 1000 * attempt
+            self.assertEqual(remote.pump(now=at), {"sent": 0, "failed": 0, "deferred": 1})
+            items = {item["item_id"]: item for item in remote.outbox()}
+            current = items[head]
+            self.assertEqual((current["state"], current["attempts"], current["next_try_at"]),
+                             ("pending", attempt, at + 300))
+            self.assertEqual(items[follower]["attempts"], 0)
+            self.assertEqual(items[follower]["state"], "pending")
+            error = json.loads(current["last_error"])
+            self.assertEqual(error["code"], "busy")
+            for detail in ("beta", head, f"attempt {attempt}", "Remote commit is uncertain",
+                           "ledger retry --item " + head, "Receiver is still finishing its commit."):
+                self.assertIn(detail, error["message"])
+        self.assertEqual(remote.retry(head), {"item_id": head, "state": "pending"})
+        self.assertIsNone(remote.outbox()[0]["last_error"])
+        transport.call.side_effect = None
+        transport.call.return_value = {}
+        self.assertEqual(remote.pump(now=1), {"sent": 2, "failed": 0, "deferred": 0})
+        items = {item["item_id"]: item for item in remote.outbox()}
+        for key in ("item_id", "target_host", "peer_seq", "kind", "payload", "message_id"):
+            self.assertEqual(items[head][key], original[key])
+        self.assertEqual(items[head]["attempts"], 104)
+        self.assertEqual(items[follower]["attempts"], 1)
+        self.assertTrue(all(item["state"] == "sent" and item["last_error"] is None
+                            for item in items.values()))
+
+    def test_pump_backoff_starts_when_failure_is_observed(self):
+        item = self.queue("beta")[0]
+        transport = mock.Mock()
+        transport.call.side_effect = LedgerError("transport_unavailable", "SSH acknowledgement was lost.")
+        remote = RemoteLedger(self.store, self.environment, transport)
+        clock = SimpleNamespace(monotonic=time.monotonic, time=mock.Mock(side_effect=[100, 140]))
+        with mock.patch.object(remote_module, "time", clock):
+            self.assertEqual(remote.pump(), {"sent": 0, "failed": 0, "deferred": 1})
+        row = next(row for row in remote.outbox() if row["item_id"] == item)
+        self.assertEqual(row["next_try_at"], 142)
+
+    def test_pump_explicit_now_keeps_deterministic_backoff(self):
+        item = self.queue("beta")[0]
+        transport = mock.Mock()
+        transport.call.side_effect = LedgerError("host_unavailable", "Host is offline.")
+        remote = RemoteLedger(self.store, self.environment, transport)
+        clock = SimpleNamespace(monotonic=time.monotonic, time=mock.Mock(side_effect=AssertionError("wall clock used")))
+        with mock.patch.object(remote_module, "time", clock):
+            self.assertEqual(remote.pump(now=100), {"sent": 0, "failed": 0, "deferred": 1})
+        row = next(row for row in remote.outbox() if row["item_id"] == item)
+        self.assertEqual(row["next_try_at"], 102)
+
     def test_pump_attempt_limit_is_total_not_per_peer(self):
         self.queue("beta", count=2)
         self.queue("gamma", count=2)
@@ -119,6 +315,20 @@ class NetworkLatencyTest(unittest.TestCase):
         self.assertEqual(remote.pump(limit=2), {"sent": 2, "failed": 0, "deferred": 0})
         self.assertEqual(transport.call.call_count, 2)
         self.assertEqual(sum(item["state"] == "pending" for item in remote.outbox()), 2)
+
+    def test_pump_default_attempt_limit_remains_one_hundred_across_refills(self):
+        self.queue("beta", count=60)
+        self.queue("gamma", count=60)
+        transport = mock.Mock()
+        transport.call.return_value = {}
+        remote = RemoteLedger(self.store, self.environment, transport)
+        clock = SimpleNamespace(monotonic=lambda: 100, time=time.time)
+        with mock.patch.object(remote_module, "time", clock):
+            self.assertEqual(remote.pump(), {"sent": 100, "failed": 0, "deferred": 0})
+        self.assertEqual(transport.call.call_count, 100)
+        pending = [item for item in remote.outbox() if item["state"] == "pending"]
+        self.assertEqual(len(pending), 20)
+        self.assertTrue(all(item["attempts"] == 0 for item in pending))
 
     def test_local_refresh_observation_and_native_wake_precede_slow_pump(self):
         events = []

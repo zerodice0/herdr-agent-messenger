@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
+import sqlite3
 import subprocess
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -150,11 +152,12 @@ class LedgerDisplay:
             return None
 
     def projection(self, agent: Mapping[str, Any], *, alias: str | None = None,
-                   marker: str | None = None, color: str | None = None) -> DisplayProjection:
+                   marker: str | None = None, color: str | None = None,
+                   connection: sqlite3.Connection | None = None) -> DisplayProjection:
         from ham.agents.labels import alias_identity
         from ham.ledger.devices import device_rows
 
-        with self.store.read() as connection:
+        with self.store.read() if connection is None else nullcontext(connection) as connection:
             claims = [claim for claim in device_rows(connection)
                       if not claim["stale"] and claim["holder"]["agent_id"] == agent["agent_id"]]
         phones = " ".join(claim["label"] for claim in claims if claim["kind"] == "phone")

@@ -23,6 +23,8 @@ from ham.ledger.store import (FINAL_STATES, STATE_RANK, LedgerError, LedgerStore
                           public_receipt, queue_outbox, receipt, require_uuid, save_receipt)
 
 PROTOCOL = 1
+SSH_TIMEOUT_SECONDS = 20
+PUMP_ADMISSION_SECONDS = 3
 TRANSIENT_CODES = frozenset({"transport_unavailable", "host_unavailable", "ledger_unavailable", "busy"})
 WIRE_COMMANDS = frozenset({"accept", "receipt", "setting", "withdraw"})
 # Explicit protocol-1 union of routing, collaboration preflight, and Mailbox
@@ -42,7 +44,7 @@ class SSHTransport:
         self.environment = environment
 
     def _run(self, command: list[str], data: Mapping[str, Any] | None = None, *,
-             timeout: float = 20) -> dict[str, Any]:
+             timeout: float = SSH_TIMEOUT_SECONDS) -> dict[str, Any]:
         values = os.environ if self.environment is None else self.environment
         executable = shutil.which(command[0], path=values.get("PATH", os.defpath))
         if executable is None or not os.path.isabs(executable):
@@ -103,7 +105,7 @@ class SSHTransport:
         return {**peer, "canonical_name": identity["canonical_name"], "uuid": identity["uuid"]}
 
     def _invoke(self, peer: Mapping[str, Any], command: str,
-                data: Mapping[str, Any] | None = None, *, timeout: float = 20) -> dict[str, Any]:
+                data: Mapping[str, Any] | None = None, *, timeout: float = SSH_TIMEOUT_SECONDS) -> dict[str, Any]:
         self._allowed(peer["ssh_alias"])
         arguments = ["env"]
         if peer.get("remote_ledger_dir"):
@@ -121,7 +123,7 @@ class SSHTransport:
                                             cwd=peer["remote_ham_root"]), data, timeout=timeout)
 
     def call(self, peer: Mapping[str, Any], command: str,
-             payload: Mapping[str, Any], *, timeout: float = 20) -> dict[str, Any]:
+             payload: Mapping[str, Any], *, timeout: float = SSH_TIMEOUT_SECONDS) -> dict[str, Any]:
         envelope = {"protocol": PROTOCOL, "transport_host": self.store.host,
                     "transport_uuid": self.store.host_uuid, "payload": payload}
         result = self._invoke(peer, command, envelope, timeout=timeout)
@@ -544,18 +546,23 @@ class RemoteLedger:
             return pending_outbox_backlog(connection, now=now)
 
     def pump(self, *, now: float | None = None, limit: int = 100,
-             budget_seconds: float = 3) -> dict[str, int]:
-        """Bounded concurrent transport, with one in-flight FIFO head per peer.
+             budget_seconds: float | None = None) -> dict[str, int]:
+        """Admit calls for three seconds, then drain within the SSH timeout.
 
-        Only this flock-owning caller changes SQLite. Timed-out calls may have
-        reached a peer; retry uses the same immutable identity, never a new mail.
+        An explicit budget bounds both admission and completion. Only this
+        flock-owning caller changes SQLite. Timed-out calls may have reached a
+        peer; retry uses the same immutable identity, never a new mail.
         """
         at = time.time() if now is None else now
-        deadline = time.monotonic() + max(0, budget_seconds)
+        started = time.monotonic()
+        admission_seconds = PUMP_ADMISSION_SECONDS if budget_seconds is None else max(0, budget_seconds)
+        admission_deadline = started + admission_seconds
+        deadline = admission_deadline + (SSH_TIMEOUT_SECONDS if budget_seconds is None else 0)
         totals = {"sent": 0, "failed": 0, "deferred": 0}
         blocked: set[str] = set()
         attempted_count = 0
         executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ham-outbox")
+        pending = {}
 
         def transmit(item: Any) -> dict[str, Any]:
             remaining = deadline - time.monotonic()
@@ -565,16 +572,23 @@ class RemoteLedger:
             command = {"message": "accept", "receipt": "receipt", "setting": "setting", "withdraw": "withdraw"}[item["kind"]]
             payload = json.loads(item["payload"])
             if isinstance(self.transport, SSHTransport):
-                return self.transport.call(peer, command, payload, timeout=remaining)
+                return self.transport.call(peer, command, payload, timeout=min(SSH_TIMEOUT_SECONDS, remaining))
             return self.transport.call(peer, command, payload)
 
         def defer_or_fail(item: Any, error: LedgerError) -> None:
             transient = error.code in TRANSIENT_CODES
+            message = error.message
+            if transient:
+                message = (f"Peer {item['target_host']}, outbox item {item['item_id']}, "
+                           f"attempt {item['attempts'] + 1}: {message} "
+                           "Remote commit is uncertain. Retry the original item with "
+                           f"ledger retry --item {item['item_id']}.")
+            failed_at = time.time() if now is None else now
             with self.store.transaction() as connection:
                 connection.execute("UPDATE outbox SET state=?,last_error=?,next_try_at=? WHERE item_id=? AND state='pending'",
                                    ("pending" if transient else "failed",
-                                    json_text({"code": error.code, "message": error.message}),
-                                    at + min(300, 2 ** min(item["attempts"] + 1, 9)), item["item_id"]))
+                                    json_text({"code": error.code, "message": message}),
+                                    failed_at + min(300, 2 ** min(item["attempts"] + 1, 9)), item["item_id"]))
             if transient:
                 blocked.add(item["target_host"])
                 totals["deferred"] += 1
@@ -582,44 +596,51 @@ class RemoteLedger:
                 totals["failed"] += 1
 
         try:
-            while attempted_count < limit and time.monotonic() < deadline:
-                with self.store.read() as connection:
-                    rows = connection.execute("SELECT o.* FROM outbox o WHERE o.state='pending' AND NOT EXISTS "
-                                              "(SELECT 1 FROM outbox earlier WHERE earlier.target_host=o.target_host AND "
-                                              "earlier.state='pending' AND earlier.peer_seq<o.peer_seq) ORDER BY o.target_host").fetchall()
-                candidates = [row for row in rows if row["target_host"] not in blocked and row["next_try_at"] <= at]
-                if not candidates:
+            while True:
+                if time.monotonic() >= deadline:
+                    for future, item in pending.items():
+                        future.cancel()
+                        defer_or_fail(item, LedgerError("transport_unavailable", "Outbox sweep deadline reached."))
                     break
-                pending = {}
-                for item in candidates[:limit - attempted_count]:
-                    with self.store.transaction() as connection:
-                        attempted = connection.execute("UPDATE outbox SET attempts=attempts+1 WHERE item_id=? AND state='pending'",
-                                                       (item["item_id"],)).rowcount
-                    if attempted:
-                        attempted_count += 1
-                        pending[executor.submit(transmit, item)] = item
-                while pending:
-                    completed, _ = wait(pending, timeout=max(0, deadline - time.monotonic()),
-                                        return_when=FIRST_COMPLETED)
-                    if not completed:
-                        for future, item in pending.items():
-                            future.cancel()
-                            defer_or_fail(item, LedgerError("transport_unavailable", "Outbox sweep deadline reached."))
-                        break
-                    for future in completed:
-                        item = pending.pop(future)
-                        try:
-                            response = future.result()
-                            with self.store.transaction() as connection:
-                                if item["kind"] in {"message", "withdraw"}:
-                                    self.apply_receipt(connection, response, item["target_host"])
-                                connection.execute("UPDATE outbox SET state='sent',last_error=NULL WHERE item_id=? AND state='pending'",
-                                                   (item["item_id"],))
-                            totals["sent"] += 1
-                        except LedgerError as error:
-                            defer_or_fail(item, error)
+                if attempted_count < limit and time.monotonic() < admission_deadline:
+                    with self.store.read() as connection:
+                        rows = connection.execute("SELECT o.* FROM outbox o WHERE o.state='pending' AND NOT EXISTS "
+                                                  "(SELECT 1 FROM outbox earlier WHERE earlier.target_host=o.target_host AND "
+                                                  "earlier.state='pending' AND earlier.peer_seq<o.peer_seq) ORDER BY o.target_host").fetchall()
+                    active_peers = {item["target_host"] for item in pending.values()}
+                    candidates = [row for row in rows if row["target_host"] not in blocked
+                                  and row["target_host"] not in active_peers and row["next_try_at"] <= at]
+                    available = min(4 - len(pending), limit - attempted_count)
+                    for item in candidates[:available]:
+                        if time.monotonic() >= admission_deadline:
+                            break
+                        with self.store.transaction() as connection:
+                            attempted = connection.execute("UPDATE outbox SET attempts=attempts+1 WHERE item_id=? AND state='pending'",
+                                                           (item["item_id"],)).rowcount
+                        if attempted:
+                            attempted_count += 1
+                            pending[executor.submit(transmit, item)] = item
+                if not pending:
+                    break
+                completed, _ = wait(pending, timeout=max(0, deadline - time.monotonic()),
+                                    return_when=FIRST_COMPLETED)
+                if not completed or time.monotonic() >= deadline:
+                    for future, item in pending.items():
+                        future.cancel()
+                        defer_or_fail(item, LedgerError("transport_unavailable", "Outbox sweep deadline reached."))
+                    break
+                for future in completed:
+                    item = pending.pop(future)
+                    try:
+                        response = future.result()
+                        with self.store.transaction() as connection:
+                            if item["kind"] in {"message", "withdraw"}:
+                                self.apply_receipt(connection, response, item["target_host"])
+                            connection.execute("UPDATE outbox SET state='sent',last_error=NULL WHERE item_id=? AND state='pending'",
+                                               (item["item_id"],))
+                        totals["sent"] += 1
+                    except LedgerError as error:
+                        defer_or_fail(item, error)
         finally:
-            # Real SSH calls carry the same deadline. A custom transport's late
-            # completion cannot change state or postpone local maintenance.
             executor.shutdown(wait=False, cancel_futures=True)
         return totals

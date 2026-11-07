@@ -545,6 +545,13 @@ and while retained messages or pending outbox items need it. A bell failure afte
 commit is a successful store with a `notification_failed`, `committed:true`
 warning, not permission to resend.
 
+The default outbox sweep starts new calls for three seconds and allows each
+admitted SSH call up to 20 seconds, within a shared 23-second completion deadline.
+At most four peers run concurrently. Explicit numeric `pump(budget_seconds=...)`
+calls keep their strict total deadline. Transient errors identify the blocked
+FIFO head and its original-item retry command. They retain ordering even after
+repeated timeouts and back off from the observed failure time.
+
 `--to main` resolves on the sender's host at send time against
 `(repo_id, canonical host, anchor_workspace_id)`, including linked workspaces
 in that role group. The immutable message stores a concrete terminal target.
@@ -685,9 +692,12 @@ Registry refresh repairs drift in the recorded display without model tokens,
 wakes or mail; meaningful phase/summary changes still need explicit `status set`.
 Snapshot repairs wait for snapshot confirmation and stop after five attempts with
 exponential backoff starting at five seconds. Explicit status, device, label and
-settings projections queue failures and lock-deferred writes without consuming an
-attempt; the explicit deferred mark survives a later snapshot sweep refund, and a
-successful explicit write clears its pending repair. Diagnose exhausted targets with
+local settings projections queue failures and lock-deferred writes without
+consuming an attempt. Incoming peer settings instead commit display reservations
+with the setting and ACK without Herdr display I/O. The worker projects them later,
+even in off mode. Duplicate settings do not project or enqueue again. The explicit
+deferred mark survives a later snapshot sweep refund, and a successful explicit
+write clears its pending repair. Diagnose exhausted targets with
 `ledger doctor`'s `display_repair` mapping; unchanged status or worker restarts do
 not reset the cap. Border ownership carries across generations only on an exact
 match to the recorded prior `last_ham_label`, never inferred from a role prefix,
