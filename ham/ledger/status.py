@@ -130,12 +130,13 @@ def _lookup_failed(lookup: str, reason: str, started: float) -> LedgerError:
     return error
 
 
-def process_ancestors() -> set[int]:
-    """Find verified caller parents without reading unrelated processes."""
+def process_ancestors(shell_pid: int) -> set[int]:
+    """Verify caller parents through the shell reported by live Herdr process-info."""
     started = time.monotonic()
     source = ProcessSource()
     try:
-        return {process.pid for process in process_chain(source=source, timeout=budget_timeout(5))}
+        return {process.pid for process in process_chain(
+            source=source, timeout=budget_timeout(5), stop_at=shell_pid)}
     except ProcessLookupFailure as error:
         raise _lookup_failed(source.lookup, error.reason, started) from None
 
@@ -162,16 +163,19 @@ def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -
                 or isinstance(value, bool) or not isinstance(value, (str, int))):
             raise ValueError
         pid = int(value)
-        if pid <= 0:
+        if pid <= 1:
             raise ValueError
         return pid
     except (ValueError, KeyError, TypeError, AttributeError):
         raise _lookup_failed("process-info", "invalid_output", started) from None
 
-def _claude_ancestor_pid() -> int | None:
-    """Return the nearest verified native root, not a foreground grandparent."""
+def _claude_ancestor_pid(shell_pid: int) -> int | None:
+    """Return the nearest native root inside the verified Herdr shell boundary."""
     try:
-        return next((process.pid for process in process_chain(timeout=budget_timeout(5))
+        chain = process_chain(timeout=budget_timeout(5), stop_at=shell_pid)
+        if not chain or chain[-1].pid != shell_pid:
+            return None
+        return next((process.pid for process in chain
                      if Path(process.name).name == "claude"), None)
     except ProcessLookupFailure:
         return None
@@ -207,7 +211,12 @@ def claude_foreground_pid(agent: Mapping[str, Any],
         pid = roots[0]["pid"]
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
             return None
-        return pid if not require_ancestor or _claude_ancestor_pid() == pid else None
+        if not require_ancestor:
+            return pid
+        shell_pid = info["shell_pid"]
+        if type(shell_pid) is not int or shell_pid <= 1:
+            return None
+        return pid if _claude_ancestor_pid(shell_pid) == pid else None
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
         return None
 
@@ -817,10 +826,12 @@ class AgentRegistry:
         values = os.environ if environment is None else environment
         terminal = values.get("HERDR_TERMINAL_ID")
         inherited_pane = values.get("HERDR_PANE_ID", '')
-        ancestors = process_ancestors()
         if terminal:
             claimed = next((raw for raw in snapshot["panes"] if raw["terminal_id"] == terminal), None)
-            if claimed is None or pane_shell_pid(claimed["pane_id"], environment) not in ancestors:
+            if claimed is None:
+                raise LedgerError("sender_unresolved", "The claimed terminal is not an ancestor of this process.")
+            shell_pid = pane_shell_pid(claimed["pane_id"], environment)
+            if shell_pid not in process_ancestors(shell_pid):
                 raise LedgerError("sender_unresolved", "The claimed terminal is not an ancestor of this process.")
         else:
             with self.store.read() as connection:
@@ -833,6 +844,7 @@ class AgentRegistry:
             for raw in panes:
                 try:
                     shell_pid = pane_shell_pid(raw["pane_id"], environment)
+                    ancestors = process_ancestors(shell_pid)
                 except LedgerError as error:
                     if error.code != "sender_lookup_failed":
                         raise

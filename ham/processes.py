@@ -117,8 +117,11 @@ class ProcessSource:
             raise ProcessLookupFailure("unavailable") from None
 
 
-def process_chain(*, source: ProcessSource | None = None, timeout: float = 5) -> list[ProcessInfo]:
-    """Read only this caller's parents and reject exits, reuse and broken chains."""
+def process_chain(*, source: ProcessSource | None = None, timeout: float = 5,
+                  stop_at: int | None = None) -> list[ProcessInfo]:
+    """Recheck caller ancestry through an explicit shell, or PID 1 if not reached."""
+    if stop_at is not None and (type(stop_at) is not int or stop_at <= 1):
+        raise ProcessLookupFailure("invalid_output")
     source = ProcessSource() if source is None else source
     deadline = time.monotonic() + timeout
     chain = []
@@ -148,6 +151,10 @@ def process_chain(*, source: ProcessSource | None = None, timeout: float = 5) ->
         if chain and info.started > chain[-1].started:
             raise ProcessLookupFailure("invalid_output")
         chain.append(info)
+        if pid == stop_at:
+            if info.parent in seen:
+                raise ProcessLookupFailure("invalid_output")
+            break
         pid = info.parent
     # A PID alone is not evidence if the process exited, was reused or reparented
     # while walking. Check the entire observed chain before returning any match.

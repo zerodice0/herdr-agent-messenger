@@ -106,12 +106,17 @@ also eliminates their associated discovery subprocesses.
 
 ## PID-local process lookup and bounded command cleanup
 
-Caller verification now walks only parent PIDs: Linux procfs or macOS libproc
-`PROC_PIDTBSDINFO`, with start-identity and parent-link revalidation. macOS
+Caller verification now walks only parent PIDs through the shell reported by live
+Herdr `pane process-info`: Linux procfs or macOS libproc `PROC_PIDTBSDINFO`,
+with start-identity and parent-link revalidation including the shell. It does not
+require access to protected ancestors above that verified boundary, and a failure
+before reaching the shell still refuses the caller. macOS
 emulator discovery uses `proc_listallpids` and BSD metadata, then `ps -p` only for
 qemu candidates; no repeated full-table `ps`, `pgrep` or `KERN_PROC_ALL` is used.
 Missing or changed identity evidence still refuses the caller; unavailable device
 observations remain unknown, with the existing claim-count admission fallback.
+An unreadable system PID makes macOS host-wide emulator discovery incomplete;
+it remains unknown rather than reporting a current-user-only count as complete.
 
 Process-query commands now include kill/pipe cleanup within their existing
 deadline and never wait indefinitely for an unkillable child. The same HAM

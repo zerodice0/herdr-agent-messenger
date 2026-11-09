@@ -1356,8 +1356,11 @@ The sender and ledger commands fail closed when HAM cannot prove who is calling 
 Both calls verify a fresh caller snapshot, ancestry, repository identity and current generation. They reconcile only the caller, without unrelated Git probes or host-wide display projection. Stable bindings need no pane display lock; changed bindings protect their old/new slots before SQL and revalidate after waiting. Successful observations, including unchanged ones, reject conflicting older full snapshots (`stale_snapshot`) but allow matching sweeps to commit. Shared workspace ordering, live displaced sessions, manual borders and recovery ownership remain protected. Worker/event paths retain pending work even when contention interrupts a sweep in off mode. See [deployment notes](migration.md#caller-scoped-runtime-registration).
 
 Ancestry follows only the caller's parent PIDs, using Linux procfs or macOS
-`proc_pidinfo(PROC_PIDTBSDINFO)`, and rechecks PID start identity and parent links
-before accepting a match. It never requests `KERN_PROC_ALL`, `ps -ax` or `pgrep`.
+`proc_pidinfo(PROC_PIDTBSDINFO)`, through the shell reported by live Herdr
+`pane process-info`. It rechecks the entire observed chain, including that shell's
+start identity and parent link, before accepting a match. Protected ancestors
+above the verified shell are not needed; a failure before reaching it still
+refuses the caller. It never requests `KERN_PROC_ALL`, `ps -ax` or `pgrep`.
 Process-query commands reserve cleanup time inside their deadline; timeout,
 output-limit and cancellation paths never follow SIGKILL with an unbounded wait.
 An unreaped child blocks another launch of the same executable in that HAM

@@ -86,7 +86,7 @@ class CliCollaborationPolicyTest(unittest.TestCase):
         self.patch(agent_skill_cli, "probe_local_agents", self.local_probe)
         self.patch(agent_skill_cli, "query_remote_agents", self.remote_probe)
         self.patch(ledger_status, "live_snapshot", lambda environment=None: deepcopy(self.local_snapshot))
-        self.patch(ledger_status, "process_ancestors", lambda: {10})
+        self.patch(ledger_status, "process_ancestors", lambda shell_pid: {10})
         self.patch(ledger_status, "pane_shell_pid", lambda pane, environment=None: 10)
         self.patch(agent_skill_cli, "run_bounded_command", self.native_command)
         self.patch(ledger_display, "run_bounded_command", self.display_command)

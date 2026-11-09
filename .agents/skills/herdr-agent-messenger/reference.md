@@ -203,10 +203,13 @@ Address resolution also reports `agent_not_found`, `agent_ambiguous`,
 `repo_ambiguous`, `main_ambiguous`, or `main_unresolved` as described above.
 Different sender/recipient repositories are not a `repo_mismatch` send error.
 Caller ancestry reads only parent PIDs through Linux procfs or macOS libproc
-`PROC_PIDTBSDINFO`, then rechecks start identity and parent links. A missing,
-changed or unreadable chain is `sender_lookup_failed`, never identity permission;
-its `lookup` is `procfs` or `libproc`. A complete nonmatching chain remains
-`sender_unresolved`. Neither path enumerates the full process table.
+`PROC_PIDTBSDINFO`, stopping at the shell reported by live Herdr `pane process-info`
+only after rechecking the entire observed chain, including that shell's start
+identity and parent link. Protected ancestors above the verified shell are not
+needed. A missing, changed or unreadable chain before reaching it is
+`sender_lookup_failed`, never identity permission; its `lookup` is `procfs` or
+`libproc`. A complete nonmatching chain remains `sender_unresolved`.
+Neither path enumerates the full process table.
 `native_session_pending` means Herdr has not yet published the OMP native session.
 The receiver waits within its existing bounded registration retries, without
 publishing the path itself; success removes HAM's waiting/unavailable status.

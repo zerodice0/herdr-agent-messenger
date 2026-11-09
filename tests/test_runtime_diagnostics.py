@@ -22,6 +22,7 @@ from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, runtime_budget
 from ham.processes import ProcessInfo, ProcessLookupFailure
 from tests.test_ledger_core import snapshot
+from tests.test_processes import ScriptedSource
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -297,7 +298,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                         mock.patch.object(ledger_status, "ProcessSource", return_value=mock.Mock(lookup=lookup)), \
                         mock.patch.object(ledger_status, "process_chain", side_effect=ProcessLookupFailure(reason)):
                     with self.assertRaises(LedgerError) as caught:
-                        ledger_status.process_ancestors()
+                        ledger_status.process_ancestors(10)
                     self.assert_lookup_error(caught.exception, lookup, reason)
 
     def test_process_info_failures_report_structured_diagnostics(self):
@@ -310,6 +311,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
             (self.pane_result(pane="wrong-pane"), "invalid_output"),
             (self.pane_result(pid=True), "invalid_output"),
             (self.pane_result(pid=0), "invalid_output"),
+            (self.pane_result(pid=1), "invalid_output"),
             (self.pane_result(pid=-1), "invalid_output"),
             (self.pane_result(pid=1.5), "invalid_output"),
             (self.pane_result(pid="unknown"), "invalid_output"),
@@ -343,6 +345,73 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         self.assertEqual(resolved["terminal_id"], "term-b")
         self.assertEqual(runner.call_count, 2)
 
+    def test_native_lookup_failure_on_one_pane_does_not_hide_another_verified_match(self):
+        with mock.patch.object(ledger_status, "process_chain", side_effect=[
+                ProcessLookupFailure("unavailable"), self.caller_chain()]), \
+                mock.patch.object(ledger_status, "run_bounded_command", side_effect=[
+                    self.pane_result(pid=99), self.pane_result(pane="w1:p2")]):
+            resolved = self.registry.resolve_context(self.environment, self.snapshot)
+        self.assertEqual(resolved["terminal_id"], "term-b")
+
+    def test_explicit_terminal_never_falls_back_to_a_different_verified_pane(self):
+        for native_failure in (None, ProcessLookupFailure("unavailable")):
+            with self.subTest(native_failure=native_failure), \
+                    mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain(),
+                                      side_effect=native_failure), \
+                    mock.patch.object(ledger_status, "run_bounded_command",
+                                      return_value=self.pane_result(pid=99)) as runner:
+                with self.assertRaises(LedgerError) as caught:
+                    self.registry.resolve_context(
+                        {**self.environment, "HERDR_TERMINAL_ID": "term-a"}, self.snapshot)
+            self.assertEqual(caught.exception.code,
+                             "sender_lookup_failed" if native_failure else "sender_unresolved")
+            self.assertEqual(runner.call_count, 1)
+
+    def test_protected_root_above_verified_pane_shell_is_not_queried(self):
+        caller, shell = self.caller_chain()
+        records = {caller.pid: caller, shell.pid: ProcessInfo(10, 5, "shell", (20,)),
+                   5: ProcessLookupFailure("unavailable")}
+        source = ScriptedSource(records)
+        source.lookup = "libproc"
+        with mock.patch.object(ledger_status, "ProcessSource", return_value=source), \
+                mock.patch.object(ledger_status, "run_bounded_command", return_value=self.pane_result()):
+            resolved = self.registry.resolve_context(
+                {**self.environment, "HERDR_TERMINAL_ID": "term-a"}, self.snapshot)
+        self.assertEqual(resolved["terminal_id"], "term-a")
+        self.assertEqual(set(source.reads), {caller.pid, shell.pid})
+        self.assertEqual(source.reads[shell.pid], 2)
+
+    def test_protected_process_before_or_at_pane_shell_reports_lookup_failure(self):
+        caller, shell = self.caller_chain()
+        for pid in (caller.pid, shell.pid):
+            for during_recheck in (False, True):
+                records = {caller.pid: caller, shell.pid: shell}
+                failure = ProcessLookupFailure("unavailable")
+                records[pid] = [records[pid], failure] if during_recheck else failure
+                source = ScriptedSource(records)
+                source.lookup = "libproc"
+                with self.subTest(pid=pid, during_recheck=during_recheck), \
+                        mock.patch.object(ledger_status, "ProcessSource", return_value=source), \
+                        mock.patch.object(ledger_status, "run_bounded_command", return_value=self.pane_result()):
+                    with self.assertRaises(LedgerError) as caught:
+                        self.registry.resolve_context(
+                            {**self.environment, "HERDR_TERMINAL_ID": "term-a"}, self.snapshot)
+                self.assert_lookup_error(caught.exception, "libproc", "unavailable")
+
+    def test_sibling_shell_sharing_only_a_root_ancestor_is_not_a_match(self):
+        caller, shell = self.caller_chain()
+        records = {caller.pid: caller, shell.pid: ProcessInfo(10, 5, "shell", (20,)),
+                   20: ProcessInfo(20, 5, "other-shell", (20,)),
+                   5: ProcessInfo(5, 1, "common-root", (10,))}
+        source = ScriptedSource(records)
+        with mock.patch.object(ledger_status, "ProcessSource", return_value=source), \
+                mock.patch.object(ledger_status, "run_bounded_command", return_value=self.pane_result(pid=20)):
+            with self.assertRaises(LedgerError) as caught:
+                self.registry.resolve_context(
+                    {**self.environment, "HERDR_TERMINAL_ID": "term-a"}, self.snapshot)
+        self.assertEqual(caught.exception.code, "sender_unresolved")
+        self.assertNotIn(20, source.reads)
+
     def test_discovery_fails_closed_if_no_match_and_any_probe_lacks_evidence(self):
         with mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain()), \
                 mock.patch.object(ledger_status, "run_bounded_command", side_effect=[
@@ -353,15 +422,15 @@ class RuntimeDiagnosticTest(unittest.TestCase):
 
     def test_multiple_probes_consume_one_deadline_instead_of_resetting_it(self):
         clock = [100.0]
-        timeouts = []
+        probes = []
 
         def chain(**options):
-            timeouts.append(options["timeout"])
+            probes.append(("chain", options["timeout"]))
             clock[0] += 4
             return self.caller_chain()
 
         def run(command, **options):
-            timeouts.append(options["timeout"])
+            probes.append(("pane", options["timeout"]))
             clock[0] += 4
             if command[-1] == "w1:p1":
                 return self.pane_result(pid=999999)
@@ -376,7 +445,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                 self.assert_lookup_error(caught.exception, "process-info", "timeout")
                 with self.assertRaises(LedgerError) as expired:
                     budget_timeout(5)
-        self.assertEqual(timeouts, [5, 5, 4])
+        self.assertEqual(probes, [("pane", 5), ("chain", 5), ("pane", 4)])
         self.assertEqual(expired.exception.code, "runtime_timeout")
 
     def test_public_register_cli_serializes_sender_lookup_details(self):
@@ -395,7 +464,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                 with self.subTest(lookup=lookup, reason=reason):
                     output, errors = io.StringIO(), io.StringIO()
                     pane_options = ({"side_effect": pane_result} if isinstance(pane_result, Exception)
-                                    else {"return_value": pane_result})
+                                    else {"return_value": self.pane_result() if pane_result is None else pane_result})
                     with mock.patch.object(ledger_status, "live_snapshot", return_value=self.snapshot), \
                             mock.patch.object(ledger_status, "ProcessSource", return_value=mock.Mock(lookup=native_lookup)), \
                             mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain(),

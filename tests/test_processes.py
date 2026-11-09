@@ -61,10 +61,10 @@ class ProcessChainTest(unittest.TestCase):
                     mock.patch.object(processes, "ProcessSource", return_value=source), \
                     mock.patch.object(status, "ProcessSource", return_value=source):
                 if consumer is status._claude_ancestor_pid:
-                    self.assertIsNone(consumer())
+                    self.assertIsNone(consumer(SHELL))
                 else:
                     with self.assertRaises(LedgerError) as caught:
-                        consumer()
+                        consumer(SHELL)
                     self.assertEqual(caught.exception.code, "sender_lookup_failed")
                     self.assertEqual(caught.exception.details["lookup"], source.lookup)
                     self.assertEqual(caught.exception.details["reason"], reason)
@@ -86,9 +86,123 @@ class ProcessChainTest(unittest.TestCase):
         with mock.patch.object(processes.os, "getpid", return_value=CALLER), \
                 mock.patch.object(processes, "ProcessSource", return_value=source), \
                 mock.patch.object(status, "ProcessSource", return_value=source):
-            self.assertEqual(status.process_ancestors(), {CALLER, SHELL})
-            self.assertIsNone(status._claude_ancestor_pid())
+            self.assertEqual(status.process_ancestors(SHELL), {CALLER, SHELL})
+            self.assertIsNone(status._claude_ancestor_pid(SHELL))
         self.assertNotIn(CLAUDE, source.reads)
+
+    def test_stop_at_rechecks_boundary_without_reading_protected_ancestors(self):
+        records = stable_records()
+        records[SHELL] = replace(records[SHELL], parent=2000)
+        records[2000] = ProcessLookupFailure("unavailable")
+        for consumer in ("chain", "ancestors", "claude"):
+            source = ScriptedSource(records)
+            source.lookup = "libproc"
+            with self.subTest(consumer=consumer), \
+                    mock.patch.object(processes.os, "getpid", return_value=CALLER), \
+                    mock.patch.object(processes, "ProcessSource", return_value=source), \
+                    mock.patch.object(status, "ProcessSource", return_value=source):
+                if consumer == "chain":
+                    self.assertEqual(process_chain(source=source, stop_at=SHELL),
+                                     [records[CALLER], records[CLAUDE], records[SHELL]])
+                elif consumer == "ancestors":
+                    self.assertEqual(status.process_ancestors(SHELL), {CALLER, CLAUDE, SHELL})
+                else:
+                    self.assertEqual(status._claude_ancestor_pid(SHELL), CLAUDE)
+            self.assertEqual(source.reads, Counter({CALLER: 2, CLAUDE: 2, SHELL: 2}))
+
+    def test_stop_at_none_still_requires_the_entire_chain(self):
+        records = stable_records()
+        records[SHELL] = replace(records[SHELL], parent=2000)
+        records[2000] = ProcessLookupFailure("unavailable")
+        source = ScriptedSource(records)
+        with mock.patch.object(processes.os, "getpid", return_value=CALLER):
+            with self.assertRaises(ProcessLookupFailure) as caught:
+                process_chain(source=source)
+        self.assertEqual(caught.exception.reason, "unavailable")
+        self.assertEqual(source.reads[2000], 1)
+
+    def test_stop_at_rejects_invalid_boundary_pids(self):
+        for shell_pid in (True, False, 0, 1, -1, "3000", 3000.0):
+            source = ScriptedSource(stable_records())
+            with self.subTest(shell_pid=shell_pid), \
+                    mock.patch.object(processes.os, "getpid", return_value=CALLER):
+                with self.assertRaises(ProcessLookupFailure) as caught:
+                    process_chain(source=source, stop_at=shell_pid)
+            self.assertEqual(caught.exception.reason, "invalid_output")
+            self.assertFalse(source.reads)
+
+    def test_invalid_boundary_is_rejected_by_both_identity_consumers(self):
+        for shell_pid in (True, False, 0, 1, -1, "3000", 3000.0):
+            for consumer in (status.process_ancestors, status._claude_ancestor_pid):
+                source = ScriptedSource(stable_records())
+                with self.subTest(shell_pid=shell_pid, consumer=consumer.__name__), \
+                        mock.patch.object(processes.os, "getpid", return_value=CALLER), \
+                        mock.patch.object(processes, "ProcessSource", return_value=source), \
+                        mock.patch.object(status, "ProcessSource", return_value=source):
+                    if consumer is status._claude_ancestor_pid:
+                        self.assertIsNone(consumer(shell_pid))
+                    else:
+                        with self.assertRaises(LedgerError) as caught:
+                            consumer(shell_pid)
+                        self.assertEqual(caught.exception.code, "sender_lookup_failed")
+                        self.assertEqual(caught.exception.details["reason"], "invalid_output")
+
+    def test_stop_at_caller_still_reads_and_rechecks_the_boundary(self):
+        source = ScriptedSource(stable_records())
+        with mock.patch.object(processes.os, "getpid", return_value=CALLER):
+            self.assertEqual(process_chain(source=source, stop_at=CALLER), [stable_records()[CALLER]])
+        self.assertEqual(source.reads, Counter({CALLER: 2}))
+
+    def test_claude_above_the_shell_boundary_is_never_observed(self):
+        records = stable_records()
+        records[CALLER] = replace(records[CALLER], parent=SHELL)
+        records[SHELL] = replace(records[SHELL], parent=CLAUDE)
+        source = ScriptedSource(records)
+        with mock.patch.object(processes.os, "getpid", return_value=CALLER), \
+                mock.patch.object(processes, "ProcessSource", return_value=source):
+            self.assertIsNone(status._claude_ancestor_pid(SHELL))
+        self.assertNotIn(CLAUDE, source.reads)
+
+    def test_stop_at_missing_target_returns_only_the_verified_root_chain(self):
+        records = stable_records()
+        records[7777] = ProcessInfo(7777, SHELL, "shell", (45,))
+        source = ScriptedSource(records)
+        with mock.patch.object(processes.os, "getpid", return_value=CALLER):
+            self.assertEqual(process_chain(source=source, stop_at=7777),
+                             [records[CALLER], records[CLAUDE], records[SHELL]])
+        self.assertNotIn(7777, source.reads)
+        with mock.patch.object(processes.os, "getpid", return_value=CALLER), \
+                mock.patch.object(processes, "ProcessSource", return_value=ScriptedSource(records)):
+            self.assertIsNone(status._claude_ancestor_pid(7777))
+
+    def test_permission_failure_before_or_at_boundary_still_rejects(self):
+        for pid in (CALLER, CLAUDE, SHELL):
+            for during_recheck in (False, True):
+                with self.subTest(pid=pid, during_recheck=during_recheck):
+                    records = stable_records()
+                    failure = ProcessLookupFailure("unavailable")
+                    records[pid] = [records[pid], failure] if during_recheck else failure
+                    self.assert_consumers_reject(records, "unavailable")
+
+    def test_stop_at_never_skips_identity_rechecks_below_or_at_boundary(self):
+        for pid in (CALLER, CLAUDE, SHELL):
+            original = stable_records()[pid]
+            for changed in (replace(original, parent=2),
+                            replace(original, started=(original.started[0] + 1,)),
+                            replace(original, name="replacement")):
+                records = stable_records()
+                records[SHELL] = replace(records[SHELL], parent=2000)
+                records[2000] = ProcessLookupFailure("unavailable")
+                if pid == SHELL:
+                    original = records[SHELL]
+                records[pid] = [original, changed]
+                source = ScriptedSource(records)
+                with self.subTest(pid=pid, changed=changed), \
+                        mock.patch.object(processes.os, "getpid", return_value=CALLER):
+                    with self.assertRaises(ProcessLookupFailure) as caught:
+                        process_chain(source=source, stop_at=SHELL)
+                self.assertEqual(caught.exception.reason, "changed")
+                self.assertNotIn(2000, source.reads)
 
     def test_missing_parent_fails_closed_even_after_claude_was_seen(self):
         records = stable_records()
@@ -219,8 +333,8 @@ class LinuxProcessSourceTest(unittest.TestCase):
         with mock.patch.object(processes.os, "getpid", return_value=CALLER), \
                 mock.patch.object(processes, "ProcessSource", return_value=self.source), \
                 mock.patch.object(status, "ProcessSource", return_value=self.source):
-            self.assertEqual(status.process_ancestors(), set(records))
-            self.assertEqual(status._claude_ancestor_pid(), CLAUDE)
+            self.assertEqual(status.process_ancestors(SHELL), set(records))
+            self.assertEqual(status._claude_ancestor_pid(SHELL), CLAUDE)
 
     def test_malformed_or_inconsistent_proc_stat_fails_closed(self):
         for options in ({"actual": CALLER + 1}, {"parent": -1}, {"parent": "unknown"},

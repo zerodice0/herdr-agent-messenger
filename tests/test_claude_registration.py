@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 import uuid
 
+from ham import processes
 from ham.ledger import cli as ledger_cli
 from ham.ledger.mail import Mailbox
 from ham.ledger.runtime import NativeReceiver
@@ -17,10 +18,12 @@ from ham.ledger.status import AgentRegistry, _claude_ancestor_pid, claude_foregr
 from ham.ledger.store import SCHEMA_VERSION, LedgerError, LedgerStore
 from ham.processes import ProcessInfo, ProcessLookupFailure
 from tests.test_ledger_core import snapshot
+from tests.test_processes import ScriptedSource
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_PID = 4242
+SHELL_PID = 3000
 
 
 class PrivateClaudeTest(unittest.TestCase):
@@ -454,7 +457,7 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
         self.agent = {'pane_id': 'w2:p9', 'terminal_id': 'term-b'}
         self.pane = {'ok': True, 'result': {'pane': dict(self.agent)}}
         self.info = {'ok': True, 'result': {'process_info': {
-            'pane_id': 'w2:p9', 'foreground_process_group_id': ROOT_PID,
+            'pane_id': 'w2:p9', 'shell_pid': SHELL_PID, 'foreground_process_group_id': ROOT_PID,
             'foreground_processes': [{
                 'pid': ROOT_PID, 'name': 'claude', 'argv': ['/opt/claude/bin/claude'],
                 'cwd': str(self.root),
@@ -476,8 +479,13 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
             return subprocess.CompletedProcess(command, 0, 'Herdr notice\n' + json.dumps(payload), '')
 
         if chain is None:
-            ancestry = mock.patch('ham.ledger.status._claude_ancestor_pid',
-                                  return_value=ROOT_PID if ROOT_PID in self.ancestors else None)
+            caller_parent = ROOT_PID if ROOT_PID in self.ancestors else SHELL_PID
+            records = {
+                9000: ProcessInfo(9000, caller_parent, 'python', (50,)),
+                ROOT_PID: ProcessInfo(ROOT_PID, SHELL_PID, 'claude', (30,)),
+                SHELL_PID: ProcessInfo(SHELL_PID, 1, 'shell', (20,)),
+            }
+            ancestry = mock.patch.object(processes, 'ProcessSource', return_value=ScriptedSource(records))
         else:
             ancestry = mock.patch('ham.ledger.status.process_chain', return_value=chain)
 
@@ -513,6 +521,38 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
         self.ancestors.add(7000)
         self.assertIsNone(self.foreground_pid(chain=chain))
         self.assertEqual(self.foreground_pid(chain=chain, require_ancestor=False), ROOT_PID)
+
+    def test_pane_shell_boundary_must_be_a_real_ancestor_not_a_common_root_sibling(self):
+        info = deepcopy(self.info)
+        info['result']['process_info']['shell_pid'] = 3999
+        self.assertIsNone(self.foreground_pid(info=info))
+        self.assertEqual(self.foreground_pid(info=info, require_ancestor=False), ROOT_PID)
+
+    def test_missing_or_invalid_shell_boundary_rejects_only_ancestry_required_observations(self):
+        for shell_pid in (None, True, False, 0, 1, -1, 1.5, 'unknown'):
+            with self.subTest(shell_pid=shell_pid):
+                info = deepcopy(self.info)
+                info['result']['process_info']['shell_pid'] = shell_pid
+                self.assertIsNone(self.foreground_pid(info=info))
+                self.assertEqual(self.foreground_pid(info=info, require_ancestor=False), ROOT_PID)
+        info = deepcopy(self.info)
+        del info['result']['process_info']['shell_pid']
+        self.assertIsNone(self.foreground_pid(info=info))
+        self.assertEqual(self.foreground_pid(info=info, require_ancestor=False), ROOT_PID)
+
+    def test_observation_without_ancestry_never_queries_the_native_chain(self):
+        info = deepcopy(self.info)
+        del info['result']['process_info']['shell_pid']
+        with mock.patch('ham.ledger.status.process_chain', side_effect=AssertionError('Unexpected native lookup')):
+            self.assertEqual(self.foreground_pid(info=info, require_ancestor=False), ROOT_PID)
+
+    def test_claude_above_the_pane_shell_cannot_replace_a_missing_local_root(self):
+        info = deepcopy(self.info)
+        info['result']['process_info']['shell_pid'] = 8000
+        chain = [ProcessInfo(9000, 8000, 'python', (50,)),
+                 ProcessInfo(8000, ROOT_PID, 'shell', (40,))]
+        self.assertIsNone(self.foreground_pid(info=info, chain=chain))
+        self.assertEqual(self.foreground_pid(info=info, chain=chain, require_ancestor=False), ROOT_PID)
 
     def test_multiple_foreground_claude_processes_including_nested_agent_reject(self):
         for nested_argv in (['claude'], ['/opt/claude/bin/claude', '--agent', 'reviewer']):
@@ -581,9 +621,9 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
 
 
 class ClaudeAncestorPidTest(PrivateClaudeTest):
-    def ancestor_pid(self, chain=(), *, failure=None):
+    def ancestor_pid(self, chain=(), *, failure=None, shell_pid=SHELL_PID):
         with mock.patch('ham.ledger.status.process_chain', return_value=chain, side_effect=failure):
-            return _claude_ancestor_pid()
+            return _claude_ancestor_pid(shell_pid)
 
     def test_ancestor_walk_crosses_hook_python_and_returns_foreground_claude(self):
         chain = [ProcessInfo(9000, 8000, 'python', (50,)),
@@ -595,25 +635,36 @@ class ClaudeAncestorPidTest(PrivateClaudeTest):
     def test_ancestor_walk_returns_nearest_background_claude_not_foreground_parent(self):
         chain = [ProcessInfo(9000, 7000, 'python', (50,)),
                  ProcessInfo(7000, ROOT_PID, 'claude', (40,)),
-                 ProcessInfo(ROOT_PID, 1, 'claude', (30,))]
+                 ProcessInfo(ROOT_PID, SHELL_PID, 'claude', (30,)),
+                 ProcessInfo(SHELL_PID, 1, 'shell', (20,))]
         self.assertEqual(self.ancestor_pid(chain), 7000)
 
     def test_ancestor_command_path_with_spaces_preserves_claude_basename(self):
         chain = [ProcessInfo(9000, 8000, '/usr/bin/python', (50,)),
                  ProcessInfo(8000, ROOT_PID, '/opt/hook python', (40,)),
-                 ProcessInfo(ROOT_PID, 1, '/opt/Claude Code/claude', (30,))]
+                 ProcessInfo(ROOT_PID, SHELL_PID, '/opt/Claude Code/claude', (30,)),
+                 ProcessInfo(SHELL_PID, 1, 'shell', (20,))]
         self.assertEqual(self.ancestor_pid(chain), ROOT_PID)
 
     def test_command_names_that_only_contain_claude_are_not_roots(self):
         for name in ('claude-helper', '/opt/claude/node', '/opt/Claude Code/claude worker'):
             with self.subTest(name=name):
-                self.assertIsNone(self.ancestor_pid([ProcessInfo(9000, 1, name, (50,))]))
+                self.assertIsNone(self.ancestor_pid([
+                    ProcessInfo(9000, SHELL_PID, name, (50,)),
+                    ProcessInfo(SHELL_PID, 1, 'shell', (20,)),
+                ]))
 
     def test_verified_chain_without_claude_or_failed_chain_rejects(self):
         self.assertIsNone(self.ancestor_pid([ProcessInfo(9000, 1, 'python', (50,))]))
         for reason in ('timeout', 'unavailable', 'exited', 'changed', 'invalid_output', 'unsupported'):
             with self.subTest(reason=reason):
                 self.assertIsNone(self.ancestor_pid(failure=ProcessLookupFailure(reason)))
+
+    def test_claude_in_a_normal_root_chain_without_the_pane_shell_is_not_trusted(self):
+        chain = [ProcessInfo(9000, ROOT_PID, 'python', (50,)),
+                 ProcessInfo(ROOT_PID, 1, 'claude', (30,))]
+        self.assertIsNone(self.ancestor_pid(chain))
+
 
 
 if __name__ == '__main__':

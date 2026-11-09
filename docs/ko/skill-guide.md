@@ -1697,10 +1697,13 @@ SSH 신뢰 설정을 바꾸거나 host-key 검증을 우회하지 마세요. 설
 
 두 호출은 최신 호출자 snapshot, 프로세스 계보, 저장소 신원과 세대를 검증하고 호출자만 갱신합니다. 무관한 Git이나 호스트 전체 표시 작업은 실행하지 않습니다. Binding이 같으면 표시 잠금을 잡지 않고, 바뀌면 기존·새 pane의 슬롯을 SQL보다 먼저 확보한 뒤 대기 후 신원을 다시 검증합니다. 변경이 없는 성공 관찰도 내용이 충돌하는 오래된 전체 snapshot을 `stale_snapshot`으로 거부하지만, 내용이 같으면 전체 갱신을 허용합니다. 공유 workspace의 관찰 순서, 다른 pane에 살아 있는 세션, 수동 테두리와 복구 소유권도 보호합니다. Worker·event 경로는 off 모드의 잠금 경합에서도 후속 작업을 영속적으로 남깁니다. [배포 시 주의점](migration.md#호출자-범위의-runtime-등록)을 참고하세요.
 
-계보는 자기 PID부터 부모 PID만 따라가며 Linux procfs 또는 macOS의
-`proc_pidinfo(PROC_PIDTBSDINFO)`를 사용합니다. 시작 식별자와 부모 관계를
-다시 확인한 뒤에만 일치하는 신원을 허용하며 `KERN_PROC_ALL`, `ps -ax`,
-`pgrep`로 전체 표를 조회하지 않습니다. 프로세스 조회 명령은 제한 시간 안에
+계보는 자기 PID부터 실제 Herdr `pane process-info`가 반환한 shell까지 부모
+PID만 따라가며 Linux procfs 또는 macOS의 `proc_pidinfo(PROC_PIDTBSDINFO)`를
+사용합니다. shell을 포함한 전체 관찰 구간의 시작 식별자와 부모 관계를 다시
+확인한 뒤에만 일치하는 신원을 허용합니다. 검증된 shell 위의 보호된 조상은
+조회할 필요가 없지만, shell에 도달하기 전의 조회 실패는 여전히 호출자를
+거부합니다. `KERN_PROC_ALL`, `ps -ax`, `pgrep`로 전체 표를 조회하지 않습니다.
+프로세스 조회 명령은 제한 시간 안에
 회수 예산을 남겨 두며 시간 초과·출력 초과·취소 후 SIGKILL을 보내더라도
 무제한 기다리지 않습니다. 같은 HAM 프로세스에서는 미회수 child가 있는
 실행파일을 다시 띄우지 않으며 이후 호출에서 비차단 회수를 시도합니다.
