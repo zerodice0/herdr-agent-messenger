@@ -132,7 +132,9 @@ class NativeReceiver:
         if not isinstance(session_ref,str) or not Path(session_ref).is_absolute():
             raise LedgerError('invalid_session','OMP session_ref must be its full supported session-file path.')
         registered = AgentRegistry(self.store).agent_session(terminal_id=agent['terminal_id'],
-                session_ref=session_ref,client=client,repo_id=agent['repo_id'],extension_present=True)
+                session_ref=session_ref,client=client,repo_id=agent['repo_id'],extension_present=True,
+                expected_agent_id=agent['agent_id'],expected_generation=agent['generation'],
+                environment=self.environment)
         return {'agent':registered,'bell_directory':str(self.store.bell_directory),
                 'bell_name':quote(registered['terminal_id'],safe='._-:'),
                 **self.inspect(terminal_id=registered['terminal_id'],agent_id=registered['agent_id'],generation=registered['generation'])}

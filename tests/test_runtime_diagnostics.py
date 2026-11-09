@@ -124,14 +124,6 @@ class RuntimeDiagnosticTest(unittest.TestCase):
             finally:
                 fcntl.flock(blocker, fcntl.LOCK_UN)
 
-    def test_register_budget_includes_registry_flock_before_snapshot(self):
-        with (self.store.directory / "registry.lock").open("a+b") as blocker:
-            fcntl.flock(blocker, fcntl.LOCK_EX)
-            try:
-                self.assertEqual(self.child_cli("register")["error"]["code"], "ledger_busy")
-            finally:
-                fcntl.flock(blocker, fcntl.LOCK_UN)
-
     def test_default_shared_deadline_is_twelve_seconds_and_resets_after_error(self):
         clock = [100.0]
         with mock.patch.object(ledger_store.time, "monotonic", side_effect=lambda: clock[0]):
@@ -416,7 +408,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         for responses, lookup, reason in cases:
             with self.subTest(lookup=lookup, reason=reason):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(AgentRegistry, "refresh", return_value=(self.snapshot, {})), \
+                with mock.patch.object(ledger_status, "live_snapshot", return_value=self.snapshot), \
                         mock.patch.object(ledger_status.subprocess, "run", side_effect=responses), \
                         mock.patch("sys.stdin", io.StringIO("{}")), \
                         redirect_stdout(output), redirect_stderr(errors):

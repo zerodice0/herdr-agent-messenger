@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -317,16 +318,116 @@ class AgentRegistry:
         self.store = store
         self.display_runner = display_runner
 
+    def _reserve_observation(self) -> int:
+        with self.store.transaction(notify=False) as connection:
+            row = connection.execute(
+                "SELECT value FROM ledger_meta WHERE key='registry-observation'").fetchone()
+            token = int(row[0]) + 1 if row else 1
+            connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES ('registry-observation',?)",
+                               (str(token),))
+        return token
+
+    @staticmethod
+    def _observation_value(connection: sqlite3.Connection, key: str) -> int:
+        row = connection.execute("SELECT value FROM ledger_meta WHERE key=?", (key,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def _fence_sweep(self, connection: sqlite3.Connection, token: int,
+                     observed: Mapping[str, Any], locations: Mapping[str, Any],
+                     workspaces: Mapping[str, Any]) -> None:
+        # A newer successful caller observation matters even when it changed
+        # no business data. Compatible observations must not starve the sweep.
+        newer = connection.execute(
+            "SELECT key FROM ledger_meta WHERE CAST(value AS INTEGER)>? AND "
+            "(key LIKE 'registry-terminal:%' OR key LIKE 'registry-workspace:%')",
+            (token,)).fetchall()
+        for entry in newer:
+            key = entry["key"]
+            if key.startswith("registry-workspace:"):
+                workspace = key.removeprefix("registry-workspace:")
+                row = connection.execute(
+                    "SELECT repo_key,is_linked_worktree,label FROM workspaces WHERE host=? AND workspace_id=?",
+                    (self.store.host, workspace)).fetchone()
+                matches = workspaces.get(workspace) == (tuple(row) if row else None)
+            else:
+                terminal = key.removeprefix("registry-terminal:")
+                row = connection.execute(
+                    "SELECT a.*,s.turn_state FROM agents a JOIN agent_status s USING(agent_id) "
+                    "WHERE a.host=? AND a.terminal_id=? AND a.active=1",
+                    (self.store.host, terminal)).fetchone()
+                incoming = observed.get(terminal)
+                matches = ((row is None and incoming is None) or
+                           (row is not None and incoming is not None and all(
+                               row[field] == incoming[field] for field in
+                               ("session_ref", "client", "repo_id", "workspace_id", "pane_id",
+                                "native_session_pid", "alias", "is_main_checkout", "turn_state"))))
+                slot = connection.execute(
+                    "SELECT pane_id,workspace_id FROM terminal_slots "
+                    "WHERE host=? AND terminal_id=? AND present=1", (self.store.host, terminal)).fetchone()
+                location = locations.get(terminal)
+                matches = matches and ((slot is None and location is None) or
+                    (slot is not None and location is not None and all(
+                        slot[field] == location[field] for field in ("pane_id", "workspace_id"))))
+            if not matches:
+                raise LedgerError("stale_snapshot", "The snapshot conflicts with a newer caller observation.")
+
+    def _commit_observation(self, connection: sqlite3.Connection, token: int,
+                            terminals: set[str] | None, *, workspace_ids: set[str] | None = None,
+                            changed: bool = True) -> None:
+        if terminals is None:
+            connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES ('registry-sweep-committed',?)",
+                               (str(token),))
+            connection.execute("DELETE FROM ledger_meta WHERE key='registry-refresh-pending' "
+                               "AND CAST(value AS INTEGER)<=?", (token,))
+            connection.execute(
+                "DELETE FROM ledger_meta WHERE CAST(value AS INTEGER)<=? AND "
+                "(key LIKE 'registry-terminal:%' OR key LIKE 'registry-workspace:%')", (token,))
+        else:
+            if changed and (self._observation_value(connection, "registry-sweep-committed") > token
+                    or any(self._observation_value(connection, "registry-terminal:" + terminal) > token
+                           for terminal in terminals)):
+                raise LedgerError("stale_snapshot", "A newer registry observation has already committed.")
+            if changed:
+                pending = max(token, self._observation_value(connection, "registry-refresh-pending"))
+                connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES ('registry-refresh-pending',?)",
+                                   (str(pending),))
+            keys = ["registry-terminal:" + terminal for terminal in terminals]
+            keys.extend("registry-workspace:" + workspace for workspace in (workspace_ids or ()))
+            for key in keys:
+                value = max(token, self._observation_value(connection, key))
+                connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES (?,?)", (key, str(value)))
+
+    def _defer_reconciliation(self) -> None:
+        token = self._reserve_observation()
+        with self.store.transaction(notify=False) as connection:
+            pending = max(token, self._observation_value(connection, "registry-refresh-pending"))
+            connection.execute("INSERT OR REPLACE INTO ledger_meta VALUES ('registry-refresh-pending',?)",
+                               (str(pending),))
+
+    @contextmanager
+    def _deferred_reconciliation(self):
+        try:
+            yield
+        except LedgerError as error:
+            if error.code in {"ledger_busy", "stale_snapshot", "stale_session", "recipient_absent"}:
+                try:
+                    self._defer_reconciliation()
+                except (LedgerError, sqlite3.Error, OSError):
+                    # Preserve the original failure if storage is unavailable.
+                    pass
+            raise
+
     def refresh(self, environment: Mapping[str, str] | None = None, *,
                 refresh_display: bool = True,
                 prune_device_claims: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
-        # Lock BEFORE snapshot acquisition: an older event cannot overwrite a
-        # newer session snapshot merely because its Git probes took longer.
-        with self.store.lock("registry"):
+        # Only full sweeps serialize here. Scoped callers fence their commits in
+        # SQL instead of waiting for unrelated Git or display I/O.
+        with self._deferred_reconciliation(), self.store.lock("registry"):
+            token = self._reserve_observation()
             snapshot = live_snapshot(environment)
             changed_panes: set[str] = set()
             result = self._reconcile(snapshot, changed_panes=changed_panes, environment=environment,
-                                     prune_device_claims=prune_device_claims)
+                                     prune_device_claims=prune_device_claims, observation=token)
             if refresh_display:
                 self._refresh_display(changed_panes, environment=environment, snapshot=snapshot)
         return snapshot, result
@@ -334,17 +435,38 @@ class AgentRegistry:
     def reconcile(self, snapshot: Mapping[str, Any], *, now: float | None = None,
                   refresh_display: bool = True,
                   environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-        """Commit a snapshot, then project changed panes; DB-only callers may opt out."""
-        changed_panes: set[str] = set()
-        result = self._reconcile(snapshot, now=now, changed_panes=changed_panes, environment=environment)
-        if refresh_display:
-            self._refresh_display(changed_panes, environment=environment, snapshot=snapshot, now=now)
+        """Commit a supplied snapshot; live callers use refresh or refresh_context."""
+        with self._deferred_reconciliation(), self.store.lock("registry"):
+            token = self._reserve_observation()
+            changed_panes: set[str] = set()
+            result = self._reconcile(snapshot, now=now, changed_panes=changed_panes,
+                                     environment=environment, observation=token)
+            if refresh_display:
+                self._refresh_display(changed_panes, environment=environment, snapshot=snapshot, now=now)
         return result
+
+    def refresh_context(self, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """Reconcile only the ancestry-verified caller, without projecting panes."""
+        values = os.environ if environment is None else environment
+        terminal = values.get("HERDR_TERMINAL_ID")
+        if not terminal:
+            terminal = self._resolve_terminal(environment, live_snapshot(environment))
+        key = hashlib.sha256(terminal.encode("utf-8")).hexdigest()
+        with self._deferred_reconciliation(), self.store.lock("registry-terminal-" + key):
+            token = self._reserve_observation()
+            snapshot = live_snapshot(environment)
+            if self._resolve_terminal(environment, snapshot) != terminal:
+                raise LedgerError("sender_unresolved", "The calling terminal changed during registration.")
+            self._reconcile(snapshot, changed_panes=set(), environment=environment,
+                            prune_device_claims=False, observation=token, caller=terminal)
+            with self.store.read() as connection:
+                return current_agent(connection, self.store.host, terminal)
 
     def _reconcile(self, snapshot: Mapping[str, Any], *, changed_panes: set[str],
                    now: float | None = None,
                    environment: Mapping[str, str] | None = None,
-                   prune_device_claims: bool = True) -> dict[str, Any]:
+                   prune_device_claims: bool = True, observation: int,
+                   caller: str | None = None) -> dict[str, Any]:
         at = time.time() if now is None else now
         panes = snapshot.get("panes")
         raw_agents = snapshot.get("agents")
@@ -385,6 +507,8 @@ class AgentRegistry:
             if not isinstance(raw, dict) or not raw.get("agent"):
                 continue
             terminal = str(raw.get("terminal_id") or '')
+            if caller is not None and terminal != caller:
+                continue
             if terminal not in locations:
                 raise LedgerError("invalid_snapshot", "An agent has no matching terminal pane.")
             if raw.get("pane_id") != locations[terminal]["pane_id"]:
@@ -411,34 +535,116 @@ class AgentRegistry:
                                   "client": str(raw["agent"]), "alias": alias,
                                   "turn_state": str(raw.get("agent_status") or 'unknown'),
                                   "native_session_pid": native_session_pid}
+        if caller is not None:
+            if caller not in observed:
+                raise LedgerError("recipient_absent", "The calling terminal no longer has an agent.")
+            # Git may take time even for the caller. Refuse a replaced session,
+            # cwd or binding rather than commit evidence from before that I/O.
+            latest = live_snapshot(environment)
+            if self._resolve_terminal(environment, latest) != caller:
+                raise LedgerError("sender_unresolved", "The calling terminal changed during registration.")
+            def caller_evidence(value: Mapping[str, Any]) -> tuple[Any, ...]:
+                pane = next((raw for raw in value["panes"] if raw.get("terminal_id") == caller), None)
+                agent = next((raw for raw in value["agents"]
+                              if raw.get("terminal_id") == caller and raw.get("agent")), None)
+                workspace = next((raw for raw in value.get("workspaces", [])
+                                  if pane is not None and raw.get("workspace_id") == pane.get("workspace_id")), None)
+                worktree = workspace.get("worktree") if workspace is not None else None
+                metadata = (None if workspace is None else (
+                    str(worktree.get("repo_key") or "") if isinstance(worktree, dict) else "",
+                    int(bool(worktree.get("is_linked_worktree"))) if isinstance(worktree, dict) else 0,
+                    str(workspace.get("label") or workspace["workspace_id"])))
+                return (None if pane is None else tuple(pane.get(key) for key in
+                        ("terminal_id", "pane_id", "workspace_id")),
+                        None if agent is None else tuple(agent.get(key) for key in
+                        ("agent", "agent_session", "cwd", "pane_id", "workspace_id")), metadata)
+            if caller_evidence(snapshot) != caller_evidence(latest):
+                raise LedgerError("stale_session", "The calling Herdr session changed during registration.")
         wake_terminals: list[str] = []
-        # Binding changes share the projector's pane lock. Never take registry
-        # from a projector: the order is registry -> sorted lock slots -> SQL.
         with self.store.read() as connection:
-            binding_panes = {row[0] for row in connection.execute(
-                "SELECT pane_id FROM agents WHERE host=? AND active=1", (self.store.host,))}
-        binding_panes.update(value["pane_id"] for value in locations.values())
+            active = [dict(row) for row in connection.execute(
+                "SELECT * FROM agents WHERE host=? AND active=1", (self.store.host,))]
+        terminals = None if caller is None else {
+            caller, *(row["terminal_id"] for row in active
+                      if row["pane_id"] == locations[caller]["pane_id"])}
+        if terminals is not None and (terminals - observed.keys()) & locations.keys():
+            raise LedgerError("stale_snapshot", "A live displaced terminal requires a full binding reconciliation.")
+        binding_panes = {row["pane_id"] for row in active
+                         if terminals is None or row["terminal_id"] in terminals}
+        binding_panes.update(value["pane_id"] for terminal, value in locations.items()
+                             if terminals is None or terminal in terminals)
         lock_panes = {self.store.display_lock_key(self.store.host, pane_id): pane_id
                       for pane_id in binding_panes}
+        if terminals is not None:
+            prior = {row["terminal_id"]: row for row in active}
+            if all(not self._binding_changed(prior.get(terminal), observed.get(terminal))
+                   for terminal in terminals):
+                lock_panes.clear()
         with ExitStack() as locks:
-            # Hash collisions share a bounded slot; acquire each slot once and
-            # in slot order, not pane order, to avoid recursive flock/deadlock.
+            # Never hold a caller's slot while waiting for another pane. Full
+            # sweeps defer atomically when any slot is busy; scoped transitions
+            # acquire only their own old/new binding slots, in the same order.
             for _key, pane_id in sorted(lock_panes.items()):
-                # Unlike an advisory display refresh, identity reconciliation
-                # must never report success with stale sessions after timeout.
                 locks.enter_context(self.store.display_lock(
-                    self.store.host, pane_id, timeout=30, error_code="ledger_busy"))
+                    self.store.host, pane_id, timeout=0 if caller is None else 30,
+                    error_code="ledger_busy"))
+            if caller is not None and lock_panes:
+                # A projector may have held these binding slots since the
+                # earlier probe. Revalidate after the wait, before touching SQL.
+                identity = repository_identity(cwd, self.store.host)
+                latest = live_snapshot(environment)
+                if self._resolve_terminal(environment, latest) != caller:
+                    raise LedgerError("sender_unresolved", "The calling terminal changed during registration.")
+                if (caller_evidence(snapshot) != caller_evidence(latest)
+                        or any(identity[key] != observed[caller][key] for key in identity)
+                        or (observed[caller]["native_session_pid"] is not None
+                            and claude_foreground_pid(observed[caller], environment,
+                                                      require_ancestor=False)
+                            != observed[caller]["native_session_pid"])):
+                    raise LedgerError("stale_session", "The calling Herdr identity changed while waiting for its binding.")
             result = self._reconcile_bindings(
                 observed, locations, workspaces, borders, at, changed_panes, wake_terminals,
-                prune_device_claims=prune_device_claims)
+                prune_device_claims=prune_device_claims, observation=observation,
+                terminals=terminals, lock_keys=set(lock_panes))
         return result
+
+    @staticmethod
+    def _binding_changed(old: Mapping[str, Any] | None, value: Mapping[str, Any] | None) -> bool:
+        if old is None or value is None:
+            return old is not value
+        return any(old[key] != value[key] for key in
+                   ("session_ref", "client", "repo_id", "workspace_id", "pane_id", "native_session_pid"))
 
     def _reconcile_bindings(self, observed: Mapping[str, Any], locations: Mapping[str, Any],
                             workspaces: Mapping[str, Any], borders: Mapping[str, Any],
                             at: float, changed_panes: set[str], wake_terminals: list[str], *,
-                            prune_device_claims: bool) -> dict[str, Any]:
+                            prune_device_claims: bool, observation: int,
+                            terminals: set[str] | None, lock_keys: set[str]) -> dict[str, Any]:
         live_terminals = set(locations)
-        with self.store.transaction(wake_terminals) as connection:
+        business_changed = False
+        with self.store.transaction(wake_terminals, notify=lambda: business_changed) as connection:
+            if terminals is not None:
+                caller_panes = {value["pane_id"] for value in observed.values()}
+                terminals.update(row["terminal_id"] for row in connection.execute(
+                    "SELECT terminal_id,pane_id FROM agents WHERE host=? AND active=1",
+                    (self.store.host,)) if row["pane_id"] in caller_panes)
+                if (terminals - observed.keys()) & locations.keys():
+                    raise LedgerError("stale_snapshot", "A live displaced terminal requires a full binding reconciliation.")
+            active_bindings = [dict(row) for row in connection.execute(
+                "SELECT * FROM agents WHERE host=? AND active=1", (self.store.host,))
+                if terminals is None or row["terminal_id"] in terminals]
+            old_by_terminal = {row["terminal_id"]: row for row in active_bindings}
+            changed_bindings = {terminal for terminal in old_by_terminal.keys() | observed.keys()
+                                if self._binding_changed(old_by_terminal.get(terminal), observed.get(terminal))}
+            required_panes = {value["pane_id"] for terminal, value in
+                              [*old_by_terminal.items(), *observed.items()]
+                              if terminals is None or terminal in changed_bindings}
+            if any(self.store.display_lock_key(self.store.host, pane) not in lock_keys
+                   for pane in required_panes):
+                raise LedgerError("stale_snapshot", "A binding moved before its display lock was acquired.")
+            if terminals is None:
+                self._fence_sweep(connection, observation, observed, locations, workspaces)
+            before = connection.total_changes
             from ham.ledger.settings import RepoSettings
             settings = RepoSettings(self.store)
             affected_scopes: set[tuple[str, str, str]] = set()
@@ -454,10 +660,18 @@ class AgentRegistry:
             previous_workspaces = {row["workspace_id"]: (row["repo_key"], row["is_linked_worktree"], row["label"])
                                    for row in connection.execute("SELECT * FROM workspaces WHERE host=?",
                                                                  (self.store.host,))}
-            for workspace_id in previous_workspaces.keys() - workspaces.keys():
-                connection.execute("DELETE FROM workspaces WHERE host=? AND workspace_id=?",
-                                   (self.store.host, workspace_id))
-            for workspace_id, metadata in workspaces.items():
+            workspace_ids = {value["workspace_id"] for value in observed.values()}
+            touched_workspaces = previous_workspaces.keys() | workspaces.keys() if terminals is None else workspace_ids
+            for workspace_id in touched_workspaces:
+                metadata = workspaces.get(workspace_id)
+                if (terminals is not None and previous_workspaces.get(workspace_id) != metadata
+                        and self._observation_value(connection, "registry-workspace:" + workspace_id) > observation):
+                    raise LedgerError("stale_snapshot", "Workspace metadata conflicts with a newer caller observation.")
+                if metadata is None:
+                    if workspace_id in previous_workspaces:
+                        connection.execute("DELETE FROM workspaces WHERE host=? AND workspace_id=?",
+                                           (self.store.host, workspace_id))
+                    continue
                 if previous_workspaces.get(workspace_id) != metadata:
                     connection.execute("INSERT INTO workspaces VALUES (?,?,?,?,?) "
                                        "ON CONFLICT(host,workspace_id) DO UPDATE SET repo_key=excluded.repo_key,"
@@ -469,6 +683,8 @@ class AgentRegistry:
             old_terminals = {row[0] for row in connection.execute(
                 "SELECT terminal_id FROM terminal_slots WHERE host=? AND present=1", (self.store.host,))}
             for terminal, location in locations.items():
+                if terminals is not None and terminal not in terminals:
+                    continue
                 connection.execute(
                     "INSERT INTO terminal_slots VALUES (?,?,?,?,1,?) ON CONFLICT(host,terminal_id) DO UPDATE SET "
                     "pane_id=excluded.pane_id,workspace_id=excluded.workspace_id,present=1,updated_at=excluded.updated_at "
@@ -477,11 +693,10 @@ class AgentRegistry:
                     (self.store.host, terminal, location["pane_id"], location["workspace_id"], at))
                 connection.execute("INSERT OR IGNORE INTO pane_bindings VALUES (?,?,?)",
                                    (self.store.host, location["pane_id"], terminal))
-            for terminal in old_terminals - locations.keys():
+            for terminal in old_terminals - locations.keys() if terminals is None else terminals - locations.keys():
                 connection.execute("UPDATE terminal_slots SET present=0,updated_at=? WHERE host=? AND terminal_id=?",
                                    (at, self.store.host, terminal))
-            active = {row["terminal_id"]: dict(row) for row in connection.execute(
-                "SELECT * FROM agents WHERE host=? AND active=1", (self.store.host,))}
+            active = {row["terminal_id"]: row for row in active_bindings}
             for terminal, old in active.items():
                 observed_agent = observed.get(terminal)
                 if not observed_agent or any(old[key] != observed_agent[key] for key in ("session_ref", "client", "repo_id")):
@@ -500,11 +715,13 @@ class AgentRegistry:
                     if any(old[key] != value[key] for key in
                            ("workspace_id", "pane_id", "alias", "is_main_checkout")):
                         changed_panes.add(value["pane_id"])
-                    connection.execute(
-                        "UPDATE agents SET workspace_id=?,pane_id=?,alias=?,is_main_checkout=?,last_seen=?,"
-                        "native_session_pid=? WHERE agent_id=?",
-                        (value["workspace_id"], value["pane_id"], value["alias"], value["is_main_checkout"], at,
-                         value["native_session_pid"], agent_id))
+                    if terminals is None or any(old[key] != value[key] for key in
+                            ("workspace_id", "pane_id", "alias", "is_main_checkout", "native_session_pid")):
+                        connection.execute(
+                            "UPDATE agents SET workspace_id=?,pane_id=?,alias=?,is_main_checkout=?,last_seen=?,"
+                            "native_session_pid=? WHERE agent_id=?",
+                            (value["workspace_id"], value["pane_id"], value["alias"], value["is_main_checkout"], at,
+                             value["native_session_pid"], agent_id))
                 else:
                     wake_terminals.append(terminal)
                     changed_panes.add(value["pane_id"])
@@ -525,7 +742,8 @@ class AgentRegistry:
                     connection.execute("INSERT INTO agent_status(agent_id,turn_state,updated_at) VALUES (?,?,?)",
                                        (agent_id, "unknown", at))
                 current_border = borders[terminal]
-                if current_border is not None and (not same or old["last_ham_label"] is None):
+                if current_border is not None and (terminals is None or lock_keys) and (
+                        not same or old["last_ham_label"] is None):
                     current = dict(connection.execute(
                         "SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone())
                     previous = recoverable_display_owner(
@@ -557,6 +775,8 @@ class AgentRegistry:
                     "WHERE d.recipient_host=? AND d.state IN ('queued','delivering')",
                     (self.store.host,)).fetchall():
                 terminal = row["recipient_terminal_id"]
+                if terminals is not None and terminal not in terminals:
+                    continue
                 target = observed.get(terminal)
                 if row["state"] == "delivering":
                     reason = "acceptance_unknown"
@@ -586,6 +806,9 @@ class AgentRegistry:
             if prune_device_claims:
                 from ham.ledger.devices import prune_stale
                 changed_panes.update(prune_stale(connection))
+            business_changed = connection.total_changes != before
+            self._commit_observation(connection, observation, terminals,
+                                     workspace_ids=workspace_ids, changed=business_changed)
         return {"agents": self.list(), "terminals": len(locations)}
 
     @staticmethod
@@ -620,11 +843,17 @@ class AgentRegistry:
 
     def resolve_context(self, environment: Mapping[str, str] | None = None,
                         snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if snapshot is None:
+            snapshot = live_snapshot(environment)
+        terminal = self._resolve_terminal(environment, snapshot)
+        with self.store.read() as connection:
+            return current_agent(connection, self.store.host, terminal)
+
+    def _resolve_terminal(self, environment: Mapping[str, str] | None,
+                          snapshot: Mapping[str, Any]) -> str:
         values = os.environ if environment is None else environment
         terminal = values.get("HERDR_TERMINAL_ID")
         inherited_pane = values.get("HERDR_PANE_ID", '')
-        if snapshot is None:
-            snapshot = live_snapshot(environment)
         ancestors = process_ancestors()
         if terminal:
             claimed = next((raw for raw in snapshot["panes"] if raw["terminal_id"] == terminal), None)
@@ -653,20 +882,23 @@ class AgentRegistry:
                 if lookup_error is not None:
                     raise lookup_error
                 raise LedgerError("sender_unresolved", "Cannot match this process to a live Herdr terminal; refusing inherited pane guesses.")
-        with self.store.read() as connection:
-            return current_agent(connection, self.store.host, terminal)
+        return terminal
 
     def agent_session(self, *, terminal_id: str, session_ref: str, client: str,
                       repo_id: str, extension_present: bool = True,
                       expected_agent_id: str | None = None, expected_generation: int | None = None,
                       environment: Mapping[str, str] | None = None) -> dict[str, Any]:
-        # OMP waits for Herdr's authoritative path. A Claude hook may fill only
-        # an unreported UUID; serialize that narrow upgrade with reconciliation.
-        with self.store.lock("registry"):
+        # Share only this terminal's capture lock with scoped reconciliation.
+        key = hashlib.sha256(terminal_id.encode("utf-8")).hexdigest()
+        with self.store.lock("registry-terminal-" + key), ExitStack() as locks:
             native_pid = None
             if client == "claude":
+                observation = self._reserve_observation()
                 with self.store.read() as connection:
                     candidate = current_agent(connection, self.store.host, terminal_id)
+                if candidate["session_ref"] == "unreported" and session_ref != "unreported":
+                    locks.enter_context(self.store.display_lock(
+                        self.store.host, candidate["pane_id"], timeout=30, error_code="ledger_busy"))
                 native_pid = claude_foreground_pid(candidate, environment)
                 if native_pid is None:
                     raise LedgerError("native_root_unverified", "Only the current foreground Claude root may register.")
@@ -684,6 +916,9 @@ class AgentRegistry:
                         raise LedgerError("stale_session", "A different native session is already reported.")
             with self.store.transaction((terminal_id,)) as connection:
                 agent = current_agent(connection, self.store.host, terminal_id)
+                if client == "claude" and any(agent[key] != candidate[key] for key in
+                        ("agent_id", "generation", "pane_id", "workspace_id", "repo_id")):
+                    raise LedgerError("stale_session", "The native root binding changed during registration.")
                 if expected_agent_id is not None or expected_generation is not None:
                     check_generation(connection, self.store.host, terminal_id,
                                      expected_agent_id, expected_generation)
@@ -704,6 +939,7 @@ class AgentRegistry:
                                        (session_ref, native_pid, agent["agent_id"]))
                     agent["session_ref"] = session_ref
                     agent["native_session_pid"] = native_pid
+                    self._commit_observation(connection, observation, {terminal_id})
                 elif (client == "claude" and agent["native_session_pid"] is not None
                       and agent["native_session_pid"] != native_pid):
                     raise LedgerError("stale_session", "The pending native root process has changed.")

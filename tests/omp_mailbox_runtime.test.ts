@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, setSystemTime, spyOn } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,23 +76,22 @@ from tests.test_ledger_core import snapshot
 root=Path(sys.argv[1]); op=sys.argv[2]; data=json.load(sys.stdin)
 repo=root/'repo'; repo.mkdir(exist_ok=True)
 store=LedgerStore(root/'ledger',canonical_name='alpha'); registry=AgentRegistry(store)
+if op in ('setup','session','turn_state'):
+ live=snapshot(repo,recipient_session=data.get('session_ref',str(root/'session.jsonl')))
+ if op=='turn_state': live['agents'][1]['agent_status']=data['turn_state']
+ # Publish the same external Herdr view that real CLI caller refreshes consume.
+ live_path=root/'snapshot.json'; pending=root/'snapshot.next'
+ pending.write_text(json.dumps(live),encoding='utf-8'); pending.replace(live_path)
+ registry.reconcile(live,refresh_display=False)
 if op=='setup':
- registry.reconcile(snapshot(repo,recipient_session=data.get('session_ref',str(root/'session.jsonl'))))
  settings=RepoSettings(store); rid=registry.list()[0]['repo_id']
  settings.mutate(rid,'mode','auto')
  settings.mutate(rid,'thresholds',{**DEFAULT_THRESHOLDS,'idle_minutes':data.get('idle_minutes',0),'coalesce_seconds':data.get('coalesce_seconds',0)})
-if op in ('session','turn_state'):
- live=snapshot(repo,recipient_session=data['session_ref'])
- if op=='turn_state': live['agents'][1]['agent_status']=data['turn_state']
- registry.reconcile(live)
 agents=registry.list(); sender=next(a for a in agents if a['terminal_id']=='term-a'); recipient=next(a for a in agents if a['terminal_id']=='term-b')
 if op in ('setup','session') and 'summary' in data:
  with store.transaction() as c: registry._status(c,recipient['agent_id'],'summary',data['summary'],0)
 mail=Mailbox(store)
-if op in ('setup','session') and data.get('register'):
- result=NativeReceiver(store).register(recipient,session_ref=data.get('session_ref',str(root/'session.jsonl')))
-elif op in ('setup','session','turn_state'): result={'agent':recipient}
-elif op=='register': result=NativeReceiver(store).register(recipient,**data)
+if op in ('setup','session','turn_state'): result={'agent':recipient}
 elif op=='summary':
  with store.transaction() as c: registry._status(c,recipient['agent_id'],'summary',data['summary'],0)
  result={'summary':data['summary']}
@@ -105,10 +104,27 @@ else: raise Exception(op)
 print(json.dumps(result))
 `;
 
+const fakeHerdr = `#!/usr/bin/env python3
+import json,sys
+from pathlib import Path
+root=Path(__file__).parent
+args=sys.argv[1:]
+if args==['api','snapshot']:
+ print(json.dumps({'result':{'snapshot':json.loads((root/'snapshot.json').read_text(encoding='utf-8'))}}))
+elif args[:2]==['pane','process-info']:
+ pane=args[args.index('--pane')+1]
+ # The Bun fixture really parents every CLI child; product ps ancestry is unpatched.
+ pid=${process.pid} if pane=='w1:p2' else 1
+ print(json.dumps({'result':{'process_info':{'pane_id':pane,'shell_pid':pid}}}))
+else:
+ raise SystemExit(2)
+`;
+
 class Fixture {
   directory = mkdtempSync(path.join(os.tmpdir(), "ham-omp-lifecycle-"));
   environment = { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: path.join(this.directory, "herdr.sock"),
-    HERDR_PANE_ID: "fixture-pane", HERDR_AGENT_LEDGER_DIR: path.join(this.directory, "ledger"),
+    HERDR_PANE_ID: "w1:p2", HERDR_TERMINAL_ID: "term-b", HERDR_BIN_PATH: path.join(this.directory, "herdr"),
+    HERDR_AGENT_LEDGER_DIR: path.join(this.directory, "ledger"),
     HERDR_AGENT_LEDGER_AUTOSTART: "0", PYTHONDONTWRITEBYTECODE: "1" };
   session = path.join(this.directory, "session.jsonl");
   branch: AcceptedMessage[] = [];
@@ -151,6 +167,8 @@ class Fixture {
   nameFailure?: "get" | "entries" | "set" | "id" | "append";
 
   constructor() {
+    writeFileSync(this.environment.HERDR_BIN_PATH, fakeHerdr);
+    chmodSync(this.environment.HERDR_BIN_PATH, 0o700);
     const timeout = (callback: () => unknown, delay: number) => {
       const token = {}; this.timers.set(token, callback); this.timeoutTokens.add(token);
       this.timerDueAt.set(token, Date.now() + delay); this.onTimeout?.(); return token;
@@ -220,8 +238,8 @@ class Fixture {
       if (operation === "register") await this.beforeRegister?.(data);
       if (operation === "inspect") await this.beforeInspect?.();
       const raw = operation === "inspect" && this.cachedInspection ? this.cachedInspection
-        : operation === "register" ? this.cacheRegistrations && this.registrationReply
-          ? this.registrationReply : await this.fixture(operation, data) : await this.cli(operation, data);
+        : operation === "register" && this.cacheRegistrations && this.registrationReply
+          ? this.registrationReply : await this.cli(operation, data);
       const result = parseReply(operation, raw);
       if (operation === "register" && "agent" in result) this.registrationReply = result;
       if (operation === "inspect" && "has_action" in result) {
@@ -292,10 +310,8 @@ class Fixture {
   }
   async setup(idle_minutes = 0, coalesce_seconds = 0) { await this.fixture("setup", { idle_minutes, coalesce_seconds }); await this.adapter.start(this.context); }
   async startNamingSession(operation: "setup" | "session", summary: string) {
-    // Naming scenarios need real ledger provenance, not repeated Python startup
-    // for unchanged inspect replies. Establish each session in one interpreter invocation.
-    const raw = await this.fixture(operation, { session_ref: this.session, summary, register: true });
-    this.registrationReply = parseReply("register", raw);
+    await this.fixture(operation, { session_ref: this.session, summary });
+    this.registrationReply = parseReply("register", await this.cli("register", { session_ref: this.session }));
     this.cacheRegistrations = true;
     this.cachedInspection = this.registrationReply;
     await this.adapter.start(this.context);

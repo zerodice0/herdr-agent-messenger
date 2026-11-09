@@ -316,9 +316,10 @@ class ClaudeReceiverTest(unittest.TestCase):
         live['agents'][1]['agent'] = 'claude'
         arguments = argparse.Namespace(command='ledger',ledger_command='runtime',runtime_command='claude-hook')
         environment = {**os.environ,'HERDR_TERMINAL_ID':'term-b','HERDR_AGENT_LEDGER_AUTOSTART':'0'}
-        with mock.patch.object(AgentRegistry,'refresh',return_value=(live,{})), \
-                mock.patch('ham.ledger.status.process_ancestors',return_value={10}), \
-                mock.patch('ham.ledger.status.pane_shell_pid',return_value=10), \
+        with mock.patch('ham.ledger.status.live_snapshot',return_value=live), \
+                mock.patch('ham.ledger.status.process_ancestors',return_value={202,4242}), \
+                mock.patch('ham.ledger.status.pane_shell_pid',
+                           side_effect=lambda pane,environment=None:202 if pane=='w1:p2' else 101), \
                 mock.patch.object(ledger_cli.sys,'stdin',io.StringIO(json.dumps(payload))):
             return ledger_cli._dispatch(arguments,environment,self.store)
 

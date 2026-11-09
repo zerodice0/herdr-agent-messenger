@@ -346,14 +346,18 @@ class DisplayRestoreTest(unittest.TestCase):
 
     def test_reconcile_contention_errors_instead_of_returning_stale_bindings(self):
         self.restored(reconcile=False)
-        before = self.dump()
+        def bindings():
+            with self.store.read() as connection:
+                return tuple(tuple(row) for row in connection.execute(
+                    "SELECT terminal_id,pane_id,workspace_id,present FROM terminal_slots ORDER BY terminal_id"))
+        before = self.registry.list(), self.entries(), bindings(), dict(self.herdr.labels)
         other = LedgerStore(self.store.directory, canonical_name=self.store.host)
         contender = AgentRegistry(other, display_runner=self.herdr)
         with self.store.display_lock(self.store.host, "pane"), ledger_store.runtime_budget(1.1):
             with self.assertRaises(LedgerError) as error:
                 contender.reconcile(self.snapshot(), now=300)
         self.assertEqual(error.exception.code, "ledger_busy")
-        self.assertEqual(self.dump(), before)
+        self.assertEqual((self.registry.list(), self.entries(), bindings(), dict(self.herdr.labels)), before)
         self.assertEqual(self.herdr.commands, [])
         self.assertEqual(other.notification_errors, [])
 

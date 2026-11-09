@@ -104,9 +104,31 @@ required. Plugin-root discovery still runs per receiver operation so installatio
 changes are not hidden by a cached checkout; eliminating unrelated wake probes
 also eliminates their associated discovery subprocesses.
 
+## Caller-scoped runtime registration
+
+Runtime `register` and `inspect` validate a fresh Herdr snapshot, process ancestry,
+and the caller's Git identity without running a host-wide Git or display sweep.
+New, replaced, and moved callers reconcile only their own binding; unrelated
+terminals are not marked absent. A changed binding still takes the sorted,
+deduplicated old/new pane display slots before SQL. Stable bindings do not wait
+for display projection, and registration never renames a user's border.
+
+Worker/event reconciliation remains responsible for the full host and display
+repair. Successful caller observations, including unchanged ones, fence older
+conflicting full snapshots (`stale_snapshot`); matching snapshots may still
+commit, so periodic inspection does not starve the worker. Rejected snapshots
+never project or wake. Contention leaves durable pending work even in off mode.
+A live displaced terminal is deferred to full reconciliation, not retired by a
+partial observation. Shared workspace metadata is ordered too. Runtime failures
+remain failures; deadlines, identity checks and warning visibility are unchanged.
+
+This is a Python ledger change with no schema/protocol or receiver-source change.
+Refresh HAM-owned workers and Mailboxes after deployment; no user-session restart
+or runtime reinstall is needed for this change.
+
 ## Sender lookup and ledger busy diagnostics
 
-The CLI now separates `sender_lookup_failed` (process ancestry or Herdr process info was unavailable, malformed or timed out; the caller is still refused) from `sender_unresolved` (a real ancestry mismatch). In `ledger runtime register|inspect` it also reports `ledger_busy` and `runtime_timeout` when a bounded wait ends. Those two calls share a 12 second deadline. SQLite waits stay at most 2 seconds per statement; bootstrap and registry file-lock waits use the remainder of the shared deadline minus a 1 second reserve (not capped at 2 seconds and not reset per lock). A call that completed successfully is returned as such, never turned into a timeout afterward. Other commands keep the 30 second SQLite wait and their existing error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged, and no identity is ever inferred from inherited pane IDs.
+The CLI separates `sender_lookup_failed` (process ancestry or Herdr process info was unavailable, malformed or timed out; the caller is still refused) from `sender_unresolved` (a real ancestry mismatch). In `ledger runtime register|inspect`, `ledger_busy` and `runtime_timeout` report an incomplete bounded call. The shared deadline remains 12 seconds; SQLite waits remain at most 2 seconds per statement, and file locks share the remaining deadline minus a 1 second reserve, without resetting per lock. Completed calls remain successful. Other commands retain their 30 second SQLite wait and existing error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged; inherited pane IDs never prove identity.
 
 The OMP receiver's extended failure report (phase, exit or signal, `timed_out`, elapsed time, stdout/stderr bytes and a stderr excerpt, with identical code and phase reports suppressed for 10 minutes) lives in the extension. Recovery is tracked per phase, so one phase succeeding does not clear the `HAM: receiver unavailable` status while another phase still has an error. Upgrade the CLI and copied skills first, then refresh the receiver with `runtime install omp` (with the user's consent, as for any runtime) and restart only the OMP sessions the user selects. Old extensions keep working and simply lack the extra detail. See [Sender identity, ledger and receiver diagnostics](skill-guide.md#sender-identity-ledger-and-receiver-diagnostics).
 

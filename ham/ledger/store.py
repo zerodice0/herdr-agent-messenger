@@ -14,7 +14,7 @@ import re
 import socket
 import sqlite3
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
@@ -441,11 +441,13 @@ class LedgerStore:
             connection.close()
 
     @contextmanager
-    def transaction(self, terminals: Sequence[str] = ()) -> Iterator[sqlite3.Connection]:
+    def transaction(self, terminals: Sequence[str] = (), *,
+                    notify: bool | Callable[[], bool] = True) -> Iterator[sqlite3.Connection]:
         """Commit board changes; callers supply only terminals whose receiver state changed.
 
         A mutable terminal list may be filled while holding the transaction lock.
         Heartbeats and board-only writes must not broadcast to native receivers.
+        A deferred notification predicate may exclude observation bookkeeping.
         """
         connection = self.connect()
         changed = False
@@ -460,7 +462,7 @@ class LedgerStore:
             raise
         finally:
             connection.close()
-        if changed:
+        if changed and (notify() if callable(notify) else notify):
             try:
                 self.ring(terminals)
             except OSError as error:

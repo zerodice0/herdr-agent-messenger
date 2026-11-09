@@ -76,6 +76,8 @@ def worker_lock(store: LedgerStore) -> Iterator[bool]:
 
 def maintenance_pending(store: LedgerStore) -> bool:
     with store.read() as connection:
+        if connection.execute("SELECT 1 FROM ledger_meta WHERE key='registry-refresh-pending'").fetchone():
+            return True
         if any(entry["state"] == "pending" for entry in load_display_repair(connection).values()):
             return True
         if connection.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone():

@@ -1025,7 +1025,26 @@ class NativeReceiverTest(unittest.TestCase):
 
     def test_actual_cli_inspect_and_claim_protocol_uses_private_ledger(self):
         self.send(kind='action')
-        environment = {**os.environ,'HERDR_AGENT_LEDGER_DIR':str(self.root/'ledger'),'HERDR_AGENT_LEDGER_AUTOSTART':'0'}
+        live = snapshot(self.repo,recipient_session=self.session)
+        herdr = self.root/'herdr'
+        herdr.write_text(
+            '#!' + sys.executable + '\n'
+            'import json, sys\n'
+            f'live = {live!r}\n'
+            'args = sys.argv[1:]\n'
+            'if args == ["api", "snapshot"]:\n'
+            '    print(json.dumps({"result":{"snapshot":live}}))\n'
+            'elif args[:2] == ["pane", "process-info"]:\n'
+            '    pane = args[args.index("--pane") + 1]\n'
+            f'    pid = {os.getpid()} if pane == "w1:p2" else 1\n'
+            '    print(json.dumps({"result":{"process_info":{"pane_id":pane,"shell_pid":pid}}}))\n'
+            'else:\n'
+            '    raise SystemExit(2)\n',
+            encoding='utf-8')
+        herdr.chmod(0o700)
+        environment = {**self.environment,'HERDR_BIN_PATH':str(herdr),
+                       'HERDR_TERMINAL_ID':'term-b','HERDR_PANE_ID':'w1:p2',
+                       'HERDR_AGENT_LEDGER_DIR':str(self.root/'ledger'),'HERDR_AGENT_LEDGER_AUTOSTART':'0'}
         root = Path(__file__).resolve().parents[1]
         def call(operation,data):
             completed = subprocess.run([sys.executable,'-m','ham','cli','ledger','runtime',operation],cwd=root,input=json.dumps(data),text=True,capture_output=True,env=environment,check=True)

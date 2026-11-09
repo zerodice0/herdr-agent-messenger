@@ -862,10 +862,17 @@ class LedgerCoreTest(unittest.TestCase):
 
     def test_incomplete_snapshot_does_not_close_agents_or_deliveries(self):
         self.send()
-        before = self.database_snapshot()
-        with self.assertRaises(LedgerError):
+        agents_before = self.registry.list()
+        with self.store.read() as connection:
+            deliveries_before = [dict(row) for row in connection.execute("SELECT * FROM deliveries ORDER BY message_id")]
+        with self.assertRaises(LedgerError) as caught:
             self.registry.reconcile({"agents": []})
-        self.assertEqual(self.database_snapshot(), before)
+        self.assertEqual(caught.exception.code, "invalid_snapshot")
+        self.assertEqual(self.registry.list(), agents_before)
+        with self.store.read() as connection:
+            self.assertEqual(
+                [dict(row) for row in connection.execute("SELECT * FROM deliveries ORDER BY message_id")],
+                deliveries_before)
 
     def test_withdraw_before_accept_tombstone_and_changed_payload_conflict(self):
         value = self.payload()

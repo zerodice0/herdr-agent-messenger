@@ -114,8 +114,25 @@ class ClaudeRegistrationTest(PrivateClaudeTest):
             ).fetchone())
 
     def durable_state(self):
+        # Internal observation reservations may advance even when admission fails.
+        # Identity, consumer state and bell changes must still fail these guards.
+        tables = {
+            'agents':'agent_id', 'agent_status':'agent_id', 'status_log':'seq',
+            'terminal_slots':'host,terminal_id', 'pane_bindings':'host,pane_id,terminal_id',
+            'device_claims':'device_id', 'workspaces':'host,workspace_id',
+            'repo_settings':'repo_id,field', 'workspace_settings':'repo_id,host,workspace_id,field',
+            'auto_main_incumbents':'repo_id,host,anchor_workspace_id', 'setting_conflicts':'seq',
+            'messages':'message_id', 'threads':'thread_id', 'deliveries':'message_id',
+            'native_claims':'claim_id', 'claim_resolutions':'seq', 'dedupe_receipts':'message_id',
+            'wake_log':'seq', 'outbox':'item_id', 'withdraw_tombstones':'message_id',
+            'mail_dismissals':'message_id', 'message_routes':'message_id',
+        }
         with self.store.read() as connection:
-            database = tuple(connection.iterdump())
+            database = {
+                table: tuple(tuple(row) for row in connection.execute(
+                    f'SELECT * FROM {table} ORDER BY {order}'))
+                for table, order in tables.items()
+            }
         bells = {path.name: (path.stat().st_mtime_ns, path.read_bytes())
                  for path in self.store.bell_directory.iterdir()}
         return database, bells

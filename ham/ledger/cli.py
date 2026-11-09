@@ -216,7 +216,21 @@ def _dispatch_command(arguments: argparse.Namespace, environment: Mapping[str, s
              LedgerStore(environment=environment, canonical_name=name))
     if store is None:
         raise LedgerError("ledger_not_initialized", "No existing HAM ledger is available to read.")
-    payload = _dispatch(arguments, environment, store)
+    try:
+        payload = _dispatch(arguments, environment, store)
+    except LedgerError:
+        # A failed nonblocking registry sweep still needs the existing worker
+        # to revisit its durable pending marker. Preserve the original error.
+        if not read_only_export:
+            try:
+                with store.read() as connection:
+                    pending = connection.execute(
+                        "SELECT 1 FROM ledger_meta WHERE key='registry-refresh-pending'").fetchone()
+                if pending:
+                    ensure_after_mutation(store, {}, environment, ensure=ensure_worker)
+            except (LedgerError, sqlite3.Error, OSError):
+                pass
+        raise
     mutating = ((arguments.command == "mail" and arguments.mail_command not in {"show", "threads", "direct-list"}) or
                 (arguments.command == "inbox" and arguments.inbox_command == "handle") or
                 (arguments.command == "ledger" and arguments.ledger_command in
@@ -330,15 +344,13 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         if command == "runtime":
             from ham.ledger.runtime import NativeReceiver
             data = _stdin_object()
-            receiver = NativeReceiver(store)
+            receiver = NativeReceiver(store, environment=environment)
             try:
                 if arguments.runtime_command == "register":
-                    snapshot = registry.refresh(environment)[0]
-                    agent = _live_context(registry, snapshot, environment)
+                    agent = registry.refresh_context(environment)
                     return receiver.register(agent, **data)
                 if arguments.runtime_command == "claude-hook":
-                    snapshot = registry.refresh(environment)[0]
-                    agent = _live_context(registry, snapshot, environment)
+                    agent = registry.refresh_context(environment)
                     subagent_id = data.get("agent_id")
                     if subagent_id is not None and not isinstance(subagent_id, str):
                         raise LedgerError("invalid_request", "Claude hook agent_id must be text.")
@@ -350,12 +362,23 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
                         subagent_id=subagent_id,
                         environment=environment,
                     )
+                if arguments.runtime_command == "inspect":
+                    agent = registry.refresh_context(environment)
+                    if (data.get("terminal_id") != agent["terminal_id"]
+                            or data.get("agent_id") != agent["agent_id"]
+                            or data.get("generation") != agent["generation"]):
+                        raise LedgerError("stale_session", "Inspect does not match the calling Herdr session.")
                 return getattr(receiver, arguments.runtime_command)(**data)
             except TypeError as error:
                 raise LedgerError("invalid_request", str(error)) from None
         data = _stdin_object()
         if command == "agent-session":
-            registry.refresh(environment)
+            agent = registry.refresh_context(environment)
+            if data.get("terminal_id") != agent["terminal_id"]:
+                raise LedgerError("stale_session", "Registration does not match the calling Herdr terminal.")
+            data.setdefault("expected_agent_id", agent["agent_id"])
+            data.setdefault("expected_generation", agent["generation"])
+            data["environment"] = environment
             method = registry.agent_session
         else:
             method = getattr(mailbox, arguments.delivery_command)
@@ -373,8 +396,8 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
             raise LedgerError("invalid_repo", "History requires a nonempty repository identity.")
         method = mailbox.list_threads if arguments.mail_command == "threads" else mailbox.list_direct
         return method(repo_id, arguments.limit, cursor=arguments.cursor)
-    # Reads never refresh last_seen/status/bells. Mutations acquire the snapshot
-    # before updating the registry under its serialization lock.
+    # Reads validate current evidence without updating status/bells. Mail
+    # mutations still need the full recipient registry, not just the sender.
     mutating = arguments.command == "mail" or (arguments.command == "inbox" and arguments.inbox_command == "handle")
     snapshot = registry.refresh(environment)[0] if mutating else live_snapshot(environment)
     sender = _live_context(registry, snapshot, environment)

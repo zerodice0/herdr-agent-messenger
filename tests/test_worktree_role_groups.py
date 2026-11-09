@@ -578,11 +578,17 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
     def test_invalid_workspace_snapshot_does_not_replace_metadata(self):
         observed = self.grouped()
         self.register(observed)
+        agents_before = self.registry.list()
+        tables = ("workspaces", "workspace_settings", "auto_main_incumbents")
         with self.store.read() as connection:
-            before = list(connection.iterdump())
+            before = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
+                      for table in tables}
         for invalid in (None, {}, [self.workspace("w1"), self.workspace("w1")], [{}]):
             with self.subTest(workspaces=invalid):
                 broken = {**observed, "workspaces": invalid}
                 self.assert_error("invalid_snapshot", lambda: self.register(broken))
+        self.assertEqual(self.registry.list(), agents_before)
         with self.store.read() as connection:
-            self.assertEqual(list(connection.iterdump()), before)
+            self.assertEqual(
+                {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")] for table in tables},
+                before)
