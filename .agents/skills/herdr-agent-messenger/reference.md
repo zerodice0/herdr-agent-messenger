@@ -202,6 +202,11 @@ The legacy request lifecycle's `error_code` field is unchanged. Useful codes:
 Address resolution also reports `agent_not_found`, `agent_ambiguous`,
 `repo_ambiguous`, `main_ambiguous`, or `main_unresolved` as described above.
 Different sender/recipient repositories are not a `repo_mismatch` send error.
+Caller ancestry reads only parent PIDs through Linux procfs or macOS libproc
+`PROC_PIDTBSDINFO`, then rechecks start identity and parent links. A missing,
+changed or unreadable chain is `sender_lookup_failed`, never identity permission;
+its `lookup` is `procfs` or `libproc`. A complete nonmatching chain remains
+`sender_unresolved`. Neither path enumerates the full process table.
 `native_session_pending` means Herdr has not yet published the OMP native session.
 The receiver waits within its existing bounded registration retries, without
 publishing the path itself; success removes HAM's waiting/unavailable status.
@@ -725,8 +730,9 @@ Android emulator claims; `process_count` counts running Android qemu processes
 excluding the target `DEVICE`. The claim-count check and insertion are atomic.
 Your own live reclaims are exempt; phones and iOS simulator `emu` claims are
 unlimited. iOS simulator claims never count toward the limit or run the process
-probe. Only Android emulator claims run the bounded `ps` probe; failure yields
-`process_count:null` and admission uses the claim count alone.
+probe. Only Android emulator claims run the bounded process probe: Linux `ps`,
+or macOS libproc PID enumeration with candidate-only `ps -p` argv reads. Failure
+yields `process_count:null` and admission uses the claim count alone.
 `--force` bypasses the limit **only on explicit user
 instruction**. On refusal, wait for capacity or do other work; never stop
 existing emulators to make room.
@@ -829,14 +835,20 @@ that omits any is unknown (`null`, `?`), never zero or empty. Claim rows carry h
 identity metadata (agent, alias, pane, terminal, generation, host, repository, workspace, active/live), never session references or transcript paths.
 
 Probing is bounded and owner-host only, and runs only when resources are
-requested: `adb devices`, a `ps` scan for emulator processes and, on macOS,
-`simctl list devices booted -j`, in parallel with a 2-second timeout each. A probe
+requested: `adb devices`, emulator discovery (Linux `ps`; macOS libproc and
+candidate-only `ps -p`) and, on macOS, `simctl list devices booted -j`, in parallel
+with a 2-second budget each including subprocess cleanup. A probe
 that fails or times out yields unknown observation and no `missing` finding for its
 platform. Physical iOS discovery is skipped on purpose (`ios_devices:null`): this
 implementation does not run `devicectl`, to avoid its report-file output, its dependence
 on pairing and access state, and its extra overhead. Registered iOS phone claims are
 still listed with
 `observed_state:"unknown"`.
+Command cleanup never waits without a deadline after kill, including open pipes,
+output-limit and cancellation failures. Unreaped children prevent a new launch
+of that executable in the same HAM process until nonblocking reaping succeeds;
+independent CLI processes do not share that guard. No cleanup targets other
+sessions' processes.
 
 Agent use: run `device board --json` on the owning host to choose a device, prefer a
 row with no holder whose `observed_state` is `attached`, `booted` or `running`, and
@@ -1719,7 +1731,7 @@ Codes can occur as envelope `error.code`, lifecycle `error_code`, or per-item er
 | Target: `agent_not_found`, `agent_ambiguous`, `invalid_route`, `route_expired`, `route_ambiguous`, `resolve_failed`, `recipient_is_sender` | Relist/reselect intended recipient or fix self-routing. Do not guess or create a missing agent unless asked. On a post-submission refresh error preserve the original request and retry status, not delivery. |
 | Connectivity: `host_not_configured`, `host_unavailable`, `read_failed` | Configure a concrete authorized SSH alias or restore Herdr/connectivity/trust. Local sandbox/socket permission failures need local-socket access; discovery failure does not prove an agent is missing. Retry discovery/status/read; never resend merely because reading failed. |
 | Sender: `sender_unavailable`, `sender_probe_failed` | Run from the current Herdr agent pane. Probe failure precedes submission; if sandbox/socket access denied, obtain access and retry that exact undelivered request. In batches retry only failed items, not accepted/unknown/timed-out peers. |
-| Sender identity: `sender_unresolved`, `sender_lookup_failed` | `sender_unresolved` is a real ancestry mismatch: run from the actual agent pane, never use inherited pane guesses. `sender_lookup_failed` means `ps` or Herdr process info was unavailable, malformed or timed out; the caller is still refused. Fix the lookup (tools, socket access) and rerun the same command. Neither is a security bypass. |
+| Sender identity: `sender_unresolved`, `sender_lookup_failed` | `sender_unresolved` is a real ancestry mismatch: run from the actual agent pane, never use inherited pane guesses. `sender_lookup_failed` means PID-local ancestry or Herdr process info was unavailable, changed, malformed or timed out; the caller is still refused. Fix the lookup (tools, socket access) and rerun the same command. Neither is a security bypass. |
 | Ledger: `ledger_busy`, `runtime_timeout` | Both come only from `ledger runtime register` and `inspect`. `ledger_busy`: a SQLite statement wait (at most 2 seconds) or file-lock allowance (the remaining shared deadline minus a 1 second reserve) ended. `runtime_timeout`: the shared 12 second deadline expired before completion. Rerun after a short pause and inspect `ledger worker status`, never delete database files. Other commands retain their 30 second wait and existing error handling. |
 | Submission: `prompt_failed` | Prompt rejected. Fix reported cause before retrying known-undelivered work. |
 | Uncertain/wait: `prompt_acceptance_unknown`, `prompt_timeout`, `wait_timed_out`, `timeout` | Delivery/completion uncertain or wait expired. Never blindly resend. Advance saved lifecycle or inspect recipient status/output without an ID. |
@@ -1742,9 +1754,9 @@ These codes are fail-closed. None of them lets a caller use an inherited pane, a
 | Code | Meaning | Safe response |
 | --- | --- | --- |
 | `sender_unresolved` | HAM completed the lookup and the process really is not a descendant of the claimed or any live Herdr terminal (a non-agent shell, a stale `HERDR_TERMINAL_ID`, or a process outside the pane). This is a genuine ancestry mismatch. | Run from the real agent pane. Never copy another pane's IDs into the environment; HAM refuses inherited pane guesses on purpose. |
-| `sender_lookup_failed` | HAM could not finish the lookup: the process ancestry (`ps`) or Herdr's process-info call was unavailable, returned malformed output, or timed out. Identity is unknown, not disproven, and the caller is still refused. | Treat as an environment problem. Check that `ps` works and that the local Herdr socket is reachable (sandbox or socket permissions), then rerun the same command. Do not retry by relaxing identity checks or setting variables by hand. |
+| `sender_lookup_failed` | HAM could not finish the lookup: PID-local ancestry or Herdr's process-info call was unavailable, changed, malformed, or timed out. Identity is unknown, not disproven, and the caller is still refused. | Check access to `procfs` or `libproc` (shown in `lookup`) and the local Herdr socket, then rerun the same command. Do not relax identity checks or set variables by hand. |
 | `ledger_busy` | A SQLite statement wait (at most 2 seconds and the remaining deadline) or file-lock allowance (the remaining shared 12 second deadline minus a 1 second reserve, not reset per lock) ended inside `ledger runtime register` or `inspect`. Other commands keep their 30 second wait and existing error handling. | Wait briefly and rerun the same call. If it persists, inspect `ledger worker status` and `ledger doctor`; never delete the database or lock files. |
-| `runtime_timeout` | The shared 12 second deadline of `ledger runtime register` or `inspect` was used up by process lookups, SQL or lock waiting before the call completed, without the call ending in a lock-wait `ledger_busy`. A call that already completed and committed successfully is returned as a success, never converted afterward. | Look for host overload, a slow `ps` or an unresponsive Herdr socket, then rerun. This is not an identity decision: do not weaken checks. |
+| `runtime_timeout` | The shared 12 second deadline of `ledger runtime register` or `inspect` was used up by process lookups, SQL or lock waiting before the call completed, without the call ending in a lock-wait `ledger_busy`. A call that already completed and committed successfully is returned as a success, never converted afterward. | Look for host overload, slow PID-local reads or an unresponsive Herdr socket, then rerun. This is not an identity decision: do not weaken checks. |
 
 The CLI bounds `ledger runtime register` and `inspect` by one 12 second monotonic deadline, below the extension's unchanged 15 second child timeout. Lookups use their usual cap or the remaining time. SQLite waits use at most 2 seconds per statement and the remaining time. File locks share the remaining deadline minus a 1 second reserve, without resetting per lock. Lock exhaustion returns `ledger_busy`; deadline exhaustion returns `runtime_timeout`. Completed calls remain successful. Other CLI commands retain their existing 30 second SQLite busy wait and error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged.
 

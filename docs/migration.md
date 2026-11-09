@@ -104,6 +104,27 @@ required. Plugin-root discovery still runs per receiver operation so installatio
 changes are not hidden by a cached checkout; eliminating unrelated wake probes
 also eliminates their associated discovery subprocesses.
 
+## PID-local process lookup and bounded command cleanup
+
+Caller verification now walks only parent PIDs: Linux procfs or macOS libproc
+`PROC_PIDTBSDINFO`, with start-identity and parent-link revalidation. macOS
+emulator discovery uses `proc_listallpids` and BSD metadata, then `ps -p` only for
+qemu candidates; no repeated full-table `ps`, `pgrep` or `KERN_PROC_ALL` is used.
+Missing or changed identity evidence still refuses the caller; unavailable device
+observations remain unknown, with the existing claim-count admission fallback.
+
+Process-query commands now include kill/pipe cleanup within their existing
+deadline and never wait indefinitely for an unkillable child. The same HAM
+process will not repeatedly launch an executable with an unreaped child.
+This does not provide a cross-process guard for separate CLI invocations.
+
+This is a Python-only change: schema 12, protocol 1, receiver sources and the
+shared 12-second register/inspect budget are unchanged. Refresh HAM-owned workers,
+Mailboxes and copied skills; no user-session restart or runtime reinstall is
+required. On an affected Mac, do not reuse deployment helpers that enumerate
+processes with full-table `ps` or `pgrep`; use PID-local or libproc inventory.
+Leave existing stalled processes and simulators to their owners.
+
 ## Caller-scoped runtime registration
 
 Runtime `register` and `inspect` validate a fresh Herdr snapshot, process ancestry,

@@ -15,6 +15,8 @@ from ham.ledger.device_board import HOLDER_FIELDS
 
 from ham.ledger.status import AgentRegistry, check_generation
 from ham.ledger.store import LedgerError, LedgerStore
+from ham.agents.directory import run_bounded_command
+from ham.processes import ProcessLookupFailure, ProcessSource
 
 
 def normalize_device(kind: str, device: str) -> str:
@@ -68,14 +70,14 @@ def emulator_limit(environment: Mapping[str, str] | None = None) -> int:
         raise LedgerError("invalid_config", "HERDR_AGENT_EMU_LIMIT must be an integer.") from None
 
 
-def scan_devices(*, runner=None, platform: str | None = None) -> dict[str, Any]:
+def scan_devices(*, runner=None, platform: str | None = None, process_source=None) -> dict[str, Any]:
     """Probe independent observation sources concurrently, each bounded to two seconds.
 
     Physical iOS devices remain unknown: devicectl can start CoreDevice services,
     request pairing/access, and has no uniform bounded, read-only availability.
     """
     platform = sys.platform if platform is None else platform
-    probes = DeviceClaims(None, runner=runner)
+    probes = DeviceClaims(None, runner=runner, platform=platform, process_source=process_source)
     errors = []
 
     def adb():
@@ -127,25 +129,38 @@ def scan_devices(*, runner=None, platform: str | None = None) -> dict[str, Any]:
 
 class DeviceClaims:
     def __init__(self, store: LedgerStore | None, *, registry: AgentRegistry | None = None,
-                 runner=None) -> None:
+                 runner=None, platform: str | None = None, process_source=None) -> None:
         self.store = store
         self.registry = registry or AgentRegistry(store)
-        self.runner = subprocess.run if runner is None else runner
+        self.runner = runner
+        self.platform = sys.platform if platform is None else platform
+        # Injected command fixtures must never leak into a real native host scan.
+        self.process_source = process_source
+        if process_source is None and runner is None:
+            self.process_source = ProcessSource(platform=self.platform)
 
-    def _run(self, command: list[str], *, timeout: int = 2):
+    def _run(self, command: list[str], *, timeout: float = 2):
         try:
-            result = self.runner(command, capture_output=True, text=True, timeout=timeout, check=False)
+            result = (run_bounded_command(command, timeout=timeout, raise_errors=True)
+                      if self.runner is None else self.runner(
+                          command, capture_output=True, text=True, timeout=timeout, check=False))
             return result if result.returncode == 0 else None
         except (OSError, subprocess.SubprocessError):
             return None
 
     def _emulator_processes(self) -> list[dict[str, Any]] | None:
         # The admission check and opt-in host resource snapshot share this parser.
+        if self.platform == "darwin":
+            return self._mac_emulator_processes()
         result = self._run(["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
         if result is None:
             return None
+        return self._parse_emulator_processes(result.stdout)
+
+    @staticmethod
+    def _parse_emulator_processes(output: str) -> list[dict[str, Any]]:
         processes = []
-        for line in result.stdout.splitlines():
+        for line in output.splitlines():
             fields = line.split(None, 2)
             if len(fields) != 3 or not fields[0].isdigit() or not fields[1].startswith("qemu-system-"):
                 continue
@@ -170,6 +185,42 @@ class DeviceClaims:
                     break
             processes.append({"pid": int(fields[0]), "port": port})
         return processes
+
+    def _mac_emulator_processes(self) -> list[dict[str, Any]] | None:
+        source = self.process_source
+        if source is None:
+            return None
+        deadline = time.monotonic() + 2
+        lines = []
+        try:
+            for pid in source.pids():
+                if time.monotonic() >= deadline:
+                    return None
+                try:
+                    process = source.read(pid)
+                except ProcessLookupFailure as error:
+                    if error.reason == "exited":
+                        continue
+                    raise
+                if not process.name.startswith("qemu-system-"):
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                result = self._run(["ps", "-ww", "-p", str(pid), "-o", "args="], timeout=remaining)
+                if result is None:
+                    return None
+                if source.read(pid) != process:
+                    return None
+                command = result.stdout.strip()
+                if not command or "\n" in command:
+                    return None
+                lines.append(f"{pid} {process.name} {command}")
+        except ProcessLookupFailure:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        return self._parse_emulator_processes("\n".join(lines))
 
     def list(self) -> dict[str, Any]:
         with self.store.read() as connection:

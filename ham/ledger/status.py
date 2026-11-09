@@ -18,6 +18,7 @@ import unicodedata
 
 from ham.agents.directory import agent_label, herdr_executable, run_bounded_command
 from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, save_receipt
+from ham.processes import ProcessLookupFailure, ProcessSource, process_chain
 
 
 def sanitize_status_text(value: Any, limit: int) -> str:
@@ -130,47 +131,25 @@ def _lookup_failed(lookup: str, reason: str, started: float) -> LedgerError:
 
 
 def process_ancestors() -> set[int]:
-    """Find the calling process tree; unavailable evidence never proves a mismatch."""
+    """Find verified caller parents without reading unrelated processes."""
     started = time.monotonic()
+    source = ProcessSource()
     try:
-        result = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True,
-                                text=True, check=False, timeout=budget_timeout(5))
-    except subprocess.TimeoutExpired:
-        raise _lookup_failed("ps", "timeout", started) from None
-    except OSError:
-        raise _lookup_failed("ps", "spawn_failed", started) from None
-    if result.returncode:
-        raise _lookup_failed("ps", "nonzero_exit", started)
-    try:
-        parents = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) != 2:
-                raise ValueError
-            pid, parent = map(int, parts)
-            if pid <= 0 or parent < 0 or pid in parents:
-                raise ValueError
-            parents[pid] = parent
-        ancestors: set[int] = set()
-        current = os.getpid()
-        while current > 1:
-            if current in ancestors or current not in parents:
-                raise ValueError
-            ancestors.add(current)
-            current = parents[current]
-        return ancestors
-    except (ValueError, TypeError, AttributeError):
-        raise _lookup_failed("ps", "invalid_output", started) from None
+        return {process.pid for process in process_chain(source=source, timeout=budget_timeout(5))}
+    except ProcessLookupFailure as error:
+        raise _lookup_failed(source.lookup, error.reason, started) from None
 
 
 def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -> int:
     started = time.monotonic()
     try:
-        result = subprocess.run([herdr_executable(environment), "pane", "process-info", "--pane", pane_id],
-                                capture_output=True, text=True, check=False, timeout=budget_timeout(5),
-                                env=None if environment is None else dict(environment))
+        result = run_bounded_command(
+            [herdr_executable(environment), "pane", "process-info", "--pane", pane_id],
+            timeout=budget_timeout(5), environment=environment, raise_errors=True)
     except subprocess.TimeoutExpired:
         raise _lookup_failed("process-info", "timeout", started) from None
+    except subprocess.SubprocessError:
+        raise _lookup_failed("process-info", "invalid_output", started) from None
     except OSError:
         raise _lookup_failed("process-info", "spawn_failed", started) from None
     if result.returncode:
@@ -190,28 +169,12 @@ def pane_shell_pid(pane_id: str, environment: Mapping[str, str] | None = None) -
         raise _lookup_failed("process-info", "invalid_output", started) from None
 
 def _claude_ancestor_pid() -> int | None:
-    """Return the nearest actual native root, not a foreground grandparent."""
+    """Return the nearest verified native root, not a foreground grandparent."""
     try:
-        result = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="],
-                                capture_output=True, text=True, check=False, timeout=budget_timeout(5))
-        if result.returncode:
-            return None
-        processes = {int(parts[0]): (int(parts[1]), parts[2])
-                     for line in result.stdout.splitlines()
-                     if len(parts := line.split(None, 2)) == 3}
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return next((process.pid for process in process_chain(timeout=budget_timeout(5))
+                     if Path(process.name).name == "claude"), None)
+    except ProcessLookupFailure:
         return None
-    seen: set[int] = set()
-    current = os.getpid()
-    while current > 1 and current not in seen:
-        seen.add(current)
-        process = processes.get(current)
-        if process is None:
-            return None
-        if Path(process[1]).name == "claude":
-            return current
-        current = process[0]
-    return None
 
 
 def claude_foreground_pid(agent: Mapping[str, Any],

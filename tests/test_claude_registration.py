@@ -15,6 +15,7 @@ from ham.ledger.mail import Mailbox
 from ham.ledger.runtime import NativeReceiver
 from ham.ledger.status import AgentRegistry, _claude_ancestor_pid, claude_foreground_pid
 from ham.ledger.store import SCHEMA_VERSION, LedgerError, LedgerStore
+from ham.processes import ProcessInfo, ProcessLookupFailure
 from tests.test_ledger_core import snapshot
 
 
@@ -462,7 +463,7 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
         self.ancestors = {ROOT_PID, ROOT_PID + 100}
 
     def foreground_pid(self, *, pane=None, info=None, require_ancestor=True, failure=None,
-                       process_table=None):
+                       chain=None):
         pane = self.pane if pane is None else pane
         info = self.info if info is None else info
 
@@ -474,12 +475,11 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
                 return payload
             return subprocess.CompletedProcess(command, 0, 'Herdr notice\n' + json.dumps(payload), '')
 
-        if process_table is None:
+        if chain is None:
             ancestry = mock.patch('ham.ledger.status._claude_ancestor_pid',
                                   return_value=ROOT_PID if ROOT_PID in self.ancestors else None)
         else:
-            ancestry = mock.patch('ham.ledger.status.subprocess.run', return_value=subprocess.CompletedProcess(
-                ['ps', '-axo', 'pid=,ppid=,comm='], 0, process_table, ''))
+            ancestry = mock.patch('ham.ledger.status.process_chain', return_value=chain)
 
         with mock.patch('ham.ledger.status.herdr_executable', return_value='private-herdr'), \
                 mock.patch('ham.ledger.status.run_bounded_command', side_effect=run), \
@@ -497,18 +497,22 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
         # Reconciliation deliberately checks the observed root without hook ancestry.
         self.assertEqual(self.foreground_pid(require_ancestor=False), ROOT_PID)
 
-    def test_foreground_root_accepts_real_nearest_claude_ancestry_through_hook_python(self):
-        processes = ('9000 8000 python\n8000 4242 python\n'
-                     '4242 3000 claude\n3000 1 driver\n')
-        self.assertEqual(self.foreground_pid(process_table=processes), ROOT_PID)
+    def test_foreground_root_accepts_nearest_claude_ancestry_through_hook_python(self):
+        chain = [ProcessInfo(9000, 8000, 'python', (50,)),
+                 ProcessInfo(8000, ROOT_PID, 'python', (40,)),
+                 ProcessInfo(ROOT_PID, 3000, 'claude', (30,)),
+                 ProcessInfo(3000, 1, 'driver', (20,))]
+        self.assertEqual(self.foreground_pid(chain=chain), ROOT_PID)
 
     def test_background_claude_rejects_foreground_claude_grandparent_even_in_ancestry(self):
-        processes = ('9000 7000 python\n7000 4242 claude\n'
-                     '4242 3000 claude\n3000 1 driver\n')
+        chain = [ProcessInfo(9000, 7000, 'python', (50,)),
+                 ProcessInfo(7000, ROOT_PID, 'claude', (40,)),
+                 ProcessInfo(ROOT_PID, 3000, 'claude', (30,)),
+                 ProcessInfo(3000, 1, 'driver', (20,))]
         # Both Claude PIDs are ancestors, but the hook belongs to the nearest one.
         self.ancestors.add(7000)
-        self.assertIsNone(self.foreground_pid(process_table=processes))
-        self.assertEqual(self.foreground_pid(process_table=processes, require_ancestor=False), ROOT_PID)
+        self.assertIsNone(self.foreground_pid(chain=chain))
+        self.assertEqual(self.foreground_pid(chain=chain, require_ancestor=False), ROOT_PID)
 
     def test_multiple_foreground_claude_processes_including_nested_agent_reject(self):
         for nested_argv in (['claude'], ['/opt/claude/bin/claude', '--agent', 'reviewer']):
@@ -577,48 +581,39 @@ class ClaudeForegroundPidTest(PrivateClaudeTest):
 
 
 class ClaudeAncestorPidTest(PrivateClaudeTest):
-    def ancestor_pid(self, processes='', *, returncode=0, failure=None):
-        result = subprocess.CompletedProcess(
-            ['ps', '-axo', 'pid=,ppid=,comm='], returncode, processes, '')
-        with mock.patch('ham.ledger.status.os.getpid', return_value=9000), \
-                mock.patch('ham.ledger.status.subprocess.run', return_value=result, side_effect=failure):
+    def ancestor_pid(self, chain=(), *, failure=None):
+        with mock.patch('ham.ledger.status.process_chain', return_value=chain, side_effect=failure):
             return _claude_ancestor_pid()
 
-    def test_native_ancestor_walk_crosses_hook_python_and_returns_foreground_claude(self):
-        processes = ('9000 8000 python\n8000 4242 python\n'
-                     '4242 3000 claude\n3000 1 driver\n')
-        self.assertEqual(self.ancestor_pid(processes), ROOT_PID)
+    def test_ancestor_walk_crosses_hook_python_and_returns_foreground_claude(self):
+        chain = [ProcessInfo(9000, 8000, 'python', (50,)),
+                 ProcessInfo(8000, ROOT_PID, 'python', (40,)),
+                 ProcessInfo(ROOT_PID, 3000, 'claude', (30,)),
+                 ProcessInfo(3000, 1, 'driver', (20,))]
+        self.assertEqual(self.ancestor_pid(chain), ROOT_PID)
 
-    def test_native_ancestor_walk_returns_nearest_background_claude_not_foreground_parent(self):
-        processes = ('9000 7000 python\n7000 4242 claude\n'
-                     '4242 3000 claude\n3000 1 driver\n')
-        self.assertEqual(self.ancestor_pid(processes), 7000)
+    def test_ancestor_walk_returns_nearest_background_claude_not_foreground_parent(self):
+        chain = [ProcessInfo(9000, 7000, 'python', (50,)),
+                 ProcessInfo(7000, ROOT_PID, 'claude', (40,)),
+                 ProcessInfo(ROOT_PID, 1, 'claude', (30,))]
+        self.assertEqual(self.ancestor_pid(chain), 7000)
 
-    def test_native_ancestor_comm_path_with_spaces_preserves_claude_basename(self):
-        processes = ('9000 8000 /usr/bin/python\n8000 4242 /opt/hook python\n'
-                     '4242 3000 /opt/Claude Code/claude\n3000 1 driver\n')
-        self.assertEqual(self.ancestor_pid(processes), ROOT_PID)
+    def test_ancestor_command_path_with_spaces_preserves_claude_basename(self):
+        chain = [ProcessInfo(9000, 8000, '/usr/bin/python', (50,)),
+                 ProcessInfo(8000, ROOT_PID, '/opt/hook python', (40,)),
+                 ProcessInfo(ROOT_PID, 1, '/opt/Claude Code/claude', (30,))]
+        self.assertEqual(self.ancestor_pid(chain), ROOT_PID)
 
-    def test_native_ancestor_unknown_missing_cycle_or_malformed_process_table_rejects(self):
-        invalid = [
-            '',
-            '9000 8000 python\n8000 3000 python\n3000 1 driver\n',
-            '9000 8000 python\n4242 3000 claude\n',
-            '9000 8000 python\n8000 9000 python\n',
-            'not-a-pid 1 claude\n9000 4242 python\n4242 1 claude\n',
-            '9000 not-a-parent python\n4242 1 claude\n',
-            '9000 4242\n4242 1 claude\n',
-        ]
-        for processes in invalid:
-            with self.subTest(processes=processes):
-                self.assertIsNone(self.ancestor_pid(processes))
+    def test_command_names_that_only_contain_claude_are_not_roots(self):
+        for name in ('claude-helper', '/opt/claude/node', '/opt/Claude Code/claude worker'):
+            with self.subTest(name=name):
+                self.assertIsNone(self.ancestor_pid([ProcessInfo(9000, 1, name, (50,))]))
 
-    def test_native_ancestor_ps_failure_or_timeout_rejects(self):
-        processes = '9000 4242 python\n4242 1 claude\n'
-        self.assertIsNone(self.ancestor_pid(processes, returncode=1))
-        for failure in (OSError('ps unavailable'), subprocess.TimeoutExpired('ps', 5)):
-            with self.subTest(failure=failure):
-                self.assertIsNone(self.ancestor_pid(processes, failure=failure))
+    def test_verified_chain_without_claude_or_failed_chain_rejects(self):
+        self.assertIsNone(self.ancestor_pid([ProcessInfo(9000, 1, 'python', (50,))]))
+        for reason in ('timeout', 'unavailable', 'exited', 'changed', 'invalid_output', 'unsupported'):
+            with self.subTest(reason=reason):
+                self.assertIsNone(self.ancestor_pid(failure=ProcessLookupFailure(reason)))
 
 
 if __name__ == '__main__':

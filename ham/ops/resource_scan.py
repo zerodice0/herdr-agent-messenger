@@ -16,6 +16,8 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from ham.agents.directory import run_bounded_command
+
 
 class ResourceScanError(RuntimeError):
     """A discovery source is unavailable; callers may still show other sources."""
@@ -25,10 +27,12 @@ _MAC_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 _RUNTIME_NAMES = {"omp", "claude", "codex"}
 
 
-def _command(runner: Callable, command: list[str], *, empty_exit: bool = False) -> str:
+def _command(runner: Callable | None, command: list[str], *, empty_exit: bool = False) -> str:
     try:
-        result = runner(command, capture_output=True, text=True, errors="replace", timeout=2,
-                        check=False, env={**os.environ, "LC_ALL": "C"})
+        environment = {**os.environ, "LC_ALL": "C"}
+        result = (run_bounded_command(command, timeout=2, environment=environment, raise_errors=True)
+                  if runner is None else runner(command, capture_output=True, text=True,
+                                                errors="replace", timeout=2, check=False, env=environment))
     except (OSError, subprocess.SubprocessError) as error:
         raise ResourceScanError(f"{command[0]}: {error}") from None
     if result.returncode and not (empty_exit and result.returncode == 1
@@ -206,7 +210,7 @@ def _mac_listeners(runner: Callable, listener_endpoints: list[dict[str, Any]]) -
     return _deduplicate(rows)
 
 
-def scan_listeners(*, runner: Callable = subprocess.run, platform: str | None = None,
+def scan_listeners(*, runner: Callable | None = None, platform: str | None = None,
                    now: Any = None, proc_root: str | Path = "/proc",
                    listener_endpoints: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Discover this user's listeners; unavailable discovery raises ResourceScanError.
@@ -235,7 +239,7 @@ def _loopback(host: str | None) -> bool:
         return False
 
 
-def scan_serve(*, runner: Callable = subprocess.run, platform: str | None = None,
+def scan_serve(*, runner: Callable | None = None, platform: str | None = None,
                now: Any = None) -> list[dict[str, Any]]:
     """Read Tailscale Web handlers. A host without Tailscale has no routes."""
     platform = sys.platform if platform is None else platform
@@ -349,8 +353,8 @@ def attribute(listeners: Sequence[Mapping[str, Any]], serve_routes: Sequence[Map
     return per_agent, resources
 
 
-def scan_host_resources(*, runner: Callable = subprocess.run, platform: str | None = None,
-                        now: Any = None, proc_root: str | Path = "/proc") -> dict[str, Any]:
+def scan_host_resources(*, runner: Callable | None = None, platform: str | None = None,
+                        now: Any = None, proc_root: str | Path = "/proc", process_source=None) -> dict[str, Any]:
     """Collect independent sources without allowing a discovery failure to break a board."""
     result: dict[str, Any] = {"listeners": [], "listener_endpoints": [], "serve": [], "error": None}
     errors = []
@@ -362,6 +366,6 @@ def scan_host_resources(*, runner: Callable = subprocess.run, platform: str | No
         except Exception as error:
             errors.append(f"{key}: {error}")
     from ham.ledger.devices import scan_devices
-    result["devices_observed"] = scan_devices(runner=runner, platform=platform)
+    result["devices_observed"] = scan_devices(runner=runner, platform=platform, process_source=process_source)
     result["error"] = "; ".join(errors) or None
     return result

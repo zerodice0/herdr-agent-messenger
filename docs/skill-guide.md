@@ -328,8 +328,9 @@ device list
   `DEVICE`. The claim-count check and insertion are atomic. Your own live reclaims
   are exempt; phones and iOS simulator `emu` claims are unlimited. iOS simulator
   claims never count toward the limit or run the process probe. Only Android
-  emulator claims run the bounded `ps` probe; if it fails, `process_count` is
-  `null` and admission uses the claim count alone.
+  emulator claims run the bounded process probe: Linux uses `ps`; macOS lists
+  PIDs with libproc and reads argv only for qemu candidates using `ps -p`.
+  If it fails, `process_count` is `null` and admission uses the claim count alone.
   `--force` bypasses the limit **only on explicit user instruction**. On refusal,
   wait for capacity or do other work; never stop existing emulators to make room.
 
@@ -426,9 +427,10 @@ process whose port cannot be determined becomes an `unknown` row with
 The reconciliation is deliberately bounded and read-only:
 
 - Only the owning host probes its own devices, and only while resources are
-  requested: `adb devices`, a `ps` scan for emulator processes and, on macOS,
-  `xcrun simctl list devices booted -j`. The probes run in parallel with a
-  2-second timeout each, so one hung tool cannot stall the board.
+  requested: `adb devices`, emulator discovery (Linux `ps`; macOS libproc plus
+  candidate-only `ps -p`) and, on macOS, `xcrun simctl list devices booted -j`.
+  The probes run in parallel with a 2-second budget each, including command
+  cleanup. A failed or incomplete observation is unknown, never zero.
 - Physical iOS discovery is skipped on purpose. This implementation does not run
   `devicectl`, to avoid its report-file output, its dependence on pairing and access
   state, and its extra overhead,
@@ -1326,7 +1328,7 @@ The [complete error code catalog](../.agents/skills/herdr-agent-messenger/refere
 | `agent_not_found`, `agent_ambiguous`, `invalid_route`, `route_expired`, `route_ambiguous`, `resolve_failed`, `recipient_is_sender` | Relist/reselect rather than guess. A post-submission resolution error means resume observation, not resubmit. Create only when asked. |
 | `host_not_configured`, `host_unavailable` | Restore authorized SSH/Herdr connectivity. Local sandbox/socket denial requires socket access; failed discovery does not mean missing agent. |
 | `sender_unavailable`, `sender_probe_failed` | Use the current Herdr agent pane. Probe failure is before submission; obtain local-socket access for sandbox/socket errors, then retry that exact undelivered request only. |
-| `sender_unresolved`, `sender_lookup_failed` | `sender_unresolved` is a genuine ancestry mismatch: run from the real agent pane, never use inherited pane guesses. `sender_lookup_failed` means `ps` or Herdr process info was unavailable, malformed, or timed out; the caller is still refused. Fix the lookup and rerun the same command; neither is a bypass. |
+| `sender_unresolved`, `sender_lookup_failed` | `sender_unresolved` is a genuine ancestry mismatch: run from the real agent pane, never use inherited pane guesses. `sender_lookup_failed` means PID-local ancestry or Herdr process info was unavailable, changed, malformed, or timed out; the caller is still refused. Fix the lookup and rerun the same command; neither is a bypass. |
 | `ledger_busy`, `runtime_timeout` | Both come only from `ledger runtime register` and `inspect`: a SQLite wait (at most 2 seconds), a file-lock allowance or the shared deadline was exhausted. Not completed; rerun the call after a short pause and never touch database files. Other commands keep their existing wait and error handling. |
 | `prompt_failed` | Submission rejected; fix cause before retrying known-undelivered work. |
 | `prompt_acceptance_unknown`, `prompt_timeout`, `wait_timed_out`, `timeout` | Possibly delivered / completion unknown. Preserve ID and use `request-status`, or inspect recipient if no ID. Never blindly resend. |
@@ -1345,13 +1347,23 @@ Local socket access is needed even for a remote request because HAM verifies the
 The sender and ledger commands fail closed when HAM cannot prove who is calling or cannot finish within its bounded wait. The outcomes differ, so do not treat them as one error:
 
 - `sender_unresolved` means the lookup finished and the process is genuinely not inside the claimed or any live Herdr terminal. Run from the real agent pane. Never copy another pane's IDs; HAM refuses inherited pane guesses.
-- `sender_lookup_failed` means the lookup itself could not finish: process ancestry (`ps`) or Herdr's process-info call was unavailable, malformed, or timed out. Identity is unknown, not disproven, and the caller is still refused. Fix the environment (tools, local socket and sandbox access) and rerun the same command. Never retry by relaxing the check.
+- `sender_lookup_failed` means the lookup itself could not finish: PID-local ancestry or Herdr's process-info call was unavailable, changed, malformed, or timed out. Identity is unknown, not disproven, and the caller is still refused. Ancestry diagnostics identify `procfs` (Linux) or `libproc` (macOS). Fix the environment (tools, local socket and sandbox access) and rerun the same command. Never retry by relaxing the check.
 - `ledger_busy` means a wait inside `ledger runtime register` or `inspect` ended without completing: one SQLite statement wait (at most 2 seconds) or a file-lock allowance (the remaining shared deadline minus a 1 second reserve). Rerun after a short pause; if it persists, inspect `ledger worker status` or `ledger doctor`. Never delete database or lock files.
 - `runtime_timeout` means the shared deadline of `ledger runtime register` or `inspect` was used up before the call completed.
 
 `ledger runtime register` and `inspect` share one 12 second monotonic deadline, below the extension's unchanged 15 second child timeout. Lookups use their usual cap or the remaining time; SQLite waits use at most 2 seconds per statement and the remaining time. File locks share the remaining deadline minus a 1 second reserve, without resetting per lock. Lock exhaustion returns `ledger_busy`; deadline exhaustion returns `runtime_timeout`. A completed call remains successful. Other commands retain their 30 second SQLite wait and existing error handling. Schema 12, protocol 1 and the eight legacy actions are unchanged.
 
 Both calls verify a fresh caller snapshot, ancestry, repository identity and current generation. They reconcile only the caller, without unrelated Git probes or host-wide display projection. Stable bindings need no pane display lock; changed bindings protect their old/new slots before SQL and revalidate after waiting. Successful observations, including unchanged ones, reject conflicting older full snapshots (`stale_snapshot`) but allow matching sweeps to commit. Shared workspace ordering, live displaced sessions, manual borders and recovery ownership remain protected. Worker/event paths retain pending work even when contention interrupts a sweep in off mode. See [deployment notes](migration.md#caller-scoped-runtime-registration).
+
+Ancestry follows only the caller's parent PIDs, using Linux procfs or macOS
+`proc_pidinfo(PROC_PIDTBSDINFO)`, and rechecks PID start identity and parent links
+before accepting a match. It never requests `KERN_PROC_ALL`, `ps -ax` or `pgrep`.
+Process-query commands reserve cleanup time inside their deadline; timeout,
+output-limit and cancellation paths never follow SIGKILL with an unbounded wait.
+An unreaped child blocks another launch of the same executable in that HAM
+process until a nonblocking reap succeeds. Separate CLI processes do not share
+that guard; macOS native enumeration avoids repeatedly spawning a stuck full-table
+`ps` in the first place. HAM does not clean up other sessions' stalled processes.
 
 When the OMP receiver cannot register or inspect, it shows `HAM: receiver unavailable` and a warning with the failing phase, exit code or signal, `timed_out`, elapsed time, stdout and stderr byte counts and a short stderr excerpt (stdout is counted but not quoted). The CLI error code (`sender_lookup_failed`, `sender_unresolved`, `ledger_busy`, `runtime_timeout`) appears in the message prefix of that excerpt and tells you which case applies. An identical report (same code and phase) is shown once and then suppressed for 10 minutes. A different code or phase is shown immediately. Recovery is tracked per phase (and root): a success clears only that phase's record, and the status stays while an error from another phase remains. The status clears, quietly and without a notification, only when every failing phase has recovered.
 

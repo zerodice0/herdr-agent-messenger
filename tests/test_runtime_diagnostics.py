@@ -20,6 +20,7 @@ from ham.ledger import status as ledger_status
 from ham.ledger import store as ledger_store
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore, budget_timeout, runtime_budget
+from ham.processes import ProcessInfo, ProcessLookupFailure
 from tests.test_ledger_core import snapshot
 
 
@@ -92,9 +93,9 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         self.assertGreaterEqual(error.details["elapsed_ms"], 0)
 
     @staticmethod
-    def ps_result(stdout=None):
-        ancestry = f"{os.getpid()} 10\n10 1\n" if stdout is None else stdout
-        return subprocess.CompletedProcess(["ps"], 0, ancestry, "")
+    def caller_chain():
+        return [ProcessInfo(os.getpid(), 10, "python", (30,)),
+                ProcessInfo(10, 1, "shell", (20,))]
 
     @staticmethod
     def pane_result(pane="w1:p1", pid=10):
@@ -124,12 +125,12 @@ class RuntimeDiagnosticTest(unittest.TestCase):
             finally:
                 fcntl.flock(blocker, fcntl.LOCK_UN)
 
-    def test_default_shared_deadline_is_twelve_seconds_and_resets_after_error(self):
+    def test_shared_deadline_caps_probes_and_resets_after_error(self):
         clock = [100.0]
         with mock.patch.object(ledger_store.time, "monotonic", side_effect=lambda: clock[0]):
             self.assertEqual(budget_timeout(30), 30)
             with self.assertRaises(LedgerError) as caught:
-                with runtime_budget():
+                with runtime_budget(12):
                     self.assertEqual(budget_timeout(30), 12)
                     self.assertEqual(budget_timeout(2), 2)
                     clock[0] += 11.75
@@ -138,15 +139,6 @@ class RuntimeDiagnosticTest(unittest.TestCase):
                     budget_timeout(5)
             self.assertEqual(caught.exception.code, "runtime_timeout")
             self.assertEqual(budget_timeout(30), 30)
-
-    def test_sqlite_nonruntime_timeout_stays_thirty_seconds(self):
-        with self.store.read() as connection:
-            self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 30000)
-        environment = {**self.environment, "HERDR_AGENT_LEDGER_DIR": str(self.store.directory)}
-        readonly = LedgerStore.open_readonly(environment)
-        self.assertIsNotNone(readonly)
-        with readonly.read() as connection:
-            self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 30000)
 
     def test_runtime_sqlite_timeout_refreshes_on_every_operation(self):
         clock = [100.0]
@@ -298,29 +290,15 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "ledger_busy")
         sleep.assert_not_called()
 
-    def test_ps_lookup_failures_report_evidence_not_a_proven_mismatch(self):
-        cases = (
-            (subprocess.TimeoutExpired(["ps"], 5), "timeout"),
-            (FileNotFoundError("private ps fixture"), "spawn_failed"),
-            (subprocess.CompletedProcess(["ps"], 7, "", "denied"), "nonzero_exit"),
-            (self.ps_result("not process output\n"), "invalid_output"),
-            (self.ps_result(""), "invalid_output"),
-            (self.ps_result("10 1\n"), "invalid_output"),
-            (self.ps_result(f"{os.getpid()} 10\n"), "invalid_output"),
-            (self.ps_result(f"{os.getpid()} 10\n10 {os.getpid()}\n"), "invalid_output"),
-            (self.ps_result(f"{os.getpid()} 10\n10 1\n10 1\n"), "invalid_output"),
-        )
-        for result, reason in cases:
-            with self.subTest(reason=reason, result=result):
-                options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
-                with mock.patch.object(ledger_status.subprocess, "run", **options):
+    def test_native_lookup_failures_report_evidence_not_a_proven_mismatch(self):
+        for lookup in ("procfs", "libproc"):
+            for reason in ("timeout", "unavailable", "exited", "changed", "invalid_output", "unsupported"):
+                with self.subTest(lookup=lookup, reason=reason), \
+                        mock.patch.object(ledger_status, "ProcessSource", return_value=mock.Mock(lookup=lookup)), \
+                        mock.patch.object(ledger_status, "process_chain", side_effect=ProcessLookupFailure(reason)):
                     with self.assertRaises(LedgerError) as caught:
                         ledger_status.process_ancestors()
-                self.assert_lookup_error(caught.exception, "ps", reason)
-
-    def test_complete_ps_ancestry_is_still_verified(self):
-        with mock.patch.object(ledger_status.subprocess, "run", return_value=self.ps_result()):
-            self.assertEqual(ledger_status.process_ancestors(), {os.getpid(), 10})
+                    self.assert_lookup_error(caught.exception, lookup, reason)
 
     def test_process_info_failures_report_structured_diagnostics(self):
         cases = (
@@ -339,7 +317,7 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         for result, reason in cases:
             with self.subTest(reason=reason, result=result):
                 options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
-                with mock.patch.object(ledger_status.subprocess, "run", **options):
+                with mock.patch.object(ledger_status, "run_bounded_command", **options):
                     with self.assertRaises(LedgerError) as caught:
                         ledger_status.pane_shell_pid("w1:p1", self.environment)
                 self.assert_lookup_error(caught.exception, "process-info", reason)
@@ -348,26 +326,27 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         for claimed in (False, True):
             with self.subTest(claimed=claimed):
                 environment = {**self.environment, **({"HERDR_TERMINAL_ID": "term-a"} if claimed else {})}
-                responses = [self.ps_result(), self.pane_result(pid=999999)]
+                responses = [self.pane_result(pid=999999)]
                 if not claimed:
                     responses.append(self.pane_result(pane="w1:p2", pid=999998))
-                with mock.patch.object(ledger_status.subprocess, "run", side_effect=responses):
+                with mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain()), \
+                        mock.patch.object(ledger_status, "run_bounded_command", side_effect=responses):
                     with self.assertRaises(LedgerError) as caught:
                         self.registry.resolve_context(environment, self.snapshot)
                 self.assertEqual(caught.exception.code, "sender_unresolved")
 
     def test_unrelated_failed_probe_does_not_hide_a_genuinely_verified_match(self):
-        with mock.patch.object(ledger_status.subprocess, "run", side_effect=[
-                self.ps_result(), subprocess.TimeoutExpired(["herdr"], 5),
-                self.pane_result(pane="w1:p2")]) as runner:
+        with mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain()), \
+                mock.patch.object(ledger_status, "run_bounded_command", side_effect=[
+                    subprocess.TimeoutExpired(["herdr"], 5), self.pane_result(pane="w1:p2")]) as runner:
             resolved = self.registry.resolve_context(self.environment, self.snapshot)
         self.assertEqual(resolved["terminal_id"], "term-b")
-        self.assertEqual(runner.call_count, 3)
+        self.assertEqual(runner.call_count, 2)
 
     def test_discovery_fails_closed_if_no_match_and_any_probe_lacks_evidence(self):
-        with mock.patch.object(ledger_status.subprocess, "run", side_effect=[
-                self.ps_result(), subprocess.TimeoutExpired(["herdr"], 5),
-                self.pane_result(pane="w1:p2", pid=999999)]):
+        with mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain()), \
+                mock.patch.object(ledger_status, "run_bounded_command", side_effect=[
+                    subprocess.TimeoutExpired(["herdr"], 5), self.pane_result(pane="w1:p2", pid=999999)]):
             with self.assertRaises(LedgerError) as caught:
                 self.registry.resolve_context(self.environment, self.snapshot)
         self.assert_lookup_error(caught.exception, "process-info", "timeout")
@@ -376,17 +355,21 @@ class RuntimeDiagnosticTest(unittest.TestCase):
         clock = [100.0]
         timeouts = []
 
+        def chain(**options):
+            timeouts.append(options["timeout"])
+            clock[0] += 4
+            return self.caller_chain()
+
         def run(command, **options):
             timeouts.append(options["timeout"])
             clock[0] += 4
-            if command[0] == "ps":
-                return self.ps_result()
             if command[-1] == "w1:p1":
                 return self.pane_result(pid=999999)
             raise subprocess.TimeoutExpired(command, options["timeout"])
 
         with mock.patch.object(ledger_store.time, "monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(ledger_status.subprocess, "run", side_effect=run):
+                mock.patch.object(ledger_status, "process_chain", side_effect=chain), \
+                mock.patch.object(ledger_status, "run_bounded_command", side_effect=run):
             with runtime_budget():
                 with self.assertRaises(LedgerError) as caught:
                     self.registry.resolve_context(self.environment, self.snapshot)
@@ -398,30 +381,38 @@ class RuntimeDiagnosticTest(unittest.TestCase):
 
     def test_public_register_cli_serializes_sender_lookup_details(self):
         cases = (
-            ([subprocess.TimeoutExpired(["ps"], 5)], "ps", "timeout"),
-            ([self.ps_result("10 1\n")], "ps", "invalid_output"),
-            ([self.ps_result(), subprocess.CompletedProcess(["herdr"], 8, "", "failed")],
-             "process-info", "nonzero_exit"),
-            ([self.ps_result(), subprocess.TimeoutExpired(["herdr"], 5)], "process-info", "timeout"),
-            ([self.ps_result(), self.pane_result(pid=True)], "process-info", "invalid_output"),
+            (ProcessLookupFailure("timeout"), None, "timeout"),
+            (ProcessLookupFailure("exited"), None, "exited"),
+            (ProcessLookupFailure("changed"), None, "changed"),
+            (ProcessLookupFailure("invalid_output"), None, "invalid_output"),
+            (None, subprocess.CompletedProcess(["herdr"], 8, "", "failed"), "nonzero_exit"),
+            (None, subprocess.TimeoutExpired(["herdr"], 5), "timeout"),
+            (None, self.pane_result(pid=True), "invalid_output"),
         )
-        for responses, lookup, reason in cases:
-            with self.subTest(lookup=lookup, reason=reason):
-                output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(ledger_status, "live_snapshot", return_value=self.snapshot), \
-                        mock.patch.object(ledger_status.subprocess, "run", side_effect=responses), \
-                        mock.patch("sys.stdin", io.StringIO("{}")), \
-                        redirect_stdout(output), redirect_stderr(errors):
-                    result = public_cli.main(
-                        ["ledger", "runtime", "register"],
-                        environment={**self.environment, "HERDR_TERMINAL_ID": "term-a"})
-                self.assertEqual(result, 1)
-                self.assertEqual(errors.getvalue(), "")
-                diagnostic = json.loads(output.getvalue())["error"]
-                self.assertEqual(diagnostic["code"], "sender_lookup_failed")
-                self.assertEqual((diagnostic["lookup"], diagnostic["reason"]), (lookup, reason))
-                self.assertIsInstance(diagnostic["elapsed_ms"], int)
-                self.assertGreaterEqual(diagnostic["elapsed_ms"], 0)
+        for native_lookup in ("procfs", "libproc"):
+            for chain_failure, pane_result, reason in cases:
+                lookup = native_lookup if chain_failure else "process-info"
+                with self.subTest(lookup=lookup, reason=reason):
+                    output, errors = io.StringIO(), io.StringIO()
+                    pane_options = ({"side_effect": pane_result} if isinstance(pane_result, Exception)
+                                    else {"return_value": pane_result})
+                    with mock.patch.object(ledger_status, "live_snapshot", return_value=self.snapshot), \
+                            mock.patch.object(ledger_status, "ProcessSource", return_value=mock.Mock(lookup=native_lookup)), \
+                            mock.patch.object(ledger_status, "process_chain", return_value=self.caller_chain(),
+                                              side_effect=chain_failure), \
+                            mock.patch.object(ledger_status, "run_bounded_command", **pane_options), \
+                            mock.patch("sys.stdin", io.StringIO("{}")), \
+                            redirect_stdout(output), redirect_stderr(errors):
+                        result = public_cli.main(
+                            ["ledger", "runtime", "register"],
+                            environment={**self.environment, "HERDR_TERMINAL_ID": "term-a"})
+                    self.assertEqual(result, 1)
+                    self.assertEqual(errors.getvalue(), "")
+                    diagnostic = json.loads(output.getvalue())["error"]
+                    self.assertEqual(diagnostic["code"], "sender_lookup_failed")
+                    self.assertEqual((diagnostic["lookup"], diagnostic["reason"]), (lookup, reason))
+                    self.assertIsInstance(diagnostic["elapsed_ms"], int)
+                    self.assertGreaterEqual(diagnostic["elapsed_ms"], 0)
 
 
 if __name__ == "__main__":

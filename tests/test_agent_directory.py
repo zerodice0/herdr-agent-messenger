@@ -17,6 +17,322 @@ from unittest import mock
 from ham.agents import directory as agent_directory
 
 
+_LIFECYCLE_OBSERVER = r'''
+from contextlib import ExitStack
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+import time
+from unittest import mock
+import tests.ham_test_support
+from ham.agents import directory
+
+scenario, failure, error_mode = sys.argv[1:]
+real_popen = subprocess.Popen
+children = []
+wait_timeouts = []
+timers = []
+injected_error = OSError("fixture selector failure")
+observed_errors = []
+real_communicate = directory._communicate_bounded
+
+def communicate(*args, **kwargs):
+    try:
+        return real_communicate(*args, **kwargs)
+    except BaseException as error:
+        observed_errors.append(error)
+        raise
+
+def interrupted(*_):
+    raise RuntimeError("external observer deadline")
+
+signal.signal(signal.SIGTERM, interrupted)
+
+class DelayedExit:
+    def __init__(self, *args, **kwargs):
+        self.child = real_popen(*args, **kwargs)
+        children.append(self.child)
+    def __getattr__(self, name):
+        return getattr(self.child, name)
+    def kill(self):
+        pass
+    def wait(self, timeout=None):
+        wait_timeouts.append(timeout)
+        assert timeout is not None, "unbounded cleanup wait"
+        return self.child.wait(timeout=timeout)
+
+def launch(*args, **kwargs):
+    child = real_popen(*args, **kwargs)
+    children.append(child)
+    return child
+
+def assert_reaped():
+    for child in children:
+        assert child.returncode is not None, child.pid
+        try:
+            os.waitpid(child.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        else:
+            raise AssertionError("child was not reaped: " + str(child.pid))
+        assert child.stdout is None or child.stdout.closed
+        assert child.stderr is None or child.stderr.closed
+
+report = {}
+try:
+    if scenario == "stalled":
+        cancelled = threading.Event()
+        if failure == "cancel":
+            timer = threading.Timer(0.04, cancelled.set)
+            timers.append(timer)
+            timer.start()
+        source = "import time; time.sleep(30)"
+        if failure == "cap":
+            source = "import os,time; os.write(1,b'x'*(3*1024*1024)); time.sleep(30)"
+        if failure == "closed":
+            source = "import os,time; os.close(1); os.close(2); time.sleep(30)"
+        command = [sys.executable, "-c", source]
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(directory.subprocess, "Popen", DelayedExit))
+            stack.enter_context(mock.patch.object(directory, "_communicate_bounded", communicate))
+            if failure == "oserror":
+                stack.enter_context(mock.patch.object(directory.selectors, "DefaultSelector",
+                                                      side_effect=injected_error))
+            started = time.monotonic()
+            try:
+                result = directory.run_bounded_command(
+                    command, timeout=0.3, cancel_event=cancelled,
+                    raise_errors=error_mode == "raise",
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                assert error_mode == "raise", repr(error)
+                assert error is observed_errors[0]
+                expected = {
+                    "timeout": subprocess.TimeoutExpired,
+                    "closed": subprocess.TimeoutExpired,
+                    "cancel": directory.CommandCancelled,
+                    "cap": directory.OutputLimitExceeded,
+                    "oserror": OSError,
+                }[failure]
+                assert isinstance(error, expected), repr(error)
+                if failure == "oserror":
+                    assert error is injected_error
+                if failure in ("timeout", "closed"):
+                    assert error.cmd == command and error.timeout == 0.3
+                report["error"] = type(error).__name__
+            else:
+                assert error_mode == "completed", repr(result)
+                assert result.returncode == 1 and result.stdout == ""
+                expected = {"cancel": "cancelled", "cap": "output_limit_exceeded",
+                            "oserror": str(injected_error)}.get(failure)
+                if expected is not None:
+                    assert result.stderr == expected, result
+                else:
+                    assert "timed out" in result.stderr, result
+                report["error"] = result.stderr
+            report["elapsed"] = time.monotonic() - started
+            assert report["elapsed"] < 0.5, report
+            assert wait_timeouts and all(0 < value <= 0.3 for value in wait_timeouts)
+            assert len(children) == 1 and children[0].poll() is None
+            for _ in range(5):
+                result = directory.run_bounded_command(command, timeout=0.3)
+                assert result.returncode == 1 and "has not exited" in result.stderr, result
+            assert len(children) == 1, "unreaped executable spawned again"
+        # Let the fixture child really exit. Its zombie must be reclaimed even
+        # when no further command runs in this Python process.
+        children[0].kill()
+        until = time.monotonic() + 2
+        while children[0].returncode is None and time.monotonic() < until:
+            time.sleep(0.01)
+        assert_reaped()
+        result = directory.run_bounded_command([sys.executable, "-c", "print('recovered')"])
+        assert result.returncode == 0 and result.stdout == "recovered\n", result
+        report["spawn_count_while_unreaped"] = len(children)
+    elif scenario == "discovery":
+        discovery = directory.RemoteDiscovery(["fixture"], config_path=Path("unused"), timeout=0.3)
+        discovery.deadline = time.monotonic() + discovery.timeout
+        source = "import time; time.sleep(30)"
+        if failure == "cap":
+            source = "import os,time; os.write(1,b'x'*(3*1024*1024)); time.sleep(30)"
+        if failure == "cancel":
+            timer = threading.Timer(0.04, discovery._cancelled.set)
+            timers.append(timer)
+            timer.start()
+        with mock.patch.object(directory.subprocess, "Popen", DelayedExit), mock.patch.object(
+            directory, "ssh_command", return_value=[sys.executable, "-c", source],
+        ):
+            started = time.monotonic()
+            discovery._probe_host("fixture")
+            assert time.monotonic() - started < 0.5
+            result, = discovery.poll()
+            assert not result.success
+            assert result.error == {"timeout": "timeout", "cancel": "cancelled",
+                                    "cap": "output_limit_exceeded"}[failure], result
+            assert not discovery._processes
+            assert wait_timeouts and all(value is not None for value in wait_timeouts)
+            assert len(children) == 1
+    elif scenario == "resources":
+        fd_directory = Path("/proc/self/fd") if sys.platform == "linux" else Path("/dev/fd")
+        before_fds = len(list(fd_directory.iterdir()))
+        with mock.patch.object(directory.subprocess, "Popen", launch):
+            for _ in range(8):
+                normal = directory.run_bounded_command(
+                    [sys.executable, "-c", "import sys; print('out'); print('err',file=sys.stderr)"],
+                    timeout=1, raise_errors=True,
+                )
+                assert normal.returncode == 0 and normal.stdout == "out\n" and normal.stderr == "err\n"
+                for closed in (False, True):
+                    source = "import time; time.sleep(30)"
+                    if closed:
+                        source = "import os,time; os.close(1); os.close(2); time.sleep(30)"
+                    result = directory.run_bounded_command(
+                        [sys.executable, "-c", source], timeout=0.15,
+                    )
+                    assert result.returncode == 1 and "timed out" in result.stderr
+                result = directory.run_bounded_command(
+                    [sys.executable, "-c", "import os,time; os.write(2,b'x'*(3*1024*1024)); time.sleep(30)"],
+                    timeout=1,
+                )
+                assert result.stderr == "output_limit_exceeded", result
+                cancelled = threading.Event()
+                timer = threading.Timer(0.04, cancelled.set)
+                timers.append(timer)
+                timer.start()
+                result = directory.run_bounded_command(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    timeout=1, cancel_event=cancelled,
+                )
+                timer.join()
+                assert result.stderr == "cancelled", result
+                assert_reaped()
+                assert len(list(fd_directory.iterdir())) <= before_fds, "file descriptors leaked"
+        report["reaped_children"] = len(children)
+        report["fd_growth"] = len(list(fd_directory.iterdir())) - before_fds
+    elif scenario == "descendant":
+        # The command closes its own outputs while its real descendant retains
+        # both pipes. Keep their parent alive to reap it on every platform.
+        release_read, release_write = os.pipe()
+        descendant_source = (
+            "import os; os.read(" + str(release_read) + ",1); "
+            "os.write(1,b'out\\n'); os.write(2,b'err\\n')"
+        )
+        source = (
+            "import os,subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c'," + repr(descendant_source) + "],"
+            "pass_fds=(" + str(release_read) + ",)); "
+            "os.close(1); os.close(2); child.wait()"
+        )
+        # Delay kill only in this fixture so its parent can reap the descendant
+        # after we release it, even when the captured pipes time out.
+        direct = DelayedExit([sys.executable, "-c", source], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, pass_fds=(release_read,))
+        os.close(release_read)
+        try:
+            if failure == "release":
+                timer = threading.Timer(0.05, lambda: os.write(release_write, b"x"))
+                timers.append(timer)
+                timer.start()
+            started = time.monotonic()
+            try:
+                stdout, stderr = directory._communicate_bounded(direct, timeout=0.3)
+            except subprocess.TimeoutExpired:
+                assert failure == "timeout"
+            else:
+                assert failure == "release"
+                assert stdout == "out\n" and stderr == "err\n"
+            assert time.monotonic() - started < 0.8
+        finally:
+            for timer in timers:
+                timer.join()
+            if failure != "release":
+                os.write(release_write, b"x")
+            os.close(release_write)
+            direct.child.wait(timeout=2)
+        assert_reaped()
+    elif scenario == "exited_parent":
+        # Linux's subreaper lets the observer own/reap the real orphan rather
+        # than leaving a fixture grandchild or zombie to the host's PID 1.
+        import ctypes
+        assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+        release_read, release_write = os.pipe()
+        pid_read, pid_write = os.pipe()
+        descendant_pid = None
+        try:
+            descendant_source = (
+                "import os; os.read(" + str(release_read) + ",1); "
+                "os.write(1,b'out\\n'); os.write(2,b'err\\n')"
+            )
+            source = (
+                "import os,subprocess,sys; "
+                "child=subprocess.Popen([sys.executable,'-c'," + repr(descendant_source) + "],"
+                "pass_fds=(" + str(release_read) + ",)); "
+                "os.write(" + str(pid_write) + ",str(child.pid).encode()+b'\\n')"
+            )
+            direct = real_popen([sys.executable, "-c", source], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, pass_fds=(release_read, pid_write))
+            children.append(direct)
+            descendant_pid = int(os.read(pid_read, 64))
+            direct.wait(timeout=2)
+            if failure == "release":
+                timer = threading.Timer(0.05, lambda: os.write(release_write, b"x"))
+                timers.append(timer)
+                timer.start()
+            started = time.monotonic()
+            try:
+                stdout, stderr = directory._communicate_bounded(direct, timeout=0.3)
+            except subprocess.TimeoutExpired:
+                assert failure == "timeout"
+            else:
+                assert failure == "release"
+                assert stdout == "out\n" and stderr == "err\n"
+            assert time.monotonic() - started < 0.5
+            assert_reaped()
+        finally:
+            for timer in timers:
+                timer.cancel()
+                timer.join()
+            if descendant_pid is not None:
+                try:
+                    os.kill(descendant_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                until = time.monotonic() + 2
+                while os.waitpid(descendant_pid, os.WNOHANG)[0] == 0:
+                    assert time.monotonic() < until, "fixture descendant did not exit"
+                    time.sleep(0.01)
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise AssertionError("fixture descendant remains")
+            for fd in (release_read, release_write, pid_read, pid_write):
+                os.close(fd)
+    print(json.dumps(report), flush=True)
+finally:
+    for timer in timers:
+        timer.cancel()
+        timer.join()
+    for child in children:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=2)
+        for stream in (child.stdout, child.stderr):
+            if stream is not None:
+                stream.close()
+        try:
+            os.kill(child.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("fixture child remains: " + str(child.pid))
+'''
+
+
 class AgentDirectoryTest(unittest.TestCase):
     def test_snapshot_pane_focus_is_preserved_for_local_and_remote_agents(self):
         payload = {"result": {"snapshot": {
@@ -897,6 +1213,83 @@ class AgentDirectoryTest(unittest.TestCase):
             timer.cancel()
             timer.join()
         self.assertEqual(result.stderr, "cancelled")
+
+    def _observe_lifecycle(self, scenario, failure="", error_mode=""):
+        program = subprocess.Popen(
+            [sys.executable, "-c", _LIFECYCLE_OBSERVER, scenario, failure, error_mode],
+            cwd=Path(__file__).resolve().parents[1],
+            env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                stdout, stderr = program.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                # Interrupt only our observer, whose finally block owns and
+                # reaps all fixture children. Never signal unrelated processes.
+                program.terminate()
+                stdout, stderr = program.communicate(timeout=4)
+                self.fail(f"observer exceeded deadline:\n{stdout}\n{stderr}")
+            self.assertEqual(program.returncode, 0, f"{stdout}\n{stderr}")
+            return json.loads(stdout)
+        finally:
+            if program.poll() is None:
+                program.terminate()
+                try:
+                    program.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    program.kill()
+                    program.wait(timeout=2)
+            for stream in (program.stdout, program.stderr):
+                stream.close()
+            with self.assertRaises(ProcessLookupError):
+                os.kill(program.pid, 0)
+
+    def test_delayed_exit_cleanup_is_bounded_and_fences_repeated_executable(self):
+        for failure in ("timeout", "closed", "cancel", "cap", "oserror"):
+            for error_mode in ("raise", "completed"):
+                with self.subTest(failure=failure, error_mode=error_mode):
+                    report = self._observe_lifecycle("stalled", failure, error_mode)
+                    self.assertEqual(report["spawn_count_while_unreaped"], 1)
+
+    def test_repeated_commands_reap_children_without_fd_growth(self):
+        report = self._observe_lifecycle("resources")
+        self.assertEqual(report["reaped_children"], 40)
+        self.assertLessEqual(report["fd_growth"], 0)
+
+    def test_descendant_inherited_output_pipes_obey_the_same_deadline(self):
+        for failure in ("release", "timeout"):
+            with self.subTest(failure=failure):
+                self._observe_lifecycle("descendant", failure)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux child-subreaper ownership")
+    def test_exited_parent_does_not_bypass_inherited_pipe_deadline(self):
+        for failure in ("release", "timeout"):
+            with self.subTest(failure=failure):
+                self._observe_lifecycle("exited_parent", failure)
+
+    def test_remote_discovery_uses_bounded_cleanup_for_each_failure(self):
+        for failure in ("timeout", "cancel", "cap"):
+            with self.subTest(failure=failure):
+                self._observe_lifecycle("discovery", failure)
+
+    def test_raise_errors_preserves_spawn_error_and_precancelled_failure(self):
+        error = OSError("cannot start fixture")
+        with mock.patch.object(agent_directory.subprocess, "Popen", side_effect=error):
+            with self.assertRaises(OSError) as raised:
+                agent_directory.run_bounded_command(["not-installed"], raise_errors=True)
+            self.assertIs(raised.exception, error)
+            result = agent_directory.run_bounded_command(["not-installed"])
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stderr, str(error))
+        cancelled = threading.Event()
+        cancelled.set()
+        with mock.patch.object(agent_directory.subprocess, "Popen") as launch:
+            with self.assertRaises(agent_directory.CommandCancelled):
+                agent_directory.run_bounded_command(
+                    ["not-started"], cancel_event=cancelled, raise_errors=True,
+                )
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":

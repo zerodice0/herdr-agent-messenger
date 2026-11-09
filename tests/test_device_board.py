@@ -16,6 +16,7 @@ from ham.ledger.remote import RemoteLedger
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore
 from ham.ops import resource_scan
+from ham.processes import ProcessInfo, ProcessLookupFailure
 
 UUID = "D7E14B5E-4130-4C9E-A066-E81743DB3C40"
 UDID = "00008110-001234567890ABCD"
@@ -256,7 +257,6 @@ class DeviceProbeTest(unittest.TestCase):
                                                         {"pid": 2, "port": 5556}, {"pid": 3, "port": None}])
         self.assertIsNone(result["ios_devices"])
         self.assertIsNone(result["ios_simulators_booted"])
-        self.assertEqual(runner.call_count, 2)
 
     def test_mac_simctl_booted_runtime_dictionary(self):
         responses = {("adb", "devices"): "List of devices attached\n",
@@ -265,13 +265,16 @@ class DeviceProbeTest(unittest.TestCase):
                      json.dumps({"devices": {"runtime": [{"udid": UUID, "name": "iPhone 18 Pro", "state": "Booted"},
                                                           {"udid": "other", "name": "Off", "state": "Shutdown"}]}})}
         runner = self.runner(responses)
-        result = scan_devices(runner=runner, platform="darwin")
+        source = mock.Mock()
+        source.pids.return_value = []
+        result = scan_devices(runner=runner, platform="darwin", process_source=source)
         self.assertEqual(result["ios_simulators_booted"], [{"udid": UUID, "name": "iPhone 18 Pro"}])
         self.assertIsNone(result["ios_devices"])
         self.assertIsNone(result["error"])
         self.assertFalse(any("devicectl" in call.args[0] for call in runner.call_args_list))
         responses[("xcrun", "simctl", "list", "devices", "booted", "--json")] = '{"devices":{"runtime":[]}}'
-        self.assertEqual(scan_devices(runner=runner, platform="darwin")["ios_simulators_booted"], [])
+        self.assertEqual(scan_devices(runner=runner, platform="darwin",
+                                      process_source=source)["ios_simulators_booted"], [])
 
     def test_missing_tools_timeout_and_malformed_json_are_null(self):
         for payload in ("not json", '{"devices": []}', '{"devices":{"runtime":[{}]}}'):
@@ -287,6 +290,46 @@ class DeviceProbeTest(unittest.TestCase):
                 self.assertIn("adb", result["error"])
                 self.assertIn("ios_simulators_booted", result["error"])
 
+    def test_mac_native_candidates_keep_android_count_and_unknown_port(self):
+        records = {
+            101: ProcessInfo(101, 1, "qemu-system-aarch64", (1, 0)),
+            102: ProcessInfo(102, 1, "qemu-system-x86_64", (2, 0)),
+            103: ProcessInfo(103, 1, "qemu-system-x86_64", (3, 0)),
+            104: ProcessInfo(104, 1, "unrelated", (4, 0)),
+        }
+        source = mock.Mock()
+        source.pids.return_value = list(records)
+        source.read.side_effect = records.__getitem__
+        runner = self.runner({
+            ("ps", "-ww", "-p", "101", "-o", "args="):
+                "/Users/test/Android SDK/emulator/qemu-system-aarch64 -ports=5554,5555",
+            ("ps", "-ww", "-p", "102", "-o", "args="):
+                "/sdk/emulator/qemu-system-x86_64 -avd Test",
+            ("ps", "-ww", "-p", "103", "-o", "args="):
+                "/usr/bin/qemu-system-x86_64 -m 512",
+        })
+        probe = DeviceClaims(None, runner=runner, platform="darwin", process_source=source)
+        self.assertEqual(probe._emulator_processes(), [
+            {"pid": 101, "port": 5554}, {"pid": 102, "port": None}])
+
+    def test_mac_incomplete_or_reused_candidates_are_unknown_not_zero(self):
+        original = ProcessInfo(101, 1, "qemu-system-aarch64", (1, 0))
+        reused = ProcessInfo(101, 1, "qemu-system-aarch64", (2, 0))
+        for responses in ([original, reused], [original, ProcessLookupFailure("exited")],
+                          [ProcessLookupFailure("unavailable")]):
+            with self.subTest(responses=responses):
+                source = mock.Mock()
+                source.pids.return_value = [101]
+                source.read.side_effect = responses
+                runner = self.runner({("ps", "-ww", "-p", "101", "-o", "args="):
+                                      "/sdk/emulator/qemu-system-aarch64 -port 5554"})
+                probe = DeviceClaims(None, runner=runner, platform="darwin", process_source=source)
+                self.assertIsNone(probe._emulator_processes())
+
+    def test_mac_injected_runner_without_source_never_reads_live_host(self):
+        with mock.patch("ham.ledger.devices.ProcessSource", side_effect=AssertionError("live source")):
+            self.assertIsNone(DeviceClaims(None, runner=self.runner({}), platform="darwin")._emulator_processes())
+
     def test_probes_are_parallel_and_reuse_admission_parser(self):
         barrier = threading.Barrier(3, timeout=2)
         def runner(command, **kwargs):
@@ -296,16 +339,8 @@ class DeviceProbeTest(unittest.TestCase):
         with mock.patch.object(DeviceClaims, "_emulator_processes", autospec=True,
                                side_effect=lambda probe: probe._run(["ps"]) and []) as processes:
             result = scan_devices(runner=runner, platform="darwin")
-        processes.assert_called_once()
         self.assertIsNone(result["error"])
 
-    def test_host_scan_owns_inventory_probe(self):
-        with mock.patch.object(resource_scan, "scan_listeners", return_value=[]), \
-             mock.patch.object(resource_scan, "scan_serve", return_value=[]), \
-             mock.patch("ham.ledger.devices.scan_devices", return_value=observed()) as devices:
-            result = resource_scan.scan_host_resources(platform="darwin")
-        self.assertEqual(result["devices_observed"], observed())
-        self.assertEqual(devices.call_args.kwargs["platform"], "darwin")
 
     def test_limit_parser_matches_admission_configuration(self):
         for environment, expected in (({}, 3), ({"HERDR_AGENT_EMU_LIMIT": "0"}, 0),

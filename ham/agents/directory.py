@@ -281,12 +281,77 @@ def _probe_payload(payload: Mapping[str, Any], *, host: str, local: bool) -> Pro
     return ProbeResult(host, agents, True)
 
 
-class OutputLimitExceeded(Exception):
+class OutputLimitExceeded(subprocess.SubprocessError):
     pass
 
 
-class CommandCancelled(Exception):
+class CommandCancelled(subprocess.SubprocessError):
     pass
+
+
+_command_process_lock = threading.Lock()
+_unreaped_commands: dict[str, list[subprocess.Popen[bytes]]] = {}
+_command_reaper: threading.Thread | None = None
+
+
+def _reap_commands() -> None:
+    global _command_reaper
+    while True:
+        with _command_process_lock:
+            for key, pending in list(_unreaped_commands.items()):
+                pending[:] = [child for child in pending if child.poll() is None]
+                if not pending:
+                    del _unreaped_commands[key]
+            if not _unreaped_commands:
+                _command_reaper = None
+                return
+        time.sleep(0.1)
+
+
+def _start_command(
+    command: Sequence[str], environment: Mapping[str, str] | None = None,
+) -> subprocess.Popen[bytes]:
+    values = os.environ if environment is None else environment
+    executable = shutil.which(command[0], path=values.get("PATH", os.defpath)) or command[0]
+    key = os.path.realpath(executable)
+    # This fence belongs to this Python process, not successive CLI invocations.
+    # A kernel-stuck child can outlive the CLI; no persistent PID ownership is assumed.
+    with _command_process_lock:
+        pending = _unreaped_commands.get(key, [])
+        pending[:] = [child for child in pending if child.poll() is None]
+        if pending:
+            raise OSError(f"previous command child has not exited: {executable}")
+        _unreaped_commands.pop(key, None)
+    # Do not hold the cleanup lock across process creation. Already in-flight
+    # launches can precede the first observed unreaped child.
+    process = subprocess.Popen(
+        list(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=None if environment is None else dict(environment),
+    )
+    process._ham_command_key = key
+    return process
+
+
+def _cleanup_command(process: subprocess.Popen[bytes], deadline: float) -> None:
+    if process.poll() is None:
+        with suppress(OSError):
+            process.kill()
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            with suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=remaining)
+    # poll() reaps an exited child without waiting for an unkillable one.
+    key = getattr(process, "_ham_command_key", None)
+    if key is not None:
+        with _command_process_lock:
+            if process.poll() is None:
+                pending = _unreaped_commands.setdefault(key, [])
+                if process not in pending:
+                    pending.append(process)
+                global _command_reaper
+                if _command_reaper is None or not _command_reaper.is_alive():
+                    _command_reaper = threading.Thread(target=_reap_commands, daemon=True)
+                    _command_reaper.start()
 
 
 def _communicate_bounded(
@@ -295,29 +360,30 @@ def _communicate_bounded(
     timeout: float,
     output_limit: int = MAX_CAPTURE_BYTES,
     cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> tuple[str, str]:
-    selector = selectors.DefaultSelector()
+    if deadline is None:
+        deadline = time.monotonic() + max(0.0, timeout)
+    work_deadline = deadline - min(0.1, max(0.0, timeout) * 0.2)
+    selector: selectors.BaseSelector | None = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     streams = {"stdout": process.stdout, "stderr": process.stderr}
-    for name, stream in streams.items():
-        if stream is not None:
-            selector.register(stream, selectors.EVENT_READ, name)
-    deadline = time.monotonic() + timeout
     try:
+        selector = selectors.DefaultSelector()
+        for name, stream in streams.items():
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
         while selector.get_map():
             if cancel_event is not None and cancel_event.is_set():
                 raise CommandCancelled
-            remaining = deadline - time.monotonic()
+            remaining = work_deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(process.args, timeout)
             events = selector.select(min(remaining, 0.1))
             if not events:
                 continue
             for key, _mask in events:
-                try:
-                    chunk = os.read(key.fd, 65536)
-                except OSError:
-                    chunk = b""
+                chunk = os.read(key.fd, 65536)
                 if not chunk:
                     with suppress(Exception):
                         selector.unregister(key.fileobj)
@@ -330,15 +396,19 @@ def _communicate_bounded(
         while process.poll() is None:
             if cancel_event is not None and cancel_event.is_set():
                 raise CommandCancelled
-            remaining = deadline - time.monotonic()
+            remaining = work_deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(process.args, timeout)
             try:
                 process.wait(timeout=min(remaining, 0.1))
             except subprocess.TimeoutExpired:
                 continue
+    except BaseException:
+        _cleanup_command(process, deadline)
+        raise
     finally:
-        selector.close()
+        if selector is not None:
+            selector.close()
         for stream in streams.values():
             if stream is not None:
                 with suppress(OSError):
@@ -355,42 +425,24 @@ def _run_command(
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
     environment: Mapping[str, str] | None = None,
+    raise_errors: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    if cancel_event is not None and cancel_event.is_set():
-        return subprocess.CompletedProcess(list(command), 1, "", "cancelled")
+    deadline = time.monotonic() + max(0.0, timeout)
     try:
-        process = subprocess.Popen(
-            list(command),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=None if environment is None else dict(environment),
-        )
-    except OSError as error:
-        return subprocess.CompletedProcess(list(command), 1, "", str(error))
-    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CommandCancelled
+        process = _start_command(command, environment)
         stdout, stderr = _communicate_bounded(
-            process,
-            timeout=timeout,
-            cancel_event=cancel_event,
+            process, timeout=timeout, cancel_event=cancel_event, deadline=deadline,
         )
-    except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.wait()
-        return subprocess.CompletedProcess(list(command), 1, "", str(error))
-    except OutputLimitExceeded:
-        process.kill()
-        process.wait()
-        return subprocess.CompletedProcess(
-            list(command),
-            1,
-            "",
-            "output_limit_exceeded",
+    except (OSError, subprocess.TimeoutExpired, OutputLimitExceeded, CommandCancelled) as error:
+        if raise_errors:
+            raise
+        detail = (
+            "cancelled" if isinstance(error, CommandCancelled) else
+            "output_limit_exceeded" if isinstance(error, OutputLimitExceeded) else str(error)
         )
-    except CommandCancelled:
-        process.kill()
-        process.wait()
-        return subprocess.CompletedProcess(list(command), 1, "", "cancelled")
+        return subprocess.CompletedProcess(list(command), 1, "", detail)
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
@@ -400,11 +452,16 @@ def run_bounded_command(
     timeout: float = REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
     environment: Mapping[str, str] | None = None,
+    raise_errors: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with the directory's timeout, cancellation, and output cap."""
+    """Run with a total timeout including cleanup; optionally propagate failures.
+
+    Unreaped children fence the executable only within this Python process.
+    Separate CLI invocations cannot share this fence or guarantee kernel exit.
+    """
 
     return _run_command(command, timeout=timeout, cancel_event=cancel_event,
-                        environment=environment)
+                        environment=environment, raise_errors=raise_errors)
 
 
 def query_local_agents(
@@ -901,7 +958,7 @@ class RemoteDiscovery:
             self._pending_hosts.put(host)
         self.deadline = 0.0
         self._cancelled = threading.Event()
-        self._processes: set[subprocess.Popen[str]] = set()
+        self._processes: set[subprocess.Popen[bytes]] = set()
         self._process_lock = threading.Lock()
 
     def start(self) -> None:
@@ -923,48 +980,39 @@ class RemoteDiscovery:
         if remaining <= 0:
             self.results.put(ProbeResult(host, (), False, "timeout"))
             return
-        process: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[bytes] | None = None
         try:
             if self._cancelled.is_set():
                 self.results.put(ProbeResult(host, (), False, "cancelled"))
                 return
             command = ssh_command(host, ["api", "snapshot"], config_path=self.config_path)
             try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+                process = _start_command(command)
             except OSError as error:
                 self.results.put(ProbeResult(host, (), False, str(error)))
                 return
             with self._process_lock:
                 self._processes.add(process)
-            if self._cancelled.is_set():
-                process.kill()
             try:
                 stdout, stderr = _communicate_bounded(
                     process,
-                    timeout=max(0.1, self.deadline - time.monotonic()),
+                    timeout=self.timeout,
                     cancel_event=self._cancelled,
+                    deadline=self.deadline,
                 )
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
                 self.results.put(ProbeResult(host, (), False, "timeout"))
                 return
             except OutputLimitExceeded:
-                process.kill()
-                process.wait()
                 self.results.put(
                     ProbeResult(host, (), False, "output_limit_exceeded")
                 )
                 return
             except CommandCancelled:
-                process.kill()
-                process.wait()
                 self.results.put(ProbeResult(host, (), False, "cancelled"))
+                return
+            except OSError as error:
+                self.results.put(ProbeResult(host, (), False, str(error)))
                 return
             if self._cancelled.is_set():
                 self.results.put(ProbeResult(host, (), False, "cancelled"))
@@ -985,10 +1033,12 @@ class RemoteDiscovery:
             processes = list(self._processes)
         for process in processes:
             if process.poll() is None:
-                process.terminate()
+                with suppress(OSError):
+                    process.terminate()
         for process in processes:
             if process.poll() is None:
-                process.kill()
+                with suppress(OSError):
+                    process.kill()
 
     def poll(self) -> list[ProbeResult]:
         items: list[ProbeResult] = []

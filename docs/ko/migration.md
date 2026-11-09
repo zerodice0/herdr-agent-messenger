@@ -95,6 +95,28 @@ python3 -m ham cli runtime install omp
 플러그인 로드는 클라이언트 설정을 쓰지 않으며 새 저장소의 기본 `auto` 모드도
 유지됩니다. 자세한 내용은 [수신 설정 가이드](skill-guide.md#수신-의존성)를 참고하세요.
 
+## PID별 프로세스 조회와 명령 회수 시간 제한
+
+호출자 검증은 자기 PID부터 부모 PID만 따라갑니다. Linux에서는 procfs,
+macOS에서는 libproc의 `PROC_PIDTBSDINFO`로 읽고 시작 식별자와 부모 관계를
+다시 확인합니다. macOS 에뮬레이터 탐색은 `proc_listallpids`와 BSD 정보로
+후보를 찾은 뒤 qemu PID에 한정해 `ps -p`로 argv를 읽습니다. 전체 표를 읽는
+`ps`, `pgrep`, `KERN_PROC_ALL`을 반복 호출하지 않습니다. 신원 증거가 없거나
+조회 중 바뀌면 호출자를 거부합니다. 기기 관찰 실패는 알 수 없음으로 남기며
+점유 수로 대체하는 기존 허용량 계산은 유지합니다.
+
+프로세스 조회 명령은 기존 제한 시간 안에서 kill과 pipe 회수를 끝내며,
+종료되지 않는 child를 무제한 기다리지 않습니다. 같은 HAM 프로세스에서는
+미회수 child가 있는 실행파일을 다시 띄우지 않습니다. 별개 CLI 호출 사이의
+중복 실행까지 막는 장치는 아닙니다.
+
+Python 코드만 바뀌며 스키마 12, 프로토콜 1, 수신기 소스와 register/inspect의
+12초 공유 예산은 유지합니다. HAM 소유 worker·Mailbox와 복사한 스킬을
+갱신하면 되며 사용자 세션 재시작이나 runtime 재설치는 필요하지 않습니다.
+문제가 생긴 Mac에서는 전체 표를 읽는 `ps`·`pgrep` 배포 스크립트를 재사용하지
+말고 PID별 조회나 libproc로 현황을 확인하세요. 이미 멈춘 프로세스와
+시뮬레이터는 소유 세션에 맡깁니다.
+
 ## 호출자 범위의 runtime 등록
 
 Runtime `register`와 `inspect`는 최신 Herdr snapshot, 프로세스 계보와 호출자의

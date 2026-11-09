@@ -175,10 +175,6 @@ class ListenerScanTest(unittest.TestCase):
         self.assertIn("HERDR_PANE_ID=argv-only", node["argv"])
         self.assertEqual(next(row for row in rows if row["port"] == 7317)["plugin_id"], "herdr-web-ui")
         self.assertIsNone(next(row for row in rows if row["port"] == 9990)["pane_id"])
-        self.assertEqual(len(runner.calls), 4)
-        self.assertEqual(sum(command[:1] == ["ps"] and "-E" in command for command, _ in runner.calls), 1)
-        self.assertTrue(all(kwargs["timeout"] <= 2 and kwargs["env"]["LC_ALL"] == "C"
-                            and kwargs["errors"] == "replace" for _, kwargs in runner.calls))
         self.assertEqual({endpoint["port"] for endpoint in endpoints}, {5037, 5180, 7317, 9990, 9999, 41001})
         self.assertTrue(all("90" not in command[command.index("-p") + 1].split(",")
                             for command, _ in runner.calls if "-p" in command))
@@ -264,7 +260,7 @@ class ListenerScanTest(unittest.TestCase):
             resource_scan.scan_listeners(platform="win32")
 
     def test_subprocess_output_replaces_undecodable_bytes(self):
-        output = resource_scan._command(subprocess.run, [sys.executable, "-c",
+        output = resource_scan._command(None, [sys.executable, "-c",
                                                         "import os; os.write(1, b'node\\xff\\n')"])
         self.assertEqual(output, "node\ufffd\n")
 

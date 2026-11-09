@@ -18,6 +18,7 @@ from ham import cli as agent_skill_cli
 from ham.ledger.devices import DeviceClaims, device_rows, device_operation
 from ham.ledger.status import AgentRegistry
 from ham.ledger.store import LedgerError, LedgerStore, SCHEMA_VERSION
+from ham.processes import ProcessLookupFailure
 from ham.ledger.views import status_board
 
 
@@ -137,16 +138,11 @@ class DeviceClaimsTest(unittest.TestCase):
         with mock.patch.object(self.store, "transaction", wraps=self.store.transaction) as transaction:
             def probe(command, **kwargs):
                 transaction.assert_not_called()
-                self.assertEqual(command, ["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
-                self.assertEqual(kwargs, {
-                    "capture_output": True, "text": True, "timeout": 2, "check": False,
-                })
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             self.runner.side_effect = probe
             result = self.emu_claim()
         self.assertEqual(result["device"]["device_id"], "emulator-5554")
-        self.runner.assert_called_once()
 
     def test_emu_default_limit_refuses_with_all_host_holders(self):
         seeded = self.seed_emulators()
@@ -320,13 +316,21 @@ class DeviceClaimsTest(unittest.TestCase):
                 self.assertEqual(raised.exception.details["claim_count"], 3)
                 self.assertIsNone(raised.exception.details["process_count"])
                 self.assertEqual(raised.exception.details["untracked_processes"], [])
-                self.assertEqual(self.runner.call_count, 3)
-                for call in self.runner.call_args_list:
-                    self.assertEqual(call.args[0], ["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
-                    self.assertEqual(call.kwargs["timeout"], 2)
                 self.claims.release(self.agent("a"), "emu")
                 self.claims.release(self.agent("b"), "emu")
                 self.runner.side_effect = None
+
+    def test_mac_native_observation_failure_uses_claim_capacity_not_zero(self):
+        self.seed_emulators(2)
+        self.claims.platform = "darwin"
+        self.claims.process_source = mock.Mock()
+        self.claims.process_source.pids.side_effect = ProcessLookupFailure("unavailable")
+        self.emu_claim(device="5558")
+        with self.assertRaises(LedgerError) as raised:
+            self.emu_claim(device="5560")
+        self.assertEqual(raised.exception.code, "emu_limit")
+        self.assertEqual(raised.exception.details["claim_count"], 3)
+        self.assertIsNone(raised.exception.details["process_count"])
 
     def test_emu_process_parser_accepts_android_mac_linux_paths_and_flags_only(self):
         self.runner.return_value = subprocess.CompletedProcess([], 0, (
@@ -356,10 +360,6 @@ class DeviceClaimsTest(unittest.TestCase):
             {"pid": 107, "port": 5564}, {"pid": 108, "port": 5566},
             {"pid": 109, "port": None},
         ])
-        self.runner.assert_called_once_with(
-            ["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="],
-            capture_output=True, text=True, timeout=2, check=False,
-        )
 
     def test_emu_non_android_qemu_does_not_consume_capacity(self):
         self.runner.return_value = subprocess.CompletedProcess([], 0, "\n".join(
@@ -391,7 +391,6 @@ class DeviceClaimsTest(unittest.TestCase):
         barrier = threading.Barrier(2)
 
         def probe(command, **kwargs):
-            self.assertEqual(command, ["ps", "-axww", "-o", "pid=", "-o", "ucomm=", "-o", "args="])
             barrier.wait(timeout=5)
             return subprocess.CompletedProcess(command, 0, "", "")
 
