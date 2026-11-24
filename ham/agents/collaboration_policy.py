@@ -59,6 +59,14 @@ class CollaborationPolicy:
                     f"mail send --to {recipient.qualified_name} --body TEXT instead "
                     "of legacy send/request/batch. No prompt was submitted.",
                 )
+            if target.get("client") == "pi" and target.get("extension_present") in (True, 1):
+                # A pi receiver owns its own queue; HAM never types into it.
+                raise LedgerError(
+                    "use_mailbox",
+                    "This pi session runs the HAM mailbox receiver, which processes mail itself. "
+                    f"Use mail send --to {recipient.qualified_name} --body TEXT instead of legacy "
+                    "send/request/batch. No prompt was submitted.",
+                )
         except Exception as error:
             refusal = error if isinstance(error, LedgerError) else LedgerError(
                 "policy_unverifiable", f"Could not verify recipient coordination: {error}. No prompts were submitted.",

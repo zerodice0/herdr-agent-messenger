@@ -900,8 +900,9 @@ class AgentRegistry:
                 if agent["client"] != client or agent["repo_id"] != repo_id:
                     raise LedgerError("stale_session", "Runtime registration does not match the current Herdr session.")
                 if agent["session_ref"] != session_ref:
-                    if client == "omp" and agent["session_ref"] == "unreported":
-                        raise LedgerError("native_session_pending", "Waiting for Herdr to report the native OMP session.")
+                    if client in ("omp", "pi") and agent["session_ref"] == "unreported":
+                        raise LedgerError("native_session_pending",
+                                          f"Waiting for Herdr to report the native {client} session.")
                     if (client != "claude" or agent["session_ref"] != "unreported"
                             or expected_agent_id is None or expected_generation is None):
                         raise LedgerError("stale_session", "Runtime registration cannot replace a reported native session.")

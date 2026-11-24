@@ -1,6 +1,6 @@
 ---
 name: herdr-agent-messenger
-description: Use HAM (Herdr Agent Messenger) for durable same-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, and omp.
+description: Use HAM (Herdr Agent Messenger) for durable same-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, omp, and pi.
 ---
 
 # HAM — Herdr Agent Messenger

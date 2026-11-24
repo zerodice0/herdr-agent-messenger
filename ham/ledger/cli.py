@@ -54,6 +54,19 @@ def add_parsers(subparsers: Any) -> None:
     body.add_argument("--body-file", help="Read the body from this UTF-8 file.")
     withdraw = mail_commands.add_parser("withdraw", help="Withdraw an unclaimed message from this terminal.")
     withdraw.add_argument("--message", required=True, help="Message UUID.")
+    amend = mail_commands.add_parser(
+        "amend", help="Main agents: urgently supplement your own earlier message (pi receivers steer it in).")
+    amend.add_argument("--message", required=True, help="UUID of the original message you sent from this terminal.")
+    amend.add_argument("--verbose", action="store_true", help="Include the full delivery receipt fields.")
+    amend_body = amend.add_mutually_exclusive_group(required=True)
+    amend_body.add_argument("--body", help="Supplementary body, at most 16 KiB UTF-8.")
+    amend_body.add_argument("--body-file", help="Read the supplementary body from this UTF-8 file.")
+    cancel = mail_commands.add_parser(
+        "cancel", help="Main agents: cancel your own earlier message; queued mail is withdrawn, "
+                       "otherwise pi receivers abort that work and report back.")
+    cancel.add_argument("--message", required=True, help="UUID of the original message you sent from this terminal.")
+    cancel.add_argument("--body", help="Optional cancellation reason.")
+    cancel.add_argument("--verbose", action="store_true", help="Include the full delivery receipt fields.")
     dismiss = mail_commands.add_parser("dismiss", help="Audit local sender resolution of undeliverable mail; not recipient handling.")
     dismiss.add_argument("--message", required=True, action="append", help="Message UUID; repeat for atomic batch dismissal.")
     dismiss.add_argument("--reason", required=True, help="Nonblank audit reason; repeats preserve the first reason.")
@@ -411,6 +424,14 @@ def _dispatch(arguments: argparse.Namespace, environment: Mapping[str, str] | No
         return mailbox.withdraw(arguments.message, sender=sender)
     if arguments.mail_command == "dismiss":
         return mailbox.dismiss(sender, arguments.message, reason=arguments.reason)
+    if arguments.mail_command in {"amend", "cancel"}:
+        body = arguments.body
+        if arguments.mail_command == "amend" and body is None:
+            try:
+                body = Path(arguments.body_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                raise LedgerError("body_file_unreadable", str(error)) from None
+        return mailbox.urgent(sender, arguments.message, urgency=arguments.mail_command, body=body)
     recipient = remote.resolve_recipient(arguments.to, sender)
     try:
         body = arguments.body if arguments.body is not None else Path(arguments.body_file).read_text(encoding="utf-8")

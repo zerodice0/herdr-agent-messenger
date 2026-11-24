@@ -38,6 +38,12 @@ HAM은 터미널 스크롤백에 메시지를 묻어 두지 않고 코딩 에이
 - **클라이언트 세 종류:** omp·Claude Code·Codex용 스킬을 제공합니다. OMP와 Claude
   수신 런타임은 선택해서 설치하며, 원장 워커가 유휴 상태의 Claude Code·Codex 세션도
   깨웁니다. Codex는 런타임이 필요 없고 작업 경계에서 메일을 직접 조회하기도 합니다.
+- **pi 수신기:** pi 세션은 별도 패키지인 [pi-mailbox](https://github.com/zerodice0/pi-mailbox)
+  (`pi install`)로 메일을 받습니다. HAM은 pi에 메시지를 밀어넣지 않습니다. 확장이 idle
+  상태에서 큐를 처리하고, `mail amend`는 원본 thread의 작업에 steer로 반영하며,
+  `mail cancel`은 그 작업을 중단시킨 뒤 수신자가 진행 내용을 보고하게 합니다. 사용자는
+  Mailbox Threads에서 `u`(amend)와 `c`(cancel)를 쓰고, main 역할의 에이전트는
+  `mail amend|cancel`을 씁니다.
 
 ## 요구 사항
 

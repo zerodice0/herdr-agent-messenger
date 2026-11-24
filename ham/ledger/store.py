@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import uuid
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 FINAL_STATES = frozenset({"handled", "withdrawn", "undeliverable"})
 STATE_RANK = {"pending": 0, "queued": 1, "delivered": 2, "handled": 3,
               "withdrawn": 4, "undeliverable": 4}
@@ -185,7 +185,8 @@ CREATE TABLE IF NOT EXISTS messages (
  repo_id TEXT NOT NULL, sender_repo_id TEXT NOT NULL, reply_to TEXT, origin_host TEXT NOT NULL,
  sender TEXT NOT NULL, sender_label TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('fyi','action')),
  hop INTEGER NOT NULL, body TEXT NOT NULL, created_at REAL NOT NULL, final_at REAL,
- payload_hash TEXT NOT NULL, sender_context TEXT);
+ payload_hash TEXT NOT NULL, sender_context TEXT,
+ urgency TEXT CHECK(urgency IS NULL OR urgency IN ('amend','cancel')));
 CREATE TABLE IF NOT EXISTS deliveries (
  message_id TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
  recipient_address TEXT NOT NULL, recipient_host TEXT NOT NULL, recipient_repo_id TEXT NOT NULL,
@@ -288,7 +289,7 @@ class LedgerStore:
                 existing = connection.execute(
                     "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()
                 existing_version = int(existing[0]) if existing else 0
-                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}:
+                if existing and existing_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, SCHEMA_VERSION}:
                     raise LedgerError("unsupported_schema", "This ledger requires a different HAM version.")
                 columns = {row["name"] for row in connection.execute("PRAGMA table_info(deliveries)")}
                 if "fyi_turn_end" not in columns:
@@ -307,6 +308,10 @@ class LedgerStore:
                 if "sender_context" not in message_columns:
                     # Historical role groups cannot be reconstructed after their workspace closes.
                     connection.execute("ALTER TABLE messages ADD COLUMN sender_context TEXT")
+                if "urgency" not in message_columns:
+                    # Schema 13: sender-owned amend/cancel of an earlier message.
+                    connection.execute("ALTER TABLE messages ADD COLUMN urgency TEXT "
+                                       "CHECK(urgency IS NULL OR urgency IN ('amend','cancel'))")
                 if "confirmation_source" not in columns:
                     connection.execute("ALTER TABLE deliveries ADD COLUMN confirmation_source TEXT "
                                        "CHECK(confirmation_source IN ('native','operator'))")

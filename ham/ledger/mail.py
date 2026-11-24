@@ -24,6 +24,9 @@ IMMUTABLE_FIELDS = ("message_id", "thread_id", "repo_id", "reply_to", "origin_ho
                     "sender_label", "kind", "hop", "body", "subject", "created_at",
                     "recipient_host", "recipient_terminal_id", "recipient_address")
 REPO_FIELDS = ("sender_repo_id", "recipient_repo_id")
+# Optional; present only on amend/cancel so ordinary payloads keep their shape and hash.
+URGENCY_FIELD = "urgency"
+URGENCIES = frozenset({"amend", "cancel"})
 MAX_HISTORY_CURSOR_SIZE = 32768
 # The worker refreshes local Herdr observations every five seconds. Do not infer
 # an interrupted turn from a cache older than three sweeps.
@@ -120,9 +123,15 @@ def sender_address(message: Mapping[str, Any]) -> str:
 
 
 def validate_payload(payload: Mapping[str, Any], *, peer: bool = False) -> dict[str, Any]:
-    if set(payload) not in (set(IMMUTABLE_FIELDS), set(IMMUTABLE_FIELDS + REPO_FIELDS)):
+    if set(payload) not in (set(IMMUTABLE_FIELDS), set(IMMUTABLE_FIELDS + REPO_FIELDS),
+                            set(IMMUTABLE_FIELDS + REPO_FIELDS + (URGENCY_FIELD,))):
         raise LedgerError("invalid_message", "Message fields do not match a supported protocol 1 payload.")
     value = dict(payload)
+    if URGENCY_FIELD in value:
+        if value[URGENCY_FIELD] not in URGENCIES:
+            raise LedgerError("invalid_urgency", "Message urgency must be amend or cancel.")
+        if value["reply_to"] is None or value["kind"] != "action":
+            raise LedgerError("invalid_urgency", "amend/cancel must be action mail addressing an earlier message.")
     for key in ("message_id", "thread_id"):
         require_uuid(value[key], key)
     if value["reply_to"] is not None:
@@ -172,7 +181,8 @@ class Mailbox:
         self.environment = environment
 
     def send(self, sender: Mapping[str, Any], recipient: Mapping[str, Any], *, body: str,
-             kind: str = "fyi", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
+             kind: str = "fyi", reply_to: str | None = None, subject: str = "",
+             urgency: str | None = None) -> dict[str, Any]:
         message_id = str(uuid.uuid4())
         payload = {"message_id": message_id, "thread_id": message_id, "repo_id": sender["repo_id"],
                    "sender_repo_id": sender["repo_id"], "recipient_repo_id": recipient["repo_id"],
@@ -182,10 +192,13 @@ class Mailbox:
                    "recipient_host": recipient["host"], "recipient_terminal_id": recipient["terminal_id"],
                    "recipient_address": recipient.get("recipient_address") or
                    f"{recipient['host']}/{recipient['alias'] or recipient['terminal_id']}"}
+        if urgency is not None:
+            payload[URGENCY_FIELD] = urgency
         return self._submit_message(payload, sender=sender, recipient=recipient, auto_handle_parent=True)
 
     def send_user(self, repo_id: str, recipient: Mapping[str, Any], *, body: str,
-                  kind: str = "action", reply_to: str | None = None, subject: str = "") -> dict[str, Any]:
+                  kind: str = "action", reply_to: str | None = None, subject: str = "",
+                  urgency: str | None = None) -> dict[str, Any]:
         """Send as the operator from repo_id context, including to another repo.
 
         Replies keep the retained thread origin; repo_id still records this
@@ -202,6 +215,8 @@ class Mailbox:
                    "recipient_terminal_id": recipient["terminal_id"],
                    "recipient_address": recipient.get("recipient_address") or
                    f"{recipient['host']}/{recipient.get('alias') or recipient['terminal_id']}"}
+        if urgency is not None:
+            payload[URGENCY_FIELD] = urgency
         result = self._submit_message(payload, sender=None, recipient=recipient, auto_handle_parent=False)
         values = os.environ if self.environment is None else self.environment
         if values.get("HERDR_AGENT_LEDGER_AUTOSTART", "1") != "0":
@@ -263,6 +278,14 @@ class Mailbox:
                         parent["state"] == "delivering"):
                     raise LedgerError("delivery_in_progress",
                                       "Resolve an uncertain delivery before marking it handled by reply.")
+            if payload.get(URGENCY_FIELD) is not None:
+                if parent is None:
+                    raise LedgerError("invalid_urgency", "amend/cancel must address an earlier message.")
+                self._urgent_target(connection, reply_to, verified_sender if sender is not None else None,
+                                    allow_withdrawn=False)
+                if (payload["recipient_host"] != parent["recipient_host"] or
+                        payload["recipient_terminal_id"] != parent["recipient_terminal_id"]):
+                    raise LedgerError("invalid_recipient", "amend/cancel must go to the original message's recipient.")
             value = validate_payload(payload)
             from ham.ledger.remote import RemoteLedger
             result = RemoteLedger(self.store, self.environment).submit(connection, value)
@@ -290,12 +313,15 @@ class Mailbox:
         submission = self.store.annotate({"message_id": payload["message_id"],
                                          "thread_id": payload["thread_id"], **result})
         client = recipient.get("client")
-        if client in {"omp", "claude"} and recipient.get("extension_present") in (False, 0):
+        if client in {"omp", "pi", "claude"} and recipient.get("extension_present") in (False, 0):
+            remedy = (f"On {recipient['host']}, with user consent install the pi-mailbox package "
+                      "(pi install) if missing" if client == "pi" else
+                      f"Run runtime status on {recipient['host']}; with user consent install the runtime "
+                      "if missing")
             submission.setdefault("warnings", []).append({
                 "code": "recipient_no_receiver", "client": client,
                 "message": f"{client} recipient has no registered HAM receiver; the message remains queued. "
-                           f"Run runtime status on {recipient['host']}; with user consent install the runtime "
-                           "if missing, then restart the selected session."})
+                           f"{remedy}, then restart the selected session."})
         from ham.ledger.runtime import FYI_WAKE_DELAY_SECONDS, WAKE_READY_STATES, wake_capable
         if (payload["kind"] == "fyi" and not submission.get("fyi_turn_end") and
                 wake_recipient.get("active") == 1 and
@@ -305,6 +331,96 @@ class Mailbox:
                 wake_recipient.get("turn_state") in WAKE_READY_STATES):
             submission["fyi_wake_after_seconds"] = FYI_WAKE_DELAY_SECONDS
         return submission
+
+    def _urgent_target(self, connection: Any, message_id: str, sender: Mapping[str, Any] | None, *,
+                       allow_withdrawn: bool) -> Any:
+        """Return the sender's own original message, or refuse amend/cancel.
+
+        Only the operator (``sender is None``) and an agent in the main role may
+        send urgent mail, and only for mail they originated on this host: the
+        operator's own ``user`` mail, or an agent's mail from this same terminal
+        and repository (the withdraw ownership rule).
+        """
+        require_uuid(message_id)
+        parent = connection.execute(
+            "SELECT m.*,d.recipient_terminal_id,d.recipient_host,d.recipient_repo_id,d.recipient_address,"
+            "d.state,d.withdraw_requested FROM messages m JOIN deliveries d USING(message_id) "
+            "WHERE message_id=?", (message_id,)).fetchone()
+        if parent is None:
+            raise LedgerError("message_not_found", "amend/cancel needs a retained message you sent.")
+        if parent["origin_host"] != self.store.host:
+            raise LedgerError("wrong_origin", "Only the original host can amend or cancel this message.")
+        if parent["urgency"] is not None:
+            raise LedgerError("invalid_urgency", "amend/cancel must address the original message, not another amend/cancel.")
+        if sender is None:
+            if parent["sender"] != "user":
+                raise LedgerError("not_sender", "The operator may only amend or cancel mail the operator sent.")
+        else:
+            owner = connection.execute("SELECT terminal_id,repo_id FROM agents WHERE agent_id=?",
+                                       (parent["sender"],)).fetchone()
+            if owner is None or owner["terminal_id"] != sender["terminal_id"] or owner["repo_id"] != sender["repo_id"]:
+                raise LedgerError("not_sender", "Only the originating terminal can amend or cancel this message.")
+            from ham.ledger.settings import RepoSettings
+            if RepoSettings(self.store).role(sender, connection=connection) != "main":
+                raise LedgerError("not_main", "Only the user or a main agent may send amend/cancel mail.")
+        if parent["state"] == "undeliverable" or (parent["state"] == "withdrawn" and not allow_withdrawn):
+            raise LedgerError("nothing_to_cancel" if parent["state"] == "withdrawn" else "message_final",
+                              "The original message was withdrawn or is undeliverable.")
+        if not parent["recipient_terminal_id"]:
+            raise LedgerError("invalid_recipient", "The original message has no concrete recipient terminal.")
+        return parent
+
+    def _urgent_recipient(self, connection: Any, parent: Any) -> dict[str, Any]:
+        """Reuse the original concrete route; never re-resolve a label."""
+        if parent["recipient_host"] != self.store.host:
+            return {"host": parent["recipient_host"], "terminal_id": parent["recipient_terminal_id"],
+                    "repo_id": parent["recipient_repo_id"], "alias": None,
+                    "recipient_address": parent["recipient_address"]}
+        agent = connection.execute("SELECT * FROM agents WHERE host=? AND terminal_id=? AND active=1",
+                                   (self.store.host, parent["recipient_terminal_id"])).fetchone()
+        if agent is None:
+            raise LedgerError("recipient_absent", "The original recipient no longer has an agent.")
+        if agent["repo_id"] != parent["recipient_repo_id"]:
+            raise LedgerError("recipient_changed", "The original recipient terminal now belongs to another repository.")
+        return {**dict(agent), "recipient_address": parent["recipient_address"]}
+
+    def urgent(self, sender: Mapping[str, Any] | None, message_id: str, *, urgency: str,
+               body: str | None = None, repo_id: str | None = None) -> dict[str, Any]:
+        """Send amend/cancel for the caller's own earlier message.
+
+        ``cancel`` first tries an ordinary withdrawal: still-queued local mail is
+        simply withdrawn and nothing is sent. Otherwise a cancel message follows
+        the original route (after any remote withdrawal request in the same FIFO).
+        """
+        if urgency not in URGENCIES:
+            raise LedgerError("invalid_urgency", "Urgency must be amend or cancel.")
+        if urgency == "amend" and (not isinstance(body, str) or not body.strip()):
+            raise LedgerError("invalid_body", "amend needs the supplementary message body.")
+        with self.store.read() as connection:
+            if sender is not None:
+                check_generation(connection, self.store.host, sender["terminal_id"],
+                                 sender["agent_id"], sender["generation"])
+            parent = self._urgent_target(connection, message_id, sender, allow_withdrawn=urgency == "cancel")
+            recipient = self._urgent_recipient(connection, parent) if parent["state"] != "withdrawn" else None
+        withdrawal = None
+        if urgency == "cancel":
+            withdrawal = self.withdraw(message_id, sender=sender)
+            if withdrawal.get("withdrawn"):
+                return {"message_id": message_id, "cancelled": "withdrawn", "state": "withdrawn"}
+            if withdrawal.get("state") in FINAL_STATES - {"handled"}:
+                raise LedgerError("nothing_to_cancel", "The original message is final and cannot be cancelled.")
+            body = body if isinstance(body, str) and body.strip() else (
+                "The sender cancelled message " + message_id + ".")
+        assert recipient is not None and body is not None
+        if sender is None:
+            result = self.send_user(repo_id or parent["sender_repo_id"], recipient, body=body, kind="action",
+                                    reply_to=message_id, urgency=urgency)
+        else:
+            result = self.send(sender, recipient, body=body, kind="action", reply_to=message_id, urgency=urgency)
+        result = {**result, "target_message_id": message_id, "urgency": urgency}
+        if withdrawal is not None and withdrawal.get("withdraw_requested"):
+            result["withdraw_requested"] = True
+        return result
 
     def enqueue(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Idempotent local acceptance; remote authentication lives at the transport boundary."""
@@ -343,12 +459,13 @@ class Mailbox:
             raise LedgerError("thread_conflict", "Thread repository and subject are immutable.")
         connection.execute("INSERT OR IGNORE INTO threads VALUES (?,?,?)", (value["thread_id"], value["repo_id"], value["subject"]))
         connection.execute(
-            "INSERT INTO messages(message_id,thread_id,repo_id,sender_repo_id,reply_to,origin_host,sender,sender_label,kind,hop,body,created_at,payload_hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(message_id,thread_id,repo_id,sender_repo_id,reply_to,origin_host,sender,sender_label,kind,hop,body,created_at,payload_hash,urgency) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(value[key] for key in ("message_id", "thread_id", "repo_id")) +
             (value.get("sender_repo_id", value["repo_id"]),) +
             tuple(value[key] for key in ("reply_to", "origin_host", "sender", "sender_label",
-                                        "kind", "hop", "body", "created_at")) + (digest,))
+                                        "kind", "hop", "body", "created_at")) +
+            (digest, value.get(URGENCY_FIELD)))
         slot = connection.execute("SELECT * FROM terminal_slots WHERE host=? AND terminal_id=?",
                                   (self.store.host, target["recipient_terminal_id"])).fetchone() if authoritative else None
         state, hold = ("queued" if authoritative else "pending"), None

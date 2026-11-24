@@ -293,6 +293,7 @@ class MailDismissTest(unittest.TestCase):
         with self.store.transaction() as connection:
             connection.execute("DROP TABLE mail_dismissals")
             connection.execute("ALTER TABLE messages DROP COLUMN sender_context")
+            connection.execute("ALTER TABLE messages DROP COLUMN urgency")
             connection.execute("UPDATE ledger_meta SET value='10' WHERE key='schema_version'")
             connection.execute("INSERT INTO workspace_settings VALUES (?,?,?,?,?,?,?,?)",
                                (self.repo_id, "alpha", "anchor", "main",
@@ -306,13 +307,14 @@ class MailDismissTest(unittest.TestCase):
         upgraded = LedgerStore(self.store.directory, canonical_name="alpha")
         self.assertEqual(upgraded.host_uuid, self.store.host_uuid)
         self.assertEqual(upgraded.doctor()["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 12)
+        self.assertEqual(SCHEMA_VERSION, 13)
         with upgraded.read() as connection:
             for table, rows in before.items():
                 self.assertEqual([tuple(row) for row in connection.execute(f"SELECT * FROM {table}")], rows)
             self.assertEqual(connection.execute("SELECT count(*) FROM mail_dismissals").fetchone()[0], 0)
-            self.assertEqual([{key: row[key] for key in row.keys() if key != "sender_context"}
+            self.assertEqual([{key: row[key] for key in row.keys() if key not in {"sender_context", "urgency"}}
                               for row in connection.execute("SELECT * FROM messages")], legacy_messages)
+            self.assertEqual({row[0] for row in connection.execute("SELECT urgency FROM messages")}, {None})
             self.assertIsNone(connection.execute("SELECT sender_context FROM messages").fetchone()[0])
         self.mail = Mailbox(upgraded)
         self.assert_error("not_sender", lambda: self.dismiss(message_id, actor="outsider"))
@@ -333,6 +335,7 @@ class MailDismissTest(unittest.TestCase):
                 "SELECT payload_hash FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]
             connection.execute("DROP TABLE mail_dismissals")
             connection.execute("ALTER TABLE messages DROP COLUMN sender_context")
+            connection.execute("ALTER TABLE messages DROP COLUMN urgency")
             connection.execute("UPDATE ledger_meta SET value='10' WHERE key='schema_version'")
         upgraded = LedgerStore(self.store.directory, canonical_name="alpha")
         self.mail = Mailbox(upgraded)

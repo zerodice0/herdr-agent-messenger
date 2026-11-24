@@ -67,6 +67,7 @@ from ham.agents.output import (
     compact_inbox_payload,
     compact_repo_payload,
     compact_send_payload,
+    compact_urgent_payload,
     compact_status_set_payload,
     compact_read_payload,
     compact_request_payload,
@@ -1611,6 +1612,8 @@ def main(
                            else compact_handle_payload)(payload)
             elif command == "mail" and arguments.mail_command == "send":
                 payload = compact_send_payload(payload)
+            elif command == "mail" and arguments.mail_command in {"amend", "cancel"}:
+                payload = compact_urgent_payload(payload)
             elif command == "mail" and arguments.mail_command == "dismiss":
                 payload = compact_dismiss_payload(payload)
             elif command == "repo":

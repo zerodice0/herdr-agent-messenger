@@ -1,6 +1,6 @@
 ---
 name: herdr-agent-messenger
-description: Use HAM (Herdr Agent Messenger) for durable cross-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, and omp.
+description: Use HAM (Herdr Agent Messenger) for durable cross-repository agent mail, inbox handling, status/roles, installation/updates, and explicitly requested labeled Herdr sessions. Trigger on HAM, Herdr delegation, or host/label addresses; supports Codex, Claude, omp, and pi.
 ---
 
 # HAM — Herdr Agent Messenger
@@ -39,12 +39,16 @@ python3 scripts/herdr_agent_messenger.py inbox handle --message MESSAGE_UUID
 python3 scripts/herdr_agent_messenger.py mail send \
   --to CANONICAL_HOST/EXACT_LABEL --reply-to MESSAGE_UUID --kind fyi --body 'Findings and evidence.'
 python3 scripts/herdr_agent_messenger.py mail withdraw --message MESSAGE_UUID
+python3 scripts/herdr_agent_messenger.py mail amend --message MESSAGE_UUID --body 'Also cover the error path.'
+python3 scripts/herdr_agent_messenger.py mail cancel --message MESSAGE_UUID --body 'Wrong repository; stop.'
 python3 scripts/herdr_agent_messenger.py mail dismiss --message MESSAGE_UUID --reason 'Recipient closed; no action remains'
 python3 scripts/herdr_agent_messenger.py status board --repo --host local
 python3 scripts/herdr_agent_messenger.py status set review --summary 'Reviewing mailbox boundaries'
 ```
 
 CLI `--kind` defaults to `fyi`; exactly one of `--body` / `--body-file` (nonblank UTF-8, ≤16 KiB). Action wakes promptly; FYI wakes idle participating OMP in batches no sooner than 600 s after local enqueue (typically ~10–15 min), or right after a turn if enqueued during fresh `working` state; wake gates apply (coalesce 60 s, 4 wakes/hour, hop ≤10). TUI compose defaults to `action`; Ctrl+G toggles. Sending stores/routes mail, not a turn. Queued/pending is not delivery or completed work. Handling needs no delivered timestamp for pull mail; replies handle their addressed queued/delivered parent.
+
+`mail amend|cancel` (main agents; the user via Mailbox Threads `u`/`c`) target only **your own** earlier message, reuse its route/thread and send urgent `action` mail. `cancel` withdraws still-queued mail and sends nothing; otherwise a pi receiver aborts the run working on that thread (even over a draft) and the recipient must report what was already done so you can decide on reverting. `amend` is steered into the run on that thread (never over a draft) or goes first at idle. Use them only for real corrections, not progress updates. Receiving a CANCEL: stop that work, do not revert yourself, reply `--reply-to CANCEL_ID --kind action` with what was done. Reference **Urgent amend and cancel**.
 
 `mail dismiss` resolves attention for locally originated `undeliverable` mail only; it never means delivered/handled and emits no recipient receipt. Only the verified original terminal or current main of the sender's host-local role group may dismiss (same repo alone grants no authority). Repeat `--message` for an atomic batch; nonblank `--reason` required. Reference **Sender dismissal**.
 
@@ -63,6 +67,7 @@ Mode/home/thresholds are repo-wide; roles are per `(repo_id, canonical host, anc
 - **OMP:** opt-in root receiver; action or eligible FYI wake needs Herdr `turn_state` `idle`/`done`, empty TUI editor, quiet input, no pending work, eligible membership and rate/hop guards; uses `nextTurn` + `triggerTurn`, never steering. Both kinds can arrive naturally even off. ACK proves journal acceptance, not provider success.
   Session-name ownership survives restart/resume through `ham-session-name` custom state entries (not sent to the LLM), written only when HAM changes the name. Matching title-entry IDs protect later user renames, including identical text. Reference **OMP session name sync**.
 - **Claude Code:** opt-in bounded `SessionStart` / `UserPromptSubmit`, plus a worker-driven idle wake (hook registered, idle/done + quiet, peer socket, transcript evidence). ACK proves host-context application or transcript acceptance, not provider-wire bytes/understanding; stdout alone is not delivery. Reference **Receiving runtimes**, **Native idle wake**.
+- **pi:** opt-in root receiver from the separate [pi-mailbox](https://github.com/zerodice0/pi-mailbox) package (`pi install`; needs `herdr integration install pi` for the session report). HAM never pushes into pi; the extension owns its queue: ordinary mail at idle with an empty editor and quiet input (HAM still admits each claim), amend/cancel as above, status `HAM ✉ N !U`, view-only `/ham-mailbox` overlay (`alt+m`). Legacy prompt submission to a registered pi receiver is refused with `use_mailbox`. Reference **pi receiver**.
 - **Codex:** worker-driven idle wake (`codex queue`, rollout evidence; no runtime install) plus skill-guided pull at work boundaries, then explicit handling; never an invented delivered receipt. Reference **Native idle wake**.
 
 Native bundles retain IDs/sender/kind/thread/hop; bodies may truncate. Marker/hash proves claimed content, not work. Reference **Native mailbox bundles**.
@@ -98,6 +103,6 @@ Runtime register/inspect verify fresh caller ancestry, session, Git identity and
 
 ## Installing or updating HAM
 
-On each selected host, install/update plugin + skill, run read-only `runtime status`, explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude`. Never overwrite foreign/modified files; restart only user-selected sessions; confirm `extension_present=1` or report **installed, activation pending**. Codex needs no runtime install; its absence is normal. Reference **Client onboarding and installation**, **Receiving runtimes**.
+On each selected host, install/update plugin + skill, run read-only `runtime status`, explain missing OMP/Claude receivers and **ask consent before** `runtime install omp|claude`; pi receives through the separate pi-mailbox package. Never overwrite foreign/modified files; restart only user-selected sessions; confirm `extension_present=1` or report **installed, activation pending**. Codex needs no runtime install; its absence is normal. Reference **Client onboarding and installation**, **Receiving runtimes**.
 
 `mail send|dismiss`, `inbox read|handle`, `repo show`, `status set|clear|board|list` default to brief output; `--verbose` restores full fields/diagnostics. CLI JSON is whitespace-free UTF-8. Reference **Compact versus verbose payloads**; read only needed sections, never the whole reference.

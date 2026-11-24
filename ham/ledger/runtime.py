@@ -13,7 +13,7 @@ import uuid
 from ham.ledger.mail import Mailbox, safe_label, sender_address
 from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import AgentRegistry, check_generation, sanitize_status_text
-from ham.ledger.store import LedgerError, LedgerStore
+from ham.ledger.store import LedgerError, LedgerStore, require_uuid
 
 MESSAGE_BYTES = 2048
 BUNDLE_BYTES = 8192
@@ -22,7 +22,13 @@ WAKE_READY_STATES = frozenset({'idle', 'done'})
 FYI_WAKE_DELAY_SECONDS = 600
 FYI_NOW_QUIET_SECONDS = 600
 WAKE_CLIENTS = frozenset({'claude','codex'})
+# Extension-driven receivers: HAM never pushes into these sessions; the
+# in-session extension decides when to claim and inject (bell is a doorbell only).
+RECEIVER_CLIENTS = frozenset({'omp','pi'})
+URGENCIES = ('amend','cancel')
 STATUS_RUN_LIMIT = 64
+INBOX_PREVIEW_LIMIT = 20
+INBOX_PREVIEW_BYTES = 240
 
 
 def wake_capable(agent: Mapping[str, Any]) -> bool:
@@ -32,7 +38,7 @@ def wake_capable(agent: Mapping[str, Any]) -> bool:
     Codex needs nothing installed. Per-target availability is the adapter's call.
     """
     client = agent.get('client')
-    if client in ('omp','claude'):
+    if client in ('omp','claude','pi'):
         return bool(agent.get('extension_present'))
     return client=='codex'
 
@@ -56,14 +62,25 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
               'No receipt replies/ACK loops.\n')
     if messages and all(message['kind'] == 'fyi' for message in messages):
         prefix += 'FYI only: read and continue; reply only if it changes your work.\n'
+    urgencies = {message.get('urgency') for message in messages}
+    if 'amend' in urgencies:
+        prefix += 'AMEND: the sender supplements the referenced message; apply it to that work.\n'
+    if 'cancel' in urgencies:
+        prefix += ('CANCEL: the sender cancelled the referenced message. Stop that work; do not continue it '
+                   'and do not revert anything yourself. Report what was already done (files, commands, '
+                   'side effects) via mail send --reply-to <the cancel message ID> --kind action so the sender '
+                   'can decide whether to revert.\n')
     headers = []
     for message in messages:
         sender_repo = message.get('sender_repo_id', message.get('repo_id', ''))
         recipient_repo = message.get('recipient_repo_id', message.get('repo_id', ''))
         repo = (' (repo ' + safe_label(sender_repo.rsplit('/', 1)[-1]) + ')'
                 if sender_repo and sender_repo != recipient_repo else '')
+        urgency = message.get('urgency')
+        label = (message['kind'] + ' · ' + urgency + ' of ' + str(message.get('reply_to'))
+                 if urgency in URGENCIES else message['kind'])
         headers.append('\n--- ' + message['message_id'] + ' ' + marker + ' ---\n' +
-                       'From ' + sender_address(message) + repo + ' [' + message['kind'] + ']\n' +
+                       'From ' + sender_address(message) + repo + ' [' + label + ']\n' +
                        'Thread ' + message['thread_id'] + ' / hop ' + str(message['hop']) + '\n')
     omitted = ['[body omitted; inbox read --message ' + message['message_id'] + ']' for message in messages]
     available = BUNDLE_BYTES - len(prefix.encode('utf-8')) - sum(len(header.encode('utf-8')) for header in headers)
@@ -127,10 +144,10 @@ class NativeReceiver:
         self._claude_scans: dict[str, dict[str, Any]] = {}
 
     def register(self, agent: Mapping[str, Any], *, session_ref: str, client: str = 'omp') -> dict[str, Any]:
-        if client != 'omp' or agent['client'] != 'omp':
-            raise LedgerError('unsupported_client','OMP registration requires the live OMP agent slot.')
+        if client not in RECEIVER_CLIENTS or agent['client'] != client:
+            raise LedgerError('unsupported_client','Receiver registration requires the live OMP or pi agent slot.')
         if not isinstance(session_ref,str) or not Path(session_ref).is_absolute():
-            raise LedgerError('invalid_session','OMP session_ref must be its full supported session-file path.')
+            raise LedgerError('invalid_session','Receiver session_ref must be its full supported session-file path.')
         registered = AgentRegistry(self.store).agent_session(terminal_id=agent['terminal_id'],
                 session_ref=session_ref,client=client,repo_id=agent['repo_id'],extension_present=True,
                 expected_agent_id=agent['agent_id'],expected_generation=agent['generation'],
@@ -210,11 +227,80 @@ class NativeReceiver:
                 (self.store.host,agent['terminal_id'],agent['repo_id'],request['at']))
         return not any(row['message_id'] in message_ids for row in delivered)
 
+    def _settle_moot_cancels(self, connection: Any, agent: Mapping[str, Any], now: float) -> list[str]:
+        """Close queued cancels whose original never reached this agent.
+
+        A cross-host cancel follows its withdrawal request in the same FIFO. When
+        that withdrawal won, the original is ``withdrawn`` here (or only a
+        tombstone remains) and there is no work to stop or report.
+        """
+        rows = connection.execute(
+            "SELECT m.message_id,m.reply_to FROM messages m JOIN deliveries d USING(message_id) "
+            "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.recipient_repo_id=? "
+            "AND d.state='queued' AND m.urgency='cancel'",
+            (self.store.host,agent['terminal_id'],agent['repo_id'])).fetchall()
+        settled = []
+        for row in rows:
+            target = connection.execute('SELECT state FROM deliveries WHERE message_id=?',(row['reply_to'],)).fetchone()
+            tombstone = connection.execute('SELECT 1 FROM withdraw_tombstones WHERE message_id=?',
+                                           (row['reply_to'],)).fetchone()
+            if (target is not None and target['state']=='withdrawn') or (target is None and tombstone is not None):
+                Mailbox._handled(connection,row['message_id'],now)
+                connection.execute("UPDATE deliveries SET evidence='cancel:target_withdrawn' WHERE message_id=?",
+                                   (row['message_id'],))
+                settled.append(row['message_id'])
+        return settled
+
+    def _urgent_rows(self, connection: Any, agent: Mapping[str, Any], maximum_hop: int,
+                     urgencies: Sequence[str]) -> list[Any]:
+        placeholders = ','.join('?' for _ in urgencies)
+        return connection.execute(
+            'SELECT m.*,d.recipient_address,d.recipient_repo_id,d.fyi_turn_end,d.updated_at AS queued_at '
+            'FROM messages m JOIN deliveries d USING(message_id) '
+            "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' "
+            f'AND d.recipient_repo_id=? AND m.hop<=? AND m.urgency IN ({placeholders}) '
+            'ORDER BY m.created_at,m.message_id LIMIT ?',
+            (self.store.host,agent['terminal_id'],agent['repo_id'],maximum_hop,*urgencies,BUNDLE_MESSAGES)).fetchall()
+
+    def _inbox_preview(self, connection: Any, agent: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """View-only rows for an in-session mailbox display; never a claim or ACK."""
+        result = []
+        for row in connection.execute(
+                'SELECT m.message_id,m.thread_id,m.kind,m.urgency,m.reply_to,m.origin_host,m.sender,m.sender_label,'
+                'm.body,m.hop,m.created_at,d.state,t.subject FROM messages m JOIN deliveries d USING(message_id) '
+                'LEFT JOIN threads t ON t.thread_id=m.thread_id '
+                "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.recipient_repo_id=? "
+                "AND d.state IN ('queued','delivering') ORDER BY m.created_at,m.message_id LIMIT ?",
+                (self.store.host,agent['terminal_id'],agent['repo_id'],INBOX_PREVIEW_LIMIT)):
+            body = ' '.join(safe_label(line, INBOX_PREVIEW_BYTES) for line in str(row['body']).splitlines()).strip()
+            result.append({'message_id':row['message_id'],'thread_id':row['thread_id'],'kind':row['kind'],
+                           'urgency':row['urgency'],'target_message_id':row['reply_to'] if row['urgency'] else None,
+                           'sender':sender_address(dict(row)),'subject':safe_label(row['subject'] or '',200),
+                           'preview':truncate_utf8(body,INBOX_PREVIEW_BYTES),'state':row['state'],
+                           'hop':row['hop'],'created_at':row['created_at']})
+        return result
+
     def inspect(self,*,terminal_id: str,agent_id: str,generation: int) -> dict[str, Any]:
         now = time.time()
         with self.store.read() as connection:
             agent = check_generation(connection,self.store.host,terminal_id,agent_id,generation)
             state = self._state(connection,agent,now)
+            urgent = []
+            for row in self._urgent_rows(connection,agent,state['thresholds']['max_hop'],URGENCIES):
+                if row['urgency']=='cancel':
+                    target = connection.execute('SELECT state FROM deliveries WHERE message_id=?',
+                                                (row['reply_to'],)).fetchone()
+                    tombstone = connection.execute('SELECT 1 FROM withdraw_tombstones WHERE message_id=?',
+                                                   (row['reply_to'],)).fetchone()
+                    if (target is not None and target['state']=='withdrawn') or (target is None and tombstone):
+                        continue  # moot: settled by the next claim, nothing to interrupt
+                urgent.append({'message_id':row['message_id'],'urgency':row['urgency'],
+                               'target_message_id':row['reply_to'],'thread_id':row['thread_id']})
+            inbox = self._inbox_preview(connection,agent)
+            queued_total = connection.execute(
+                "SELECT count(*) FROM deliveries WHERE recipient_host=? AND recipient_terminal_id=? "
+                "AND recipient_repo_id=? AND state='queued'",
+                (self.store.host,terminal_id,agent['repo_id'])).fetchone()[0]
             rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=True,
                                   coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
             trigger = min(rows,key=lambda row:(
@@ -227,7 +313,8 @@ class NativeReceiver:
         triggers = [row for row in rows if row['kind']=='action' or row['fyi_turn_end']
                     or wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now]
         return {**state,'queued_count':len(rows),'has_action':bool(triggers),'skip_input_quiet':skip_input_quiet,
-                'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0)}
+                'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0),
+                'urgent':urgent,'inbox':inbox,'queued_total':queued_total}
 
     def fyi_now(self,*,terminal_id: str,agent_id: str | None = None,generation: int | None = None) -> dict[str, Any]:
         """Request queued FYI without its delay and with bounded input-quiet bypass.
@@ -336,13 +423,55 @@ class NativeReceiver:
             result = self._ensure_worker(result)
         return self.store.annotate(result)
 
-    def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False) -> dict[str, Any]:
+    def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False,
+              urgent: Sequence[str] | None = None, message_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        """Claim one bounded bundle for the in-session receiver.
+
+        ``urgent`` (a list of amend/cancel) claims only those queued urgent
+        messages plus any still-queued originals they reference. It skips turn
+        state, coalescing and the hourly wake limit (the sender explicitly asked
+        to reach a working agent) but keeps registration and the hop limit.
+        ``message_ids`` optionally narrows an urgent claim, e.g. to the amends
+        whose original thread the receiver is currently working on.
+        """
+        if urgent is not None:
+            if (isinstance(urgent,(str,bytes)) or not isinstance(urgent,Sequence) or not urgent
+                    or any(value not in URGENCIES for value in urgent)):
+                raise LedgerError('invalid_urgency','urgent must list amend and/or cancel.')
+            if wake:
+                raise LedgerError('invalid_request','An urgent claim is not a wake claim.')
+        if message_ids is not None:
+            if (urgent is None or isinstance(message_ids,(str,bytes)) or not isinstance(message_ids,Sequence)
+                    or not message_ids):
+                raise LedgerError('invalid_request','message_ids narrows a nonempty urgent claim only.')
+            for value in message_ids:
+                require_uuid(value,'message_ids')
         now = time.time()
         with self.store.transaction((terminal_id,)) as connection:
             agent = check_generation(connection,self.store.host,terminal_id,agent_id,generation)
-            if agent['client']!='omp' or not agent['extension_present']:
-                raise LedgerError('extension_absent','Only the registered OMP receiver may admit native context.')
+            if agent['client'] not in RECEIVER_CLIENTS or not agent['extension_present']:
+                raise LedgerError('extension_absent','Only a registered OMP or pi receiver may admit native context.')
+            self._settle_moot_cancels(connection,agent,now)
             state = self._state(connection,agent,now)
+            if urgent is not None:
+                chosen = [row for row in self._urgent_rows(connection,agent,state['thresholds']['max_hop'],
+                                                           tuple(dict.fromkeys(urgent)))
+                          if message_ids is None or row['message_id'] in set(message_ids)]
+                if not chosen:
+                    return {'claim_id':None,'reason':'empty','messages':[]}
+                targets = {row['reply_to'] for row in chosen}
+                placeholders = ','.join('?' for _ in targets)
+                originals = connection.execute(
+                    'SELECT m.*,d.recipient_address,d.recipient_repo_id,d.fyi_turn_end,d.updated_at AS queued_at '
+                    'FROM messages m JOIN deliveries d USING(message_id) '
+                    "WHERE d.recipient_host=? AND d.recipient_terminal_id=? AND d.state='queued' "
+                    f'AND d.recipient_repo_id=? AND m.message_id IN ({placeholders})',
+                    (self.store.host,terminal_id,agent['repo_id'],*targets)).fetchall()
+                rows = fit_claim_rows(sorted({row['message_id']:row for row in [*originals,*chosen]}.values(),
+                                             key=lambda row:(row['created_at'],row['message_id'])))
+                if not any(row['urgency'] for row in rows):
+                    return {'claim_id':None,'reason':'unrepresentable','messages':[]}
+                return self._native_claim(connection,agent,rows,'urgent',now,skip_input_quiet=False)
             rows = self._eligible(connection,agent,state['thresholds']['max_hop'],wake=wake,
                                   coalesce_seconds=state['thresholds']['coalesce_seconds'],now=now)
             trigger = min(rows,key=lambda row:(
@@ -355,28 +484,34 @@ class NativeReceiver:
             if not rows:
                 return {'claim_id':None,'reason':'unrepresentable','messages':[]}
             skip_input_quiet = self._skip_input_quiet(connection,agent,rows,now)
-            claim = Mailbox._claim_messages(connection,rows,agent_id,generation,'wake' if wake else 'before_agent_start')
-            marker = 'HAM_CLAIM_' + claim['claim_id'] + '_' + uuid.uuid4().hex
-            message = format_context(claim,agent,marker)
-            digest = hashlib.sha256(message['content'].encode('utf-8')).hexdigest()
-            connection.execute('INSERT INTO native_claims '
-                    '(claim_id,client,session_ref,marker,content_sha256,created_at) VALUES (?,?,?,?,?,?)',
-                    (claim['claim_id'],'omp',agent['session_ref'],marker,digest,now))
+            return self._native_claim(connection,agent,rows,'wake' if wake else 'before_agent_start',now,
+                                      skip_input_quiet=skip_input_quiet)
+
+    @staticmethod
+    def _native_claim(connection: Any, agent: Mapping[str, Any], rows: Sequence[Any], via: str, now: float, *,
+                      skip_input_quiet: bool) -> dict[str, Any]:
+        claim = Mailbox._claim_messages(connection,rows,agent['agent_id'],agent['generation'],via)
+        marker = 'HAM_CLAIM_' + claim['claim_id'] + '_' + uuid.uuid4().hex
+        message = format_context(claim,agent,marker)
+        digest = hashlib.sha256(message['content'].encode('utf-8')).hexdigest()
+        connection.execute('INSERT INTO native_claims '
+                '(claim_id,client,session_ref,marker,content_sha256,created_at) VALUES (?,?,?,?,?,?)',
+                (claim['claim_id'],agent['client'],agent['session_ref'],marker,digest,now))
         return {**claim,'session_ref':agent['session_ref'],'marker':marker,'content_sha256':digest,'message':message,
-                'skip_input_quiet':skip_input_quiet}
+                'skip_input_quiet':skip_input_quiet,'via':via}
 
     def applied(self,*,claim_id: str,agent_id: str,generation: int,session_ref: str,
                 marker: str,content_sha256: str,entry_id: str) -> dict[str, Any]:
         with self.store.read() as connection:
             row = connection.execute('SELECT * FROM native_claims WHERE claim_id=?',(claim_id,)).fetchone()
-        if (row is None or row['client']!='omp' or row['session_ref']!=session_ref or row['marker']!=marker or
+        if (row is None or row['client'] not in RECEIVER_CLIENTS or row['session_ref']!=session_ref or row['marker']!=marker or
                 row['content_sha256']!=content_sha256 or not isinstance(entry_id,str) or not entry_id):
             raise LedgerError('invalid_evidence','ACK must match the exact session, claim marker and accepted context hash.')
         # Trust boundary: the root extension has inspected a public read-only
         # active-branch custom_message entry. This is host journal acceptance,
         # not proof of later context/provider transforms or model understanding.
         return Mailbox(self.store).started(claim_id=claim_id,agent_id=agent_id,generation=generation,
-                evidence='omp:accepted-journal:'+session_ref+'#'+entry_id+';sha256='+content_sha256)
+                evidence=row['client']+':accepted-journal:'+session_ref+'#'+entry_id+';sha256='+content_sha256)
 
     @staticmethod
     def _wake_reason(state: Mapping[str, Any], trigger: Mapping[str, Any] | None, now: float, *,
@@ -486,6 +621,7 @@ class NativeReceiver:
                     or not wake_capable(current)
                     or (current['client']=='claude' and current['session_ref']!=target.session_ref)):
                 return {'claim_id':None,'reason':'stale_target','messages':[]}
+            self._settle_moot_cancels(connection,current,now)
             durable_ready_since = self.wake_ready_since(connection,current['agent_id'],ready_since)
             ready_since = (max(ready_since,durable_ready_since)
                            if ready_since is not None and durable_ready_since is not None else None)
@@ -566,6 +702,7 @@ class NativeReceiver:
                     "AND d.claimed_generation=? LIMIT 1",(registered['agent_id'],registered['generation'])).fetchone()
             if pending:
                 return {**empty,'agent':registered}
+            self._settle_moot_cancels(connection,current,now)
             state = self._state(connection,current,now)
             rows = fit_claim_rows(self._eligible(connection,current,state['thresholds']['max_hop'],wake=False))
             if not rows:

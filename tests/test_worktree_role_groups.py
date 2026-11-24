@@ -435,7 +435,7 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
                 upgraded = LedgerStore(self.store.directory, canonical_name="alpha")
                 with upgraded.read() as connection:
                     self.assertEqual(connection.execute(
-                        "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "12")
+                        "SELECT value FROM ledger_meta WHERE key='schema_version'").fetchone()[0], "13")
                     self.assertEqual(connection.execute("SELECT count(*) FROM auto_main_incumbents").fetchone()[0], 0)
                     self.assertEqual([tuple(row) for row in connection.execute(
                         "SELECT * FROM workspace_settings ORDER BY workspace_id,field")], settings_before)

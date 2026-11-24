@@ -426,8 +426,9 @@ def fyi_now_summary(result: Mapping[str, Any], *, wall_clock=time.time) -> tuple
     if outcome == "not_agent":
         return "The focused pane is not a HAM agent.", "error", "not an agent"
     if outcome == "no_receiver":
-        if client == "omp":
-            detail = "OMP receiver not registered, so no wake. Run runtime status, then restart that session"
+        if client in ("omp", "pi"):
+            detail = (f"{'OMP' if client == 'omp' else 'pi'} receiver not registered, so no wake. "
+                      "Run runtime status, then restart that session")
         elif client in ("claude", "codex") and result.get("reason"):
             detail = (f"{client.capitalize()} cannot be woken right now ({result['reason']}: "
                       f"{result.get('detail') or 'no detail'})")
@@ -545,6 +546,10 @@ def execute_job(request: Mapping[str, Any], environment: Mapping[str, str]) -> A
             terminal_id=request["terminal_id"], agent_id=request["agent_id"], generation=request["generation"])
     if operation == "withdraw":
         return maintain(store, mail.withdraw(request["message_id"]), environment)
+    if operation in {"amend", "cancel"}:
+        # Operator amend/cancel of the operator's own mail (ownership is rechecked by the ledger).
+        return maintain(store, mail.urgent(None, request["message_id"], urgency=operation,
+                                           body=request.get("body"), repo_id=repo_id), environment)
     if operation == "retry":
         return maintain(store, RemoteLedger(store, environment).retry(request["item_id"]), environment)
     raise LedgerError("invalid_operation", "Unsupported mailbox UI operation.")
@@ -886,7 +891,8 @@ def describe_message(message: Mapping[str, Any]) -> str:
         suffix += " USER-CONFIRMED (operator evidence; NOT native ACK)"
     elif message.get("confirmation_source") == "native":
         suffix += " NATIVE runtime-journal confirmation"
-    return f"{message['kind']} {state}{suffix}"
+    kind = message["kind"] + (" " + str(message["urgency"]).upper() if message.get("urgency") else "")
+    return f"{kind} {state}{suffix}"
 
 
 def wrap_summary(value: str, width: int) -> list[str]:
@@ -983,9 +989,10 @@ class MailboxApp:
         self.status, self.input_error = "", ""
         self.status_level, self.last_error = "info", ""
         self.drafts: dict[tuple[str, str, str | None], dict[str, Any]] = {}
-        self.draft_key: tuple[str, str, str | None] | None = None
+        self.draft_key: tuple[str, ...] | None = None
         self.body, self.body_cursor, self.draft_version = "", 0, 0
         self.delivery, self.reply_to = "mailbox", None
+        self.urgency: str | None = None
         self.mail_kind = "action"
         self.recipient: dict[str, Any] | None = None
         self.submitted: dict[str, Any] | None = None
@@ -1150,7 +1157,7 @@ class MailboxApp:
             if (agent.get("host") == self.local.get("host") and
                     (self.repo_id is None or repo == self.repo_id) and
                     agent.get("active", True) and not agent.get("stale") and
-                    mode in {"auto", "manual"} and agent.get("client") in {"omp", "claude"} and
+                    mode in {"auto", "manual"} and agent.get("client") in {"omp", "pi", "claude"} and
                     agent.get("extension_present") in (False, 0)):
                 client = agent["client"]
                 missing[client] = missing.get(client, 0) + 1
@@ -1302,8 +1309,12 @@ class MailboxApp:
                             f"✕ {error.get('code')}: {error.get('message')}" if error else
                             "Saved." if self.matches_settings_scope(value) else "Settings scope changed; reloading…")
                     self.settings_saving = None
-                if job.operation in {"send", "direct"}:
+                if job.operation in {"send", "direct", "amend"}:
                     self.finish_send(value, error)
+                elif job.operation == "cancel" and not error:
+                    self.set_status("Queued message withdrawn; nothing was delivered."
+                                    if value.get("cancelled") == "withdrawn" else
+                                    "Cancel sent: a pi receiver stops that work and reports back.")
                 elif job.operation == "fyi_now":
                     self.finish_fyi_now(value, error)
                 elif error:
@@ -1347,13 +1358,16 @@ class MailboxApp:
             self.drafts[self.draft_key] = {"text": self.body, "cursor": self.body_cursor,
                                           "version": self.draft_version, "delivery": self.delivery}
 
-    def open_input(self, recipient: Mapping[str, Any], reply_to: str | None = None) -> None:
+    def open_input(self, recipient: Mapping[str, Any], reply_to: str | None = None,
+                   urgency: str | None = None) -> None:
         if recipient.get("stale"):
             self.set_status("Remote snapshot is stale; refresh before selecting a recipient.", "error")
             return
         self.recipient = dict(recipient)
         self.reply_to = reply_to
-        self.draft_key = (recipient["host"], recipient["terminal_id"], reply_to)
+        self.urgency = urgency
+        self.draft_key = ((recipient["host"], recipient["terminal_id"], reply_to) if urgency is None
+                          else (recipient["host"], recipient["terminal_id"], reply_to, urgency))
         draft = self.drafts.get(self.draft_key, {})
         self.body, self.body_cursor = draft.get("text", ""), draft.get("cursor", 0)
         self.draft_version, self.delivery = draft.get("version", 0), draft.get("delivery", "mailbox")
@@ -1411,7 +1425,10 @@ class MailboxApp:
         request = {"repo_id": self.repo_id or recipient["repo_id"],
                    "recipient": dict(self.recipient), "body": self.body, "kind": self.mail_kind,
                    "subject": None, "reply_to": self.reply_to}
-        if self.delivery == "direct":
+        if self.urgency == "amend":
+            self.send_request("amend", {"repo_id": request["repo_id"], "recipient": request["recipient"],
+                                        "message_id": self.reply_to, "body": self.body})
+        elif self.delivery == "direct":
             self.open_confirm("DIRECT · may interrupt; acceptance ≠ native delivery",
                               [f"To {self.address(recipient)}", self.body],
                               "direct", request, return_mode="input")
@@ -1529,9 +1546,39 @@ class MailboxApp:
                 f"Generation: {message.get('claimed_generation', '—')}",
                 f"Current state: {message.get('state', '—')}"]
 
+    def own_user_message(self, item: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """Latest live operator-originated original (not amend/cancel) in the selected thread."""
+        candidates = [message for message in (item or {}).get("messages", [])
+                      if message.get("sender") == "user" and message.get("origin_host") == self.store.host
+                      and not message.get("urgency")
+                      and message.get("state") not in {"withdrawn", "undeliverable"}]
+        return max(candidates, key=lambda message: (message.get("created_at", 0), message["message_id"]),
+                   default=None)
+
+    def urgent_action(self, key: str) -> None:
+        item = self.selected("threads")
+        message = self.own_user_message(item if item and item.get("type") == "thread" else None)
+        if message is None:
+            self.set_status("Select a thread with a live message you sent to amend or cancel it.", "error")
+            return
+        if key == "c":
+            self.open_confirm("Cancel message? Queued mail is withdrawn; otherwise a pi receiver aborts "
+                              "that work and reports what was done.",
+                              self.message_target(message), "cancel", {"message_id": message["message_id"]})
+            return
+        identity = (message.get("recipient_host"), message.get("recipient_terminal_id"))
+        recipient = next((agent for agent in self.agents()
+                          if self.identity(agent) == identity and not agent.get("stale")), None)
+        if recipient is None:
+            self.set_status("The original recipient is unavailable or stale; refresh before amending.", "error")
+            return
+        self.open_input(recipient, message["message_id"], urgency="amend")
+
     def thread_action(self, key: str) -> None:
         item = self.selected("threads")
-        if key in ("a", "n"):
+        if key in ("c", "u"):
+            self.urgent_action(key)
+        elif key in ("a", "n"):
             self.resolve("applied" if key == "a" else "not_applied")
         elif key == "w":
             message = next((message for message in (item or {}).get("messages", [])
@@ -2105,7 +2152,7 @@ class MailboxApp:
             self.refresh()
         elif key == "t" and self.focus == "detail" and self.technical_supported():
             self.toggle_detail()
-        elif self.focus == "threads" and key in ("w", "t", "a", "n"):
+        elif self.focus == "threads" and key in ("w", "t", "a", "n", "c", "u"):
             self.thread_action(key)
 
     def add_hit(self, rect: tuple[int, int, int, int], target: str, value: Any = None) -> None:
@@ -3177,7 +3224,10 @@ class MailboxApp:
         section("Receiver/technical", [
             f"Receiver: {'ready' if item.get('extension_present') else 'extension absent'}",
             f"Extension present: {yes_no(item.get('extension_present'))}",
-            *([f"Remedy: runtime status on {item['host']}; ask the user before runtime install "
+            *([f"Remedy: ask the user before installing the pi-mailbox package (pi install) on "
+               f"{item['host']}, then restart only the selected sessions."]
+              if item.get("client") == "pi" and item.get("extension_present") in (False, 0) else
+              [f"Remedy: runtime status on {item['host']}; ask the user before runtime install "
                f"{item['client']}, then restart only the selected sessions."]
               if item.get("client") in {"omp", "claude"} and item.get("extension_present") in (False, 0) else []),
             f"Repo ID: {item.get('repo_id') or '—'}",
@@ -3339,6 +3389,8 @@ class MailboxApp:
     def render_input(self, rect: tuple[int, int, int, int]) -> None:
         direct = self.delivery == "direct"
         title = ("Reply to " if self.reply_to else "To ") + self.address(self.recipient)
+        if self.urgency == "amend":
+            title = "AMEND (urgent supplement) · " + self.address(self.recipient)
         if direct:
             title = "DIRECT · " + title + " · may interrupt; acceptance ≠ native delivery"
         else:
@@ -3456,6 +3508,7 @@ class MailboxApp:
                     "Detail PgUp/PgDn: viewport page with one row overlap; range + ↑/↓ show more.",
                     "s settings · ? / F1 help · e diagnostics · r refresh · q close",
                     "Threads: w withdraw · t retry · a/n uncertain claim recovery (evidence + confirm)",
+                    "Threads: u amend (urgent supplement) · c cancel your own message (pi aborts + reports)",
                     "Thread states: . queued/pending · > submitting · + accepted/delivered · = handled",
                     "! failed/undeliverable · - withdrawn · ? UNCERTAIN delivering / unknown",
                     "x dismissed: audited sender resolution; NOT delivered / recipient handled",
@@ -3578,7 +3631,8 @@ class MailboxApp:
         if self.focus == "agents":
             return ["Agents: Space view; Enter opens quick send; [f] FYI now; [m] Main pin/unpin"]
         if self.focus == "threads":
-            return ["Threads: Space view; Enter reply", "w withdraw", "t retry", "a/n recover uncertain claim"]
+            return ["Threads: Space view; Enter reply", "w withdraw", "u amend", "c cancel", "t retry",
+                    "a/n recover uncertain claim"]
         if self.focus == "devices":
             return ["Devices: Space view; Enter Detail; read-only, all hosts/repositories"]
         return ["Detail: ↑↓ / PgUp/PgDn scroll; read-only, never ACK"] + (

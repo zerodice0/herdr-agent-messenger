@@ -1050,6 +1050,79 @@ old claim for later ordinary receiving; it does not submit a prompt. `Esc`
 cancels. Never call internal `started` just because text was read or a hook
 returned success. See the [UI reference](../../../docs/ui-reference.md).
 
+### Urgent amend and cancel
+
+`mail amend --message UUID (--body TEXT | --body-file PATH)` and
+`mail cancel --message UUID [--body REASON]` are restricted to the **user**
+(Mailbox Threads `u` amend, `c` cancel) and agents whose current role is **main**,
+and only for mail they originated on this host (agents: the same terminal and
+repository, the `withdraw` ownership rule; the user: `user` mail). The target must
+be an original message, not another amend/cancel. Errors: `not_sender`, `not_main`,
+`invalid_urgency`, `nothing_to_cancel` (already withdrawn), `message_final`
+(undeliverable), `recipient_absent`/`recipient_changed` for a local route.
+
+Both send `kind=action` mail with `reply_to` = the original (same thread, hop + 1)
+to the original concrete route (never re-resolved) and the new optional wire field
+`urgency` (`amend`|`cancel`). The field is present only on urgent mail, so ordinary
+payload shapes and hashes are unchanged; a peer older than schema 13 rejects urgent
+mail as `invalid_message` (failed outbox item). Upgrade all hosts together.
+
+`cancel` first withdraws: still-queued local mail becomes `withdrawn` and nothing
+is sent (`{"cancelled":"withdrawn"}`). Remote mail gets the usual withdrawal
+request followed, in the same per-peer FIFO, by the cancel; if the withdrawal won,
+the recipient host settles the cancel as `handled` (evidence
+`cancel:target_withdrawn`) without delivering it. Otherwise the cancel is queued.
+
+Native bundles label urgent headers `[action · amend of ID]` / `[action · cancel of ID]`
+and add one guidance line. CANCEL guidance: stop that work, do not continue or revert
+it yourself, report what was already done (files, commands, side effects) with
+`mail send --reply-to <cancel ID> --kind action` so the sender decides on reverting.
+
+Receiver-side admission: `ledger runtime claim` accepts `urgent: ["amend"|"cancel",...]`
+and optional `message_ids` (narrowing). An urgent claim takes only queued urgent mail
+plus any still-queued originals it references, skips turn state, coalescing and the
+hourly wake limit, keeps receiver registration and `max_hop`, records `via='urgent'`
+and never writes `wake_log`. `inspect` also returns `urgent` (queued, within hop,
+non-moot), a view-only `inbox` preview (≤20 queued/delivering rows, bodies ≤240 B)
+and `queued_total`.
+
+### pi receiver
+
+The receiver is the separate pi package
+[pi-mailbox](https://github.com/zerodice0/pi-mailbox) (`pi install`); HAM's
+`runtime install` does not manage it. It also works without HAM (local
+backend); with HAM available inside Herdr it uses the HAM backend described
+here. In HAM mode it runs only in the pane's root interactive pi (`mode=tui`, Herdr environment, no `PI_SUBAGENT_CHILD`). Registration
+uses `client=pi` and the session file Herdr's pi integration reports
+(`herdr integration install pi`); without that report it waits as
+`native_session_pending`. The ledger worker never wakes pi (`WAKE_CLIENTS` stays
+Claude/Codex); the bell file is only a doorbell.
+
+Queue processing inside pi:
+
+- **Ordinary:** pi idle (`isIdle`, no queued pi messages, no open extension
+  dialog), empty editor, `idle_minutes` input quiet, Herdr `turn_state`
+  `idle`/`done`, then a HAM wake claim (role, coalesce, hourly, hop) and one
+  bundle via `sendMessage(..., {deliverAs:"followUp", triggerTurn:true})`.
+  A user prompt also carries queued mail (`before_agent_start`).
+- **cancel:** if the current run is working on the cancelled thread (a thread this
+  extension injected in that run), `ctx.abort()` even over an editor draft; after
+  `agent_settled` the cancel is claimed and starts a reporting turn, still over a
+  draft (the draft is untouched). Cancels for other work wait for idle and go first.
+- **amend:** while the run works on that thread and the editor is empty, it is
+  claimed (narrowed by `message_ids`) and steered (`deliverAs:"steer"`); otherwise
+  it waits for idle with an empty editor and goes first.
+- **ACK:** exact `custom_message` `ham_mailbox` marker/details/sha256 in the active
+  branch → `applied` (evidence `pi:accepted-journal:SESSION#ENTRY;sha256=…`). At idle,
+  a sent message absent from the whole journal with nothing queued in pi (after a
+  3 s start grace) is released `not_applied`; other unconfirmed claims become
+  `unknown` (operator recovery), never replayed.
+- **UI:** status `HAM ✉ N !U …` (queued, urgent, claim in flight);
+  `/ham-mailbox` or `alt+m` opens a read-only overlay; neither claims nor ACKs.
+- Legacy `send`/`request`/`batch` from a participating sender to a registered pi
+  receiver is refused with `use_mailbox` regardless of repository.
+- Session-name sync is OMP-only.
+
 ### Receiving runtimes
 
 The plugin provides the ledger, mailbox, UI and transport; the skill provides

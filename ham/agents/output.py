@@ -193,6 +193,18 @@ def compact_send_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def compact_urgent_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """amend/cancel: a withdrawn cancel or the urgent message's compact send receipt."""
+
+    if payload.get("cancelled") == "withdrawn":
+        return {key: payload[key] for key in ("message_id", "cancelled", "state")}
+    compact = compact_send_payload(payload)
+    for key in ("target_message_id", "urgency", "withdraw_requested"):
+        if payload.get(key):
+            compact[key] = payload[key]
+    return compact
+
+
 def compact_handle_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return only each handled message's identity and final state."""
 

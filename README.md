@@ -39,6 +39,12 @@ keyboard-first view of who is working, what they are doing, and what needs a rep
 - **Three clients:** bundled skills for omp, Claude Code, and Codex. OMP and
   Claude receiving runtimes are opt-in; the ledger worker also wakes idle Claude
   Code and Codex sessions, and Codex needs no runtime and pulls at work boundaries.
+- **pi receiver:** pi sessions receive through the separate
+  [pi-mailbox](https://github.com/zerodice0/pi-mailbox) package (`pi install`).
+  HAM never pushes into pi; the extension processes its queue at idle, steers
+  `mail amend` into the work on the original thread and aborts it on
+  `mail cancel` so the recipient reports back. The user sends amend/cancel from
+  Mailbox Threads (`u`, `c`); agents with the main role use `mail amend|cancel`.
 
 ## Requirements
 
