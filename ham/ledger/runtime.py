@@ -67,9 +67,9 @@ def render_bundle(messages: Sequence[Mapping[str, Any]], marker: str) -> str | N
         prefix += 'AMEND: the sender supplements the referenced message; apply it to that work.\n'
     if 'cancel' in urgencies:
         prefix += ('CANCEL: the sender cancelled the referenced message. Stop that work; do not continue it '
-                   'and do not revert anything yourself. Report what was already done (files, commands, '
-                   'side effects) via mail send --reply-to <the cancel message ID> --kind action so the sender '
-                   'can decide whether to revert.\n')
+                   'and do not revert anything yourself. Report what was already done (files, commands, side '
+                   'effects) so the sender can decide whether to revert: to an agent sender with mail send '
+                   '--reply-to <the cancel message ID> --kind action; to a user@HOST sender in your response.\n')
     headers = []
     for message in messages:
         sender_repo = message.get('sender_repo_id', message.get('repo_id', ''))

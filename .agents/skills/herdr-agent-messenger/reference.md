@@ -1075,8 +1075,9 @@ the recipient host settles the cancel as `handled` (evidence
 
 Native bundles label urgent headers `[action · amend of ID]` / `[action · cancel of ID]`
 and add one guidance line. CANCEL guidance: stop that work, do not continue or revert
-it yourself, report what was already done (files, commands, side effects) with
-`mail send --reply-to <cancel ID> --kind action` so the sender decides on reverting.
+it yourself, report what was already done (files, commands, side effects) so the
+sender decides on reverting: an agent sender by `mail send --reply-to <cancel ID>
+--kind action`; a `user@HOST` sender, who has no mail address, in the response.
 
 Receiver-side admission: `ledger runtime claim` accepts `urgent: ["amend"|"cancel",...]`
 and optional `message_ids` (narrowing). An urgent claim takes only queued urgent mail
