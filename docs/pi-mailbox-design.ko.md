@@ -95,6 +95,18 @@ cancel 메시지가 시작한 턴에서 에이전트는 다음 지침을 받습�
 
 "지금 처리 중인 thread"인지는 pi extension이 판정합니다. extension은 자신이 주입한 묶음의 thread ID를 기록해 두고, 턴이 끝나 idle 상태가 되면 이 기록을 지웁니다. amend와 cancel은 원본과 같은 thread에 속하므로 thread ID로 비교할 수 있습니다.
 
+### 4.5 pi가 관찰한 idle로 wake 판정
+
+Herdr의 `turn_state`는 화면을 보고 추정한 값이라 늦거나 틀릴 수 있습니다. pi extension은 agent 이벤트와 `ctx.isIdle()`로 자신의 idle 상태를 직접 압니다. 그래서 `inspect`의 `capabilities`에 `pi_observed_idle`이 있으면, pi extension은 wake claim(`wake: true`)에 `observed_idle: true`와 `observed_at`(idle을 확인한 시각, epoch 초)을 함께 보낼 수 있습니다.
+
+- **건너뛰는 조건:** Herdr `turn_state` 조건만 건너뜁니다.
+- **유지하는 조건:** 역할, 시간당 횟수, coalesce, hop 제한은 그대로 검사합니다.
+- **시각 검사:** HAM은 ledger transaction 안에서 `observed_at`이 60초 이내이고 5초 넘게 미래가 아닌지 봅니다. 이 범위를 벗어나면 `turn_state`로 대신 판정하지 않고 `reason: "observed_stale"`로 거절합니다.
+- **거절하는 요청:** `client=pi`가 아니면 `unsupported_client`, `wake` 없이 보내거나 `observed_idle`이 true가 아니거나 `observed_at`이 숫자가 아니면 `invalid_request`입니다.
+- **기록:** wake claim 결과의 `idle_source`에 `pi_observed_idle` 또는 `turn_state`가 들어갑니다.
+
+옛 HAM은 모르는 필드를 거절하므로, pi extension은 capability가 있을 때만 이 필드를 보냅니다.
+
 ## 5. 프로토콜과 저장소 변경
 
 - **schema 13:** `messages.urgency` 열을 추가합니다(NULL, `amend`, `cancel`).

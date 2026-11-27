@@ -29,6 +29,13 @@ URGENCIES = ('amend','cancel')
 STATUS_RUN_LIMIT = 64
 INBOX_PREVIEW_LIMIT = 20
 INBOX_PREVIEW_BYTES = 240
+# A pi receiver observes its own idle state (agent events and ctx.isIdle()),
+# which is more current than Herdr's screen-derived turn_state. Its wake claim
+# may carry that observation instead of relying on turn_state.
+PI_OBSERVED_IDLE = 'pi_observed_idle'
+OBSERVED_IDLE_MAX_AGE_SECONDS = 60
+OBSERVED_IDLE_FUTURE_SKEW_SECONDS = 5
+RECEIVER_CAPABILITIES = (PI_OBSERVED_IDLE,)
 
 
 def wake_capable(agent: Mapping[str, Any]) -> bool:
@@ -312,7 +319,8 @@ class NativeReceiver:
         # guard retries. Its existing safety interval and natural events recheck.
         triggers = [row for row in rows if row['kind']=='action' or row['fyi_turn_end']
                     or wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now]
-        return {**state,'queued_count':len(rows),'has_action':bool(triggers),'skip_input_quiet':skip_input_quiet,
+        return {**state,'capabilities':list(RECEIVER_CAPABILITIES),
+                'queued_count':len(rows),'has_action':bool(triggers),'skip_input_quiet':skip_input_quiet,
                 'coalesce_until':min((wake_ready_at(row,state['thresholds']['coalesce_seconds']) for row in triggers),default=0),
                 'urgent':urgent,'inbox':inbox,'queued_total':queued_total}
 
@@ -423,8 +431,28 @@ class NativeReceiver:
             result = self._ensure_worker(result)
         return self.store.annotate(result)
 
+    @staticmethod
+    def _observed_idle(observed_idle: Any, observed_at: Any, *, wake: bool, client: str | None,
+                       now: float) -> str | None:
+        """Validate a pi receiver's own idle observation; return 'fresh', 'stale' or None (absent)."""
+        if observed_idle is None and observed_at is None:
+            return None
+        if observed_idle is not True:
+            raise LedgerError('invalid_request','observed_idle must be true when given.')
+        if not wake:
+            raise LedgerError('invalid_request','observed_idle applies to a wake claim only.')
+        if (isinstance(observed_at,bool) or not isinstance(observed_at,(int,float))
+                or observed_at!=observed_at or observed_at in (float('inf'),float('-inf'))):
+            raise LedgerError('invalid_request','observed_at must be the epoch seconds of the idle observation.')
+        if client is not None and client!='pi':
+            raise LedgerError('unsupported_client','observed_idle is accepted from a pi receiver only.')
+        if observed_at>now+OBSERVED_IDLE_FUTURE_SKEW_SECONDS or now-observed_at>OBSERVED_IDLE_MAX_AGE_SECONDS:
+            return 'stale'
+        return 'fresh'
+
     def claim(self,*,terminal_id: str,agent_id: str,generation: int,wake: bool = False,
-              urgent: Sequence[str] | None = None, message_ids: Sequence[str] | None = None) -> dict[str, Any]:
+              urgent: Sequence[str] | None = None, message_ids: Sequence[str] | None = None,
+              observed_idle: bool | None = None, observed_at: float | None = None) -> dict[str, Any]:
         """Claim one bounded bundle for the in-session receiver.
 
         ``urgent`` (a list of amend/cancel) claims only those queued urgent
@@ -433,6 +461,12 @@ class NativeReceiver:
         to reach a working agent) but keeps registration and the hop limit.
         ``message_ids`` optionally narrows an urgent claim, e.g. to the amends
         whose original thread the receiver is currently working on.
+
+        ``observed_idle=True`` with ``observed_at`` (epoch seconds, at most 60 s
+        old) lets a pi receiver's wake claim stand on its own idle observation:
+        only the Herdr turn_state gate is skipped. Role, hourly limit, coalescing
+        and hop gates still apply. A stale observation refuses with
+        ``observed_stale`` rather than falling back to turn_state.
         """
         if urgent is not None:
             if (isinstance(urgent,(str,bytes)) or not isinstance(urgent,Sequence) or not urgent
@@ -447,10 +481,16 @@ class NativeReceiver:
             for value in message_ids:
                 require_uuid(value,'message_ids')
         now = time.time()
+        self._observed_idle(observed_idle,observed_at,wake=wake,client=None,now=now)
         with self.store.transaction((terminal_id,)) as connection:
             agent = check_generation(connection,self.store.host,terminal_id,agent_id,generation)
             if agent['client'] not in RECEIVER_CLIENTS or not agent['extension_present']:
                 raise LedgerError('extension_absent','Only a registered OMP or pi receiver may admit native context.')
+            # Re-evaluated inside the transaction: the ledger lock wait counts toward its age.
+            observation = self._observed_idle(observed_idle,observed_at,wake=wake,client=agent['client'],
+                                              now=time.time())
+            if observation=='stale':
+                return {'claim_id':None,'reason':'observed_stale','messages':[]}
             self._settle_moot_cancels(connection,agent,now)
             state = self._state(connection,agent,now)
             if urgent is not None:
@@ -477,15 +517,19 @@ class NativeReceiver:
             trigger = min(rows,key=lambda row:(
                 not (row['kind']=='action' and wake_ready_at(row,state['thresholds']['coalesce_seconds'])<=now),
                 wake_ready_at(row,state['thresholds']['coalesce_seconds'])),default=None) if wake else None
-            reason = self._wake_reason(state,trigger,now) if wake else None
+            reason = (self._wake_reason(state,trigger,now,observed_idle=observation=='fresh')
+                      if wake else None)
             if reason or not rows:
                 return {'claim_id':None,'reason':reason or 'empty','messages':[]}
             rows = fit_claim_rows(rows,wake_trigger=trigger['message_id'] if trigger is not None else None)
             if not rows:
                 return {'claim_id':None,'reason':'unrepresentable','messages':[]}
             skip_input_quiet = self._skip_input_quiet(connection,agent,rows,now)
-            return self._native_claim(connection,agent,rows,'wake' if wake else 'before_agent_start',now,
-                                      skip_input_quiet=skip_input_quiet)
+            result = self._native_claim(connection,agent,rows,'wake' if wake else 'before_agent_start',now,
+                                        skip_input_quiet=skip_input_quiet)
+            if wake:
+                result['idle_source'] = PI_OBSERVED_IDLE if observation=='fresh' else 'turn_state'
+            return result
 
     @staticmethod
     def _native_claim(connection: Any, agent: Mapping[str, Any], rows: Sequence[Any], via: str, now: float, *,
@@ -515,18 +559,21 @@ class NativeReceiver:
 
     @staticmethod
     def _wake_reason(state: Mapping[str, Any], trigger: Mapping[str, Any] | None, now: float, *,
-                     external: bool = False, ready_since: float | None = None) -> str | None:
+                     external: bool = False, ready_since: float | None = None,
+                     observed_idle: bool = False) -> str | None:
         """First gate that refuses a wake; ``external`` adds the worker-driven gates.
 
         OMP evaluates quiet/idle/editor in its own extension, so its claim path
         never asks for them. A worker-driven wake cannot observe input, so it
         also requires no pending claim and, unless explicitly requested by the
         operator, a continuous ready period of ``idle_minutes`` (the quiet proxy).
+        ``observed_idle`` (a fresh pi receiver observation) replaces only the
+        turn_state gate.
         """
         thresholds = state['thresholds']
         if state['role'] is None:
             return 'not_participating'
-        if state['turn_state'] not in WAKE_READY_STATES:
+        if not observed_idle and state['turn_state'] not in WAKE_READY_STATES:
             return 'not_idle'
         if external:
             if state['pending_claims']:

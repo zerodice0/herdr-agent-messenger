@@ -312,6 +312,83 @@ class PiMailboxLedgerTest(unittest.TestCase):
         settled = self.message(cancel["message_id"])
         self.assertEqual((settled["state"], settled["evidence"]), ("handled", "cancel:target_withdrawn"))
 
+    # pi observed idle ------------------------------------------------------------------------
+    def observed(self, age=0.0):
+        return {"observed_idle": True, "observed_at": time.time() - age}
+
+    def wake_log_count(self):
+        with self.store.read() as connection:
+            return connection.execute("SELECT count(*) FROM wake_log WHERE agent_id=?",
+                                      (self.recipient["agent_id"],)).fetchone()[0]
+
+    def test_inspect_advertises_pi_observed_idle(self):
+        self.assertIn("pi_observed_idle", self.receiver.inspect(**self.identity)["capabilities"])
+
+    def test_fresh_observed_idle_replaces_only_the_turn_state_gate(self):
+        sent = self.send()
+        for state in ("working", "unknown", "blocked"):
+            with self.subTest(state=state):
+                self.set_turn_state(state)
+                self.assertEqual(self.receiver.claim(**self.identity, wake=True)["reason"], "not_idle")
+        claim = self.receiver.claim(**self.identity, wake=True, **self.observed(age=30))
+        self.assertEqual((claim["via"], claim["idle_source"]), ("wake", "pi_observed_idle"))
+        self.assertEqual([row["message_id"] for row in claim["messages"]], [sent["message_id"]])
+        self.applied(claim)
+        self.assertEqual(self.state(sent["message_id"]), "delivered")
+        self.assertEqual(self.wake_log_count(), 1)
+        self.set_turn_state("idle")
+        self.send(body="second")
+        plain = self.receiver.claim(**self.identity, wake=True)
+        self.assertEqual(plain["idle_source"], "turn_state")
+        self.assertNotIn("idle_source", self.receiver.claim(**self.identity))
+
+    def test_observed_idle_keeps_role_hourly_coalescing_and_hop_gates(self):
+        self.set_turn_state("working")
+        sent = self.send()
+        self.settings.mutate(self.recipient["repo_id"], "thresholds", {**self.thresholds, "wakes_per_hour": 0})
+        self.assertEqual(self.receiver.claim(**self.identity, wake=True, **self.observed())["reason"], "hourly_limit")
+        self.settings.mutate(self.recipient["repo_id"], "thresholds", {**self.thresholds, "coalesce_seconds": 600})
+        self.assertEqual(self.receiver.claim(**self.identity, wake=True, **self.observed())["reason"], "coalescing")
+        self.settings.mutate(self.recipient["repo_id"], "thresholds", self.thresholds)
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE messages SET hop=? WHERE message_id=?",
+                               (self.thresholds["max_hop"] + 1, sent["message_id"]))
+        self.assertEqual(self.receiver.claim(**self.identity, wake=True, **self.observed())["reason"], "no_action")
+        with self.store.transaction() as connection:
+            connection.execute("UPDATE messages SET hop=0 WHERE message_id=?", (sent["message_id"],))
+        self.settings.mutate(self.recipient["repo_id"], "mode", "off")
+        self.assertEqual(self.receiver.claim(**self.identity, wake=True, **self.observed())["reason"],
+                         "not_participating")
+        self.assertEqual(self.wake_log_count(), 0)
+
+    def test_stale_or_future_observation_refuses_without_turn_state_fallback(self):
+        sent = self.send()
+        self.set_turn_state("idle")
+        for age in (61, -6):
+            with self.subTest(age=age):
+                claim = self.receiver.claim(**self.identity, wake=True, **self.observed(age=age))
+                self.assertEqual((claim["claim_id"], claim["reason"]), (None, "observed_stale"))
+        self.assertEqual(self.state(sent["message_id"]), "queued")
+
+    def test_invalid_observed_idle_requests_are_rejected(self):
+        self.send()
+        now = time.time()
+        for invalid, code in (({"wake": True, "observed_idle": False, "observed_at": now}, "invalid_request"),
+                              ({"wake": True, "observed_idle": True}, "invalid_request"),
+                              ({"wake": True, "observed_at": now}, "invalid_request"),
+                              ({"wake": True, "observed_idle": True, "observed_at": "now"}, "invalid_request"),
+                              ({"wake": True, "observed_idle": True, "observed_at": True}, "invalid_request"),
+                              ({"wake": True, "observed_idle": True, "observed_at": float("nan")}, "invalid_request"),
+                              ({"observed_idle": True, "observed_at": now}, "invalid_request"),
+                              ({"urgent": ["amend"], "observed_idle": True, "observed_at": now}, "invalid_request")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(LedgerError) as caught:
+                    self.receiver.claim(**self.identity, **invalid)
+                self.assertEqual(caught.exception.code, code)
+        with self.assertRaises(LedgerError) as caught:
+            NativeReceiver._observed_idle(True, now, wake=True, client="omp", now=now)
+        self.assertEqual(caught.exception.code, "unsupported_client")
+
     def test_receiver_capability_by_client(self):
         self.assertTrue(wake_capable({"client": "omp", "extension_present": 1}))
         self.assertFalse(wake_capable({"client": "pi", "extension_present": 0}))
@@ -352,6 +429,7 @@ class PiMailboxLedgerTest(unittest.TestCase):
         self.assertEqual(registered["urgent"][0]["message_id"], cancel["message_id"])
         state = call("ledger", "runtime", "inspect", data=self.identity)
         self.assertEqual(state["urgent"][0]["urgency"], "cancel")
+        self.assertIn("pi_observed_idle", state["capabilities"])
         claim = call("ledger", "runtime", "claim", data={**self.identity, "urgent": ["cancel"]})
         self.assertEqual(claim["via"], "urgent")
         self.assertEqual([row["message_id"] for row in claim["messages"]], [cancel["message_id"]])

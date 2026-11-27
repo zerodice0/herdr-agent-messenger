@@ -1087,6 +1087,19 @@ and never writes `wake_log`. `inspect` also returns `urgent` (queued, within hop
 non-moot), a view-only `inbox` preview (≤20 queued/delivering rows, bodies ≤240 B)
 and `queued_total`.
 
+pi observed idle: `inspect` returns `capabilities` containing `pi_observed_idle`.
+A `client=pi` receiver may then add `observed_idle: true` and `observed_at`
+(epoch seconds of its own idle observation, from agent events and
+`ctx.isIdle()`) to a `wake: true` claim. A fresh observation (≤60 s old, ≤5 s
+in the future, measured inside the ledger transaction) replaces only the Herdr
+`turn_state` gate; role, `wakes_per_hour`, coalescing and `max_hop` still apply.
+A stale one returns `reason: "observed_stale"` without falling back to
+`turn_state`. Other clients get `unsupported_client`; the fields without
+`wake`, a non-true `observed_idle` or a missing/non-numeric `observed_at` get
+`invalid_request`. A wake claim result reports `idle_source`
+(`pi_observed_idle` or `turn_state`). Older HAM rejects the unknown fields, so a
+receiver sends them only when the capability is advertised.
+
 ### pi receiver
 
 The receiver is the separate pi package
