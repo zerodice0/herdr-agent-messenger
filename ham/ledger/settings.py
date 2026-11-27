@@ -63,7 +63,9 @@ def validate_setting(value: Mapping[str, Any], *, allow_oversized_version: bool 
         valid = (valid and field == "main" and data is None and result["changed_by"] == "main_host" and
                  isinstance(expected, dict) and set(expected) == {"version", "origin_host", "value"} and
                  isinstance(expected["value"], dict) and expected["value"].get("host") == result["origin_host"])
-    if not valid or result["changed_by"] not in {"user", "home", "main_host"}:
+    changed_by = result["changed_by"]
+    if not valid or not (changed_by in {"user", "home", "main_host"} or
+                         (changed_by == "restore" and field in WORKSPACE_FIELDS)):
         raise LedgerError("invalid_setting", f"Invalid value for {field}.")
     if not isinstance(result["changed_at"], (int, float)):
         raise LedgerError("invalid_setting", "Setting timestamp is required.")
@@ -126,6 +128,21 @@ class RepoSettings:
             "SELECT * FROM workspace_settings WHERE repo_id=? AND host=? AND workspace_id=?",
             (repo_id, host, workspace_id))}
 
+    @staticmethod
+    def _target_agent(connection: Any, target: Mapping[str, str]) -> Any:
+        """Prefer the active binding, otherwise the terminal's latest generation."""
+        return connection.execute(
+            "SELECT active,repo_id,workspace_id,pane_id FROM agents WHERE host=? AND terminal_id=? "
+            "ORDER BY active DESC,generation DESC LIMIT 1",
+            (target["host"], target["terminal_id"])).fetchone()
+
+    @staticmethod
+    def _missing_target(connection: Any, target: Mapping[str, str]) -> dict[str, Any] | None:
+        agent = RepoSettings._target_agent(connection, target)
+        if agent is not None and agent["active"]:
+            return None
+        return {**target, "pane_id": agent["pane_id"] if agent is not None else None}
+
     def show(self, repo_id: str, host: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
         requested_workspace_id = workspace_id
         with self.store.read() as connection:
@@ -139,6 +156,11 @@ class RepoSettings:
                                          "AND json_extract(payload,'$.repo_id')=?", (repo_id,)).fetchone()[0]
             mode = fields.get("mode", {}).get("value", "off")
             main = main_source = computed = None
+            pin = scoped.get("main", {}).get("value")
+            members = scoped.get("members", {}).get("value", [])
+            main_missing = self._missing_target(connection, pin) if pin else None
+            members_missing = [missing for target in members
+                               if (missing := self._missing_target(connection, target)) is not None]
             if host is not None and workspace_id is not None:
                 main, main_source, computed = self._election(connection, repo_id, host, workspace_id, mode)
         return {"repo_id": repo_id, "host": host, "workspace_id": workspace_id,
@@ -146,7 +168,8 @@ class RepoSettings:
                 "home_host": fields.get("home", {}).get("value"),
                 "mode": fields.get("mode", {}).get("value", "off"), "settings": {**fields, **scoped},
                 "main": main, "main_source": main_source,
-                "members": scoped.get("members", {}).get("value", []), "computed_main": computed,
+                "members": members, "computed_main": computed,
+                "main_missing": main_missing, "members_missing": members_missing,
                 "conflicts": conflicts, "propagation_pending": pending}
 
     @staticmethod
@@ -260,11 +283,18 @@ class RepoSettings:
                     (agent is None and (field == "main" or target not in existing))):
                 raise LedgerError("target_out_of_scope", f"Target must be an active agent in role scope {workspace_id} on {host}.")
         connection.execute("INSERT OR IGNORE INTO repos VALUES (?,NULL,?)", (repo_id, time.time()))
-        version = max((row["version"] for row in scoped.values()), default=0) + 1
+        self._write_workspace_setting(connection, repo_id, host, workspace_id, field, value, "user", time.time())
+
+    @staticmethod
+    def _write_workspace_setting(connection: Any, repo_id: str, host: str, workspace_id: str,
+                                 field: str, value: Any, changed_by: str, at: float) -> None:
+        version = connection.execute(
+            "SELECT coalesce(max(version),0)+1 FROM workspace_settings WHERE repo_id=? AND host=? AND workspace_id=?",
+            (repo_id, host, workspace_id)).fetchone()[0]
         connection.execute("INSERT INTO workspace_settings VALUES (?,?,?,?,?,?,?,?) "
                            "ON CONFLICT(repo_id,host,workspace_id,field) DO UPDATE SET "
                            "value=excluded.value,version=excluded.version,changed_by=excluded.changed_by,changed_at=excluded.changed_at",
-                           (repo_id, host, workspace_id, field, json_text(value), version, "user", time.time()))
+                           (repo_id, host, workspace_id, field, json_text(value), version, changed_by, at))
 
     def mutate(self, repo_id: str, field: str, value: Any, *, host: str | None = None,
                workspace_id: str | None = None) -> dict[str, Any]:
@@ -370,6 +400,53 @@ class RepoSettings:
             return None, None, None
         elected = RepoSettings._incumbent_from(connection, repo_id, host, anchor, agents) or computed
         return elected, "auto" if elected else None, computed
+
+    def reconcile_restored_targets(self, connection: Any, at: float,
+                                   live_terminals: set[str]) -> set[tuple[str, str, str]]:
+        """Recover host-local settings only from an authoritative pane/agent sweep."""
+        host = self.store.host
+        changed: set[tuple[str, str, str]] = set()
+        rows = connection.execute(
+            "SELECT repo_id,workspace_id,field,value FROM workspace_settings WHERE host=? "
+            "ORDER BY repo_id,workspace_id,field", (host,)).fetchall()
+        for row in rows:
+            repo_id, anchor, field = row["repo_id"], row["workspace_id"], row["field"]
+            value = json.loads(row["value"])
+            if not value:
+                continue
+            if field == "main":
+                updated = self._restored_target(connection, repo_id, anchor, value, live_terminals)
+            else:
+                restored = {}
+                for target in value:
+                    replacement = self._restored_target(connection, repo_id, anchor, target, live_terminals)
+                    restored[(replacement["host"], replacement["terminal_id"])] = replacement
+                updated = list(restored.values())
+            if updated == value:
+                continue
+            validate_setting({"repo_id": repo_id, "field": field, "value": updated, "version": 1,
+                              "origin_host": host, "changed_by": "restore", "changed_at": at})
+            self._write_workspace_setting(connection, repo_id, host, anchor, field, updated, "restore", at)
+            changed.add((repo_id, host, anchor))
+        return changed
+
+    def _restored_target(self, connection: Any, repo_id: str, anchor: str, target: dict[str, str],
+                         live_terminals: set[str]) -> dict[str, str]:
+        host, terminal = target["host"], target["terminal_id"]
+        if host != self.store.host or terminal in live_terminals or connection.execute(
+                "SELECT 1 FROM terminal_slots WHERE host=? AND terminal_id=? AND present=1",
+                (host, terminal)).fetchone():
+            return target
+        old = self._target_agent(connection, target)
+        if (old is None or old["active"] or old["repo_id"] != repo_id
+                or not old["workspace_id"] or not old["pane_id"]
+                or self.scope_workspace(connection, repo_id, host, old["workspace_id"]) != anchor):
+            return target
+        candidates = connection.execute(
+            "SELECT terminal_id FROM agents WHERE host=? AND repo_id=? AND workspace_id=? AND pane_id=? "
+            "AND active=1 AND terminal_id<>? LIMIT 2",
+            (host, repo_id, old["workspace_id"], old["pane_id"], terminal)).fetchall()
+        return {"host": host, "terminal_id": candidates[0]["terminal_id"]} if len(candidates) == 1 else target
 
     def reconcile_auto_main(self, connection: Any, at: float) -> set[tuple[str, str, str]]:
         """Maintain local election memory only inside the authoritative registry transaction."""

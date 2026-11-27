@@ -15,6 +15,8 @@ SUPPORTED_LANGUAGES = ("en", "ja", "ko")
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         "title": "Agent Messenger",
+        "mailbox_main_missing": "Pinned main unavailable; choose another.",
+        "mailbox_members_missing": "Saved members unavailable; review selection.",
         "held_empty": "No held messages.",
         "held_warning": "Pushing combines this message with any unsent text in the recipient pane.",
         "held_help": "↑↓ Select  P Push  C Cancel  Esc Close",
@@ -120,6 +122,8 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "ko": {
         "title": "에이전트 메신저",
+        "mailbox_main_missing": "고정한 main을 사용할 수 없습니다. 다른 대상을 선택하세요.",
+        "mailbox_members_missing": "저장한 구성원을 사용할 수 없습니다. 선택을 확인하세요.",
         "held_empty": "보류된 메시지가 없습니다.",
         "held_warning": "지금 보내면 수신 창에 작성 중인 미전송 내용과 이 메시지가 합쳐집니다.",
         "held_help": "↑↓ 선택하세요  P 보내세요  C 취소하세요  Esc 닫으세요",
@@ -217,6 +221,8 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
     "ja": {
         "title": "エージェントメッセンジャー",
+        "mailbox_main_missing": "固定した main は利用できません。別の対象を選んでください。",
+        "mailbox_members_missing": "保存したメンバーを利用できません。選択内容を確認してください。",
         "held_empty": "保留中のメッセージはありません。",
         "held_warning": "送信すると、宛先ペインの未送信テキストとこのメッセージが結合されます。",
         "held_help": "↑↓ 選択  P 送信  C キャンセル  Esc 閉じる",

@@ -156,6 +156,11 @@ Threads keep the question and replies together. Viewing them never ACKs mail.
 
 Settings controls repository participation and host-local main/worker membership.
 Linked worktrees inherit their anchor workspace's role settings while grouped.
+After a Herdr restart, HAM restores a saved main or member when the old terminal
+is gone and exactly one active agent occupies the same host, repository,
+workspace, pane, and role group. If a saved target has no active agent and
+cannot be restored, Settings warns you and `repo show` reports `main_missing`
+or `members_missing`. Use Settings to review the selection.
 
 ![Mailbox Settings: mode, main, members, and wake thresholds](docs/images/mailbox-settings.png)
 

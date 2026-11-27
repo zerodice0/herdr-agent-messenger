@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from ham.agents.labels import alias_identity
+from ham.agents.output import compact_repo_payload
 from ham.ledger.display import SOURCE
 from ham.ledger.mail import Mailbox
 from ham.ledger.remote import RemoteLedger
@@ -70,6 +71,11 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         if workspaces is not None:
             result["workspaces"] = workspaces
         return result
+
+    def on_pane(self, snapshot, terminal, pane_id):
+        for rows in (snapshot["panes"], snapshot["agents"]):
+            next(row for row in rows if row["terminal_id"] == terminal)["pane_id"] = pane_id
+        return snapshot
 
     def grouped(self, *, main=True):
         placements = ([("main", "anchor", "main-checkout")] if main else []) + [
@@ -301,6 +307,113 @@ class WorktreeRoleGroupsTest(unittest.TestCase):
         self.mutate("mode", "manual")
         self.assertIsNone(self.show()["main"])
         self.assertTrue(all(self.settings.role(row) is None for row in agents.values()))
+
+    def test_restored_main_keeps_pin_when_both_agents_are_main_checkout(self):
+        old = ("main", "anchor", "main-checkout")
+        sibling = ("second", "anchor", "main-checkout")
+        self.register(self.snapshot(old, sibling))
+        before = self.mutate("main", self.target("main"), "anchor")["settings"]["main"]
+        restored = self.on_pane(self.snapshot(("other", *old[1:]), sibling), "other", "p-main")
+        restored["agents"][0]["agent"] = "codex"  # The client and session both changed.
+        self.herdr.terminals["p-main"] = "other"
+        agents = self.register(restored, display=True)
+        self.assertEqual({key: row["role"] for key, row in agents.items()}, {"other": "main", "second": "worker"})
+        shown = self.show("anchor")
+        self.assertEqual(shown["main"], self.target("other"))
+        self.assertEqual(shown["main_source"], "pinned")
+        self.assertIsNone(shown["computed_main"])
+        self.assertIsNone(shown["main_missing"])
+        stamp = shown["settings"]["main"]
+        self.assertEqual((stamp["changed_by"], stamp["version"]), ("restore", before["version"] + 1))
+        self.assertIn("[메인]", self.herdr.labels["p-main"])
+        self.register(restored)
+        self.assertEqual(self.show("anchor")["settings"]["main"], stamp)
+        manual = self.mutate("main", self.target("second"), "anchor")
+        self.assertEqual(manual["main"], self.target("second"))
+        self.assertEqual((manual["settings"]["main"]["changed_by"], manual["settings"]["main"]["version"]),
+                         ("user", stamp["version"] + 1))
+
+    def test_restored_manual_members_deduplicate_and_report_unavailable_member(self):
+        observed = self.grouped()
+        extra = self.on_pane(self.snapshot(("second", "w1", "worktree")), "second", "p-worker")
+        for key in ("agents", "panes"):
+            observed[key].extend(extra[key])
+        self.register(observed)
+        self.mutate("mode", "manual")
+        self.mutate("main", self.target("main"))
+        before = self.mutate("members", [self.target(name) for name in ("worker", "second", "worker2")])
+        restored = self.on_pane(self.snapshot(("main", "anchor", "main-checkout"), ("other", "w1", "worktree"),
+                                workspaces=observed["workspaces"]), "other", "p-worker")
+        agents = self.register(restored)
+        self.assertEqual(agents["other"]["role"], "worker")
+        self.assertEqual(agents["other"]["role_workspace_id"], "anchor")
+        shown = self.show("anchor")
+        self.assertEqual(shown["members"], [self.target("other"), self.target("worker2")])
+        self.assertEqual(shown["members_missing"], [{**self.target("worker2"), "pane_id": "p-worker2"}])
+        stamp = shown["settings"]["members"]
+        self.assertEqual((stamp["changed_by"], stamp["version"]),
+                         ("restore", before["settings"]["members"]["version"] + 1))
+        self.assertEqual(compact_repo_payload(self.registry.repo_show(self.repo_id, "alpha", "w1"))["members_missing"],
+                         shown["members_missing"])
+
+    def test_restore_requires_unique_same_pane_repo_workspace_and_current_anchor(self):
+        old = ("main", "w1", "main-checkout")
+        anchor = ("other", "anchor", "main-checkout")
+        workspaces = [self.workspace("anchor"), self.workspace("w1", True), self.workspace("w2", True)]
+        self.register(self.snapshot(old, anchor, workspaces=workspaces))
+        before = self.mutate("main", self.target("main"))["settings"]["main"]
+        for case, placements, pane, current_workspaces in (
+            ("no candidate", [], "p-main", workspaces),
+            ("different pane", [("worker", "w1", "worktree")], "p-worker", workspaces),
+            ("different repo", [("worker", "w1", "other-repo")], "p-main", workspaces),
+            ("different workspace", [("worker", "w2", "worktree")], "p-main", workspaces),
+            ("different anchor", [("worker", "w1", "worktree")], "p-main",
+             [self.workspace("anchor"), self.workspace("w1", True, repo_key="/other/.git")]),
+            ("multiple candidates", [("worker", "w1", "worktree"), ("second", "w1", "worktree")],
+             "p-main", workspaces),
+        ):
+            with self.subTest(case=case):
+                observed = self.snapshot(anchor, *placements, workspaces=current_workspaces)
+                for terminal, *_ in placements:
+                    self.on_pane(observed, terminal, pane)
+                self.register(observed)
+                shown = self.registry.repo_show(self.repo_id, "alpha", "anchor")
+                self.assertEqual(shown["settings"]["main"], before)
+                self.assertEqual(shown["main_source"], "auto")
+                self.assertEqual(shown["main"], self.target("other"))
+                diagnostic = {**self.target("main"), "pane_id": "p-main"}
+                self.assertEqual(shown["main_missing"], diagnostic)
+                self.assertEqual(compact_repo_payload(shown)["main_missing"], diagnostic)
+
+    def test_restore_does_not_reassign_a_present_terminal_without_an_agent(self):
+        old = ("main", "anchor", "main-checkout")
+        original = self.snapshot(old)
+        self.register(original)
+        before = self.mutate("main", self.target("main"), "anchor")["settings"]["main"]
+        observed = self.on_pane(self.snapshot(("other", *old[1:])), "other", "p-main")
+        observed["panes"].extend(original["panes"])
+        self.register(observed)
+        with self.store.read() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT present FROM terminal_slots WHERE host='alpha' AND terminal_id='main'").fetchone()[0], 1)
+        shown = self.show("anchor")
+        self.assertEqual(shown["settings"]["main"], before)
+        self.assertEqual(shown["main_source"], "auto")
+        self.assertEqual(shown["main_missing"], {**self.target("main"), "pane_id": "p-main"})
+
+    def test_caller_registration_defers_restore_to_a_full_sweep(self):
+        old = ("main", "anchor", "main-checkout")
+        self.register(self.snapshot(old))
+        self.mutate("main", self.target("main"), "anchor")
+        observed = self.on_pane(self.snapshot(("other", *old[1:])), "other", "p-main")
+        with mock.patch("ham.ledger.status.live_snapshot", return_value=observed), \
+                mock.patch.object(self.registry, "_resolve_terminal", return_value="other"):
+            self.registry.refresh_context({"HERDR_TERMINAL_ID": "other"})
+        self.assertEqual(self.show("anchor")["settings"]["main"]["value"], self.target("main"))
+        self.assertEqual(self.show("anchor")["main_missing"], {**self.target("main"), "pane_id": "p-main"})
+        self.register(observed)
+        self.assertEqual(self.show("anchor")["main"], self.target("other"))
+        self.assertEqual(self.show("anchor")["main_source"], "pinned")
 
     def test_auto_tie_and_sole_anchor_rules_apply_over_whole_group(self):
         observed = self.grouped()

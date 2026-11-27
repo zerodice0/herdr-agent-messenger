@@ -726,6 +726,10 @@ class AgentRegistry:
                 if self._status(connection, agent_id, "turn_state", value["turn_state"], at):
                     wake_terminals.append(terminal)
                     changed_panes.add(value["pane_id"])
+            # A caller observation can update its own binding, but cannot prove
+            # that all other bindings are gone or that a replacement is unique.
+            if terminals is None:
+                affected_scopes.update(settings.reconcile_restored_targets(connection, at, live_terminals))
             affected_scopes.update(settings.reconcile_auto_main(connection, at))
             # A move, arrival or departure can change the derived main for every
             # survivor in both scopes, even when their own registry rows did not change.

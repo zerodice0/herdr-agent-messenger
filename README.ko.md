@@ -155,6 +155,11 @@ Threads는 질문과 답장을 한 대화로 보여 줍니다. 조회만으로 �
 
 Settings에서 저장소 참여 모드와 호스트별 main·worker 구성을 관리합니다.
 연결된 worktree는 그룹에 속한 동안 기준 workspace의 역할 설정을 따릅니다.
+Herdr를 다시 시작했을 때 이전 터미널이 사라지고 같은 호스트·저장소·workspace·pane·역할
+그룹에 활성 에이전트가 하나뿐이면, HAM은 고정한 main이나 저장한 구성원을 그 에이전트로
+복원합니다. 활성 에이전트가 없고 복원하지 못한 대상은 Settings에 경고가 표시되며,
+`repo show`에서도 `main_missing` 또는 `members_missing`으로 확인할 수 있습니다.
+Settings에서 선택을 확인하세요.
 
 ![모드·main·구성원·깨우기 임곗값을 보여 주는 Settings](docs/images/mailbox-settings.png)
 

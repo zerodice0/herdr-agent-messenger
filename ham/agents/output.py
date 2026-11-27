@@ -229,7 +229,7 @@ def compact_repo_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if payload.get("requested_workspace_id") != payload["workspace_id"]:
         compact["requested_workspace_id"] = payload.get("requested_workspace_id")
     for key in ("home_host", "main", "main_source", "members", "computed_main",
-                "conflicts", "propagation_pending"):
+                "main_missing", "members_missing", "conflicts", "propagation_pending"):
         if payload.get(key):
             compact[key] = payload[key]
     extra = {name: setting["value"] for name, setting in payload["settings"].items()

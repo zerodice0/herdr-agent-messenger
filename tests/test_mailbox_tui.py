@@ -2186,6 +2186,26 @@ class MailboxUiTest(unittest.TestCase):
             self.assertNotIn('mutation', app.jobs)
             self.assertIn("opener's workspace", app.status)
 
+    def test_settings_warn_about_saved_roles_without_active_targets(self):
+        self.environment['LC_ALL'] = 'en_US.UTF-8'
+        target = {'host': self.store.host, 'terminal_id': 'term-b'}
+        with patch('ham.ledger.display.LedgerDisplay.refresh', return_value={'updated': [], 'failed': []}):
+            for field, value in (('main', target), ('members', [target])):
+                RepoSettings(self.store).mutate(
+                    self.repo_id, field, value, host=self.store.host, workspace_id='w1')
+        app = self.app()
+        app.key('s')
+        self.assertNotIn('unavailable;', '\n'.join(app.settings_lines()))
+        self.registry.reconcile({**self.snapshot, 'agents': self.snapshot['agents'][:1]}, refresh_display=False)
+        app.local = local_snapshot(self.store, self.repo_id, self.environment)
+        settings = '\n'.join(app.settings_lines())
+        self.assertIn('⚠ Pinned main unavailable; choose another.', settings)
+        self.assertIn('⚠ Saved members unavailable; review selection.', settings)
+        text = '\n'.join(self.capture(app).lines())
+        self.assertIn('⚠ Pinned main unavailable;', text)
+        self.assertIn('⚠ Saved members unavailable;', text)
+        self.assertIn('main source: auto', text)
+
     def test_settings_workspace_move_cancels_picker_numeric_and_pending_edits(self):
         for field in ('mode', 'main', 'members', 'idle_minutes'):
             with self.subTest(field=field):

@@ -43,6 +43,7 @@ from ham.ledger.settings import DEFAULT_THRESHOLDS, RepoSettings
 from ham.ledger.status import repository_identity
 from ham.ledger.store import LedgerError, LedgerStore, ledger_directory
 from ham.ledger.views import status_board
+from ham.ui.messenger_i18n import detect_language, messages
 from ham.ui.tui_style import Theme, Hint, content_rect, draw_footer, draw_title, footer_lines
 from ham.ui.terminal_text import (character_index_at_display_column, display_width,
                            pad_display_text, truncate_display_text,
@@ -959,6 +960,7 @@ class MailboxApp:
     def __init__(self, screen: Any, environment: Mapping[str, str], *, job_factory=Job,
                  clock=time.monotonic, wall_clock=time.time, quick_send: bool = False):
         self.screen, self.environment = screen, dict(environment)
+        self.text = messages(detect_language(environment))
         self.repo_id = self.environment.get(REPO_ENV) or None
         self.store = LedgerStore(environment=environment)
         self.job_factory, self.clock, self.wall_clock = job_factory, clock, wall_clock
@@ -3467,7 +3469,10 @@ class MailboxApp:
             if (self.settings_saving and self.settings_saving["field"] == field
                     and self.settings_saving["scope"] == scope and not feedback.startswith("Saving settings")):
                 feedback = "Saving settings… · " + feedback
-            result.append(("▌ " if index == self.settings_selection else "  ") + f"{self.setting_label(field)}: {shown}" +
+            warning = (self.text[f"mailbox_{field}_missing"]
+                       if field in {"main", "members"} and settings.get(f"{field}_missing") else "")
+            result.append(("▌ " if index == self.settings_selection else "  ") + f"{self.setting_label(field)}: " +
+                          (f"⚠ {warning} · " if warning else "") + shown +
                           (" · unsaved" if field in self.settings_pending else "") +
                           (" · " + feedback if feedback else ""))
         main = settings.get("main")
